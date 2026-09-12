@@ -23,6 +23,9 @@ class TestQuestion(BaseModel):
     expected_record_ids: list[str] = Field(default_factory=list)
     expected_group_values: list[dict] = Field(default_factory=list)
     expected_normalized_result: dict | None = None
+    expected_violation_codes: list[str] = Field(default_factory=list)
+    expected_answer_contract: dict | None = None
+    expected_unsupported_capabilities: list[str] = Field(default_factory=list)
     turns: list[dict] = Field(default_factory=list)
     expected_error: str | None = None
 

@@ -9,17 +9,28 @@ import unicodedata
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from week5.new_implementation.attendance_schema import (
-    BUSINESS_PREDICATE_DEFINITIONS,
-    FIELD_DEFINITIONS,
-    INTERPRETATION_PRESETS,
-    MEASURE_DEFINITIONS,
-    RETRIEVAL_INTENT_DEFINITIONS,
-    VALUE_CONCEPT_DEFINITIONS,
-    EvidenceOrigin,
-    FilterOperator,
-    ResolutionKind,
-)
+try:
+    from .attendance_schema import (
+        BUSINESS_PREDICATE_DEFINITIONS,
+        FIELD_DEFINITIONS,
+        MEASURE_DEFINITIONS,
+        RETRIEVAL_INTENT_DEFINITIONS,
+        VALUE_CONCEPT_DEFINITIONS,
+        EvidenceOrigin,
+        FilterOperator,
+        ResolutionKind,
+    )
+except ImportError:  # Direct execution from week5/new_implementation.
+    from attendance_schema import (
+        BUSINESS_PREDICATE_DEFINITIONS,
+        FIELD_DEFINITIONS,
+        MEASURE_DEFINITIONS,
+        RETRIEVAL_INTENT_DEFINITIONS,
+        VALUE_CONCEPT_DEFINITIONS,
+        EvidenceOrigin,
+        FilterOperator,
+        ResolutionKind,
+    )
 
 
 def normalize_semantic_text(value: object) -> str:
@@ -89,7 +100,7 @@ class FieldResolver(ABC):
         self, question: str, field: str, context: ResolutionContext
     ) -> tuple[SemanticFact, ...]:
         definition = FIELD_DEFINITIONS[field]
-        return tuple(
+        field_facts = tuple(
             SemanticFact(
                 kind="field",
                 field=field,
@@ -100,6 +111,63 @@ class FieldResolver(ABC):
             for phrase in sorted(definition.natural_names, key=len, reverse=True)
             if evidence_occurs(question, phrase)
         )[:1]
+        if not field_facts:
+            return ()
+        value_search_text = normalize_semantic_text(question).replace(
+            normalize_semantic_text(field_facts[0].evidence_text), " ", 1
+        )
+        values: list[tuple[object, str]] = []
+        if definition.resolution_kind == "closed_value":
+            values.extend(
+                (value, value)
+                for value in definition.closed_values
+                if evidence_occurs(question, value)
+            )
+            values.extend(
+                (alias.canonical_value, alias.natural_name)
+                for alias in definition.value_aliases
+                if evidence_occurs(question, alias.natural_name)
+            )
+        elif definition.resolution_kind == "catalog":
+            values.extend(
+                (value, value)
+                for value in context.catalog.get(field, ())
+                if evidence_occurs(question, value)
+            )
+        elif definition.resolution_kind == "identifier":
+            match = re.search(r"\b[A-Za-z][A-Za-z0-9_-]*\d[A-Za-z0-9_-]*\b", question)
+            if match:
+                values.append((match.group(0), match.group(0)))
+        elif definition.resolution_kind == "entity":
+            values.extend(
+                (employee.name, employee.name)
+                for employee in context.employees
+                if evidence_occurs(question, employee.name)
+            )
+        elif definition.resolution_kind == "numeric":
+            match = re.search(
+                r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?(?![A-Za-z])",
+                value_search_text,
+            )
+            if match:
+                values.append((float(match.group(0)), match.group(0)))
+        elif definition.resolution_kind == "temporal":
+            match = re.search(r"\b\d{4}-\d{2}-\d{2}\b", question)
+            if match:
+                values.append((match.group(0), match.group(0)))
+        value_facts = tuple(
+            SemanticFact(
+                kind="filter",
+                field=field,
+                operator="eq",
+                values=(value,),
+                evidence_text=evidence,
+                origin="question",
+                strength="strong",
+            )
+            for value, evidence in dict.fromkeys(values)
+        )
+        return field_facts + value_facts
 
     @abstractmethod
     def canonicalize(
@@ -287,9 +355,31 @@ def detect_semantic_facts(
 ) -> tuple[SemanticFact, ...]:
     facts: list[SemanticFact] = []
     registry = ResolverRegistry.default()
-    for field, definition in FIELD_DEFINITIONS.items():
-        if definition.planner_visible:
-            facts.extend(registry.for_kind(definition.resolution_kind).detect(question, field, context))
+    field_matches = [
+        (field, phrase)
+        for field, definition in FIELD_DEFINITIONS.items()
+        if definition.planner_visible
+        for phrase in definition.natural_names
+        if evidence_occurs(question, phrase)
+    ]
+    maximal_field_matches = [
+        (field, phrase)
+        for field, phrase in field_matches
+        if not any(
+            field != other_field
+            and normalize_semantic_text(phrase) != normalize_semantic_text(other_phrase)
+            and evidence_occurs(other_phrase, phrase)
+            for other_field, other_phrase in field_matches
+        )
+    ]
+    selected_fields = tuple(dict.fromkeys(field for field, _ in maximal_field_matches))
+    for field in selected_fields:
+        definition = FIELD_DEFINITIONS[field]
+        facts.extend(
+            registry.for_kind(definition.resolution_kind).detect(
+                question, field, context
+            )
+        )
     for name, concept in VALUE_CONCEPT_DEFINITIONS.items():
         for phrase in sorted(concept.natural_names, key=len, reverse=True):
             if not evidence_occurs(question, phrase):
@@ -312,8 +402,24 @@ def detect_semantic_facts(
                 )
             )
             break
-    facts.extend(_facts_for_named_phrases(question, "measure", MEASURE_DEFINITIONS))
-    facts.extend(_facts_for_named_phrases(question, "predicate", BUSINESS_PREDICATE_DEFINITIONS))
+    if re.search(r"\b(?:how many|count|number of|total number)\b", question, re.I):
+        facts.extend(_facts_for_named_phrases(question, "measure", MEASURE_DEFINITIONS))
+    predicate_facts = _facts_for_named_phrases(
+        question, "predicate", BUSINESS_PREDICATE_DEFINITIONS
+    )
+    selected_phrases = [
+        phrase for field, phrase in maximal_field_matches if field in selected_fields
+    ]
+    facts.extend(
+        fact
+        for fact in predicate_facts
+        if not any(
+            normalize_semantic_text(fact.evidence_text)
+            != normalize_semantic_text(field_phrase)
+            and evidence_occurs(field_phrase, fact.evidence_text)
+            for field_phrase in selected_phrases
+        )
+    )
     facts.extend(_facts_for_named_phrases(question, "semantic_intent", RETRIEVAL_INTENT_DEFINITIONS))
     return merge_semantic_facts(facts)
 

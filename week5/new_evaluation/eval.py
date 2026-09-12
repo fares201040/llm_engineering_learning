@@ -107,6 +107,9 @@ class BehaviorEval(BaseModel):
     expected_error_ok: bool = True
     record_ids_ok: bool = True
     group_values_ok: bool = True
+    violation_codes_ok: bool = True
+    answer_contract_ok: bool = True
+    unsupported_capabilities_ok: bool = True
 
 
 def _expected_subset(actual: dict | None, expected: dict | None):

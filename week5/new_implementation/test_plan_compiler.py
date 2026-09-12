@@ -19,7 +19,7 @@ from week5.new_implementation.semantic_resolution import (
 
 class PlanCompilerTests(unittest.TestCase):
     def setUp(self):
-        self.question = "off days for A11017"
+        self.question = "how many off days for A11017"
         self.resolution = ResolutionContext(
             catalog={
                 "Day_Type": ("Working Day", "OFF Day", "OFF Day (ZAS)"),

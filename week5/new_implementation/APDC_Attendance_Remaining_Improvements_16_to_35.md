@@ -47,6 +47,10 @@ When documents disagree, use this order of authority:
 The dataset fingerprint is kept in the local-only evaluation manifest and is
 not published.
 
+Repository handoff baseline: GitHub `main` commit
+`931445979f8ef9e2909f0282d95e5ce41b4cc421`. That commit was independently
+reviewed with no remaining Critical or Important finding before it was pushed.
+
 The private raw table also contains one historical quarantined fixture row.
 That row is intentional append-only history, not an active source and not stale
 data to delete.
@@ -56,6 +60,109 @@ overtime, authorization status, and record identity. Employee-linked expected
 values stay in the ignored private evaluation corpus and are not reproduced in
 this publishable handoff. Only non-identifying aggregate acceptance results are
 reported here.
+
+## New observed issue and next-agent mission
+
+This section records the new screenshot received after the baseline above. It
+is an unresolved investigation request, not a verified diagnosis.
+
+### Sanitized observed conversation
+
+The real employee ID and employee-linked result values remain local and are not
+published in this handoff. During authorized local reproduction, replace
+`E00001` below with the employee ID from the supplied screenshot.
+
+1. The user asked how many days synthetic employee `E00001` attended during a
+   month that extends beyond the loaded coverage. The assistant returned a
+   worked-day result with the correct partial-coverage warning.
+2. The user asked how many days the same employee did not attend. The assistant
+   returned a scheduled-non-attendance result with the same warning.
+3. The user asked `who is this employee`.
+4. The assistant incorrectly returned:
+
+   ```text
+   I could not safely interpret that request: Interpretation clarification
+   requires at least two distinct choices.
+   ```
+
+5. The Gradio **Relevant Context** panel was empty for the displayed response.
+
+The expected third-turn behavior is to retain the validated employee selected
+by the earlier turns, retrieve only evidence for that employee, answer the
+identity question from trusted directory/evidence data, and render the evidence
+used in the Relevant Context panel. It must not invent an identity, retrieve
+another employee, or expose private fields outside the approved context schema.
+
+### What is confirmed and what still requires tracing
+
+Confirmed from the previous investigation:
+
+- Gradio passes prior chat messages and a per-session `ConversationState` into
+  `answer_question_with_state()`.
+- Direct employee resolution is committed to `selected_employees` only after
+  successful retrieval.
+- Singular follow-ups such as `Who is this employee?` reuse the selected
+  employee, while population/group/ranking requests do not.
+- Worked-day and scheduled-non-attendance calculations for the shown employee
+  were source-checked against the real local retrieval backend.
+
+The new error text strongly suggests that a one-item interpretation candidate
+set reached a validation/clarification boundary that requires at least two
+choices. That is only a hypothesis until the next agent captures the actual
+question, history, state before/after, raw planner output, normalized plan,
+interpretation candidates, resolved employee IDs, retrieved chunks, and app
+callback outputs from the failing runtime. The empty context panel may be a
+downstream consequence of the safe-error path returning no chunks, or it may be
+a separate rendering/data-flow defect. Trace both independently.
+
+### Required investigation workflow
+
+The next agent must first read this handoff and the scripts listed in the
+required reading order. Then:
+
+1. Reproduce the exact three-turn screenshot flow through `new_app.chat_with_state()`
+   and through the running Gradio UI. Capture state and evidence at every
+   boundary without logging private values.
+2. Add a failing regression that proves the actual root cause before changing
+   production code. Fix the owning schema, compiler, resolver, state, retrieval,
+   or rendering boundary; do not special-case the exact user sentence.
+3. Verify that a valid single interpretation is accepted directly, while true
+   ambiguity still requires at least two distinct choices and unsafe/empty
+   interpretations still fail closed.
+4. Verify that deterministic answers and narrative answers both return the
+   evidence actually used, and that `new_app._render_context()` displays it.
+   If a calculation intentionally needs summarized rather than row-level
+   evidence, provide a truthful structured evidence object instead of fabricating
+   context.
+5. Run a long, stateful Gradio conversation—at least 60 turns, plus fresh-session
+   controls—covering direct IDs, names, pronouns, `this employee`, changed
+   employees, unknown and ambiguous employees, worked/not-worked/absent/scheduled
+   distinctions, record counts, authorization, overtime, percentages, grouping,
+   ranking, dates, coverage, semantic questions, malformed input, retries, and
+   clear/reset behavior. For every turn, record the expected scope/calculation,
+   actual answer, selected state, pending state, and displayed evidence.
+6. When a wrong answer, missing context, state leak, unsafe behavior, or unrelated
+   code defect is found, stop that scenario, trace it to the first incorrect
+   boundary, add a failing test, implement the native fix, rerun adjacent tests,
+   restart/reload Gradio when necessary, and resume the long conversation. Do
+   not accumulate unexplained failures until the end.
+7. Test at least two independent Gradio sessions interleaved to prove that
+   employee selection, pending clarification, and history cannot cross sessions.
+8. Review risky logic step by step: model-plan trust boundaries, contradiction
+   detection, single/multiple interpretation handling, pending-state mutation,
+   employee follow-up scoping, exact/hybrid/semantic routing, zero-result
+   behavior, coverage wording, context propagation, HTML escaping, exception
+   paths, and clean-checkout behavior without private fixtures.
+9. Run the complete verification commands, independently review the final diff,
+   update this handoff and related documentation, commit all authorized source,
+   tests, docs, and notebooks, and push to
+   `https://github.com/fares201040/llm_engineering_learning.git` without force.
+
+Do not commit `.env` files, access tokens, raw or identifiable employee
+attendance data, `tests.jsonl`, `dataset_manifest.json`, generated Chroma or
+database files, or ingestion-state artifacts. Scan the full outgoing commit for
+credentials before pushing; the previous push correctly stopped on and then
+removed an embedded Hugging Face token from a notebook.
 
 ## Locked architectural decisions
 

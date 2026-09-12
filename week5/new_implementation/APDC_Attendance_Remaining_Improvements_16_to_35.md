@@ -492,11 +492,78 @@ One uninterrupted sequential provider/database run passed 300/300 cases with
 no retries. The affected date and Authorized-record categories were rerun after
 their corrections with zero failures. Each later regression case, including
 the final distinct-employee wording, then passed individually against the final
-rule set. The latest screenshot-specific three-turn replay passed through the
-real state, normalization, employee-directory, and PostgreSQL boundaries with
-only the unavailable provider calls replaced. The configured LiteLLM endpoint
-was refusing connections during the final live-provider probe; this is an
-environmental verification limitation, not recorded as a passing live run.
+rule set. An earlier screenshot-specific replay passed the real state,
+normalization, employee-directory, and PostgreSQL boundaries while the provider
+was temporarily unavailable. The later final replay and long acceptance run
+both passed through the configured live provider.
+
+## 2026-09-12 Gradio interpretation and evidence investigation
+
+The supplied three-turn Gradio failure was reproduced at the plan-normalization
+boundary. A valid, single-item `interpretation_candidates` list was being sent
+to clarification validation, which requires at least two distinct choices. The
+request therefore stopped before employee resolution and retrieval, so the
+answer correctly carried no chunks and Relevant Context had nothing to render.
+The rendering component itself was not the original fault.
+
+Interpretation candidates are now stably deduplicated. One compatible valid
+candidate compiles directly, multiple distinct candidates remain a genuine
+clarification, and invalid enum values fail schema validation. Explicit
+quantitative, projection, identity, semantic, ranking, percentage, and limited
+record intent takes precedence over contradictory advisory planner labels.
+
+The same investigation exposed and fixed adjacent deterministic-boundary
+defects:
+
+- reset now clears chat history, Relevant Context, selected employees, and all
+  pending clarification state;
+- employee anaphora without a trusted selection stops before retrieval;
+- population questions cannot inherit or accept planner-invented employee
+  scope;
+- numeric calculations, scheduled-attendance percentages, grouped rankings,
+  and ordered record projections compile from explicit user wording;
+- positive worked-day wording does not override an explicit worked-hours
+  threshold;
+- case-only controlled-value differences do not create false contradictions;
+- narrative field, identity, and semantic projections cannot become record
+  counts merely because of planner candidates;
+- identity answers use the current trusted selection and current retrieval,
+  rather than stale conversation claims;
+- broad exact record requests report the authoritative match count and label
+  the displayed chunks as an evidence sample;
+- punctuation-only, malformed comparison, unsupported-domain, and creative
+  requests fail before unsafe or irrelevant retrieval.
+
+Both deterministic and model-generated answer paths now have explicit parity
+tests proving that the answer boundary returns the exact retrieved evidence.
+The Gradio callback has a matching test proving that this evidence is escaped
+and rendered under Relevant Context.
+
+An uninterrupted provider/database acceptance run completed 60 turns in the
+primary session and nine turns in an independently interleaved control session.
+It covered identities and anaphora, employee replacement, unknown and ambiguous
+identity, attendance distinctions, status and record counts, numeric and
+percentage calculations, grouping and ranking, time coverage, semantic
+questions, invalid input, clarification/retry, and reset. Assertions recorded
+scope, calculation, answer, selected and pending state, evidence count, and the
+final executable plan for every turn in a private temporary transcript. The two
+sessions remained isolated, and reset cleared the second session before its
+fresh-session controls. The transcript and private-derived facts are not
+tracked.
+
+The restarted Gradio application also passed the supplied three-turn browser
+replay. The identity follow-up returned the trusted employee identity with real
+retrieved evidence. Clear removed both chat and context, and the same anaphoric
+question in a fresh state returned a controlled request for an employee name or
+ID with no evidence. A final ordered-record browser check returned and displayed
+exactly the explicitly requested two most recent evidence rows.
+
+Final automated verification passed 257 implementation tests and 29
+app/evaluation/benchmark tests. Ruff check and format check, Python compilation,
+private dataset integrity verification, five APDC-adjacent notebook schema
+validations, and `git diff --check` passed. The only warning remained the known
+third-party protobuf deprecation warning. Independent final re-review reported
+no Critical or Important findings.
 
 ## Verification commands
 
@@ -529,6 +596,10 @@ $env:ANONYMIZED_TELEMETRY='False'
   week5/new_app.py
 
 & '.venv\Scripts\python.exe' week5/new_evaluation/eval.py --verify-dataset
+
+& '.venv\Scripts\python.exe' -c `
+  "import glob,nbformat; paths=glob.glob('week5/day*.ipynb'); [nbformat.validate(nbformat.read(p, as_version=4)) for p in paths]; print(f'Validated {len(paths)} APDC-adjacent notebooks')"
+
 git diff --check
 ```
 

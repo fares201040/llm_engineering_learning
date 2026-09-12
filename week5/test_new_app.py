@@ -47,6 +47,49 @@ class ContextRenderingTests(unittest.TestCase):
 
 
 class SessionStateTests(unittest.TestCase):
+    def test_reset_conversation_clears_context_and_trusted_state(self):
+        selected = answer.EmployeeCandidate(
+            employee_id="A11017", name="Example Employee Alpha"
+        )
+        original = answer.ConversationState(
+            selected_employees=[selected],
+            pending_question="Which employee?",
+            pending_plan=answer.QueryPlan(mode="exact", search_query="employee"),
+            pending_candidates=[selected],
+        )
+
+        context, state = new_app.reset_conversation(original)
+
+        self.assertIn("Relevant Context", context)
+        self.assertNotIn("Employee_ID", context)
+        self.assertEqual(state, answer.ConversationState())
+        self.assertIsNot(state, original)
+
+    def test_chat_with_state_renders_the_answer_evidence(self):
+        document = answer.Result(
+            page_content="Employee_ID: A11017\nName: <Example Employee>",
+            metadata={"source": "<attendance.xlsx>"},
+        )
+
+        with patch.object(
+            new_app,
+            "answer_question_with_state",
+            return_value=(
+                "The employee is Example Employee.",
+                [document],
+                answer.ConversationState(),
+            ),
+        ):
+            history, context, _state = new_app.chat_with_state(
+                [{"role": "user", "content": "Who is this employee?"}],
+                answer.ConversationState(),
+            )
+
+        self.assertEqual(history[-1]["content"], "The employee is Example Employee.")
+        self.assertIn("&lt;attendance.xlsx&gt;", context)
+        self.assertIn("Name: &lt;Example Employee&gt;", context)
+        self.assertIn("<pre><code>", context)
+
     def test_chat_with_state_returns_an_independent_updated_session(self):
         first = answer.ConversationState()
         second = answer.ConversationState()

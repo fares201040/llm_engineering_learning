@@ -8,6 +8,56 @@ from week5.new_implementation import answer
 
 
 class AccessScopeTests(unittest.TestCase):
+    def test_creative_out_of_scope_request_stops_before_planning(self):
+        with patch.object(answer, "plan_query") as planner:
+            text, chunks = answer.answer_question("Write a poem about the harbor.")
+
+        self.assertEqual(text, answer.ACCESS_DENIED_MESSAGE)
+        self.assertEqual(chunks, [])
+        planner.assert_not_called()
+
+    def test_invalid_over_comparison_stops_before_planning(self):
+        with patch.object(answer, "plan_query") as planner:
+            with self.assertRaisesRegex(
+                answer.PlanValidationError, "numeric comparison"
+            ):
+                answer.fetch_context(
+                    "Show records where this employee worked over bananas hours."
+                )
+
+        planner.assert_not_called()
+
+    def test_temporal_over_under_phrasing_reaches_planning(self):
+        questions = (
+            "Show overtime over the last month",
+            "Summarize attendance over September 2026",
+            "Who worked under the current schedule?",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                with (
+                    patch.object(
+                        answer,
+                        "plan_query",
+                        return_value=answer.QueryPlan(
+                            mode="exact", search_query="attendance"
+                        ),
+                    ) as planner,
+                    patch.object(answer, "_postgres_enabled", return_value=False),
+                    patch.object(answer, "fetch_exact_chroma", return_value=[]),
+                ):
+                    answer.fetch_context(question)
+
+                planner.assert_called_once()
+
+    def test_punctuation_only_input_stops_before_planning(self):
+        with patch.object(answer, "plan_query") as planner:
+            text, chunks = answer.answer_question("???")
+
+        self.assertIn("could not safely interpret", text.casefold())
+        self.assertEqual(chunks, [])
+        planner.assert_not_called()
+
     def test_invalid_numeric_comparison_stops_before_planning(self):
         with patch.object(answer, "plan_query") as planner:
             with self.assertRaisesRegex(
@@ -236,26 +286,33 @@ class QueryPlannerSchemaTests(unittest.TestCase):
                     answer.normalize_query_plan(question, proposed)
 
     def test_nonzero_hour_upper_bound_is_not_treated_as_zero_work(self):
-        proposed = answer.QueryPlan(
-            mode="exact",
-            search_query="worked hours threshold",
-            filters=[
-                answer.FilterCondition(
-                    field="Total_Worked_Hrs", operator="lte", value=8.0
+        for wording in (
+            "How many days did A11017 have not more than 8 worked hours?",
+            "How many days did A11017 work under 8 hours?",
+        ):
+            with self.subTest(wording=wording):
+                proposed = answer.QueryPlan(
+                    mode="exact",
+                    search_query="worked hours threshold",
+                    filters=[
+                        answer.FilterCondition(
+                            field="Total_Worked_Hrs", operator="lte", value=8.0
+                        )
+                    ],
+                    measure="distinct_dates",
                 )
-            ],
-            measure="distinct_dates",
-        )
 
-        plan = answer.normalize_query_plan(
-            "How many days did A11017 have not more than 8 worked hours?", proposed
-        )
+                plan = answer.normalize_query_plan(wording, proposed)
 
-        self.assertEqual(plan.business_predicates, [])
-        self.assertIn(
-            {"field": "Total_Worked_Hrs", "operator": "lte", "value": 8.0},
-            [condition.model_dump() for condition in plan.filters],
-        )
+                self.assertEqual(plan.business_predicates, [])
+                self.assertIn(
+                    {
+                        "field": "Total_Worked_Hrs",
+                        "operator": "lte",
+                        "value": 8.0,
+                    },
+                    [condition.model_dump() for condition in plan.filters],
+                )
 
     def test_negated_schedule_modifier_is_not_treated_as_non_attendance(self):
         proposed = answer.QueryPlan(
@@ -666,6 +723,399 @@ class BackendLoggingTests(unittest.TestCase):
 
 
 class PlanNormalizationTests(unittest.TestCase):
+    def test_limited_record_projection_preserves_order_and_limit(self):
+        normalized = answer.normalize_query_plan(
+            "Show the last two attendance records for this employee",
+            answer.QueryPlan(
+                mode="exact",
+                search_query="last attendance records",
+                measure="attendance_records",
+                limit=2,
+            ),
+        )
+
+        self.assertIsNone(normalized.measure)
+        self.assertEqual(normalized.aggregation, "none")
+        self.assertEqual(normalized.order_by, "Date")
+        self.assertEqual(normalized.order_direction, "desc")
+        self.assertEqual(normalized.limit, 2)
+        answer.QueryPlan.model_validate(normalized.model_dump())
+
+    def test_unrequested_row_order_and_limit_are_discarded(self):
+        normalized = answer.normalize_query_plan(
+            "Show attendance records",
+            answer.QueryPlan(
+                mode="exact",
+                search_query="attendance records",
+                order_by="Date",
+                order_direction="desc",
+                limit=2,
+            ),
+        )
+
+        self.assertIsNone(normalized.order_by)
+        self.assertIsNone(normalized.limit)
+
+    def test_highest_overtime_day_compiles_as_one_ranked_date(self):
+        normalized = answer.normalize_query_plan(
+            "Which day had this employee's highest overtime?",
+            answer.QueryPlan(
+                mode="exact",
+                search_query="highest overtime day",
+                measure="attendance_records",
+                group_by=["Date"],
+            ),
+        )
+
+        self.assertIsNone(normalized.measure)
+        self.assertEqual(normalized.aggregation, "sum")
+        self.assertEqual(normalized.aggregation_field, "Total_OT")
+        self.assertEqual(normalized.group_by, ["Date"])
+        self.assertEqual(normalized.order_by, "value")
+        self.assertEqual(normalized.order_direction, "desc")
+        self.assertEqual(normalized.limit, 1)
+
+    def test_plain_attended_days_remove_unrequested_scheduled_predicate(self):
+        normalized = answer.normalize_query_plan(
+            "How many days did this employee attend?",
+            answer.QueryPlan(
+                mode="exact",
+                search_query="attended days",
+                measure="distinct_dates",
+                business_predicates=["scheduled_working_day"],
+            ),
+        )
+
+        self.assertEqual(normalized.business_predicates, ["worked"])
+        self.assertNotIn(
+            "Day_Type", {condition.field for condition in normalized.filters}
+        )
+
+    def test_days_employee_worked_add_positive_work_predicate(self):
+        normalized = answer.normalize_query_plan(
+            "How many days did this employee work in all of September 2026?",
+            answer.QueryPlan(
+                mode="exact",
+                search_query="employee days",
+                measure="distinct_dates",
+                business_predicates=["scheduled_working_day"],
+            ),
+        )
+
+        self.assertEqual(normalized.business_predicates, ["worked"])
+        self.assertIn(
+            answer.FilterCondition(field="Total_Worked_Hrs", operator="gt", value=0.0),
+            normalized.filters,
+        )
+
+    def test_explicit_numeric_sum_overrides_planner_record_measure(self):
+        normalized = answer.normalize_query_plan(
+            "Total worked hours for this employee in September 2026",
+            answer.QueryPlan(
+                mode="exact",
+                search_query="worked hours",
+                measure="attendance_records",
+                aggregation="sum",
+                aggregation_field="Total_Worked_Hrs",
+            ),
+        )
+
+        self.assertIsNone(normalized.measure)
+        self.assertEqual(normalized.aggregation, "sum")
+        self.assertEqual(normalized.aggregation_field, "Total_Worked_Hrs")
+
+    def test_explicit_numeric_aggregation_contracts_are_deterministic(self):
+        cases = [
+            ("total overtime", "sum", "Total_OT"),
+            ("average worked hours", "average", "Total_Worked_Hrs"),
+            ("maximum overtime", "max", "Total_OT"),
+            ("minimum worked hours", "min", "Total_Worked_Hrs"),
+        ]
+
+        for question, operation, field in cases:
+            with self.subTest(question=question):
+                normalized = answer.normalize_query_plan(
+                    question,
+                    answer.QueryPlan(
+                        mode="exact",
+                        search_query=question,
+                        measure="attendance_records",
+                        aggregation="count",
+                    ),
+                )
+                self.assertIsNone(normalized.measure)
+                self.assertEqual(normalized.aggregation, operation)
+                self.assertEqual(normalized.aggregation_field, field)
+
+    def test_numeric_aggregation_binds_to_the_metric_nearest_the_operation(self):
+        for question in (
+            "Average overtime for records with total worked hours over 8",
+            "For records with total worked hours over 8, what is the average overtime?",
+        ):
+            with self.subTest(question=question):
+                normalized = answer.normalize_query_plan(
+                    question,
+                    answer.QueryPlan(
+                        mode="exact",
+                        search_query="overtime by worked-hours threshold",
+                        filters=[
+                            answer.FilterCondition(
+                                field="Total_Worked_Hrs", operator="gt", value=8.0
+                            )
+                        ],
+                        aggregation="sum",
+                        aggregation_field="Total_Worked_Hrs",
+                    ),
+                )
+
+                self.assertEqual(normalized.aggregation, "average")
+                self.assertEqual(normalized.aggregation_field, "Total_OT")
+
+    def test_scheduled_attendance_percentage_compiles_denominator_and_numerator(self):
+        normalized = answer.normalize_query_plan(
+            "What percentage of scheduled working days did this employee attend?",
+            answer.QueryPlan(
+                mode="hybrid",
+                search_query="attendance percentage",
+                measure="attendance_records",
+                aggregation="percentage",
+                aggregation_field="Date",
+                business_predicates=["scheduled_working_day"],
+                interpretation_candidates=[
+                    "attendance_records",
+                    "scheduled_working_days",
+                ],
+            ),
+        )
+
+        self.assertIsNone(normalized.measure)
+        self.assertEqual(normalized.aggregation, "percentage")
+        self.assertEqual(normalized.aggregation_field, "Date")
+        self.assertEqual(normalized.business_predicates, ["scheduled_working_day"])
+        self.assertIn(
+            answer.FilterCondition(
+                field="Day_Type", operator="eq", value="Working Day"
+            ),
+            normalized.filters,
+        )
+        self.assertEqual(
+            normalized.percentage_condition,
+            answer.FilterCondition(field="Total_Worked_Hrs", operator="gt", value=0.0),
+        )
+
+    def test_numeric_projection_does_not_become_record_count(self):
+        normalized = answer.normalize_query_plan(
+            "Show this employee's overtime",
+            answer.QueryPlan(
+                mode="exact",
+                search_query="employee overtime",
+                measure="attendance_records",
+                aggregation="none",
+            ),
+        )
+
+        self.assertIsNone(normalized.measure)
+        self.assertEqual(normalized.aggregation, "none")
+        self.assertIsNone(normalized.aggregation_field)
+
+    def test_identity_question_discards_multiple_advisory_count_interpretations(self):
+        normalized = answer.normalize_query_plan(
+            "Who is this employee?",
+            answer.QueryPlan(
+                mode="exact",
+                search_query="employee identity",
+                interpretation_candidates=["employees", "attendance_records"],
+            ),
+        )
+
+        self.assertEqual(normalized.interpretation_candidates, [])
+        self.assertIsNone(normalized.measure)
+        self.assertEqual(normalized.aggregation, "none")
+
+    def test_numeric_yes_no_projection_discards_unrelated_interpretations(self):
+        normalized = answer.normalize_query_plan(
+            "Did she have any lateness?",
+            answer.QueryPlan(
+                mode="hybrid",
+                search_query="lateness",
+                interpretation_candidates=["worked_days", "scheduled_working_days"],
+            ),
+        )
+
+        self.assertEqual(normalized.interpretation_candidates, [])
+        self.assertIsNone(normalized.measure)
+        self.assertEqual(normalized.aggregation, "none")
+
+    def test_lowercase_absent_filter_matches_explicit_absence_predicate(self):
+        normalized = answer.normalize_query_plan(
+            "How many explicitly absent days?",
+            answer.QueryPlan(
+                mode="exact",
+                search_query="absent days",
+                measure="distinct_dates",
+                filters=[
+                    answer.FilterCondition(
+                        field="Exception", operator="eq", value="absent"
+                    )
+                ],
+            ),
+        )
+
+        self.assertIn("absent", normalized.business_predicates)
+        self.assertEqual(
+            [
+                condition.value
+                for condition in normalized.filters
+                if condition.field == "Exception"
+            ],
+            ["Absent"],
+        )
+
+    def test_controlled_field_projection_does_not_become_a_count(self):
+        for question in (
+            "What attendance statuses does this employee have?",
+            "What exceptions does this employee have?",
+        ):
+            with self.subTest(question=question):
+                normalized = answer.normalize_query_plan(
+                    question,
+                    answer.QueryPlan(
+                        mode="exact",
+                        search_query="employee attendance field",
+                        measure="attendance_records",
+                        interpretation_candidates=[
+                            "attendance_records",
+                            "worked_days",
+                        ],
+                    ),
+                )
+
+                self.assertEqual(normalized.interpretation_candidates, [])
+                self.assertIsNone(normalized.measure)
+                self.assertEqual(normalized.aggregation, "none")
+
+    def test_employee_overtime_ranking_compiles_from_explicit_question(self):
+        normalized = answer.normalize_query_plan(
+            "Which five employees have the most overtime?",
+            answer.QueryPlan(
+                mode="exact",
+                search_query="",
+                measure="attendance_records",
+                order_by="value",
+                order_direction="desc",
+                limit=5,
+            ),
+        )
+
+        self.assertIsNone(normalized.measure)
+        self.assertEqual(normalized.aggregation, "sum")
+        self.assertEqual(normalized.aggregation_field, "Total_OT")
+        self.assertEqual(normalized.group_by, ["Employee_ID"])
+        self.assertEqual(normalized.order_by, "value")
+        self.assertEqual(normalized.order_direction, "desc")
+        self.assertEqual(normalized.limit, 5)
+
+    def test_singular_employee_superlative_defaults_to_one_result(self):
+        normalized = answer.normalize_query_plan(
+            "Which employee had the most overtime?",
+            answer.QueryPlan(
+                mode="exact",
+                search_query="employee overtime ranking",
+                aggregation="sum",
+                aggregation_field="Total_OT",
+                group_by=["Employee_ID"],
+                order_by="value",
+            ),
+        )
+
+        self.assertEqual(normalized.group_by, ["Employee_ID"])
+        self.assertEqual(normalized.order_by, "value")
+        self.assertEqual(normalized.order_direction, "desc")
+        self.assertEqual(normalized.limit, 1)
+
+    def test_semantic_summary_discards_quantitative_interpretations(self):
+        normalized = answer.normalize_query_plan(
+            "Summarize the attendance pattern for this employee",
+            answer.QueryPlan(
+                mode="hybrid",
+                search_query="attendance pattern",
+                interpretation_candidates=["worked_days", "scheduled_working_days"],
+            ),
+        )
+
+        self.assertEqual(normalized.mode, "semantic")
+        self.assertEqual(normalized.interpretation_candidates, [])
+        self.assertIsNone(normalized.measure)
+        self.assertEqual(normalized.aggregation, "none")
+
+    def test_recurring_lateness_patterns_route_to_semantic_narrative(self):
+        normalized = answer.normalize_query_plan(
+            "Were there recurring lateness patterns for them?",
+            answer.QueryPlan(
+                mode="exact",
+                search_query="recurring lateness",
+                interpretation_candidates=["worked_days", "attendance_records"],
+            ),
+        )
+
+        self.assertEqual(normalized.mode, "semantic")
+        self.assertEqual(normalized.interpretation_candidates, [])
+        self.assertIsNone(normalized.measure)
+
+    def test_single_quantified_interpretation_compiles_directly(self):
+        plan = answer.QueryPlan(
+            mode="exact",
+            search_query="attendance days",
+            interpretation_candidates=["worked_days"],
+        )
+
+        normalized = answer.normalize_query_plan(
+            "How many attendance days were there?", plan
+        )
+
+        self.assertEqual(normalized.interpretation_candidates, [])
+
+    def test_lone_valid_interpretation_applies_without_count_phrase(self):
+        normalized = answer.normalize_query_plan(
+            "Attendance days for employee A11017?",
+            answer.QueryPlan(
+                mode="exact",
+                search_query="employee attendance days",
+                interpretation_candidates=["worked_days"],
+            ),
+        )
+
+        self.assertEqual(normalized.measure, "distinct_dates")
+        self.assertEqual(normalized.business_predicates, ["worked"])
+        self.assertEqual(normalized.interpretation_candidates, [])
+        self.assertEqual(normalized.measure, "distinct_dates")
+        self.assertEqual(normalized.business_predicates, ["worked"])
+        self.assertEqual(normalized.aggregation, "distinct_count")
+        self.assertEqual(normalized.aggregation_field, "Date")
+
+    def test_duplicate_interpretation_candidates_compile_as_one_choice(self):
+        plan = answer.QueryPlan(
+            mode="exact",
+            search_query="attendance days",
+            interpretation_candidates=["worked_days", "worked_days"],
+        )
+
+        normalized = answer.normalize_query_plan(
+            "How many attendance days were there?", plan
+        )
+
+        self.assertEqual(normalized.interpretation_candidates, [])
+        self.assertEqual(normalized.measure, "distinct_dates")
+        self.assertEqual(normalized.business_predicates, ["worked"])
+
+    def test_unknown_interpretation_candidate_fails_schema_validation(self):
+        with self.assertRaises(ValueError):
+            answer.QueryPlan(
+                mode="exact",
+                search_query="attendance days",
+                interpretation_candidates=["invented_meaning"],
+            )
+
     def test_authorized_records_preserve_explicit_overtime_scope(self):
         for wording in ("authorized overtime", "authorized OT greater than 0"):
             with self.subTest(wording=wording):
@@ -1150,6 +1600,59 @@ class PlanNormalizationTests(unittest.TestCase):
 
 
 class EmployeeResolutionTests(unittest.TestCase):
+    def test_population_query_strips_planner_generated_employee_filter(self):
+        selected = answer.EmployeeCandidate(
+            employee_id="A11017", name="Example Employee Alpha"
+        )
+        plan = answer.QueryPlan(
+            mode="exact",
+            search_query="employee population",
+            measure="employees",
+            filters=[
+                answer.FilterCondition(
+                    field="Employee_ID", operator="eq", value="A11017"
+                )
+            ],
+        )
+
+        prepared, resolution = answer.resolve_employee_plan(
+            "How many employees have attendance records?",
+            plan,
+            directory=[selected],
+            default_candidates=[selected],
+        )
+
+        self.assertIsNone(resolution)
+        self.assertNotIn(
+            "Employee_ID", {condition.field for condition in prepared.filters}
+        )
+
+    def test_structured_population_filter_does_not_inherit_selected_employee(self):
+        selected = answer.EmployeeCandidate(
+            employee_id="A11017", name="Example Employee Alpha"
+        )
+        plan = answer.QueryPlan(
+            mode="exact",
+            search_query="department attendance records",
+            filters=[
+                answer.FilterCondition(
+                    field="Department", operator="eq", value="Services"
+                )
+            ],
+        )
+
+        prepared, resolution = answer.resolve_employee_plan(
+            "Show department Services attendance records",
+            plan,
+            directory=[selected],
+            default_candidates=[selected],
+        )
+
+        self.assertIsNone(resolution)
+        self.assertNotIn(
+            "Employee_ID", {condition.field for condition in prepared.filters}
+        )
+
     def test_trusted_selection_overrides_planner_id_on_identity_free_follow_up(self):
         selected = answer.EmployeeCandidate(
             employee_id="A11017", name="Example Employee Alpha"
@@ -1428,10 +1931,77 @@ class ExecutablePlanSafetyTests(unittest.TestCase):
         fetch.assert_called_once_with(
             plan.filters,
             limit=answer.settings.evidence_sample_size,
+            order_by=None,
+            order_direction="asc",
             connection=connection,
         )
         connection.cursor.return_value.__enter__.return_value.execute.assert_called_once_with(
             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+        )
+
+    def test_exact_postgres_record_projection_executes_order_and_limit(self):
+        psycopg = MagicMock()
+        connection = MagicMock()
+        psycopg.connect.return_value.__enter__.return_value = connection
+        plan = answer.QueryPlan(
+            mode="exact",
+            search_query="last two records",
+            order_by="Date",
+            order_direction="desc",
+            limit=2,
+        )
+
+        with (
+            patch.object(answer, "_import_psycopg", return_value=(psycopg, object())),
+            patch.object(answer, "calculate_aggregation_postgres", return_value=None),
+            patch.object(answer, "count_exact_postgres", return_value=7),
+            patch.object(answer, "fetch_exact_postgres", return_value=[]) as fetch,
+        ):
+            answer.execute_exact_postgres(plan)
+
+        fetch.assert_called_once_with(
+            plan.filters,
+            limit=2,
+            order_by="Date",
+            order_direction="desc",
+            connection=connection,
+        )
+
+    def test_postgres_record_fetch_uses_safe_field_ordering(self):
+        connection = MagicMock()
+        cursor = connection.cursor.return_value.__enter__.return_value
+        cursor.fetchall.return_value = []
+
+        answer.fetch_exact_postgres(
+            [],
+            limit=2,
+            order_by="Date",
+            order_direction="desc",
+            connection=connection,
+        )
+
+        sql = " ".join(cursor.execute.call_args.args[0].split())
+        self.assertIn("ORDER BY attendance_date DESC", sql)
+        self.assertEqual(cursor.execute.call_args.args[1][-1], 2)
+
+    def test_chroma_record_projection_executes_order_and_limit(self):
+        chunks = [
+            answer.Result(page_content=value, metadata={"Date": value})
+            for value in ("2026-09-01", "2026-09-03", "2026-09-02")
+        ]
+        plan = answer.QueryPlan(
+            mode="exact",
+            search_query="last two records",
+            order_by="Date",
+            order_direction="desc",
+            limit=2,
+        )
+
+        projected = answer._order_and_limit_exact_chunks(plan, chunks, 2)
+
+        self.assertEqual(
+            [chunk.metadata["Date"] for chunk in projected],
+            ["2026-09-03", "2026-09-02"],
         )
 
     def test_chroma_not_equal_matches_postgres_null_semantics(self):
@@ -1575,6 +2145,121 @@ class ExecutablePlanSafetyTests(unittest.TestCase):
 
 
 class ClarificationStateTests(unittest.TestCase):
+    def test_identity_followup_ignores_stale_unknown_id_history(self):
+        selected = answer.EmployeeCandidate(
+            employee_id="A11017", name="Example Employee Alpha"
+        )
+        plan = answer.QueryPlan(mode="exact", search_query="employee identity")
+        chunk = answer.Result(
+            page_content="Employee_ID: A11017\nName: Example Employee Alpha",
+            metadata={"Employee_ID": "A11017", "Name": "Example Employee Alpha"},
+        )
+        history = [
+            {"role": "user", "content": "Show employee A99999"},
+            {"role": "assistant", "content": "No matching employee was found."},
+        ]
+
+        with (
+            patch.object(answer, "plan_query", return_value=plan),
+            patch.object(answer, "load_employee_directory", return_value=[selected]),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=([chunk], None, 1),
+            ),
+            patch.object(answer, "completion") as completion,
+        ):
+            text, chunks, updated = answer.answer_question_with_state(
+                "Who is this employee?",
+                history,
+                answer.ConversationState(selected_employees=[selected]),
+            )
+
+        self.assertEqual(text, "This employee is Example Employee Alpha (A11017).")
+        self.assertEqual(chunks, [chunk])
+        self.assertEqual(updated.selected_employees, [selected])
+        completion.assert_not_called()
+
+    def test_identity_anaphora_without_trusted_selection_stops_before_retrieval(self):
+        plan = answer.QueryPlan(mode="exact", search_query="employee identity")
+
+        with (
+            patch.object(answer, "plan_query", return_value=plan),
+            patch.object(answer, "fetch_exact_postgres") as exact_postgres,
+            patch.object(answer, "fetch_exact_chroma") as exact_chroma,
+            patch.object(answer, "fetch_semantic_postgres") as semantic_postgres,
+            patch.object(answer, "fetch_semantic_chroma") as semantic_chroma,
+            patch.object(answer, "completion") as final_completion,
+        ):
+            text, chunks, updated = answer.answer_question_with_state(
+                "Who is this employee?", [], answer.ConversationState()
+            )
+
+        self.assertIn("no employee is selected", text.casefold())
+        self.assertEqual(chunks, [])
+        self.assertEqual(updated, answer.ConversationState())
+        exact_postgres.assert_not_called()
+        exact_chroma.assert_not_called()
+        semantic_postgres.assert_not_called()
+        semantic_chroma.assert_not_called()
+        final_completion.assert_not_called()
+
+    def test_single_valid_interpretation_executes_without_clarification(self):
+        selected = answer.EmployeeCandidate(
+            employee_id="A11017", name="Example Employee Alpha"
+        )
+        advisory_plan = answer.QueryPlan(
+            mode="exact",
+            search_query="selected employee identity",
+            interpretation_candidates=["employees"],
+        )
+        identity_chunk = answer.Result(
+            page_content="Employee_ID: A11017\nName: Example Employee Alpha",
+            metadata={
+                "Employee_ID": "A11017",
+                "Name": "Example Employee Alpha",
+                "chunk_type": "attendance_record",
+            },
+        )
+        final_response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="This employee is Example Employee Alpha (A11017)."
+                    )
+                )
+            ]
+        )
+
+        with (
+            patch.object(answer, "plan_query", return_value=advisory_plan),
+            patch.object(answer, "load_employee_directory", return_value=[selected]),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=([identity_chunk], None, 7),
+            ) as execute,
+            patch.object(answer, "completion", return_value=final_response),
+        ):
+            text, chunks, updated = answer.answer_question_with_state(
+                "Who is this employee?",
+                [],
+                answer.ConversationState(selected_employees=[selected]),
+            )
+
+        self.assertEqual(text, "This employee is Example Employee Alpha (A11017).")
+        self.assertEqual(chunks, [identity_chunk])
+        self.assertEqual(updated.selected_employees, [selected])
+        self.assertEqual(updated.pending_interpretations, [])
+        executed = execute.call_args.args[0]
+        self.assertEqual(executed.aggregation, "none")
+        self.assertIn(
+            answer.FilterCondition(field="Employee_ID", operator="eq", value="A11017"),
+            executed.filters,
+        )
+
     def test_successful_direct_employee_resolution_scopes_identity_followup(self):
         selected = answer.EmployeeCandidate(
             employee_id="A11017", name="Example Employee Alpha"
@@ -2647,6 +3332,63 @@ class CoverageMetadataTests(unittest.TestCase):
 
 
 class DeterministicAggregationAnswerTests(unittest.TestCase):
+    def test_truncated_broad_record_lookup_uses_deterministic_summary(self):
+        plan = answer.QueryPlan(
+            mode="exact",
+            search_query="department attendance records",
+        )
+        chunks = [
+            answer.Result(page_content="record", metadata={"record_id": str(index)})
+            for index in range(3)
+        ]
+
+        with patch.object(answer, "completion") as completion:
+            text, returned = answer._answer_from_context(
+                "Show attendance records for all selected departments",
+                [],
+                chunks,
+                plan,
+                None,
+                25,
+            )
+
+        self.assertEqual(
+            text,
+            "25 attendance records matched the requested criteria. "
+            "Relevant Context displays a 3-record evidence sample.",
+        )
+        self.assertEqual(returned, chunks)
+        completion.assert_not_called()
+
+    def test_ordered_limited_record_lookup_answers_from_requested_rows(self):
+        plan = answer.QueryPlan(
+            mode="exact",
+            search_query="last two attendance records",
+            order_by="Date",
+            order_direction="desc",
+            limit=2,
+        )
+        chunks = [
+            answer.Result(page_content=f"record {index}", metadata={"Date": value})
+            for index, value in enumerate(("2026-09-07", "2026-09-06"), start=1)
+        ]
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="The requested last two records.")
+                )
+            ]
+        )
+
+        with patch.object(answer, "completion", return_value=response) as completion:
+            text, returned_chunks = answer._answer_from_context(
+                "Show the last two attendance records", [], chunks, plan, None, 7
+            )
+
+        self.assertEqual(text, "The requested last two records.")
+        self.assertEqual(len(returned_chunks), 2)
+        completion.assert_called_once()
+
     def test_percentage_can_count_attendance_records(self):
         plan = answer.QueryPlan(
             mode="exact",
@@ -2855,6 +3597,43 @@ class PostgresResultParityTests(unittest.TestCase):
         self.assertIn("1", text)
         completion.assert_not_called()
 
+    def test_narrative_answer_returns_the_evidence_used_by_completion(self):
+        plan = answer.QueryPlan(mode="exact", search_query="employee identity")
+        chunks = [
+            answer.Result(
+                page_content="Employee_ID: A10029\nName: Example Employee",
+                metadata={"record_id": "r1", "chunk_type": "attendance_record"},
+            ),
+            answer.Result(
+                page_content="Employee_ID: A10030\nName: Second Employee",
+                metadata={"record_id": "r2", "chunk_type": "attendance_record"},
+            ),
+        ]
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="The employee is Example Employee.")
+                )
+            ]
+        )
+
+        with (
+            patch.object(answer, "MAX_EXACT_CONTEXT_RECORDS", 1),
+            patch.object(answer, "FINAL_RECORD_MAX_CHARS", 19),
+            patch.object(answer, "completion", return_value=response) as completion,
+        ):
+            text, returned_chunks = answer._answer_from_context(
+                "Who is this employee?", [], chunks, plan, None, 2
+            )
+
+        self.assertEqual(text, "The employee is Example Employee.")
+        self.assertEqual(len(returned_chunks), 1)
+        self.assertEqual(returned_chunks[0].page_content, "Employee_ID: A10029")
+        self.assertEqual(returned_chunks[0].metadata, chunks[0].metadata)
+        prompt = completion.call_args.kwargs["messages"][0]["content"]
+        self.assertIn(returned_chunks[0].page_content, prompt)
+        self.assertNotIn("Second Employee", prompt)
+
 
 class QuestionSpecificContextTests(unittest.TestCase):
     @staticmethod
@@ -2939,6 +3718,24 @@ class QuestionSpecificContextTests(unittest.TestCase):
 
         self.assertIn("Total_OT: 2.0", messages[0]["content"])
         self.assertIn("Leave_Type: Annual", messages[0]["content"])
+
+    def test_current_retrieval_is_declared_authoritative_over_stale_history(self):
+        messages = answer.make_rag_messages(
+            "Summarize the attendance pattern for this employee.",
+            [
+                {"role": "user", "content": "Show unknown employee A99999."},
+                {"role": "assistant", "content": "No matching employee was found."},
+            ],
+            [self._chunk()],
+            answer.QueryPlan(mode="semantic", search_query="attendance pattern"),
+            None,
+            1,
+        )
+
+        system_context = messages[0]["content"].casefold()
+        self.assertIn("current retrieved evidence", system_context)
+        self.assertIn("do not let older conversation turns override", system_context)
+        self.assertIn("matched records is greater than zero", system_context)
 
     def test_broad_exact_context_keeps_complete_content(self):
         plan = answer.QueryPlan(

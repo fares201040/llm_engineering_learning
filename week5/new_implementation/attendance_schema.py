@@ -67,7 +67,7 @@ class QueryPlan(BaseModel):
     aggregation_field: str | None = None
     group_by: list[str] = Field(default_factory=list)
     percentage_condition: FilterCondition | None = None
-    order_by: Literal["group", "value"] | None = None
+    order_by: str | None = None
     order_direction: Literal["asc", "desc"] = "desc"
     limit: int | None = None
     measure: MeasureName | None = None
@@ -479,6 +479,7 @@ SEMANTIC_INTENT_PATTERNS = (
     r"\b(?:abnormal|anomal(?:y|ies)|concerning|concerns?|odd|problematic|resembling|similar|suspicious|unusual|irregular)\b",
     r"\b(?:attendance|clocking) (?:behavior|behaviour|issues?|patterns?|summary|summaries)\b",
     r"\b(?:incomplete clocking|hr review|chronic lateness)\b",
+    r"\b(?:recurring|repeated)\s+(?:lateness|absence|attendance)\s+patterns?\b",
 )
 
 INCOMPATIBLE_BUSINESS_PREDICATE_SETS = (
@@ -539,15 +540,27 @@ def compile_business_intent(plan: QueryPlan) -> QueryPlan:
                 if condition.field == required.field
             ]
             if existing:
-                if any(
-                    condition.operator != required.operator
-                    or condition.value != required.value
-                    for condition in existing
-                ):
+
+                def matches_required(condition):
+                    same_value = (
+                        str(condition.value).casefold()
+                        == str(required.value).casefold()
+                        if isinstance(condition.value, str)
+                        and isinstance(required.value, str)
+                        else condition.value == required.value
+                    )
+                    return condition.operator == required.operator and same_value
+
+                if any(not matches_required(condition) for condition in existing):
                     raise ValueError(
                         f"Business predicate {name} conflicts with an explicit "
                         f"{required.field} filter."
                     )
+                for condition in existing:
+                    if isinstance(condition.value, str) and isinstance(
+                        required.value, str
+                    ):
+                        condition.value = required.value
                 continue
             compiled.filters.append(
                 FilterCondition(

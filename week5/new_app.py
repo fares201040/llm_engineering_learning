@@ -72,6 +72,10 @@ def chat_with_state(history, state):
     return history, format_context(context), updated_state
 
 
+def reset_conversation(_state=None):
+    return format_context([]), ConversationState()
+
+
 def main():
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
@@ -120,6 +124,12 @@ def main():
             chat_with_state,
             inputs=[chatbot, conversation_state],
             outputs=[chatbot, context_markdown, conversation_state],
+        )
+        chatbot.clear(
+            reset_conversation,
+            inputs=[conversation_state],
+            outputs=[context_markdown, conversation_state],
+            show_progress="hidden",
         )
 
     ui.launch(inbrowser=True)

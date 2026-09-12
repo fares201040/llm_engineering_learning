@@ -2352,11 +2352,10 @@ app/evaluation/benchmark tests. Ruff check, Ruff formatting, Python compilation,
 direct local dataset verification, and `git diff --check` also passed. The
 private corpus integrity and deterministic calculation checks passed locally,
 and every later regression case passed individually against the final rule set.
-The screenshot-specific state flow was subsequently reproduced and verified
-against the real employee directory and PostgreSQL data with the unavailable
-provider boundary replaced. The configured LiteLLM endpoint refused connections
-during the final live-provider replay, so that replay is documented as an
-environmental limitation rather than a passing provider result.
+The screenshot-specific state flow was initially reproduced against the real
+employee directory and PostgreSQL data while the provider was temporarily
+unavailable. The later final replay and long acceptance run both passed through
+the configured live provider.
 
 # 19. Current Operational Architecture
 
@@ -2381,3 +2380,44 @@ Before multi-user production use, add real identity, row/field authorization,
 and an outbox/shared publication boundary. Before adding another HR domain,
 approve real sample data, record grain, natural key, event dates, measures, and
 access policy.
+
+# 20. Stateful Gradio Interpretation and Evidence Hardening
+
+The final Gradio investigation traced the reported identity-follow-up failure
+to deterministic plan normalization. A lone valid interpretation candidate was
+incorrectly treated as a clarification even though clarification requires at
+least two distinct choices. Because execution stopped before retrieval, the
+empty Relevant Context panel was an accurate downstream symptom, not a separate
+rendering failure.
+
+Normalization now treats planner interpretations as advisory: it stably
+deduplicates them, directly compiles one compatible valid choice, preserves two
+or more choices for clarification, and relies on schema validation for invalid
+values. Explicit user wording deterministically owns calculations, attendance
+semantics, projections, ranking, percentages, and record ordering.
+
+The state boundary was hardened at the same time. Only directory-validated
+employees can be selected; fresh-session anaphora cannot invent an identity;
+population questions cannot inherit or accept hallucinated employee filters;
+successful identity answers use the current trusted selection and retrieved
+evidence; and Gradio Clear resets chat, context, selection, and pending
+clarification state together.
+
+Evidence remains end-to-end: exact and narrative answer paths return the chunks
+they actually used, and the app HTML-escapes those chunks before display. Broad
+exact matches use a deterministic count plus an explicit evidence-sample label
+when the rendered subset is smaller than the authoritative result set.
+
+Acceptance included an uninterrupted 60-turn primary session and an interleaved
+independent control session, followed by reset and fresh-session controls. All
+scope, calculation, answer, state, and evidence assertions passed. A restarted
+live Gradio replay of the supplied three-turn sequence also passed, including
+visible evidence on the identity turn and empty evidence after a safe
+fresh-session anaphora failure. Private transcripts and employee-linked facts
+remain outside version control.
+
+The final verification baseline is 257 implementation tests and 29
+app/evaluation/benchmark tests, plus Ruff lint/format, compilation, private
+dataset integrity, five APDC-adjacent notebook schema validations, and Git
+whitespace validation. Independent final re-review found no Critical or
+Important issues.

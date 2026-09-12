@@ -2,27 +2,53 @@
 
 from dataclasses import dataclass, replace
 from datetime import date
+import json
 import re
 from types import MappingProxyType
-from typing import Literal
+from typing import Literal, get_args
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+ResolutionKind = Literal[
+    "identifier",
+    "entity",
+    "temporal",
+    "numeric",
+    "closed_value",
+    "catalog",
+    "free_text",
+]
+EvidenceOrigin = Literal["question", "trusted_state", "deterministic_default"]
+PlanningStatus = Literal["ready", "ambiguous", "unsupported"]
+UnsupportedCapability = Literal[
+    "nested_boolean_filters",
+    "having_filter",
+    "window_calculation",
+    "cross_period_comparison",
+    "multi_stage_aggregation",
+]
+FilterOperator = Literal[
+    "eq",
+    "ne",
+    "gt",
+    "gte",
+    "lt",
+    "lte",
+    "in",
+    "contains",
+    "starts_with",
+]
+FILTER_OPERATORS: frozenset[FilterOperator] = frozenset(get_args(FilterOperator))
+FilterScalar = str | float
+FilterValue = FilterScalar | list[FilterScalar]
+RegistryFilterValue = FilterScalar | tuple[FilterScalar, ...]
 
 
 class FilterCondition(BaseModel):
     field: str
-    operator: Literal[
-        "eq",
-        "ne",
-        "gt",
-        "gte",
-        "lt",
-        "lte",
-        "in",
-        "contains",
-        "starts_with",
-    ]
-    value: str | float | list[str] | list[float]
+    operator: FilterOperator
+    value: FilterValue
 
 
 # Counts unique attendance dates after all filters are applied; duplicate rows for the same date are counted once (for example, three matching records on 2026-09-01 count as one date).
@@ -82,6 +108,140 @@ class QueryPlan(BaseModel):
     interpretation_candidates: list[InterpretationName] = Field(default_factory=list)
 
 
+class _StrictPlannerModel(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class _EvidenceChoice(_StrictPlannerModel):
+    evidence_text: str = Field(min_length=1)
+
+    @field_validator("evidence_text")
+    @classmethod
+    def _evidence_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("evidence_text must not be blank")
+        return value
+
+
+class ProposedFilter(_EvidenceChoice):
+    field: str = Field(min_length=1)
+    operator: FilterOperator
+    value: FilterValue
+
+
+class ProposedMeasureChoice(_EvidenceChoice):
+    name: MeasureName
+
+
+class ProposedPredicateChoice(_EvidenceChoice):
+    name: BusinessPredicateName
+
+
+class ProposedFieldChoice(_EvidenceChoice):
+    field: str = Field(min_length=1)
+
+
+class ProposedOrderChoice(ProposedFieldChoice):
+    direction: Literal["asc", "desc"]
+
+
+class ProposedNameHint(_EvidenceChoice):
+    value: str = Field(min_length=1)
+
+
+class ProposedLimit(_EvidenceChoice):
+    value: int = Field(gt=0)
+
+
+class ProposedCalculation(_EvidenceChoice):
+    operation: Literal[
+        "count", "distinct_count", "sum", "average", "min", "max", "percentage"
+    ]
+    field: str | None = None
+    percentage_condition: ProposedFilter | None = None
+
+    @model_validator(mode="after")
+    def _validate_operation_shape(self):
+        field_required = self.operation in {
+            "distinct_count",
+            "sum",
+            "average",
+            "min",
+            "max",
+            "percentage",
+        }
+        if field_required and not self.field:
+            raise ValueError(f"{self.operation} requires a field")
+        if self.operation == "count" and self.field is not None:
+            raise ValueError("count must not invent a field")
+        if self.operation == "percentage" and self.percentage_condition is None:
+            raise ValueError("percentage requires percentage_condition")
+        if self.operation != "percentage" and self.percentage_condition is not None:
+            raise ValueError("percentage_condition is only valid for percentage")
+        return self
+
+
+class AnswerContract(_StrictPlannerModel):
+    shape: Literal["scalar", "grouped", "rows", "narrative"]
+    unit: Literal["dates", "records", "employees", "hours", "percentage", "value"]
+    subject_field: str | None = None
+    grain: list[str] = Field(default_factory=list)
+
+
+class PlannerProposal(_StrictPlannerModel):
+    status: PlanningStatus
+    filters: list[ProposedFilter] = Field(default_factory=list)
+    name_hint: ProposedNameHint | None = None
+    measure: ProposedMeasureChoice | None = None
+    business_predicates: list[ProposedPredicateChoice] = Field(default_factory=list)
+    calculation: ProposedCalculation | None = None
+    group_by: list[ProposedFieldChoice] = Field(default_factory=list)
+    order_by: ProposedOrderChoice | None = None
+    limit: ProposedLimit | None = None
+    answer_contract: AnswerContract | None = None
+    interpretation_candidates: list[InterpretationName] = Field(default_factory=list)
+    unsupported_capabilities: list[UnsupportedCapability] = Field(default_factory=list)
+    explanation: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_status_and_shape(self):
+        if self.status == "ready":
+            if self.answer_contract is None:
+                raise ValueError("ready proposals require answer_contract")
+            if self.interpretation_candidates:
+                raise ValueError("ready proposals cannot contain interpretation candidates")
+        if self.status != "unsupported" and self.unsupported_capabilities:
+            raise ValueError("capability identifiers require unsupported status")
+        if self.status == "unsupported":
+            if not self.unsupported_capabilities:
+                raise ValueError("unsupported proposals require a capability identifier")
+            execution_choices = (
+                self.filters
+                or self.name_hint is not None
+                or self.measure is not None
+                or self.business_predicates
+                or self.calculation is not None
+                or self.group_by
+                or self.order_by is not None
+                or self.limit is not None
+                or self.answer_contract is not None
+                or self.interpretation_candidates
+            )
+            if execution_choices:
+                raise ValueError("unsupported proposals cannot contain execution choices")
+        if self.measure is not None and self.calculation is not None:
+            raise ValueError("measure and calculation are mutually exclusive")
+        if self.answer_contract is not None:
+            grouped = self.answer_contract.shape == "grouped"
+            if grouped != bool(self.group_by):
+                raise ValueError("grouped answer shape and group_by must agree")
+        return self
+
+
+class ExecutableQueryPlan(QueryPlan):
+    answer_contract: AnswerContract
+
+
 @dataclass(frozen=True)
 class AccessContext:
     principal_id: str
@@ -135,32 +295,66 @@ class FieldDefinition:
     description: str
     aliases: tuple[str, ...] = ()
     closed_values: tuple[str, ...] = ()
-    operators: tuple[str, ...] = ()
+    operators: tuple[FilterOperator, ...] = ()
     sql_expression: str = ""
     searchable: bool = True
     metadata: bool = True
     context: bool = True
     catalog_resolution: bool = False
+    natural_names: tuple[str, ...] = ()
+    resolution_kind: ResolutionKind = "free_text"
+    value_aliases: tuple["ValueAliasDefinition", ...] = ()
+    filterable: bool = True
+    groupable: bool = True
+    orderable: bool = True
+    aggregatable: bool = False
+    planner_visible: bool = True
+
+
+@dataclass(frozen=True, kw_only=True)
+class ValueAliasDefinition:
+    natural_name: str
+    canonical_value: str
 
 
 @dataclass(frozen=True)
 class RequiredFilter:
     field: str
-    operator: str
-    value: str | float
+    operator: FilterOperator
+    value: RegistryFilterValue
 
 
 @dataclass(frozen=True)
 class MeasureDefinition:
     description: str
-    aggregation: str
+    aggregation: Literal["count", "distinct_count"]
     aggregation_field: str | None
+    natural_names: tuple[str, ...] = ()
+    answer_unit: Literal["dates", "records", "employees"] = "records"
+    default_answer_shape: Literal["scalar", "grouped"] = "scalar"
 
 
 @dataclass(frozen=True)
 class PredicateDefinition:
     description: str
     required_filters: tuple[RequiredFilter, ...]
+    natural_names: tuple[str, ...] = ()
+    incompatible_with: tuple[BusinessPredicateName, ...] = ()
+    incompatible_filters: tuple[RequiredFilter, ...] = ()
+
+
+@dataclass(frozen=True, kw_only=True)
+class ValueConceptDefinition:
+    field: str
+    description: str
+    natural_names: tuple[str, ...]
+    members: tuple[str, ...]
+
+
+@dataclass(frozen=True, kw_only=True)
+class RetrievalIntentDefinition:
+    description: str
+    natural_names: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -353,6 +547,65 @@ _CATALOG_FIELDS = {
     "Exception",
     "Leave_Type",
 }
+
+_FIELD_NATURAL_NAMES = {
+    "Employee_ID": ("employee id", "employee ids", "id", "ids"),
+    "Name": ("employee name", "employee names", "name", "names"),
+    "Organization_Unit": (
+        "organization unit",
+        "organization units",
+        "organizational unit",
+        "organizational units",
+    ),
+    "Country": ("country", "countries"),
+    "Work_Location": ("work location", "work locations", "location", "locations"),
+    "Department": ("department", "departments"),
+    "Position": ("position", "positions"),
+    "Job": ("job", "jobs"),
+    "Grade": ("grade", "grades"),
+    "Day_Type": ("day type", "day types", "scheduled working day", "scheduled working days"),
+    "Holiday_Type": ("holiday", "holidays", "holiday type", "holiday types"),
+    "Shift": ("shift", "shifts"),
+    "Status": ("status", "authorized record", "authorized records", "draft record", "draft records"),
+    "Exception": ("exception", "exceptions", "absent", "absence"),
+    "Total_Worked_Hrs": ("worked hour", "worked hours", "hours worked", "work hours"),
+    "Lateness_Hrs": ("late", "lateness", "late in", "late-in"),
+    "Early_Out_Hrs": ("early out", "early-out"),
+    "Overbreak_Hrs": ("over break", "over-break", "overbreak"),
+    "Regular_Units": ("regular unit", "regular units"),
+    "Total_OT": ("overtime", "total ot"),
+    "OT_Authorized": ("authorized overtime", "overtime authorized", "authorized ot", "ot authorized"),
+    "OT_Not_Authorized": (
+        "unauthorized overtime",
+        "overtime not authorized",
+        "unauthorized ot",
+        "ot not authorized",
+    ),
+    "Leave_Type": ("leave", "leave type", "leave types"),
+    "Leave_Hrs": ("leave", "leave hour", "leave hours"),
+}
+
+
+def _canonical_natural_name(field: str) -> str:
+    return " ".join(part for part in re.split(r"[_\-\s]+", field) if part).casefold()
+
+
+def _resolution_kind(field: str, definition: FieldDefinition) -> ResolutionKind:
+    if field == "Employee_ID":
+        return "identifier"
+    if field == "Name":
+        return "entity"
+    if field == "Period" or definition.storage_type in {"date", "time", "datetime"}:
+        return "temporal"
+    if definition.storage_type == "number":
+        return "numeric"
+    if definition.closed_values or field == "chunk_type":
+        return "closed_value"
+    if field == "Employee_Remarks":
+        return "free_text"
+    return "catalog"
+
+
 for _field, _definition in tuple(_FIELD_DEFINITIONS.items()):
     _sql_expression = _TYPED_POSTGRES_COLUMNS.get(_field)
     if _sql_expression is None:
@@ -376,6 +629,20 @@ for _field, _definition in tuple(_FIELD_DEFINITIONS.items()):
         ),
         sql_expression=_sql_expression,
         catalog_resolution=_field in _CATALOG_FIELDS,
+        natural_names=tuple(
+            dict.fromkeys(
+                (
+                    _canonical_natural_name(_field),
+                    *_FIELD_NATURAL_NAMES.get(_field, ()),
+                )
+            )
+        ),
+        resolution_kind=_resolution_kind(_field, _definition),
+        aggregatable=(
+            _definition.storage_type == "number"
+            or _field in {"Date", "Employee_ID"}
+        ),
+        planner_visible=_field != "chunk_type",
     )
 FIELD_DEFINITIONS = MappingProxyType(_FIELD_DEFINITIONS)
 FILTERABLE_FIELDS = frozenset(FIELD_DEFINITIONS)
@@ -408,15 +675,25 @@ QUESTION_CONTEXT_FIELDS = MappingProxyType(
 MEASURE_DEFINITIONS = MappingProxyType(
     {
         "distinct_dates": MeasureDefinition(
-            "Count distinct attendance dates.", "distinct_count", "Date"
+            description="Count distinct attendance dates.",
+            aggregation="distinct_count",
+            aggregation_field="Date",
+            natural_names=("day", "days", "date", "dates"),
+            answer_unit="dates",
         ),
         "attendance_records": MeasureDefinition(
-            "Count matching daily attendance rows.", "count", None
+            description="Count matching daily attendance rows.",
+            aggregation="count",
+            aggregation_field=None,
+            natural_names=("attendance record", "attendance records", "row", "rows"),
+            answer_unit="records",
         ),
         "employees": MeasureDefinition(
-            "Count distinct employee identifiers.",
-            "distinct_count",
-            "Employee_ID",
+            description="Count distinct employee identifiers.",
+            aggregation="distinct_count",
+            aggregation_field="Employee_ID",
+            natural_names=("employee", "employees", "people"),
+            answer_unit="employees",
         ),
     }
 )
@@ -424,24 +701,31 @@ MEASURE_DEFINITIONS = MappingProxyType(
 BUSINESS_PREDICATE_DEFINITIONS = MappingProxyType(
     {
         "scheduled_working_day": PredicateDefinition(
-            "Scheduled working dates; this is not proof that work occurred.",
-            (RequiredFilter("Day_Type", "eq", "Working Day"),),
+            description="Scheduled working dates; this is not proof that work occurred.",
+            required_filters=(RequiredFilter("Day_Type", "eq", "Working Day"),),
+            natural_names=("scheduled working day", "scheduled working days"),
         ),
         "worked": PredicateDefinition(
-            "Dates with positive actual worked hours.",
-            (RequiredFilter("Total_Worked_Hrs", "gt", 0.0),),
+            description="Dates with positive actual worked hours.",
+            required_filters=(RequiredFilter("Total_Worked_Hrs", "gt", 0.0),),
+            natural_names=("worked", "attended", "present"),
+            incompatible_with=("not_worked", "absent"),
+            incompatible_filters=(RequiredFilter("Exception", "eq", "Absent"),),
         ),
         "not_worked": PredicateDefinition(
-            "Dates without positive actual worked hours.",
-            (RequiredFilter("Total_Worked_Hrs", "lte", 0.0),),
+            description="Dates without positive actual worked hours.",
+            required_filters=(RequiredFilter("Total_Worked_Hrs", "lte", 0.0),),
+            natural_names=("not worked", "did not work", "not attended", "not present"),
         ),
         "absent": PredicateDefinition(
-            "Dates carrying the explicit Absent exception.",
-            (RequiredFilter("Exception", "eq", "Absent"),),
+            description="Dates carrying the explicit Absent exception.",
+            required_filters=(RequiredFilter("Exception", "eq", "Absent"),),
+            natural_names=("absent", "absence", "absent day", "absent days"),
         ),
         "authorized": PredicateDefinition(
-            "Rows with workflow Status Authorized.",
-            (RequiredFilter("Status", "eq", "Authorized"),),
+            description="Rows with workflow Status Authorized.",
+            required_filters=(RequiredFilter("Status", "eq", "Authorized"),),
+            natural_names=("authorized", "authorized record", "authorized records"),
         ),
     }
 )
@@ -482,6 +766,170 @@ INTERPRETATION_PRESETS = MappingProxyType(
     }
 )
 
+VALUE_CONCEPT_DEFINITIONS = MappingProxyType(
+    {
+        "off_day": ValueConceptDefinition(
+            field="Day_Type",
+            description=(
+                "Dates classified by the source system as either off-day category."
+            ),
+            natural_names=("off day", "off days"),
+            members=("OFF Day", "OFF Day (ZAS)"),
+        ),
+    }
+)
+
+RETRIEVAL_INTENT_DEFINITIONS = MappingProxyType(
+    {
+        "attendance_anomaly": RetrievalIntentDefinition(
+            description="Fuzzy requests about unusual attendance or clocking behavior.",
+            natural_names=(
+                "abnormal",
+                "anomaly",
+                "anomalies",
+                "concerning",
+                "concern",
+                "concerns",
+                "odd",
+                "problematic",
+                "resembling",
+                "similar",
+                "suspicious",
+                "unusual",
+                "irregular",
+            ),
+        ),
+        "attendance_pattern": RetrievalIntentDefinition(
+            description="Fuzzy requests about attendance or clocking patterns.",
+            natural_names=(
+                "attendance behavior",
+                "attendance behaviour",
+                "attendance issue",
+                "attendance issues",
+                "attendance pattern",
+                "attendance patterns",
+                "attendance summary",
+                "attendance summaries",
+                "clocking behavior",
+                "clocking behaviour",
+                "clocking issue",
+                "clocking issues",
+                "clocking pattern",
+                "clocking patterns",
+                "clocking summary",
+                "clocking summaries",
+            ),
+        ),
+        "attendance_review": RetrievalIntentDefinition(
+            description="Fuzzy requests requiring attendance-record review.",
+            natural_names=(
+                "incomplete clocking",
+                "hr review",
+                "chronic lateness",
+                "recurring lateness pattern",
+                "recurring lateness patterns",
+                "repeated lateness pattern",
+                "repeated lateness patterns",
+                "recurring absence pattern",
+                "recurring absence patterns",
+                "repeated absence pattern",
+                "repeated absence patterns",
+                "recurring attendance pattern",
+                "recurring attendance patterns",
+                "repeated attendance pattern",
+                "repeated attendance patterns",
+            ),
+        ),
+    }
+)
+
+
+def _named_registry_items(registry):
+    return ((name, registry[name]) for name in sorted(registry))
+
+
+def render_planner_schema() -> str:
+    """Render deterministic, planner-safe metadata without SQL implementation details."""
+    payload = {
+        "fields": [
+            {
+                "name": name,
+                "description": definition.description,
+                "natural_names": list(definition.natural_names),
+                "storage_type": definition.storage_type,
+                "operators": list(definition.operators),
+                "resolution_kind": definition.resolution_kind,
+                "closed_values": list(definition.closed_values),
+                "value_aliases": [
+                    {
+                        "natural_name": alias.natural_name,
+                        "canonical_value": alias.canonical_value,
+                    }
+                    for alias in definition.value_aliases
+                ],
+                "roles": {
+                    "filterable": definition.filterable,
+                    "groupable": definition.groupable,
+                    "orderable": definition.orderable,
+                    "aggregatable": definition.aggregatable,
+                },
+            }
+            for name, definition in _named_registry_items(FIELD_DEFINITIONS)
+            if definition.planner_visible
+        ],
+        "measures": [
+            {
+                "name": name,
+                "description": definition.description,
+                "natural_names": list(definition.natural_names),
+                "aggregation": definition.aggregation,
+                "aggregation_field": definition.aggregation_field,
+                "answer_unit": definition.answer_unit,
+                "default_answer_shape": definition.default_answer_shape,
+            }
+            for name, definition in _named_registry_items(MEASURE_DEFINITIONS)
+        ],
+        "predicates": [
+            {
+                "name": name,
+                "description": definition.description,
+                "natural_names": list(definition.natural_names),
+                "required_filters": [
+                    {
+                        "field": item.field,
+                        "operator": item.operator,
+                        "value": item.value,
+                    }
+                    for item in definition.required_filters
+                ],
+                "incompatible_with": list(definition.incompatible_with),
+            }
+            for name, definition in _named_registry_items(
+                BUSINESS_PREDICATE_DEFINITIONS
+            )
+        ],
+        "interpretations": [
+            {
+                "name": name,
+                "description": definition.description,
+                "measure": definition.measure,
+                "business_predicates": list(definition.business_predicates),
+            }
+            for name, definition in _named_registry_items(INTERPRETATION_PRESETS)
+        ],
+        "value_concepts": [
+            {
+                "name": name,
+                "field": definition.field,
+                "description": definition.description,
+                "natural_names": list(definition.natural_names),
+                "members": list(definition.members),
+            }
+            for name, definition in _named_registry_items(VALUE_CONCEPT_DEFINITIONS)
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
 SEMANTIC_INTENT_PATTERNS = (
     r"\b(?:abnormal|anomal(?:y|ies)|concerning|concerns?|odd|problematic|resembling|similar|suspicious|unusual|irregular)\b",
     r"\b(?:attendance|clocking) (?:behavior|behaviour|issues?|patterns?|summary|summaries)\b",
@@ -489,9 +937,15 @@ SEMANTIC_INTENT_PATTERNS = (
     r"\b(?:recurring|repeated)\s+(?:lateness|absence|attendance)\s+patterns?\b",
 )
 
-INCOMPATIBLE_BUSINESS_PREDICATE_SETS = (
-    frozenset(("worked", "not_worked")),
-    frozenset(("worked", "absent")),
+INCOMPATIBLE_BUSINESS_PREDICATE_SETS = tuple(
+    sorted(
+        {
+            frozenset((name, incompatible))
+            for name, definition in BUSINESS_PREDICATE_DEFINITIONS.items()
+            for incompatible in definition.incompatible_with
+        },
+        key=lambda item: tuple(sorted(item)),
+    )
 )
 
 

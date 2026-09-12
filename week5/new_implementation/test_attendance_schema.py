@@ -1,6 +1,97 @@
 import importlib
 import unittest
 
+from pydantic import ValidationError
+
+
+class SemanticSchemaContractTests(unittest.TestCase):
+    def test_planner_proposal_is_not_an_executable_plan(self):
+        schema = importlib.import_module("week5.new_implementation.attendance_schema")
+        proposal = schema.PlannerProposal(
+            status="ready",
+            measure=schema.ProposedMeasureChoice(
+                name="distinct_dates", evidence_text="days"
+            ),
+            answer_contract=schema.AnswerContract(
+                shape="scalar", unit="dates", subject_field="Date", grain=["Date"]
+            ),
+        )
+
+        self.assertNotIsInstance(proposal, schema.QueryPlan)
+        self.assertNotIsInstance(proposal, schema.ExecutableQueryPlan)
+
+    def test_planner_models_reject_unknown_keys_and_blank_evidence(self):
+        schema = importlib.import_module("week5.new_implementation.attendance_schema")
+
+        with self.assertRaises(ValidationError):
+            schema.PlannerProposal.model_validate(
+                {
+                    "status": "unsupported",
+                    "unsupported_capabilities": ["nested_boolean_filters"],
+                    "expected_sql": "SELECT 1",
+                }
+            )
+        with self.assertRaises(ValidationError):
+            schema.ProposedFilter(
+                field="Status", operator="eq", value="Authorized", evidence_text=" "
+            )
+
+    def test_registry_references_are_valid(self):
+        schema = importlib.import_module("week5.new_implementation.attendance_schema")
+
+        for field, definition in schema.FIELD_DEFINITIONS.items():
+            self.assertTrue(definition.description, field)
+            self.assertTrue(definition.natural_names, field)
+            self.assertEqual(bool(definition.operators), definition.filterable, field)
+            self.assertTrue(set(definition.operators) <= schema.FILTER_OPERATORS, field)
+            for alias in definition.value_aliases:
+                if definition.resolution_kind == "closed_value":
+                    self.assertIn(alias.canonical_value, definition.closed_values, field)
+                else:
+                    self.assertEqual(definition.resolution_kind, "catalog", field)
+
+        for concept in schema.VALUE_CONCEPT_DEFINITIONS.values():
+            self.assertIn(concept.field, schema.FIELD_DEFINITIONS)
+            definition = schema.FIELD_DEFINITIONS[concept.field]
+            if definition.resolution_kind == "closed_value":
+                self.assertTrue(set(concept.members) <= set(definition.closed_values))
+            else:
+                self.assertEqual(definition.resolution_kind, "catalog")
+
+        for definition in schema.MEASURE_DEFINITIONS.values():
+            if definition.aggregation_field is not None:
+                self.assertIn(definition.aggregation_field, schema.FIELD_DEFINITIONS)
+                self.assertTrue(
+                    schema.FIELD_DEFINITIONS[definition.aggregation_field].aggregatable
+                )
+
+        for name, definition in schema.BUSINESS_PREDICATE_DEFINITIONS.items():
+            self.assertNotIn(name, definition.incompatible_with)
+            for incompatible in definition.incompatible_with:
+                self.assertIn(incompatible, schema.BUSINESS_PREDICATE_DEFINITIONS)
+            for required in definition.required_filters + definition.incompatible_filters:
+                self.assertIn(required.field, schema.FIELD_DEFINITIONS)
+                self.assertIn(
+                    required.operator,
+                    schema.FIELD_DEFINITIONS[required.field].operators,
+                )
+
+        for definition in schema.INTERPRETATION_PRESETS.values():
+            self.assertIn(definition.measure, schema.MEASURE_DEFINITIONS)
+            self.assertTrue(
+                set(definition.business_predicates)
+                <= set(schema.BUSINESS_PREDICATE_DEFINITIONS)
+            )
+
+    def test_planner_schema_exposes_only_planner_metadata(self):
+        schema = importlib.import_module("week5.new_implementation.attendance_schema")
+        rendered = schema.render_planner_schema()
+
+        self.assertIn('"name":"Day_Type"', rendered)
+        self.assertIn('"name":"Schedule_From_Date"', rendered)
+        self.assertNotIn('"name":"chunk_type"', rendered)
+        self.assertNotIn("record_json ->>", rendered)
+
 
 class ComposableIntentTests(unittest.TestCase):
     def test_scheduled_non_attendance_compiles_compositionally(self):

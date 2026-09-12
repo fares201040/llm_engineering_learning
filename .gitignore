@@ -123,6 +123,7 @@ celerybeat.pid
 
 # Environments
 .env
+.env.postgres
 .venv
 env/
 venv/
@@ -202,6 +203,12 @@ week4/main.rs
 
 week5/preprocessed_db/
 week5/vector_db/
+
+# APDC local source data, ingestion state, and generated vector indexes.
+week5/new-knowledge-base/
+week5/new_preprocessed_db/
+week5/new_evaluation/tests.jsonl
+week5/new_evaluation/dataset_manifest.json
 
 
 local/

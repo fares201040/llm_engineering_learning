@@ -527,15 +527,47 @@ after.
 | Logs exposed PII/DSNs | Default structured redaction |
 | Benchmark measured placeholders | Real local/read-only component calls |
 
+## Post-baseline addition — APDC evaluation dashboard
+
+`week5/new_evaluator.py` adds a Gradio dashboard over the current
+`week5/new_evaluation` package. It intentionally does not import the legacy
+Insurellm evaluator. The page exposes four independently runnable workflows:
+
+1. private dataset fingerprint verification;
+2. deterministic behavior-contract evaluation;
+3. retrieval MRR, nDCG, and keyword-coverage evaluation;
+4. provider-backed answer accuracy, completeness, and relevance evaluation.
+
+A shared maximum-case control defaults to 10 and treats `0` as an explicit full
+corpus request. Per-case errors are retained as typed failure rows without
+rendering sensitive exception details. `week5/test_new_evaluator.py` verifies
+case limiting, aggregation, failure reporting, and manifest summaries.
+
+The dashboard component tree and all four tabs were rendered in a live browser
+smoke test. The refreshed local baseline is 257 implementation tests and 35
+app/dashboard/evaluation/benchmark tests. These dashboard and documentation
+changes remain uncommitted until the user explicitly requests delivery.
+
+### Newly diagnosed answer-quality defect
+
+The first numeric reply to an ambiguous `who is faris` request can return the
+global 568-employee count. The candidate is initially selected correctly, but
+the saved `measure="employees"` makes a second resolver pass classify the plan
+as a population query and remove the trusted `Employee_ID` filter. This is a
+traced diagnosis, not a completed correction. The next implementation must
+start with a failing regression, preserve validated clarification scope through
+retrieval, and prove that genuine population queries still discard stale
+employee scope.
+
 ## Verification procedure
 
 ```powershell
 $env:ANONYMIZED_TELEMETRY='False'
 $env:POSTHOG_DISABLED='true'
 & '.venv\Scripts\python.exe' -m unittest discover -s week5 -p '*test*.py' -v
-& '.venv\Scripts\ruff.exe' check week5/new_implementation week5/new_evaluation week5/new_app.py week5/test_new_app.py
-& '.venv\Scripts\ruff.exe' format --check week5/new_implementation week5/new_evaluation week5/new_app.py week5/test_new_app.py
-& '.venv\Scripts\python.exe' -m compileall -q week5/new_implementation week5/new_evaluation week5/new_app.py week5/test_new_app.py
+& '.venv\Scripts\ruff.exe' check week5/new_implementation week5/new_evaluation week5/new_evaluator.py week5/test_new_evaluator.py week5/new_app.py week5/test_new_app.py
+& '.venv\Scripts\ruff.exe' format --check week5/new_implementation week5/new_evaluation week5/new_evaluator.py week5/test_new_evaluator.py week5/new_app.py week5/test_new_app.py
+& '.venv\Scripts\python.exe' -m compileall -q week5/new_implementation week5/new_evaluation week5/new_evaluator.py week5/test_new_evaluator.py week5/new_app.py week5/test_new_app.py
 git diff --check
 & '.venv\Scripts\python.exe' -m week5.new_evaluation.eval --verify-dataset
 & '.venv\Scripts\python.exe' -m week5.new_evaluation.benchmark --warmups 2 --runs 10
@@ -559,7 +591,7 @@ executable, preserves identity, performs deterministic analytics, aligns
 PostgreSQL and Chroma evidence, makes Chroma ingestion resumable, and provides
 reproducible evaluation and performance tools.
 
-It remains operationally incomplete in six areas:
+It remains operationally incomplete in seven areas:
 
 1. provider-dependent planner/reranker/final-answer verification;
 2. live pgvector verification;
@@ -567,3 +599,5 @@ It remains operationally incomplete in six areas:
 4. live manifest v1→v2 integrity migration;
 5. semantic/hybrid identity labels and enforced quality thresholds;
 6. persisted performance gates and physical module extraction.
+7. trusted clarification scope surviving the second resolver pass without
+   contaminating genuine population queries.

@@ -25,7 +25,14 @@ class FilterCondition(BaseModel):
     value: str | float | list[str] | list[float]
 
 
-MeasureName = Literal["distinct_dates", "attendance_records", "employees"]
+# Counts unique attendance dates after all filters are applied; duplicate rows for the same date are counted once (for example, three matching records on 2026-09-01 count as one date).
+# Counts every matching daily attendance row after all filters are applied, including duplicate employee-date rows (for example, three matching rows count as three records).
+# Counts unique non-null employee identifiers after all filters are applied; multiple rows for the same employee are counted once (for example, records for E123 on five dates count as one employee)..
+MeasureName = Literal[
+    "distinct_dates",
+    "attendance_records",
+    "employees",
+]
 BusinessPredicateName = Literal[
     "scheduled_working_day",
     "worked",

@@ -18,15 +18,20 @@ When documents disagree, use this order of authority:
 
 1. This handoff.
 2. `APDC_Attendance_Knowledge_Base_Improvements_1_to_21_Complete_Documentation.md`.
-3. `docs/superpowers/plans/2026-09-12-apdc-foundation-and-answer-correctness-implementation.md`.
-4. `attendance_schema.py`, especially `QueryPlan`, `FIELD_DEFINITIONS`,
+3. `APDC_Attendance_Remaining_Improvements_Implementation.md`.
+4. `APDC_Answer_Quality_Next_Agent_Request.md`.
+5. `docs/superpowers/plans/2026-09-12-apdc-foundation-and-answer-correctness-implementation.md`.
+6. `attendance_schema.py`, especially `QueryPlan`, `FIELD_DEFINITIONS`,
    `MEASURE_DEFINITIONS`, `BUSINESS_PREDICATE_DEFINITIONS`, and
    `compile_business_intent()`.
-5. `answer.py`, following `fetch_context()` and
+7. `answer.py`, following `fetch_context()` and
    `answer_question_with_state()` rather than reading helpers randomly.
-6. `source_ingestion.py`, `ingest.py`, `ingestion_state.py`, and
+8. `new_app.py`, `new_evaluator.py`, `test_new_app.py`, and
+   `test_new_evaluator.py`.
+9. `source_ingestion.py`, `ingest.py`, `ingestion_state.py`, and
    `chroma_client.py`.
-7. `new_evaluation/test.py`, `eval.py`, `tests.jsonl`, and their unit tests.
+10. `new_evaluation/test.py`, `eval.py`, `benchmark.py`, `tests.jsonl`, and
+    their unit tests.
 
 ## Current verified state
 
@@ -40,16 +45,26 @@ When documents disagree, use this order of authority:
 | Employee-period chunks | 568 |
 | Valid raw attendance rows | 3,964 |
 | Local evaluation questions (private-derived, not published) | 310 |
-| Implementation tests | 219 passing |
-| App/evaluation/benchmark tests | 27 passing |
+| Implementation tests | 257 passing |
+| App/dashboard/evaluation/benchmark tests | 35 passing |
 | Pending ingestion generations | 0 |
 
 The dataset fingerprint is kept in the local-only evaluation manifest and is
 not published.
 
 Repository handoff baseline: GitHub `main` commit
-`931445979f8ef9e2909f0282d95e5ce41b4cc421`. That commit was independently
+`7b5ef62531f384c9b453decd301613d12b406f92`. That commit was independently
 reviewed with no remaining Critical or Important finding before it was pushed.
+The only configured remote is
+`https://github.com/fares201040/llm_engineering_learning.git`; do not add or
+push to `ed-donner/llm_engineering`.
+
+The current working tree intentionally contains the new APDC evaluation
+dashboard (`week5/new_evaluator.py`) and its tests
+(`week5/test_new_evaluator.py`) plus the documentation updates described here.
+These changes were verified locally but were not committed or pushed at the
+time of this handoff update. Preserve and inspect them; do not reset or clean
+the worktree.
 
 The private raw table also contains one historical quarantined fixture row.
 That row is intentional append-only history, not an active source and not stale
@@ -61,101 +76,67 @@ values stay in the ignored private evaluation corpus and are not reproduced in
 this publishable handoff. Only non-identifying aggregate acceptance results are
 reported here.
 
-## New observed issue and next-agent mission
+## Current answer-quality issue and next-agent mission
 
-This section records the new screenshot received after the baseline above. It
-is an unresolved investigation request, not a verified diagnosis.
+The earlier single-interpretation/empty-evidence screenshot defect is fixed and
+covered by the 257-test implementation baseline. A newer screenshot exposed a
+different unresolved clarification defect.
 
-### Sanitized observed conversation
+### Reproduced user-visible sequence
 
-The real employee ID and employee-linked result values remain local and are not
-published in this handoff. During authorized local reproduction, replace
-`E00001` below with the employee ID from the supplied screenshot.
+1. The user asked `hi there, tell me who is faris`.
+2. The assistant correctly displayed two matching employees and asked for a
+   numbered clarification.
+3. The first reply `1` incorrectly returned `568 distinct employees matched the
+   requested criteria.`
+4. A second reply `1` returned the intended employee profile.
 
-1. The user asked how many days synthetic employee `E00001` attended during a
-   month that extends beyond the loaded coverage. The assistant returned a
-   worked-day result with the correct partial-coverage warning.
-2. The user asked how many days the same employee did not attend. The assistant
-   returned a scheduled-non-attendance result with the same warning.
-3. The user asked `who is this employee`.
-4. The assistant incorrectly returned:
+The first valid choice must immediately remain scoped to the selected employee
+and answer the saved identity request. It must never execute a global employee
+count, require the same choice twice, or lose the validated candidate.
 
-   ```text
-   I could not safely interpret that request: Interpretation clarification
-   requires at least two distinct choices.
-   ```
+### Traced root cause, not yet implemented
 
-5. The Gradio **Relevant Context** panel was empty for the displayed response.
+The first numeric reply is parsed correctly and its candidate is revalidated.
+`answer_question_with_state()` then builds a prepared plan with the selected
+`Employee_ID`. The saved planner plan still has `measure="employees"` because
+the original wording (`who is faris`) is not the narrow `who is this employee`
+projection pattern. During `_fetch_context_result()`, plan normalization and
+`resolve_employee_plan()` run again. `_is_employee_followup()` classifies the
+plan as a population request because of that measure and removes the newly
+added trusted employee filter. The exact backend consequently counts the full
+568-employee population, and the resolved selection is not committed. The next
+`1` is therefore handled as a new history-informed turn rather than as the
+original clarification.
 
-The expected third-turn behavior is to retain the validated employee selected
-by the earlier turns, retrieve only evidence for that employee, answer the
-identity question from trusted directory/evidence data, and render the evidence
-used in the Relevant Context panel. It must not invent an identity, retrieve
-another employee, or expose private fields outside the approved context schema.
+This diagnosis was established by tracing the current code path, but the fix
+has deliberately not been implemented without a failing regression. The
+approved correction is to carry an explicit trusted clarification scope (or an
+equivalent typed internal contract) through retrieval so a directory-validated
+choice cannot be stripped by population cleanup. Genuine population questions
+must continue to discard stale conversational employee scope.
 
-### What is confirmed and what still requires tracing
+### Future implementation workflow
 
-Confirmed from the previous investigation:
+After the user explicitly asks the next agent to implement improvements:
 
-- Gradio passes prior chat messages and a per-session `ConversationState` into
-  `answer_question_with_state()`.
-- Direct employee resolution is committed to `selected_employees` only after
-  successful retrieval.
-- Singular follow-ups such as `Who is this employee?` reuse the selected
-  employee, while population/group/ranking requests do not.
-- Worked-day and scheduled-non-attendance calculations for the shown employee
-  were source-checked against the real local retrieval backend.
-
-The new error text strongly suggests that a one-item interpretation candidate
-set reached a validation/clarification boundary that requires at least two
-choices. That is only a hypothesis until the next agent captures the actual
-question, history, state before/after, raw planner output, normalized plan,
-interpretation candidates, resolved employee IDs, retrieved chunks, and app
-callback outputs from the failing runtime. The empty context panel may be a
-downstream consequence of the safe-error path returning no chunks, or it may be
-a separate rendering/data-flow defect. Trace both independently.
-
-### Required investigation workflow
-
-The next agent must first read this handoff and the scripts listed in the
-required reading order. Then:
-
-1. Reproduce the exact three-turn screenshot flow through `new_app.chat_with_state()`
-   and through the running Gradio UI. Capture state and evidence at every
-   boundary without logging private values.
-2. Add a failing regression that proves the actual root cause before changing
-   production code. Fix the owning schema, compiler, resolver, state, retrieval,
-   or rendering boundary; do not special-case the exact user sentence.
-3. Verify that a valid single interpretation is accepted directly, while true
-   ambiguity still requires at least two distinct choices and unsafe/empty
-   interpretations still fail closed.
-4. Verify that deterministic answers and narrative answers both return the
-   evidence actually used, and that `new_app._render_context()` displays it.
-   If a calculation intentionally needs summarized rather than row-level
-   evidence, provide a truthful structured evidence object instead of fabricating
-   context.
-5. Run a long, stateful Gradio conversation—at least 60 turns, plus fresh-session
-   controls—covering direct IDs, names, pronouns, `this employee`, changed
-   employees, unknown and ambiguous employees, worked/not-worked/absent/scheduled
-   distinctions, record counts, authorization, overtime, percentages, grouping,
-   ranking, dates, coverage, semantic questions, malformed input, retries, and
-   clear/reset behavior. For every turn, record the expected scope/calculation,
-   actual answer, selected state, pending state, and displayed evidence.
-6. When a wrong answer, missing context, state leak, unsafe behavior, or unrelated
-   code defect is found, stop that scenario, trace it to the first incorrect
-   boundary, add a failing test, implement the native fix, rerun adjacent tests,
-   restart/reload Gradio when necessary, and resume the long conversation. Do
-   not accumulate unexplained failures until the end.
-7. Test at least two independent Gradio sessions interleaved to prove that
-   employee selection, pending clarification, and history cannot cross sessions.
-8. Review risky logic step by step: model-plan trust boundaries, contradiction
-   detection, single/multiple interpretation handling, pending-state mutation,
-   employee follow-up scoping, exact/hybrid/semantic routing, zero-result
-   behavior, coverage wording, context propagation, HTML escaping, exception
-   paths, and clean-checkout behavior without private fixtures.
-9. Run the complete verification commands, independently review the final diff,
-   update this handoff and related documentation, commit all authorized source,
-   tests, docs, and notebooks, and push to
+1. Reproduce `who is faris` → two candidates → first reply `1` at both
+   `answer_question_with_state()` and `new_app.chat_with_state()` boundaries.
+2. Add a failing end-to-end regression proving that the first selection keeps
+   the selected ID, answers the saved identity question, clears pending state,
+   and never returns the global count.
+3. Add a paired safety regression proving that a real employee-population query
+   still removes stale selected-employee scope.
+4. Implement the smallest typed fix at the state/retrieval/resolver boundary;
+   do not special-case `Faris`, the number `1`, or the screenshot sentence.
+5. Use `new_evaluator.py` to measure behavior, retrieval, and answer quality on
+   a bounded sample before any full provider-backed run.
+6. Expand answer-quality testing across identity, ambiguous names, follow-ups,
+   deterministic calculations, semantic/hybrid questions, malformed input,
+   evidence parity, reset behavior, and interleaved sessions.
+7. Run the complete verification commands, independently review the final diff,
+   update this handoff and related documentation, and only commit/push when the
+   user asks. Push only to
    `https://github.com/fares201040/llm_engineering_learning.git` without force.
 
 Do not commit `.env` files, access tokens, raw or identifiable employee
@@ -558,12 +539,30 @@ question in a fresh state returned a controlled request for an employee name or
 ID with no evidence. A final ordered-record browser check returned and displayed
 exactly the explicitly requested two most recent evidence rows.
 
-Final automated verification passed 257 implementation tests and 29
-app/evaluation/benchmark tests. Ruff check and format check, Python compilation,
+Final automated verification passed 257 implementation tests and 35
+app/dashboard/evaluation/benchmark tests. Ruff check and format check, Python compilation,
 private dataset integrity verification, five APDC-adjacent notebook schema
 validations, and `git diff --check` passed. The only warning remained the known
 third-party protobuf deprecation warning. Independent final re-review reported
 no Critical or Important findings.
+
+## APDC evaluation dashboard
+
+`week5/new_evaluator.py` is the Gradio UI for the current APDC evaluator. It
+imports `week5.new_evaluation`, never the legacy Insurellm evaluator. Its four
+tabs expose dataset verification, deterministic behavior checks, retrieval
+metrics, and provider-backed answer-quality scoring. The shared maximum-cases
+control defaults to 10; `0` means the full private corpus. Per-case exceptions
+are isolated and rendered by exception type without exposing exception details.
+
+Run it from the repository root:
+
+```powershell
+& '.venv\Scripts\python.exe' 'week5\new_evaluator.py'
+```
+
+The legacy `week5/evaluator.py` remains unchanged and must not be used to judge
+the APDC `new_implementation`.
 
 ## Verification commands
 
@@ -574,6 +573,7 @@ $env:ANONYMIZED_TELEMETRY='False'
   -s week5/new_implementation -p 'test_*.py' -v
 
 & '.venv\Scripts\python.exe' -m unittest `
+  week5.test_new_evaluator `
   week5.test_new_app `
   week5.new_evaluation.test_eval `
   week5.new_evaluation.test_benchmark -v
@@ -581,19 +581,26 @@ $env:ANONYMIZED_TELEMETRY='False'
 & '.venv\Scripts\ruff.exe' check `
   week5/new_implementation `
   week5/new_evaluation `
+  week5/new_evaluator.py `
+  week5/test_new_evaluator.py `
   week5/new_app.py `
   week5/test_new_app.py
 
 & '.venv\Scripts\ruff.exe' format --check `
   week5/new_implementation `
   week5/new_evaluation `
+  week5/new_evaluator.py `
+  week5/test_new_evaluator.py `
   week5/new_app.py `
   week5/test_new_app.py
 
 & '.venv\Scripts\python.exe' -m compileall -q `
   week5/new_implementation `
   week5/new_evaluation `
-  week5/new_app.py
+  week5/new_evaluator.py `
+  week5/test_new_evaluator.py `
+  week5/new_app.py `
+  week5/test_new_app.py
 
 & '.venv\Scripts\python.exe' week5/new_evaluation/eval.py --verify-dataset
 
@@ -639,7 +646,7 @@ Before changing code, a new agent should:
 1. Confirm branch and inspect the dirty worktree without modifying it.
 2. Read the required documents and trace one exact, one hybrid, one semantic,
    one ambiguity, and one malformed-input question through the code.
-3. Run the 219 implementation and 27 app/evaluation/benchmark tests.
+3. Run the 257 implementation and 35 app/dashboard/evaluation/benchmark tests.
 4. Verify the dataset manifest before trusting expected values.
 5. Reproduce every suspected defect with a failing test.
 6. Fix the rule at the deterministic compiler, schema, resolver, or backend

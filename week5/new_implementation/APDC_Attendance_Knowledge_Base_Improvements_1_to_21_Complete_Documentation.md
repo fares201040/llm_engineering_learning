@@ -1866,6 +1866,26 @@ final LLM context
 final answer
 ```
 
+## `new_app.py`
+
+Owns the Gradio chat surface, per-session `ConversationState`, clear/reset
+behavior, and HTML-escaped evidence display. It delegates question answering to
+`answer_question_with_state()` and must return exactly the evidence used by the
+answer path.
+
+## `new_evaluation/`
+
+Contains the private-derived APDC corpus loader, deterministic behavior checks,
+retrieval and LLM-judge metrics, dataset fingerprint verification, and offline
+component benchmark. `tests.jsonl` and `dataset_manifest.json` are local-only
+authorized fixtures and are never published.
+
+## `new_evaluator.py`
+
+Provides the APDC Gradio evaluation dashboard. It imports `new_evaluation`, not
+the legacy Insurellm evaluator, and exposes dataset, behavior, retrieval, and
+answer-quality tabs with a bounded case-count control.
+
 ---
 
 # 8. Key Design Principles
@@ -2347,8 +2367,8 @@ The evaluator validates:
 Expected data is locked locally to the authorized row count, employee count,
 date range, and private fingerprint. The fingerprint is not published.
 
-Final local verification passed 219 implementation tests and 27
-app/evaluation/benchmark tests. Ruff check, Ruff formatting, Python compilation,
+Final local verification passed 257 implementation tests and 35
+app/dashboard/evaluation/benchmark tests. Ruff check, Ruff formatting, Python compilation,
 direct local dataset verification, and `git diff --check` also passed. The
 private corpus integrity and deterministic calculation checks passed locally,
 and every later regression case passed individually against the final rule set.
@@ -2416,8 +2436,45 @@ visible evidence on the identity turn and empty evidence after a safe
 fresh-session anaphora failure. Private transcripts and employee-linked facts
 remain outside version control.
 
-The final verification baseline is 257 implementation tests and 29
-app/evaluation/benchmark tests, plus Ruff lint/format, compilation, private
+The final verification baseline is 257 implementation tests and 35
+app/dashboard/evaluation/benchmark tests, plus Ruff lint/format, compilation, private
 dataset integrity, five APDC-adjacent notebook schema validations, and Git
 whitespace validation. Independent final re-review found no Critical or
 Important issues.
+
+# 21. APDC Evaluation Dashboard and Next Answer-Quality Boundary
+
+The current APDC evaluator now has a dedicated Gradio entry point:
+
+```powershell
+& '.venv\Scripts\python.exe' 'week5\new_evaluator.py'
+```
+
+The dashboard wraps the existing `new_evaluation` functions without duplicating
+their scoring rules. Dataset verification checks the private PostgreSQL
+fingerprint. Behavior evaluation reports typed contract failures. Retrieval
+evaluation reports MRR, nDCG, and keyword coverage. Answer evaluation uses the
+configured model as judge and is therefore explicitly bounded by a maximum-case
+control; `0` opts into the full corpus. Each failure is isolated so completed
+cases remain visible, while exception details are kept out of the browser.
+
+The dashboard and its tests were added after commit
+`7b5ef62531f384c9b453decd301613d12b406f92` and were locally verified with the
+current suite and a real browser construction/rendering smoke test. They were
+not committed or pushed at the time this documentation was updated.
+
+The next answer-quality defect is separate from the already-fixed
+single-interpretation issue. For `who is faris`, the assistant displays two
+valid candidates. The first numeric choice is revalidated and receives a typed
+employee filter, but the saved `measure="employees"` causes later population
+cleanup to remove that trusted filter. The exact backend then returns the full
+568-employee count. A second numeric reply is treated as a new turn and can
+produce the intended profile.
+
+The correction must preserve an explicitly trusted, directory-validated
+clarification scope through retrieval while retaining the existing rule that
+genuine population/group/ranking questions cannot inherit stale employee
+scope. This remains diagnosed but unimplemented. Before changing production
+code, create a failing end-to-end regression for the first-choice flow and a
+paired population-scope safety regression. Do not patch the employee name,
+choice number, or screenshot wording.

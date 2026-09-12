@@ -140,6 +140,68 @@ class AccessScopeTests(unittest.TestCase):
 
 
 class QueryPlannerSchemaTests(unittest.TestCase):
+    def test_proposal_prompt_is_generated_from_safe_registry(self):
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            '{"status":"ready","filters":[],'
+                            '"measure":{"name":"distinct_dates","evidence_text":"days"},'
+                            '"answer_contract":{"shape":"scalar","unit":"dates",'
+                            '"subject_field":"Date","grain":["Date"]}}'
+                        )
+                    )
+                )
+            ]
+        )
+
+        with patch.object(answer, "completion", return_value=response) as completion:
+            answer.propose_query("How many days?")
+
+        kwargs = completion.call_args.kwargs
+        prompt = kwargs["messages"][0]["content"]
+        self.assertIs(kwargs["response_format"], answer.PlannerProposal)
+        self.assertEqual(prompt.count("SEMANTIC REGISTRY"), 1)
+        self.assertIn("Day_Type", prompt)
+        self.assertIn("Schedule_From_Date", prompt)
+        self.assertNotIn("record_json ->>", prompt)
+        self.assertNotIn('"name":"chunk_type"', prompt)
+        self.assertNotIn("For worked or attended days use", prompt)
+        self.assertNotIn("For explicit absent days use", prompt)
+        self.assertNotIn("If the user says", prompt)
+        self.assertNotIn("expected_sql", prompt)
+
+    def test_proposal_prompt_contains_only_supplied_bounded_candidates(self):
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            '{"status":"ready","filters":[],'
+                            '"measure":{"name":"employees","evidence_text":"employees"},'
+                            '"answer_contract":{"shape":"scalar","unit":"employees",'
+                            '"subject_field":"Employee_ID","grain":[]}}'
+                        )
+                    )
+                )
+            ]
+        )
+        trusted = [answer.EmployeeCandidate(employee_id="A1", name="Trusted Person")]
+
+        with patch.object(answer, "completion", return_value=response) as completion:
+            answer.propose_query(
+                "employees in night shift",
+                trusted_employees=trusted,
+                candidate_catalog={"Shift": ("Night A", "Night B")},
+            )
+
+        prompt = completion.call_args.kwargs["messages"][0]["content"]
+        self.assertIn("Trusted Person", prompt)
+        self.assertIn("Night A", prompt)
+        self.assertNotIn("Unrelated Person", prompt)
+        self.assertNotIn("Working Day", prompt.split("BOUNDED CANDIDATE CONTEXT", 1)[1])
+
     def test_negative_attendance_plan_compiles_measure_and_predicates(self):
         response = SimpleNamespace(
             choices=[

@@ -1,10 +1,12 @@
 from datetime import date, datetime, time as dt_time, timedelta
 from contextlib import contextmanager
+from collections.abc import Mapping
 from difflib import SequenceMatcher
 from time import perf_counter
 from typing import Literal, NamedTuple
 from zoneinfo import ZoneInfo
 import math
+import json
 import logging
 import re
 import uuid
@@ -26,6 +28,7 @@ try:
         MEASURE_DEFINITIONS,
         NUMERIC_FILTER_FIELDS,
         POSTGRES_FIELD_MAP,
+        PlannerProposal,
         QUESTION_CONTEXT_FIELDS,
         SEMANTIC_INTENT_PATTERNS,
         FilterCondition,
@@ -33,7 +36,9 @@ try:
         QueryPlan,
         compile_business_intent,
         relevant_field_definitions,
+        render_planner_schema,
     )
+    from .semantic_resolution import SemanticFact
     from .chroma_client import create_chroma_client
     from .config import settings
     from .observability import EventLogger
@@ -49,6 +54,7 @@ except ImportError:  # Running answer.py directly from its directory.
         MEASURE_DEFINITIONS,
         NUMERIC_FILTER_FIELDS,
         POSTGRES_FIELD_MAP,
+        PlannerProposal,
         QUESTION_CONTEXT_FIELDS,
         SEMANTIC_INTENT_PATTERNS,
         FilterCondition,
@@ -56,7 +62,9 @@ except ImportError:  # Running answer.py directly from its directory.
         QueryPlan,
         compile_business_intent,
         relevant_field_definitions,
+        render_planner_schema,
     )
+    from semantic_resolution import SemanticFact
     from chroma_client import create_chroma_client
     from config import settings
     from observability import EventLogger
@@ -595,6 +603,60 @@ def _business_intent_context_text():
 # ---------------------------------------------------------------------------
 # Improvement 18 — stronger query planner
 # ---------------------------------------------------------------------------
+
+
+@_retry()
+def propose_query(
+    question: str,
+    history: list[dict] | None = None,
+    trusted_employees: list[EmployeeCandidate] | None = None,
+    semantic_facts: tuple[SemanticFact, ...] = (),
+    candidate_catalog: Mapping[str, tuple[str, ...]] | None = None,
+) -> PlannerProposal:
+    """Ask for an untrusted semantic proposal using registry-generated context."""
+    generic_contract = """Return PlannerProposal, never SQL.
+Use only definitions and values supplied by the semantic registry or candidate context.
+Attach exact question evidence to every semantic choice.
+Do not invent a field, value, predicate, measure, grouping, order, or limit.
+Return ambiguous when evidence supports multiple meanings.
+Return unsupported with controlled capability identifiers when the typed proposal cannot express the request."""
+    fact_context = {
+        "date_context": _date_context_text(question),
+        "semantic_facts": [fact.model_dump(mode="json") for fact in semantic_facts],
+        "recent_history": (history or [])[-4:],
+    }
+    candidate_context = {
+        "trusted_employees": [
+            {"name": candidate.name, "employee_id": candidate.employee_id}
+            for candidate in trusted_employees or []
+        ],
+        "catalog": {
+            field: list(values)
+            for field, values in sorted((candidate_catalog or {}).items())
+            if field in FIELD_DEFINITIONS and FIELD_DEFINITIONS[field].planner_visible
+        },
+    }
+    prompt = "\n\n".join(
+        (
+            f"PLANNER CONTRACT\n{generic_contract}",
+            f"SEMANTIC REGISTRY\n{render_planner_schema()}",
+            "DETERMINISTIC CONTEXT\n"
+            + json.dumps(fact_context, ensure_ascii=False, separators=(",", ":")),
+            "BOUNDED CANDIDATE CONTEXT\n"
+            + json.dumps(
+                candidate_context, ensure_ascii=False, separators=(",", ":")
+            )
+            + f"\nQUESTION\n{question}",
+        )
+    )
+    response = completion(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        response_format=PlannerProposal,
+        temperature=0,
+        timeout=settings.planner_timeout_seconds,
+    )
+    return PlannerProposal.model_validate_json(response.choices[0].message.content)
 
 
 @_retry()

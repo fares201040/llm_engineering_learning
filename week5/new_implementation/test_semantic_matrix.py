@@ -90,7 +90,7 @@ def generate_registry_cases() -> tuple[SemanticMatrixCase, ...]:
                 )
             ],
             answer_contract=AnswerContract(
-                shape="scalar", unit="value", subject_field=None, grain=[]
+                shape="rows", unit="value", subject_field=None, grain=[]
             ),
         )
         cases.append(
@@ -325,7 +325,7 @@ class SemanticMatrixTests(unittest.TestCase):
                 )
             ],
             answer_contract=AnswerContract(
-                shape="scalar", unit="value", subject_field=None, grain=[]
+                shape="rows", unit="value", subject_field=None, grain=[]
             ),
         )
         context = ResolutionContext({})

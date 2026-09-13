@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 try:
     from .attendance_schema import (
         BUSINESS_PREDICATE_DEFINITIONS,
+        AnswerContract,
         CALCULATION_DEFINITIONS,
         DERIVED_RESULT_DEFINITIONS,
         FIELD_DEFINITIONS,
@@ -30,6 +31,7 @@ try:
 except ImportError:  # Direct execution from week5/new_implementation.
     from attendance_schema import (
         BUSINESS_PREDICATE_DEFINITIONS,
+        AnswerContract,
         CALCULATION_DEFINITIONS,
         DERIVED_RESULT_DEFINITIONS,
         FIELD_DEFINITIONS,
@@ -379,9 +381,14 @@ class ContradictionInvariant(PlanInvariant):
 class AnswerContractInvariant(PlanInvariant):
     def check(self, context):
         proposal = context.proposal
-        if proposal is None or proposal.answer_contract is None:
+        contract = (
+            proposal.answer_contract
+            if proposal is not None
+            else getattr(context.candidate_plan, "answer_contract", None)
+        )
+        if contract is None:
             return ()
-        if proposal.answer_contract.shape == "narrative" and (
+        if contract.shape == "narrative" and (
             context.candidate_plan.mode == "exact"
             or context.candidate_plan.aggregation != "none"
         ):
@@ -392,38 +399,57 @@ class AnswerContractInvariant(PlanInvariant):
                     "Narrative explanations cannot be executed as structured calculations.",
                 ),
             )
-        expected_unit = None
-        expected_subject = None
-        if proposal.measure is not None:
-            definition = MEASURE_DEFINITIONS[proposal.measure.name]
-            expected_unit = definition.answer_unit
-            expected_subject = definition.aggregation_field
-        elif proposal.calculation is not None:
-            expected_unit = (
-                "percentage"
-                if proposal.calculation.operation == "percentage"
-                else (
-                    "hours"
-                    if proposal.calculation.field
-                    and FIELD_DEFINITIONS.get(proposal.calculation.field)
-                    and FIELD_DEFINITIONS[proposal.calculation.field].storage_type
-                    == "number"
-                    else "value"
-                )
-            )
-            expected_subject = proposal.calculation.field
-        contract = proposal.answer_contract
-        if expected_unit and (
-            contract.unit != expected_unit or contract.subject_field != expected_subject
-        ):
+        expected = derive_expected_answer_contract(context.candidate_plan)
+        if contract != expected:
             return (
                 PlanViolation(
                     "answer_contract_mismatch",
                     "answer_contract",
-                    "The answer contract does not match the selected calculation.",
+                    "The answer contract does not match the complete compiled operation.",
                 ),
             )
         return ()
+
+
+def derive_expected_answer_contract(plan: QueryPlan) -> AnswerContract:
+    """Derive the only answer shape allowed for a compiled operation."""
+    if plan.aggregation != "none":
+        shape = "grouped" if plan.group_by else "scalar"
+        if plan.measure is not None:
+            definition = MEASURE_DEFINITIONS[plan.measure]
+            unit = definition.answer_unit
+            subject_field = definition.aggregation_field
+        elif plan.aggregation == "count":
+            unit = "records"
+            subject_field = None
+        elif plan.aggregation == "percentage":
+            unit = "percentage"
+            subject_field = plan.aggregation_field
+        else:
+            subject_field = plan.aggregation_field
+            definition = FIELD_DEFINITIONS.get(subject_field or "")
+            unit = definition.output_unit if definition is not None else "value"
+        grain = list(
+            dict.fromkeys([*plan.group_by, *([subject_field] if subject_field else [])])
+        )
+        return AnswerContract(
+            shape=shape,
+            unit=unit,
+            subject_field=subject_field,
+            grain=grain,
+        )
+    if plan.projection:
+        return AnswerContract(
+            shape="rows",
+            unit="value",
+            subject_field=None,
+            grain=list(plan.projection),
+        )
+    if plan.mode in {"semantic", "hybrid"}:
+        return AnswerContract(
+            shape="narrative", unit="value", subject_field=None, grain=[]
+        )
+    return AnswerContract(shape="rows", unit="value", subject_field=None, grain=[])
 
 
 class CapabilityInvariant(PlanInvariant):
@@ -1007,7 +1033,8 @@ def compile_proposal(
             None, tuple(provenance), violations, clarification=clarification
         )
     executable = ExecutableQueryPlan(
-        **candidate.model_dump(), answer_contract=proposal.answer_contract
+        **candidate.model_dump(),
+        answer_contract=derive_expected_answer_contract(candidate),
     )
     return PlanCompilationResult(executable, tuple(provenance), ())
 
@@ -1017,7 +1044,7 @@ def revalidate_executable_plan(
     context: CompilationContext,
     provenance: tuple[ConstraintProvenance, ...],
 ) -> PlanCompilationResult:
-    candidate = QueryPlan.model_validate(plan.model_dump(exclude={"answer_contract"}))
+    candidate = plan
     invariant_context = InvariantContext(context, None, candidate, provenance)
     violations = tuple(
         violation

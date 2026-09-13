@@ -81,6 +81,10 @@ def _proposal_side_effect(*plans):
             ProposedFieldChoice(field=field, evidence_text=question)
             for field in plan.group_by
         ]
+        projections = [
+            ProposedFieldChoice(field=field, evidence_text=question)
+            for field in plan.projection
+        ]
         status = "ambiguous" if plan.interpretation_candidates else "ready"
         answer_contract = None
         if status == "ready":
@@ -94,10 +98,8 @@ def _proposal_side_effect(*plans):
                     "percentage"
                     if calculation.operation == "percentage"
                     else (
-                        "hours"
+                        answer.FIELD_DEFINITIONS[calculation.field].output_unit
                         if calculation.field
-                        and answer.FIELD_DEFINITIONS[calculation.field].storage_type
-                        == "number"
                         else "value"
                     )
                 )
@@ -105,8 +107,20 @@ def _proposal_side_effect(*plans):
                 grain = [subject] if subject else []
             else:
                 unit, subject, grain = "value", None, []
+            if groups:
+                shape = "grouped"
+                grain = list(dict.fromkeys([*(item.field for item in groups), *grain]))
+            elif projections:
+                shape = "rows"
+                grain = [item.field for item in projections]
+            elif plan.aggregation != "none":
+                shape = "scalar"
+            elif plan.mode in {"semantic", "hybrid"}:
+                shape = "narrative"
+            else:
+                shape = "rows"
             answer_contract = answer.AnswerContract(
-                shape="grouped" if groups else "rows",
+                shape=shape,
                 unit=unit,
                 subject_field=subject,
                 grain=grain,
@@ -123,6 +137,7 @@ def _proposal_side_effect(*plans):
             business_predicates=predicates,
             calculation=calculation,
             group_by=groups,
+            projection=projections,
             order_by=(
                 ProposedOrderChoice(
                     field=plan.order_by,
@@ -1890,6 +1905,8 @@ class CoverageMetadataTests(unittest.TestCase):
             ],
             measure="distinct_dates",
             business_predicates=["worked"],
+            aggregation="distinct_count",
+            aggregation_field="Date",
         )
 
         enriched = answer.attach_coverage_metadata(
@@ -1899,7 +1916,7 @@ class CoverageMetadataTests(unittest.TestCase):
         )
 
         self.assertTrue(enriched["coverage"]["complete"])
-        text = answer._format_aggregation_answer("How many days?", enriched)
+        text = answer._format_aggregation_answer(plan, enriched)
         self.assertNotIn("not the full requested period", text)
 
     def test_partial_non_attendance_answer_uses_business_label_and_warning(self):
@@ -1918,9 +1935,23 @@ class CoverageMetadataTests(unittest.TestCase):
             },
         }
 
-        text = answer._format_aggregation_answer(
-            "How many days did A11017 not attend?", aggregation
+        plan = answer.QueryPlan(
+            mode="exact",
+            search_query="days not attended",
+            filters=[
+                answer.FilterCondition(
+                    field="Date", operator="gte", value="2026-09-01"
+                ),
+                answer.FilterCondition(
+                    field="Date", operator="lte", value="2026-09-30"
+                ),
+            ],
+            measure="distinct_dates",
+            business_predicates=["scheduled_working_day", "not_worked"],
+            aggregation="distinct_count",
+            aggregation_field="Date",
         )
+        text = answer._format_aggregation_answer(plan, aggregation)
 
         self.assertIn("1 scheduled working day was not attended", text)
         self.assertIn(
@@ -1943,9 +1974,13 @@ class CoverageMetadataTests(unittest.TestCase):
             },
         }
 
-        text = answer._format_aggregation_answer(
-            "How many attendance records were there in September?", aggregation
+        plan = answer.QueryPlan(
+            mode="exact",
+            search_query="attendance records",
+            measure="attendance_records",
+            aggregation="count",
         )
+        text = answer._format_aggregation_answer(plan, aggregation)
 
         self.assertIn("7 attendance records", text)
         self.assertIn("not the full requested period", text)
@@ -1959,9 +1994,15 @@ class CoverageMetadataTests(unittest.TestCase):
             "business_predicates": ["not_worked"],
         }
 
-        text = answer._format_aggregation_answer(
-            "How many days did A11017 work zero hours?", aggregation
+        plan = answer.QueryPlan(
+            mode="exact",
+            search_query="days with no worked hours",
+            measure="distinct_dates",
+            business_predicates=["not_worked"],
+            aggregation="distinct_count",
+            aggregation_field="Date",
         )
+        text = answer._format_aggregation_answer(plan, aggregation)
 
         self.assertEqual(text, "3 recorded days had no positive worked hours.")
 
@@ -1979,13 +2020,112 @@ class CoverageMetadataTests(unittest.TestCase):
             },
         }
 
-        text = answer._format_aggregation_answer("What percentage?", aggregation)
+        plan = answer.QueryPlan(
+            mode="exact",
+            search_query="percentage authorized",
+            aggregation="percentage",
+            percentage_condition=answer.FilterCondition(
+                field="Status", operator="eq", value="Authorized"
+            ),
+        )
+        text = answer._format_aggregation_answer(plan, aggregation)
 
         self.assertIn("denominator is zero", text)
         self.assertIn("not the full requested period", text)
 
 
 class DeterministicAggregationAnswerTests(unittest.TestCase):
+    def test_scalar_count_identifies_verified_employee_and_temporal_scope(self):
+        plan = _executable_plan(
+            filters=[
+                answer.FilterCondition(
+                    field="Employee_ID", operator="eq", value="A11017"
+                ),
+                answer.FilterCondition(
+                    field="Date", operator="gte", value="2026-09-01"
+                ),
+                answer.FilterCondition(
+                    field="Date", operator="lte", value="2026-09-07"
+                ),
+            ],
+            measure="distinct_dates",
+            business_predicates=["scheduled_working_day"],
+            aggregation="distinct_count",
+            aggregation_field="Date",
+            answer_contract=answer.AnswerContract(
+                shape="scalar",
+                unit="dates",
+                subject_field="Date",
+                grain=["Date"],
+            ),
+        )
+
+        text = answer._format_aggregation_answer(
+            plan,
+            {"operation": "distinct_count", "field": "Date", "value": 5},
+        )
+
+        self.assertIn("scheduled working", text.casefold())
+        self.assertIn("employee id a11017", text.casefold())
+        self.assertIn("September 1-7, 2026", text)
+
+    def test_percentage_identifies_verified_numerator_and_denominator_meaning(self):
+        plan = _executable_plan(
+            aggregation="percentage",
+            percentage_condition=answer.FilterCondition(
+                field="Status", operator="eq", value="Authorized"
+            ),
+            answer_contract=answer.AnswerContract(
+                shape="scalar",
+                unit="percentage",
+                subject_field=None,
+                grain=[],
+            ),
+        )
+
+        text = answer._format_aggregation_answer(
+            plan,
+            {
+                "operation": "percentage",
+                "field": "attendance_records",
+                "numerator": 2,
+                "denominator": 3,
+                "value": 66.6666666667,
+            },
+        )
+
+        self.assertIn("Status equal to Authorized", text)
+        self.assertIn("2 of 3 attendance records", text)
+
+    def test_grouped_header_names_operation_and_registered_field(self):
+        plan = _executable_plan(
+            aggregation="average",
+            aggregation_field="Lateness_Hrs",
+            group_by=["Department"],
+            answer_contract=answer.AnswerContract(
+                shape="grouped",
+                unit="hours",
+                subject_field="Lateness_Hrs",
+                grain=["Department", "Lateness_Hrs"],
+            ),
+        )
+
+        text = answer._format_aggregation_answer(
+            plan,
+            {
+                "operation": "average",
+                "field": "Lateness_Hrs",
+                "group_by": ["Department"],
+                "rows": [{"group": ["Operations"], "value": 1.25}],
+                "total_groups": 1,
+                "truncated": False,
+            },
+        )
+
+        header = text.splitlines()[0]
+        self.assertIn("Average", header)
+        self.assertIn("lateness", header.casefold())
+
     def test_truncated_broad_record_lookup_uses_deterministic_summary(self):
         plan = answer.QueryPlan(
             mode="exact",
@@ -2059,7 +2199,7 @@ class DeterministicAggregationAnswerTests(unittest.TestCase):
         ]
 
         result = answer.calculate_aggregation_chroma(plan, chunks)
-        text = answer._format_aggregation_answer("percentage", result)
+        text = answer._format_aggregation_answer(plan, result)
 
         self.assertEqual(result["field"], "attendance_records")
         self.assertEqual(result["numerator"], 2)
@@ -2069,17 +2209,28 @@ class DeterministicAggregationAnswerTests(unittest.TestCase):
 
     def test_record_count_does_not_infer_days_from_question_wording(self):
         text = answer._format_aggregation_answer(
-            "How many attendance records were there in the last 7 days?",
+            answer.QueryPlan(
+                mode="exact",
+                search_query="attendance records",
+                measure="attendance_records",
+                aggregation="count",
+            ),
             {"operation": "count", "value": 3964, "field": None},
         )
         self.assertEqual(
             text, "3964 attendance records matched the requested criteria."
         )
 
-    def test_count_answer_uses_the_authoritative_record_count(self):
+    def test_distinct_date_answer_uses_the_authoritative_count(self):
         text = answer._format_aggregation_answer(
-            "How many days did Example attend?",
-            {"operation": "count", "value": 14, "field": "Date"},
+            answer.QueryPlan(
+                mode="exact",
+                search_query="attendance dates",
+                measure="distinct_dates",
+                aggregation="distinct_count",
+                aggregation_field="Date",
+            ),
+            {"operation": "distinct_count", "value": 14, "field": "Date"},
         )
 
         self.assertIn("14", text)
@@ -2087,12 +2238,17 @@ class DeterministicAggregationAnswerTests(unittest.TestCase):
 
     def test_sum_answer_formats_the_authoritative_numeric_value(self):
         text = answer._format_aggregation_answer(
-            "What was the total overtime?",
+            answer.QueryPlan(
+                mode="exact",
+                search_query="total overtime",
+                aggregation="sum",
+                aggregation_field="Total_OT",
+            ),
             {"operation": "sum", "value": 5.24, "field": "Total_OT"},
         )
 
         self.assertIn("5.24", text)
-        self.assertIn("Total_OT", text)
+        self.assertIn("total ot", text.casefold())
 
     def test_grouped_average_orders_and_limits_deterministically(self):
         plan = answer.QueryPlan(
@@ -2178,8 +2334,15 @@ class DeterministicAggregationAnswerTests(unittest.TestCase):
         self.assertEqual(len(result["rows"]), 2)
 
     def test_grouped_results_render_without_llm(self):
+        plan = answer.QueryPlan(
+            mode="exact",
+            search_query="average lateness by department",
+            aggregation="average",
+            aggregation_field="Lateness_Hrs",
+            group_by=["Department"],
+        )
         text = answer._format_aggregation_answer(
-            "Average lateness by department",
+            plan,
             {
                 "operation": "average",
                 "field": "Lateness_Hrs",

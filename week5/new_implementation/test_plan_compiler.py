@@ -1,5 +1,6 @@
 import unittest
 
+from week5.new_implementation import plan_compiler
 from week5.new_implementation.attendance_schema import (
     AnswerContract,
     PlannerProposal,
@@ -8,6 +9,7 @@ from week5.new_implementation.attendance_schema import (
     ProposedMeasureChoice,
     ProposedPredicateChoice,
     ProposedNameHint,
+    QueryPlan,
 )
 from week5.new_implementation.plan_compiler import (
     PLAN_INVARIANTS,
@@ -229,7 +231,7 @@ class ExecutableChoiceCoverageTests(unittest.TestCase):
             "Count records with Department equal to Finance",
             measure=dict(name="attendance_records", evidence_text="records"),
             group_by=[dict(field="Department", evidence_text="Department")],
-            answer_contract=dict(shape="grouped", unit="records"),
+            answer_contract=dict(shape="grouped", unit="records", grain=["Department"]),
         )
         self.assertIn("ungrounded_constraint", {v.code for v in result.violations})
 
@@ -250,7 +252,7 @@ class ExecutableChoiceCoverageTests(unittest.TestCase):
             group_by=[dict(field="Department", evidence_text="Departments")],
             order_by=dict(field="value", direction="desc", evidence_text="Top 3"),
             limit=dict(value=3, evidence_text="Top 3"),
-            answer_contract=dict(shape="grouped", unit="records"),
+            answer_contract=dict(shape="grouped", unit="records", grain=["Department"]),
         )
         self.assertTrue(result.ready, result.violations)
         self.assertEqual(result.executable_plan.order_by, "value")
@@ -262,7 +264,7 @@ class ExecutableChoiceCoverageTests(unittest.TestCase):
                 dict(field="Date", evidence_text="Date"),
                 dict(field="Status", evidence_text="Status"),
             ],
-            answer_contract=dict(shape="rows", unit="value"),
+            answer_contract=dict(shape="rows", unit="value", grain=["Date", "Status"]),
         )
         self.assertTrue(result.ready, result.violations)
         self.assertEqual(result.executable_plan.projection, ["Date", "Status"])
@@ -311,6 +313,112 @@ class ExecutableChoiceCoverageTests(unittest.TestCase):
                 self.assertIn(
                     "unsupported_capability", {v.code for v in result.violations}
                 )
+
+
+class CompleteAnswerContractTests(unittest.TestCase):
+    def test_expected_contract_is_derived_from_the_complete_operation(self):
+        cases = (
+            (
+                QueryPlan(
+                    mode="exact",
+                    search_query="records",
+                    measure="attendance_records",
+                    aggregation="count",
+                ),
+                dict(shape="scalar", unit="records", subject_field=None, grain=[]),
+            ),
+            (
+                QueryPlan(
+                    mode="exact",
+                    search_query="employee percentage",
+                    aggregation="percentage",
+                    aggregation_field="Employee_ID",
+                    percentage_condition=dict(
+                        field="Status", operator="eq", value="Authorized"
+                    ),
+                ),
+                dict(
+                    shape="scalar",
+                    unit="percentage",
+                    subject_field="Employee_ID",
+                    grain=["Employee_ID"],
+                ),
+            ),
+            (
+                QueryPlan(
+                    mode="exact",
+                    search_query="average lateness by department",
+                    aggregation="average",
+                    aggregation_field="Lateness_Hrs",
+                    group_by=["Department"],
+                ),
+                dict(
+                    shape="grouped",
+                    unit="hours",
+                    subject_field="Lateness_Hrs",
+                    grain=["Department", "Lateness_Hrs"],
+                ),
+            ),
+            (
+                QueryPlan(
+                    mode="exact",
+                    search_query="selected columns",
+                    projection=["Date", "Status"],
+                ),
+                dict(
+                    shape="rows",
+                    unit="value",
+                    subject_field=None,
+                    grain=["Date", "Status"],
+                ),
+            ),
+            (
+                QueryPlan(mode="semantic", search_query="attendance anomaly"),
+                dict(shape="narrative", unit="value", subject_field=None, grain=[]),
+            ),
+        )
+
+        for plan, expected in cases:
+            with self.subTest(plan=plan.search_query):
+                self.assertEqual(
+                    plan_compiler.derive_expected_answer_contract(plan).model_dump(),
+                    expected,
+                )
+
+    def test_revalidation_rejects_changed_contract_grain(self):
+        question = "How many attendance records?"
+        resolution = ResolutionContext({})
+        context = CompilationContext(
+            question,
+            detect_semantic_facts(question, resolution),
+            resolution,
+        )
+        proposal = PlannerProposal(
+            status="ready",
+            measure=ProposedMeasureChoice(
+                name="attendance_records", evidence_text="attendance records"
+            ),
+            answer_contract=AnswerContract(
+                shape="scalar", unit="records", subject_field=None, grain=[]
+            ),
+        )
+        compiled = compile_proposal(proposal, context)
+        self.assertTrue(compiled.ready, compiled.violations)
+
+        changed = compiled.executable_plan.model_copy(
+            update={
+                "answer_contract": AnswerContract(
+                    shape="scalar",
+                    unit="records",
+                    subject_field=None,
+                    grain=["Date"],
+                )
+            }
+        )
+        checked = revalidate_executable_plan(changed, context, compiled.provenance)
+
+        self.assertFalse(checked.ready)
+        self.assertIn("answer_contract_mismatch", {v.code for v in checked.violations})
 
 
 class TemporalCompositionCompilerTests(unittest.TestCase):

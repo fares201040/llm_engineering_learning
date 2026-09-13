@@ -48,6 +48,7 @@ FILTER_OPERATORS: frozenset[FilterOperator] = frozenset(get_args(FilterOperator)
 FilterScalar = str | float
 FilterValue = FilterScalar | list[FilterScalar]
 RegistryFilterValue = FilterScalar | tuple[FilterScalar, ...]
+AnswerUnit = Literal["dates", "records", "employees", "hours", "percentage", "value"]
 
 
 def _validate_filter_value_shape(operator: FilterOperator, value: FilterValue):
@@ -214,7 +215,7 @@ class ProposedCalculation(_EvidenceChoice):
 
 class AnswerContract(_StrictPlannerModel):
     shape: Literal["scalar", "grouped", "rows", "narrative"]
-    unit: Literal["dates", "records", "employees", "hours", "percentage", "value"]
+    unit: AnswerUnit
     subject_field: str | None = None
     grain: list[str] = Field(default_factory=list)
 
@@ -366,6 +367,7 @@ class FieldDefinition:
     aggregatable: bool = False
     planner_visible: bool = True
     phrase_priority: int = 100
+    output_unit: AnswerUnit = "value"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -680,6 +682,21 @@ _FIELD_NATURAL_NAMES = {
     "Leave_Hrs": ("leave", "leave hour", "leave hours"),
 }
 
+_FIELD_OUTPUT_UNITS: dict[str, AnswerUnit] = {
+    "Employee_ID": "employees",
+    "Date": "dates",
+    "Total_Worked_Hrs": "hours",
+    "Lateness_Hrs": "hours",
+    "Early_Out_Hrs": "hours",
+    "Overbreak_Hrs": "hours",
+    "pre_ot_hrs": "hours",
+    "Post_OT_hrs": "hours",
+    "Total_OT": "hours",
+    "OT_Authorized": "hours",
+    "OT_Not_Authorized": "hours",
+    "Leave_Hrs": "hours",
+}
+
 
 def _canonical_natural_name(field: str) -> str:
     return " ".join(part for part in re.split(r"[_\-\s]+", field) if part).casefold()
@@ -771,6 +788,7 @@ for _field, _definition in tuple(_FIELD_DEFINITIONS.items()):
             _definition.storage_type == "number" or _field in {"Date", "Employee_ID"}
         ),
         planner_visible=_field != "chunk_type",
+        output_unit=_FIELD_OUTPUT_UNITS.get(_field, _definition.output_unit),
     )
 FIELD_DEFINITIONS = MappingProxyType(_FIELD_DEFINITIONS)
 FILTERABLE_FIELDS = frozenset(FIELD_DEFINITIONS)
@@ -1103,6 +1121,7 @@ def render_planner_schema() -> str:
                 "storage_type": definition.storage_type,
                 "operators": list(definition.operators),
                 "resolution_kind": definition.resolution_kind,
+                "output_unit": definition.output_unit,
                 "closed_values": list(definition.closed_values),
                 "value_aliases": [
                     {

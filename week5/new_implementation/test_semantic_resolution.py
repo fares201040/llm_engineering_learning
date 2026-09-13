@@ -1,7 +1,14 @@
 import unittest
+from contextlib import contextmanager
+from dataclasses import replace
 from datetime import date
+from unittest.mock import patch
 
-from week5.new_implementation.attendance_schema import FIELD_DEFINITIONS
+from week5.new_implementation.attendance_schema import (
+    FIELD_DEFINITIONS,
+    MEASURE_DEFINITIONS,
+    VALUE_CONCEPT_DEFINITIONS,
+)
 from week5.new_implementation.semantic_resolution import (
     EmployeeReference,
     ResolutionContext,
@@ -13,7 +20,169 @@ from week5.new_implementation.semantic_resolution import (
 )
 
 
+ROLE_ALIAS_CASES = (
+    ("Total_Worked_Hrs", "total worked hrs"),
+    ("Total_Worked_Hrs", "total worked hr"),
+    ("Total_Worked_Hrs", "total worked hour"),
+    ("Total_Worked_Hrs", "total worked hours"),
+    ("Total_OT", "total ot"),
+    *(
+        ("Total_OT", alias)
+        for alias in (
+            "sum amount",
+            "average amount",
+            "minimum amount",
+            "maximum amount",
+            "rate amount",
+            "highest amount",
+            "latest amount",
+            "top 2 amount",
+            "show amount",
+            "rank amount",
+            "ordered by amount",
+            "median amount",
+        )
+    ),
+)
+
+
+@contextmanager
+def registered_test_alias(field, alias):
+    """Extend real registry metadata for all consumers, never mock detection."""
+    from week5.new_implementation import attendance_schema
+
+    definition = FIELD_DEFINITIONS[field]
+    with patch.dict(
+        attendance_schema._FIELD_DEFINITIONS,
+        {
+            field: replace(
+                definition,
+                natural_names=tuple(dict.fromkeys((*definition.natural_names, alias))),
+            )
+        },
+    ):
+        yield
+
+
 class BaselineOrderingGrammarTests(unittest.TestCase):
+    def test_identity_operand_mask_cannot_synthesize_projection(self):
+        context = ResolutionContext(
+            {},
+            employees=(
+                EmployeeReference(employee_id="A10001", name="Registry Person"),
+            ),
+        )
+        facts = detect_semantic_facts("Show employee name Registry Person", context)
+        self.assertTrue(any(fact.kind == "entity" for fact in facts))
+        self.assertFalse(any(fact.kind == "projection" for fact in facts))
+
+        facts = detect_semantic_facts(
+            "Show Date and Status from records for Registry Person where Total OT equals 2",
+            context,
+        )
+        self.assertEqual(
+            {fact.field for fact in facts if fact.kind == "projection"},
+            {"Date", "Status"},
+        )
+        self.assertFalse(any(fact.kind == "calculation" for fact in facts))
+
+    def test_bound_field_aliases_cannot_create_executable_roles(self):
+        for field, alias in ROLE_ALIAS_CASES:
+            with (
+                self.subTest(field=field, alias=alias),
+                registered_test_alias(field, alias),
+            ):
+                question = f"Count records where {alias} equals 2"
+                facts = detect_semantic_facts(question, ResolutionContext({}))
+                self.assertIn(
+                    (field, "eq", (2.0,)),
+                    {
+                        (fact.field, fact.operator, fact.values)
+                        for fact in facts
+                        if fact.kind == "filter"
+                    },
+                )
+                self.assertEqual(
+                    [
+                        (fact.kind, fact.concept_name)
+                        for fact in facts
+                        if fact.kind
+                        in {
+                            "measure",
+                            "calculation",
+                            "order_by",
+                            "ranking",
+                            "limit",
+                            "projection",
+                            "unsupported",
+                        }
+                    ],
+                    [("measure", "attendance_records")],
+                )
+
+    def test_bound_registry_measure_and_value_phrases_are_literal_only(self):
+        phrases = {
+            phrase
+            for registry in (MEASURE_DEFINITIONS, VALUE_CONCEPT_DEFINITIONS)
+            for definition in registry.values()
+            for phrase in definition.natural_names
+        }
+        phrases.update(
+            value
+            for definition in FIELD_DEFINITIONS.values()
+            for value in (
+                *definition.closed_values,
+                *(alias.natural_name for alias in definition.value_aliases),
+            )
+        )
+        for phrase in sorted(phrases):
+            with self.subTest(phrase=phrase):
+                facts = detect_semantic_facts(
+                    f"Count records where Position equals {phrase}",
+                    ResolutionContext({"Position": (phrase,)}),
+                )
+                self.assertEqual(
+                    [
+                        (fact.field, fact.operator, fact.values)
+                        for fact in facts
+                        if fact.kind == "filter"
+                    ],
+                    [("Position", "eq", (phrase,))],
+                )
+                self.assertEqual(
+                    [
+                        (fact.kind, fact.concept_name)
+                        for fact in facts
+                        if fact.kind
+                        in {"measure", "calculation", "predicate", "unsupported"}
+                    ],
+                    [("measure", "attendance_records")],
+                )
+
+    def test_independent_roles_survive_bound_alias_occurrences(self):
+        for field, alias in ROLE_ALIAS_CASES:
+            with self.subTest(alias=alias), registered_test_alias(field, alias):
+                facts = detect_semantic_facts(
+                    f"Which department has the highest total overtime where {alias} equals 2?",
+                    ResolutionContext({}),
+                )
+                self.assertIn(
+                    ("calculation", "Total_OT", "sum"),
+                    {(fact.kind, fact.field, fact.concept_name) for fact in facts},
+                )
+                self.assertEqual(
+                    [
+                        (fact.field, fact.direction)
+                        for fact in facts
+                        if fact.kind == "order_by"
+                    ],
+                    [("value", "desc")],
+                )
+                self.assertEqual(
+                    [fact.values for fact in facts if fact.kind == "limit"], [(1.0,)]
+                )
+                self.assertFalse([fact for fact in facts if fact.kind == "unsupported"])
+
     def test_implicit_equality_suffixes_require_complete_typed_operands(self):
         context = ResolutionContext(
             {

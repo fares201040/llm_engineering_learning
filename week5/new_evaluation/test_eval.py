@@ -20,6 +20,135 @@ PRIVATE_FIXTURES_AVAILABLE = (
 
 
 class BaselineCapabilityParityTests(unittest.TestCase):
+    def test_bound_field_alias_matrix_executes_count_filters(self):
+        from week5.new_implementation.test_semantic_resolution import (
+            ROLE_ALIAS_CASES,
+            registered_test_alias,
+        )
+
+        for field, alias in ROLE_ALIAS_CASES:
+            for introducer in ("", "where "):
+                for operator in ("equals", "is"):
+                    with (
+                        self.subTest(
+                            field=field,
+                            alias=alias,
+                            introducer=introducer,
+                            operator=operator,
+                        ),
+                        registered_test_alias(field, alias),
+                    ):
+                        _, plan, result, _ = self.answer.fetch_context(
+                            f"Count records {introducer}{alias} {operator} 2"
+                        )
+                        self.assertEqual(
+                            (plan.aggregation, result["value"]), ("count", 1)
+                        )
+                        self.assertEqual(
+                            [
+                                (condition.field, condition.operator, condition.value)
+                                for condition in plan.filters
+                                if condition.field != "chunk_type"
+                            ],
+                            [(field, "eq", 2.0)],
+                        )
+                        self.assertEqual(
+                            (plan.group_by, plan.order_by, plan.limit, plan.projection),
+                            ([], None, None, []),
+                        )
+
+    def test_bound_measure_and_value_words_execute_as_catalog_literals(self):
+        from week5.new_implementation.attendance_schema import (
+            FIELD_DEFINITIONS,
+            MEASURE_DEFINITIONS,
+            VALUE_CONCEPT_DEFINITIONS,
+        )
+
+        phrases = {
+            phrase
+            for registry in (MEASURE_DEFINITIONS, VALUE_CONCEPT_DEFINITIONS)
+            for definition in registry.values()
+            for phrase in definition.natural_names
+        }
+        phrases.update(
+            value
+            for definition in FIELD_DEFINITIONS.values()
+            for value in (
+                *definition.closed_values,
+                *(alias.natural_name for alias in definition.value_aliases),
+            )
+        )
+        for phrase in sorted(phrases):
+            with self.subTest(phrase=phrase):
+                for row, position in zip(
+                    self.rows, (phrase, phrase, "Other", "Other", "Other")
+                ):
+                    row["Position"] = position
+                with patch.object(
+                    self.answer,
+                    "load_attendance_catalog_candidates",
+                    return_value={"Position": (phrase, "Other")},
+                ):
+                    _, plan, result, _ = self.answer.fetch_context(
+                        f"Count records where Position equals {phrase}"
+                    )
+                self.assertEqual((plan.aggregation, result["value"]), ("count", 2))
+                self.assertEqual(
+                    {condition.field for condition in plan.filters},
+                    {"Position", "chunk_type"},
+                )
+
+    def test_independent_operations_survive_same_field_constraint_alias(self):
+        for row, department in zip(
+            self.rows, ("Sales", "Sales", "Support", "Support", "Support")
+        ):
+            row["Department"] = department
+        for question, expected in (
+            ("What is total overtime?", 7.0),
+            ("What is total overtime where Total OT equals 2?", 2.0),
+        ):
+            with self.subTest(question=question):
+                _, plan, result, _ = self.answer.fetch_context(question)
+                self.assertEqual(
+                    (plan.aggregation, plan.aggregation_field, result["value"]),
+                    ("sum", "Total_OT", expected),
+                )
+        _, plan, result, _ = self.answer.fetch_context(
+            "Which department has the highest total overtime where Total OT equals 2?"
+        )
+        self.assertEqual(
+            (
+                plan.aggregation,
+                plan.aggregation_field,
+                plan.group_by,
+                plan.order_by,
+                plan.limit,
+            ),
+            ("sum", "Total_OT", ["Department"], "value", 1),
+        )
+        self.assertEqual(result["rows"], [{"group": ["Sales"], "value": 2.0}])
+        _, plan, _, _ = self.answer.fetch_context(
+            "Show latest 3 records where Total OT equals 2"
+        )
+        self.assertEqual(
+            (plan.order_by, plan.order_direction, plan.limit), ("Date", "desc", 3)
+        )
+        _, plan, _, _ = self.answer.fetch_context(
+            "Show Date and Status from records where Total OT equals 2"
+        )
+        self.assertEqual(plan.projection, ["Date", "Status"])
+
+    def test_independent_unsupported_calculation_is_not_masked_by_constraint(self):
+        for question in (
+            "Median overtime where Total OT equals 2",
+            "Count records where Total OT equals Unknown",
+        ):
+            with self.subTest(question=question):
+                self.store.get.reset_mock()
+                with self.assertRaises(self.answer.PlanValidationError):
+                    self.answer.fetch_context(question)
+                self.store.get.assert_not_called()
+
     def test_implicit_typed_suffixes_execute_the_same_constraints_as_explicit_eq(self):
         catalog = {
             "Department": ("Sales", "Sales and Job Services", "Support"),

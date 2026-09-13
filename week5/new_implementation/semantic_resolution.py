@@ -435,7 +435,7 @@ def _adjacent_categorical_bindings(question, field_evidence, value_evidence):
 
 
 @dataclass(frozen=True)
-class CategoricalClause:
+class ConstraintClause:
     field: str
     operator: FilterOperator | None
     field_span: tuple[int, int]
@@ -657,7 +657,9 @@ def _clause_operand_ends(question, start, fields, context, field, operator, cach
     return cache[key]
 
 
-def _parse_categorical_clauses(question, context, *, excluded_spans=()):
+def _parse_constraint_clauses(
+    question, context, *, excluded_spans=(), include_typed=False
+):
     fields = tuple(
         item
         for item in _registry_field_occurrences(question)
@@ -691,14 +693,18 @@ def _parse_categorical_clauses(question, context, *, excluded_spans=()):
     clauses = []
     for field, start, end in fields:
         definition = FIELD_DEFINITIONS[field]
-        if definition.resolution_kind not in {"catalog", "closed_value"}:
+        categorical = definition.resolution_kind in {"catalog", "closed_value"}
+        if not categorical and not (
+            include_typed
+            and definition.resolution_kind in {"numeric", "temporal", "identifier"}
+        ):
             continue
         if any(
             lo <= start < hi for clause in clauses for lo, hi in (clause.consumed_span,)
         ) or _field_has_collective_modifier(question, start, end):
             continue
         recognized, operator, operator_end = _operator_prefix(
-            question, end, len(question)
+            question, end, len(question), field
         )
         if not recognized and (
             any(
@@ -763,8 +769,12 @@ def _parse_categorical_clauses(question, context, *, excluded_spans=()):
             )
             if preposed:
                 violation = "ambiguous_value_binding"
+        # Other field kinds retain their authoritative detector's rejection path;
+        # this parser contributes only fully proved source provenance for them.
+        if not categorical and violation is not None:
+            continue
         clauses.append(
-            CategoricalClause(
+            ConstraintClause(
                 field,
                 operator,
                 (start, end),
@@ -781,7 +791,7 @@ def _parse_categorical_clauses(question, context, *, excluded_spans=()):
 
 def _categorical_field_facts(question, field, field_evidence, context, clauses=None):
     clauses = (
-        _parse_categorical_clauses(question, context) if clauses is None else clauses
+        _parse_constraint_clauses(question, context) if clauses is None else clauses
     )
     facts = []
     for clause in clauses:
@@ -997,7 +1007,7 @@ class EntityResolver(FieldResolver):
             for span in _raw_phrase_spans(question, phrase)
         ]
         non_entity_field_spans = []
-        categorical_clauses = _parse_categorical_clauses(question, context)
+        categorical_clauses = _parse_constraint_clauses(question, context)
         categorical_operator_spans = [
             clause.operator_span for clause in categorical_clauses
         ]
@@ -1906,7 +1916,8 @@ def _calculation_facts(
         matches = _calculation_matches(question, definition, existing_facts)
         if not matches:
             continue
-        evidence = min(matches, key=lambda match: match.start()).group(0)
+        match = min(matches, key=lambda match: match.start())
+        evidence = match.group(0)
         if name == "percentage":
             population_text = question[
                 min(matches, key=lambda match: match.start()).end() :
@@ -1934,10 +1945,6 @@ def _calculation_facts(
                 for field in selected_fields
                 if FIELD_DEFINITIONS[field].storage_type == "number"
                 and FIELD_DEFINITIONS[field].aggregatable
-                and not any(
-                    fact.kind == "filter" and fact.field == field
-                    for fact in existing_facts
-                )
             ]
             if len(numeric_fields) != 1:
                 continue
@@ -1948,6 +1955,7 @@ def _calculation_facts(
                 field=field,
                 concept_name=name,
                 evidence_text=evidence,
+                evidence_span=match.span(),
                 origin="question",
                 strength="strong",
             )
@@ -2046,9 +2054,10 @@ def detect_semantic_facts(
                 + " " * (end - start)
                 + semantic_question[end:]
             )
-    categorical_clauses = _parse_categorical_clauses(
+    constraint_clauses = _parse_constraint_clauses(
         question,
         context,
+        include_typed=True,
         excluded_spans=tuple(
             fact.evidence_span
             for fact in facts
@@ -2097,7 +2106,7 @@ def detect_semantic_facts(
                 field,
                 context,
                 **(
-                    {"categorical_clauses": categorical_clauses}
+                    {"categorical_clauses": constraint_clauses}
                     if definition.resolution_kind in {"catalog", "closed_value"}
                     else {}
                 ),
@@ -2114,7 +2123,7 @@ def detect_semantic_facts(
                     semantic_question,
                     field,
                     context,
-                    categorical_clauses=categorical_clauses,
+                    categorical_clauses=constraint_clauses,
                 )
             )
     facts.extend(
@@ -2122,9 +2131,33 @@ def detect_semantic_facts(
             semantic_question, selected_fields, context
         )
     )
+    role_question = semantic_question
+    constraint_question = question
+    for clause in constraint_clauses:
+        if clause.violation is None and any(
+            fact.kind == "filter"
+            and fact.strength == "strong"
+            and (fact.field, fact.operator, fact.values)
+            == (clause.field, clause.operator, clause.values)
+            for fact in facts
+        ):
+            start, end = clause.consumed_span
+            role_question = (
+                role_question[:start] + " " * (end - start) + role_question[end:]
+            )
+            constraint_question = (
+                constraint_question[:start]
+                + " " * (end - start)
+                + constraint_question[end:]
+            )
+    role_field_matches = [
+        (field, phrase)
+        for field, phrase in maximal_field_matches
+        if evidence_occurs(role_question, phrase)
+    ]
     for name, concept in VALUE_CONCEPT_DEFINITIONS.items():
         for phrase in sorted(concept.natural_names, key=len, reverse=True):
-            if not evidence_occurs(semantic_question, phrase):
+            if not evidence_occurs(role_question, phrase):
                 continue
             members = concept.members
             if FIELD_DEFINITIONS[concept.field].resolution_kind == "catalog":
@@ -2143,22 +2176,33 @@ def detect_semantic_facts(
                     strength="strong",
                 )
             )
-    facts.extend(_grouping_facts(semantic_question, maximal_field_matches))
-    facts.extend(_calculation_facts(semantic_question, selected_fields, facts))
-    if re.search(r"\b(?:how many|count|number of|total number)\b", question, re.I):
-        facts.extend(_earliest_measure_facts(semantic_question, facts))
+    facts.extend(_grouping_facts(role_question, role_field_matches))
+    facts.extend(
+        _calculation_facts(
+            role_question,
+            tuple(dict.fromkeys(field for field, _ in role_field_matches)),
+            facts,
+        )
+    )
+    if re.search(r"\b(?:how many|count|number of|total number)\b", role_question, re.I):
+        facts.extend(_earliest_measure_facts(role_question, facts))
     predicate_facts = _facts_for_named_phrases(
-        semantic_question, "predicate", BUSINESS_PREDICATE_DEFINITIONS
+        role_question, "predicate", BUSINESS_PREDICATE_DEFINITIONS
     )
     facts.extend(predicate_facts)
     facts.extend(
         _facts_for_named_phrases(
-            question, "semantic_intent", RETRIEVAL_INTENT_DEFINITIONS
+            role_question, "semantic_intent", RETRIEVAL_INTENT_DEFINITIONS
         )
     )
     selected = list(_select_longest_supported_facts(question, facts))
     selected = _executable_choice_facts(
-        semantic_question, maximal_field_matches, selected, original_question=question
+        role_question,
+        role_field_matches,
+        selected,
+        # Preserve identity operand syntax: erasing only its value must not turn
+        # a Name constraint into a bare projection of the Name field.
+        original_question=constraint_question,
     )
     return merge_semantic_facts(selected)
 

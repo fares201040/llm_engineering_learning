@@ -20,6 +20,70 @@ PRIVATE_FIXTURES_AVAILABLE = (
 
 
 class BaselineCapabilityParityTests(unittest.TestCase):
+    def test_quantified_grouping_relations_execute_grouped_counts(self):
+        for index, row in enumerate(self.rows):
+            row["Department"] = "Alpha" if index < 3 else "Beta"
+        for field, singular, plural in (
+            ("Department", "department", "departments"),
+            ("Employee_ID", "employee", "employees"),
+        ):
+            for quantifier, noun, verb in (
+                ("each", singular, "does"),
+                ("every", singular, "does"),
+                ("all", plural, "do"),
+                ("any", singular, "does"),
+            ):
+                for question in (
+                    f"How many records {verb} {quantifier} {noun} have?",
+                    f"Count records by {quantifier} {noun}",
+                ):
+                    with self.subTest(question=question):
+                        _, plan, calculation, _ = self.answer.fetch_context(question)
+                        self.assertEqual(plan.group_by, [field])
+                        self.assertEqual(plan.answer_contract.shape, "grouped")
+                        self.assertEqual(
+                            sorted(row["value"] for row in calculation["rows"]),
+                            [2, 3],
+                        )
+
+    def test_collection_population_without_grouping_stays_scalar(self):
+        for question in (
+            "Count records for all employees",
+            "Count records for any department",
+        ):
+            with self.subTest(question=question):
+                _, plan, calculation, _ = self.answer.fetch_context(question)
+                self.assertEqual(plan.group_by, [])
+                self.assertEqual(plan.answer_contract.shape, "scalar")
+                self.assertEqual(calculation["value"], 5)
+
+    def test_bound_value_provenance_preserves_independent_ranked_result(self):
+        for index, row in enumerate(self.rows):
+            row.update(Position="Highest", Department="Alpha" if index < 3 else "Beta")
+        for connector in ("is exactly", "has the value"):
+            with self.subTest(connector=connector):
+                with patch.object(
+                    self.answer,
+                    "load_attendance_catalog_candidates",
+                    return_value={"Position": ("Highest",)},
+                ):
+                    _, plan, calculation, _ = self.answer.fetch_context(
+                        "Which department has the highest total overtime "
+                        f"where Position {connector} Highest?"
+                    )
+                self.assertEqual(plan.group_by, ["Department"])
+                self.assertEqual(
+                    (plan.order_by, plan.order_direction, plan.limit),
+                    ("value", "desc", 1),
+                )
+                self.assertIn(
+                    ("Position", "eq", "Highest"),
+                    {(item.field, item.operator, item.value) for item in plan.filters},
+                )
+                self.assertEqual(
+                    calculation["rows"], [{"group": ["Beta"], "value": 4.0}]
+                )
+
     def test_bound_catalog_superlative_preserves_all_groups(self):
         for title in ("Highest Officer", "Lowest Officer", "Latest Officer"):
             with self.subTest(title=title):

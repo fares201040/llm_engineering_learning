@@ -334,6 +334,13 @@ class FieldResolver(ABC):
                     ),
                     values=(value,),
                     evidence_text=evidence,
+                    evidence_span=(
+                        _field_value_evidence_span(
+                            question, field_facts[0].evidence_text, evidence
+                        )
+                        if definition.resolution_kind in {"catalog", "closed_value"}
+                        else None
+                    ),
                     origin="question",
                     strength="strong",
                 )
@@ -360,6 +367,36 @@ def _raw_phrase_spans(text: str, phrase: str) -> tuple[tuple[int, int], ...]:
     return tuple(
         match.span() for match in re.finditer(rf"(?<!\w){pattern}(?!\w)", text, re.I)
     )
+
+
+def _field_value_evidence_span(question, field_evidence, value_evidence):
+    """Bind a resolved value to its unique nearest field-relative occurrence."""
+    value_spans = _raw_phrase_spans(question, value_evidence)
+    if len(value_spans) == 1:
+        return value_spans[0]
+    field_spans = {
+        span
+        for form in _token_forms(field_evidence)
+        for span in _raw_phrase_spans(question, form)
+    }
+    following = [
+        (value_start - field_end, (value_start, value_end))
+        for _, field_end in field_spans
+        for value_start, value_end in value_spans
+        if field_end <= value_start
+    ]
+    preceding = [
+        (field_start - value_end, (value_start, value_end))
+        for field_start, _ in field_spans
+        for value_start, value_end in value_spans
+        if value_end <= field_start
+    ]
+    candidates = following or preceding
+    if not candidates:
+        return None
+    distance = min(item[0] for item in candidates)
+    nearest = {span for gap, span in candidates if gap == distance}
+    return next(iter(nearest)) if len(nearest) == 1 else None
 
 
 class IdentifierResolver(FieldResolver):
@@ -1371,9 +1408,18 @@ def _grouping_facts(
         )
     ]
     for field, phrase in [*field_matches, *subject_matches]:
-        normalized_phrase = normalize_semantic_text(phrase)
+        subject_forms = {
+            variant
+            for form in _token_forms(phrase)
+            for variant in (form, form if form.endswith("s") else form + "s")
+        }
+        subject = (
+            "(?:" + "|".join(re.escape(form) for form in sorted(subject_forms)) + ")"
+        )
         match = re.search(
-            rf"\b(?:by|per|for each|in each|each)\s+(?:the\s+)?{re.escape(normalized_phrase)}\b",
+            rf"\b(?:(?:by|per)\s+(?:(?:each|every|all|any)\s+)?(?:the\s+)?{subject}\b"
+            rf"|(?:each|every)\s+(?:the\s+)?{subject}\b"
+            rf"|(?:does|do)\s+(?:each|every|all|any)\s+(?:the\s+)?{subject}\b(?=\s+have\b))",
             normalized_question,
         )
         if match is None:
@@ -1511,28 +1557,22 @@ def detect_semantic_facts(
 
 def _executable_choice_facts(question, field_matches, facts, *, original_question):
     """Compose executable roles from recognized fields and operation clauses."""
-    normalized = normalize_semantic_text(question)
+    role_question = question
     for fact in facts:
         if fact.strength == "strong" and fact.kind == "filter":
-            value_spans = _raw_phrase_spans(normalized, fact.evidence_text)
-            bound_spans = [
-                value_span
-                for value_span in value_spans
-                if fact.field in FIELD_DEFINITIONS
-                and any(
-                    field_end <= value_span[0]
-                    and re.fullmatch(
-                        r"\s*(?:(?:is|equals?|equal to|in|contains|starts with)\s*)?",
-                        normalized[field_end : value_span[0]],
-                    )
-                    for phrase in FIELD_DEFINITIONS[fact.field].natural_names
-                    for _, field_end in _raw_phrase_spans(normalized, phrase)
+            value_spans = (
+                (fact.evidence_span,)
+                if fact.evidence_span is not None
+                else _raw_phrase_spans(question, fact.evidence_text)
+            )
+            # Never guess that every identical word has the resolved value role.
+            # Source offsets survive entity masking and normalization happens last.
+            if len(value_spans) == 1:
+                start, end = value_spans[0]
+                role_question = (
+                    role_question[:start] + " " * (end - start) + role_question[end:]
                 )
-            ]
-            # Preserve a separate grammatical ranking occurrence when the same
-            # token is also the independently bound value of a field.
-            for start, end in bound_spans or value_spans:
-                normalized = normalized[:start] + " " * (end - start) + normalized[end:]
+    normalized = normalize_semantic_text(role_question)
 
     def add(kind, evidence, **values):
         facts.append(

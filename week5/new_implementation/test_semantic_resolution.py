@@ -14,6 +14,19 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class BaselineOrderingGrammarTests(unittest.TestCase):
+    def test_catalog_filter_retains_the_resolved_source_occurrence(self):
+        question = "Which department has the highest total overtime where Position is exactly Highest?"
+        facts = detect_semantic_facts(
+            question, ResolutionContext({"Position": ("Highest",)})
+        )
+        filters = [
+            fact for fact in facts if fact.kind == "filter" and fact.field == "Position"
+        ]
+        self.assertEqual(len(filters), 1)
+        self.assertEqual(
+            filters[0].evidence_span, (question.rindex("Highest"), len(question) - 1)
+        )
+
     def test_bound_value_occurrence_does_not_hide_independent_ranking(self):
         facts = detect_semantic_facts(
             "Which department has the highest total overtime where Position equal to Highest?",

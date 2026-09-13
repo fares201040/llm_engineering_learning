@@ -20,6 +20,54 @@ PRIVATE_FIXTURES_AVAILABLE = (
 
 
 class BaselineCapabilityParityTests(unittest.TestCase):
+    def test_collective_quantifier_modifiers_execute_scalar_totals(self):
+        for index, row in enumerate(self.rows):
+            row["Department"] = "Alpha" if index < 3 else "Beta"
+        for subject in ("departments", "employees"):
+            for question in (
+                f"How many records do all {subject} have combined?",
+                f"How many records do all {subject} have in total?",
+                f"In total, how many records do all {subject} have?",
+                f"Count records that belong to all {subject} combined",
+            ):
+                with self.subTest(question=question):
+                    _, plan, calculation, _ = self.answer.fetch_context(question)
+                    self.assertEqual(plan.group_by, [])
+                    self.assertEqual(plan.answer_contract.shape, "scalar")
+                    self.assertEqual(calculation["value"], 5)
+
+    def test_preposed_bound_value_preserves_ranked_result(self):
+        for index, row in enumerate(self.rows):
+            row.update(Position="Highest", Department="Alpha" if index < 3 else "Beta")
+        with patch.object(
+            self.answer,
+            "load_attendance_catalog_candidates",
+            return_value={"Position": ("Highest",)},
+        ):
+            _, plan, calculation, _ = self.answer.fetch_context(
+                "Among employees in the Highest position, which department has the highest total overtime?"
+            )
+        self.assertEqual(plan.group_by, ["Department"])
+        self.assertEqual(
+            (plan.order_by, plan.order_direction, plan.limit), ("value", "desc", 1)
+        )
+        self.assertIn(
+            ("Position", "eq", "Highest"),
+            {(item.field, item.operator, item.value) for item in plan.filters},
+        )
+        self.assertEqual(calculation["rows"], [{"group": ["Beta"], "value": 4.0}])
+
+    def test_tied_value_binding_does_not_retrieve_a_guessed_plan(self):
+        with patch.object(
+            self.answer,
+            "load_attendance_catalog_candidates",
+            return_value={"Position": ("Highest",)},
+        ):
+            with self.assertRaises(self.answer.SemanticPlanValidationError):
+                self.answer.fetch_context(
+                    "Which department has the highest total overtime where Highest Position Highest?"
+                )
+
     def test_quantified_grouping_relations_execute_grouped_counts(self):
         for index, row in enumerate(self.rows):
             row["Department"] = "Alpha" if index < 3 else "Beta"

@@ -14,6 +14,84 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class BaselineOrderingGrammarTests(unittest.TestCase):
+    def test_equidistant_value_occurrences_retain_binding_uncertainty(self):
+        for question in ("Highest Position Highest", "Highest     Position Highest"):
+            with self.subTest(question=question):
+                facts = (
+                    ResolverRegistry.default()
+                    .for_kind("catalog")
+                    .detect(
+                        question,
+                        "Position",
+                        ResolutionContext({"Position": ("Highest",)}),
+                    )
+                )
+                self.assertFalse(
+                    [
+                        fact
+                        for fact in facts
+                        if fact.kind == "filter" and fact.strength == "strong"
+                    ]
+                )
+                self.assertTrue([fact for fact in facts if fact.kind == "unsupported"])
+
+    def test_preposed_value_and_identity_keep_separate_evidence_roles(self):
+        question = (
+            "Among employees in the Highest position, which department has the highest "
+            "total overtime for Highest River?"
+        )
+        facts = detect_semantic_facts(
+            question,
+            ResolutionContext(
+                {"Position": ("Highest",)},
+                employees=(
+                    EmployeeReference(employee_id="A10001", name="Highest River"),
+                ),
+            ),
+        )
+        self.assertEqual(
+            [
+                fact.evidence_text
+                for fact in facts
+                if fact.kind == "entity" and fact.field == "Name"
+            ],
+            ["Highest River"],
+        )
+        self.assertEqual(
+            [
+                fact.evidence_span
+                for fact in facts
+                if fact.kind == "filter" and fact.field == "Position"
+            ],
+            [(question.index("Highest"), question.index("Highest") + 7)],
+        )
+        self.assertEqual(
+            [(fact.field, fact.direction) for fact in facts if fact.kind == "ranking"],
+            [("value", "desc")],
+        )
+
+    def test_collective_word_in_identity_does_not_erase_distributive_grouping(self):
+        facts = detect_semantic_facts(
+            "How many records does each department have for Combined River?",
+            ResolutionContext(
+                {},
+                employees=(
+                    EmployeeReference(employee_id="A10001", name="Combined River"),
+                ),
+            ),
+        )
+        self.assertEqual(
+            [
+                fact.evidence_text
+                for fact in facts
+                if fact.kind == "entity" and fact.field == "Name"
+            ],
+            ["Combined River"],
+        )
+        self.assertEqual(
+            {fact.field for fact in facts if fact.kind == "group_by"}, {"Department"}
+        )
+
     def test_catalog_filter_retains_the_resolved_source_occurrence(self):
         question = "Which department has the highest total overtime where Position is exactly Highest?"
         facts = detect_semantic_facts(

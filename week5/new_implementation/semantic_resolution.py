@@ -323,6 +323,19 @@ class FieldResolver(ABC):
             ):
                 rejected_facts.append(_unsupported_fact("malformed_value", evidence))
                 continue
+            evidence_span = None
+            if definition.resolution_kind in {"catalog", "closed_value"}:
+                evidence_span = _field_value_evidence_span(
+                    question, field_facts[0].evidence_text, evidence
+                )
+                if (
+                    evidence_span is None
+                    and len(_raw_phrase_spans(question, evidence)) > 1
+                ):
+                    rejected_facts.append(
+                        _unsupported_fact("ambiguous_value_binding", evidence)
+                    )
+                    continue
             value_facts.append(
                 SemanticFact(
                     kind="filter",
@@ -334,13 +347,7 @@ class FieldResolver(ABC):
                     ),
                     values=(value,),
                     evidence_text=evidence,
-                    evidence_span=(
-                        _field_value_evidence_span(
-                            question, field_facts[0].evidence_text, evidence
-                        )
-                        if definition.resolution_kind in {"catalog", "closed_value"}
-                        else None
-                    ),
+                    evidence_span=evidence_span,
                     origin="question",
                     strength="strong",
                 )
@@ -370,7 +377,7 @@ def _raw_phrase_spans(text: str, phrase: str) -> tuple[tuple[int, int], ...]:
 
 
 def _field_value_evidence_span(question, field_evidence, value_evidence):
-    """Bind a resolved value to its unique nearest field-relative occurrence."""
+    """Bind only a unique nearest occurrence in either source direction."""
     value_spans = _raw_phrase_spans(question, value_evidence)
     if len(value_spans) == 1:
         return value_spans[0]
@@ -379,19 +386,19 @@ def _field_value_evidence_span(question, field_evidence, value_evidence):
         for form in _token_forms(field_evidence)
         for span in _raw_phrase_spans(question, form)
     }
-    following = [
-        (value_start - field_end, (value_start, value_end))
-        for _, field_end in field_spans
+    candidates = [
+        (
+            len(
+                normalize_semantic_text(
+                    question[min(field_end, value_end) : max(field_start, value_start)]
+                )
+            ),
+            (value_start, value_end),
+        )
+        for field_start, field_end in field_spans
         for value_start, value_end in value_spans
-        if field_end <= value_start
+        if field_end <= value_start or value_end <= field_start
     ]
-    preceding = [
-        (field_start - value_end, (value_start, value_end))
-        for field_start, _ in field_spans
-        for value_start, value_end in value_spans
-        if value_end <= field_start
-    ]
-    candidates = following or preceding
     if not candidates:
         return None
     distance = min(item[0] for item in candidates)
@@ -544,7 +551,7 @@ class EntityResolver(FieldResolver):
             if not reference or re.search(r"\d", reference):
                 continue
             quantified = re.fullmatch(
-                r"(?:each|every|all|any)\s+(?:the\s+)?(.+)",
+                r"(?:each|every|all|any)\s+(?:the\s+)?(.+?)(?:\s+(?:combined|in total))?",
                 normalize_semantic_text(reference),
             )
             if quantified and any(
@@ -1426,6 +1433,16 @@ def _grouping_facts(
             continue
         if re.search(
             r"\b(?:order(?:ed)?|sort(?:ed)?)\s*$", normalized_question[: match.start()]
+        ):
+            continue
+        # A collective modifier scopes the quantified population as one total;
+        # it does not cancel a separately explicit by/per grouping clause.
+        if not re.match(r"(?:by|per)\b", match.group(0)) and (
+            re.match(r"in total\b", normalized_question)
+            or re.match(
+                r"\s+(?:have\s+)?(?:combined|in total)\b",
+                normalized_question[match.end() :],
+            )
         ):
             continue
         facts.append(

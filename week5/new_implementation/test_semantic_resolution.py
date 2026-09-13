@@ -1,4 +1,5 @@
 import unittest
+from datetime import date
 
 from week5.new_implementation.attendance_schema import FIELD_DEFINITIONS
 from week5.new_implementation.semantic_resolution import (
@@ -10,6 +11,129 @@ from week5.new_implementation.semantic_resolution import (
     evidence_occurs,
     merge_semantic_facts,
 )
+
+
+class EntityTemporalReviewRegressionTests(unittest.TestCase):
+    def test_temporal_reference_spans_are_not_lowercase_employee_names(self):
+        for phrase in ("last month", "September 2026", "this week"):
+            with self.subTest(phrase=phrase):
+                facts = detect_semantic_facts(
+                    f"Show records for {phrase}", ResolutionContext({})
+                )
+                self.assertFalse(any(f.kind == "entity" for f in facts))
+
+    def test_entity_mask_preserves_independent_month_occurrence(self):
+        facts = detect_semantic_facts(
+            "Count May's records before May 3, 2026",
+            ResolutionContext(
+                {}, employees=(EmployeeReference(employee_id="A10017", name="May"),)
+            ),
+        )
+        self.assertIn(
+            ("Date", "lt", ("2026-05-03",)),
+            {(f.field, f.operator, f.values) for f in facts},
+        )
+        self.assertEqual(len([f for f in facts if f.kind == "entity"]), 1)
+
+    def test_catalog_field_and_value_spans_are_not_employee_candidates(self):
+        facts = detect_semantic_facts(
+            "Count records for Department Human Resources",
+            ResolutionContext({"Department": ("Human Resources",)}),
+        )
+        self.assertFalse(any(f.kind == "entity" for f in facts))
+        self.assertIn(
+            ("Department", ("Human Resources",)),
+            {(f.field, f.values) for f in facts if f.kind == "filter"},
+        )
+
+    def test_complete_temporal_operator_expressions_preserve_meaning(self):
+        for expression, operator in (
+            ("not before 2026-09-03", "gte"),
+            ("not after 2026-09-03", "lte"),
+            ("Date > 2026-09-03", "gt"),
+            ("Date <= 2026-09-03", "lte"),
+            ("before Date 2026-09-03", "lt"),
+            ("on or after Date 2026-09-03", "gte"),
+        ):
+            with self.subTest(expression=expression):
+                facts = detect_semantic_facts(
+                    f"Count records {expression}", ResolutionContext({})
+                )
+                self.assertEqual(
+                    [(f.operator, f.values) for f in facts if f.kind == "filter"],
+                    [(operator, ("2026-09-03",))],
+                )
+        for expression in (
+            "Date approximately 2026-09-03",
+            "not not before 2026-09-03",
+            "Date >< 2026-09-03",
+        ):
+            with self.subTest(expression=expression):
+                self.assertTrue(
+                    any(
+                        f.kind == "unsupported"
+                        for f in detect_semantic_facts(
+                            f"Count records {expression}", ResolutionContext({})
+                        )
+                    )
+                )
+
+    def test_date_candidate_shapes_cannot_disappear(self):
+        for literal in ("09/03/26", "2026-09-03xyz", "2026-09-03/extra"):
+            with self.subTest(literal=literal):
+                facts = detect_semantic_facts(
+                    f"Count records before {literal}", ResolutionContext({})
+                )
+                self.assertTrue(
+                    any(
+                        f.kind == "unsupported" and literal in f.evidence_text
+                        for f in facts
+                    )
+                )
+        facts = detect_semantic_facts(
+            "Count records from Sept 1, 2026 to Sept 3, 2026", ResolutionContext({})
+        )
+        self.assertEqual(
+            [(f.operator, f.values) for f in facts if f.kind == "filter"],
+            [("gte", ("2026-09-01",)), ("lte", ("2026-09-03",))],
+        )
+
+    def test_every_temporal_literal_is_bound_and_validated_independently(self):
+        for question in (
+            "Count records with Date 2026-09-03 after 09:00",
+            "Count records with last_Updated_date 2026-02-30",
+            "Count records with last_Updated_date 2026-02-30T09:00:00",
+        ):
+            with self.subTest(question=question):
+                self.assertTrue(
+                    any(
+                        f.kind == "unsupported"
+                        for f in detect_semantic_facts(question, ResolutionContext({}))
+                    )
+                )
+        facts = detect_semantic_facts(
+            "Count records with Date 2026-09-03 and Actual_From_Time after 09:00",
+            ResolutionContext({}),
+        )
+        self.assertIn(
+            ("Actual_From_Time", "gt", ("09:00:00",)),
+            {(f.field, f.operator, f.values) for f in facts},
+        )
+
+    def test_yearless_endpoint_inherits_explicit_paired_year(self):
+        for phrase in (
+            "from September 1, 2025 to September 10",
+            "between September 1, 2025 and September 10",
+        ):
+            with self.subTest(phrase=phrase):
+                facts = detect_semantic_facts(
+                    f"Count records {phrase}",
+                    ResolutionContext({}, reference_date=date(2026, 9, 13)),
+                )
+                self.assertEqual(
+                    [(f.operator, f.values) for f in facts if f.kind == "filter"],
+                    [("gte", ("2025-09-01",)), ("lte", ("2025-09-10",))],
+                )
 
 
 class SemanticResolutionTests(unittest.TestCase):

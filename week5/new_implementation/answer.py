@@ -1007,14 +1007,6 @@ def resolve_employee_plan(
     trusted_scope: bool = False,
 ):
     prepared = plan.model_copy(deep=True)
-    if trusted_scope and default_candidates:
-        return _plan_for_selected_employees(
-            plan, default_candidates
-        ), EmployeeResolution(
-            outcome="unique",
-            candidates=default_candidates,
-            reference="directory-validated request selection",
-        )
     explicit_tokens = re.findall(r"\b[A-Za-z]\d{5}\b", question)
     normalized_question = _normalize_name(question)
     planned_names = [
@@ -1028,6 +1020,19 @@ def resolve_employee_plan(
     has_explicit_name = any(
         name and _normalize_name(name) in normalized_question for name in planned_names
     )
+    if (
+        trusted_scope
+        and default_candidates
+        and not has_explicit_name
+        and not explicit_tokens
+    ):
+        return _plan_for_selected_employees(
+            plan, default_candidates
+        ), EmployeeResolution(
+            outcome="unique",
+            candidates=default_candidates,
+            reference="directory-validated request selection",
+        )
     if (
         not explicit_tokens
         and not has_explicit_name
@@ -2639,7 +2644,9 @@ def _fetch_context_result(
                     outcome=(
                         "unique"
                         if len(matches) == 1
-                        else "ambiguous" if matches else "none"
+                        else "ambiguous"
+                        if matches
+                        else "none"
                     ),
                     candidates=matches,
                     reference=fact.evidence_text,

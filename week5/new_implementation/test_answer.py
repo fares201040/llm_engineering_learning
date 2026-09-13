@@ -161,6 +161,96 @@ def _executable_plan(**values):
     return answer.ExecutableQueryPlan(**values)
 
 
+class EntityTemporalAnswerReviewTests(unittest.TestCase):
+    def test_trusted_scope_cannot_override_an_explicit_new_name_hint(self):
+        old = answer.EmployeeCandidate(employee_id="A10017", name="Prior Employee")
+        new = answer.EmployeeCandidate(employee_id="A10018", name="Morgan River")
+        plan, resolution = answer.resolve_employee_plan(
+            "Show records concerning morgan river",
+            answer.QueryPlan(
+                mode="exact", search_query="records", name_hint="morgan river"
+            ),
+            directory=[old, new],
+            default_candidates=[old],
+            trusted_scope=True,
+        )
+        self.assertEqual(resolution.candidates, [new])
+        self.assertEqual(
+            [f.value for f in plan.filters if f.field == "Employee_ID"], ["A10018"]
+        )
+
+    def test_new_lowercase_identity_replaces_previous_employee(self):
+        old = answer.EmployeeCandidate(employee_id="A10017", name="Prior Employee")
+        new = answer.EmployeeCandidate(employee_id="A10018", name="Morgan River")
+
+        def propose(question, *args, **kwargs):
+            return answer.PlannerProposal.model_validate(
+                answer._overlay_authoritative_facts(
+                    {
+                        "status": "ready",
+                        "name_hint": {
+                            "value": "morgan river",
+                            "evidence_text": "morgan river",
+                        },
+                        "answer_contract": {"shape": "rows", "unit": "value"},
+                    },
+                    kwargs["semantic_facts"],
+                )
+            )
+
+        with (
+            patch.object(answer, "propose_query", side_effect=propose),
+            patch.object(answer, "load_employee_directory", return_value=[old, new]),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "execute_exact_postgres", return_value=([], None, 0)),
+        ):
+            result = answer._fetch_context_result(
+                "Show records for morgan river", default_employees=[old]
+            )
+        self.assertEqual(
+            [f.value for f in result.plan.filters if f.field == "Employee_ID"],
+            ["A10018"],
+        )
+
+    def test_invalid_temporal_shapes_stop_before_provider_and_retrieval(self):
+        for literal in (
+            "09/03/26",
+            "2026-09-03xyz",
+            "Date 2026-09-03 after 09:00",
+            "last_Updated_date 2026-02-30",
+        ):
+            with (
+                self.subTest(literal=literal),
+                patch.object(
+                    answer, "load_attendance_catalog_candidates", return_value={}
+                ),
+                patch.object(
+                    answer,
+                    "propose_query",
+                    return_value=answer.PlannerProposal(
+                        status="ready",
+                        answer_contract=answer.AnswerContract(
+                            shape="rows", unit="value"
+                        ),
+                    ),
+                ) as planner,
+                patch.object(
+                    answer, "execute_exact_postgres", return_value=([], None, 0)
+                ) as postgres,
+                patch.object(answer, "fetch_exact_chroma", return_value=[]) as chroma,
+                patch.object(
+                    answer, "fetch_semantic_chroma", return_value=[]
+                ) as semantic,
+            ):
+                with self.assertRaises(answer.PlanValidationError):
+                    answer.fetch_context(f"Show records for {literal}")
+                planner.assert_not_called()
+                postgres.assert_not_called()
+                chroma.assert_not_called()
+                semantic.assert_not_called()
+
+
 class AccessScopeTests(unittest.TestCase):
     def test_creative_out_of_scope_request_stops_before_planning(self):
         with patch.object(answer, "propose_query") as planner:

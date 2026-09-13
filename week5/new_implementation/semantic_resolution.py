@@ -169,6 +169,7 @@ class SemanticFact(BaseModel):
     evidence_text: str = Field(min_length=1)
     origin: EvidenceOrigin
     strength: str
+    evidence_span: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -345,6 +346,17 @@ class FieldResolver(ABC):
         raise NotImplementedError
 
 
+def _raw_phrase_spans(text: str, phrase: str) -> tuple[tuple[int, int], ...]:
+    """Locate a registry phrase without losing the source character offsets."""
+    tokens = normalize_semantic_text(phrase).split()
+    if not tokens:
+        return ()
+    pattern = r"[\W_]+".join(re.escape(token) for token in tokens)
+    return tuple(
+        match.span() for match in re.finditer(rf"(?<!\w){pattern}(?!\w)", text, re.I)
+    )
+
+
 class IdentifierResolver(FieldResolver):
     kinds = frozenset({"identifier"})
 
@@ -399,28 +411,82 @@ class EntityResolver(FieldResolver):
     kinds = frozenset({"entity"})
 
     def detect(self, question, field, context):
-        references = [
-            item.name
-            for item in context.employees
-            if evidence_occurs(question, item.name)
-        ]
-        # Possession is an entity-reference syntax, independent of attendance vocabulary.
-        for match in re.finditer(
-            r"\b([A-Z][\w-]*(?:\s+[A-Z][\w-]*)*)['’]s\b", question
-        ):
-            reference = re.sub(
-                r"^(?:Count|Show|List|Find|Summarize)\s+", "", match.group(1)
+        temporal_spans = TemporalResolver.reference_spans(question)
+        protected_spans = [
+            span
+            for definition in (
+                *VALUE_CONCEPT_DEFINITIONS.values(),
+                *MEASURE_DEFINITIONS.values(),
+                *BUSINESS_PREDICATE_DEFINITIONS.values(),
             )
-            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*\d[A-Za-z0-9_-]*", reference):
+            for phrase in definition.natural_names
+            for span in _raw_phrase_spans(question, phrase)
+        ]
+        non_entity_field_spans = []
+        for target, definition in FIELD_DEFINITIONS.items():
+            if definition.resolution_kind in {"entity", "identifier"}:
                 continue
-            if not any(evidence_occurs(reference, known) for known in references):
-                references.append(reference)
+            field_spans = [
+                span
+                for phrase in definition.natural_names
+                for span in _raw_phrase_spans(question, phrase)
+            ]
+            non_entity_field_spans.extend(field_spans)
+            if field_spans:
+                values = (*context.catalog.get(target, ()), *definition.closed_values)
+                protected_spans.extend(
+                    span
+                    for value in values
+                    for span in _raw_phrase_spans(question, value)
+                )
+        syntax_spans = []
         for match in re.finditer(
-            r"\b(?:for|did|named)\s+([A-Z][\w-]*(?:\s+[A-Z][\w-]*)+)\b", question
+            r"\b(?P<name>[^\W\d_][\w'-]*(?:\s+[^\W\d_][\w'-]*)*)['’]s\b", question
         ):
-            reference = match.group(1)
+            name = match.group("name")
+            command = re.match(r"(?:count|show|list|find|summarize)\s+", name, re.I)
+            syntax_spans.append(
+                (
+                    match.start("name") + (command.end() if command else 0),
+                    match.end("name"),
+                )
+            )
+        for match in re.finditer(
+            r"\b(?:for|did|named)\s+(?P<name>[^\W\d_][\w'-]*(?:\s+[^\W\d_][\w'-]*)*)",
+            question,
+            re.I,
+        ):
+            start, end = match.span("name")
+            boundary = re.search(
+                r"\s+(?:have|has|had|work|worked|attend|attended|before|after|on|in|and|with|who|whose|that|which)\b",
+                question[start:end],
+                re.I,
+            )
+            syntax_spans.append((start, start + boundary.start() if boundary else end))
+        known_spans = [
+            span
+            for employee in context.employees
+            for span in _raw_phrase_spans(question, employee.name)
+        ]
+        facts = list(super().detect(question, field, context))
+        candidates = []
+        for start, end in sorted(
+            set(syntax_spans + known_spans),
+            key=lambda span: (span[0], -(span[1] - span[0])),
+        ):
+            reference = question[start:end]
+            if not reference or re.search(r"\d", reference):
+                continue
+            if any(start < stop and begin < end for begin, stop in temporal_spans):
+                continue
+            if any(begin <= start and end <= stop for begin, stop in protected_spans):
+                continue
+            if any(
+                begin == start and stop <= end for begin, stop in non_entity_field_spans
+            ):
+                continue
+            # A fully registered concept is a constraint, not a new person's name.
             definitions = (
-                *FIELD_DEFINITIONS.values(),
                 *VALUE_CONCEPT_DEFINITIONS.values(),
                 *MEASURE_DEFINITIONS.values(),
                 *BUSINESS_PREDICATE_DEFINITIONS.values(),
@@ -431,14 +497,13 @@ class EntityResolver(FieldResolver):
                 for phrase in definition.natural_names
             ):
                 continue
-            if not any(evidence_occurs(reference, known) for known in references):
-                references.append(reference)
-        facts = list(super().detect(question, field, context))
-        for reference in dict.fromkeys(references):
+            if any(begin <= start and end <= stop for begin, stop in candidates):
+                continue
+            candidates.append((start, end))
             matches = tuple(
-                item.employee_id
-                for item in context.employees
-                if normalize_semantic_text(item.name)
+                employee.employee_id
+                for employee in context.employees
+                if normalize_semantic_text(employee.name)
                 == normalize_semantic_text(reference)
             )
             facts.append(
@@ -449,6 +514,7 @@ class EntityResolver(FieldResolver):
                     evidence_text=reference,
                     origin="question",
                     strength="candidate",
+                    evidence_span=(start, end),
                 )
             )
         return tuple(facts)
@@ -469,120 +535,227 @@ class EntityResolver(FieldResolver):
 
 class TemporalResolver(FieldResolver):
     kinds = frozenset({"temporal"})
+    _month = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
+    # Candidate shapes deliberately include malformed suffixes and short years.
+    _literal_pattern = re.compile(
+        rf"(?<!\w)(?:"
+        rf"\d{{4}}-\d{{1,2}}(?:-\d{{1,2}})?(?:[T ]\d{{1,2}}:\d{{2}}(?::\d{{2}}(?:\.\d+)?)?(?:Z|[+-]\d{{2}}:\d{{2}})?)?[\w/+-]*"
+        rf"|\d{{1,2}}/\d{{1,2}}/\d{{1,4}}[\w/+-]*"
+        rf"|\d{{1,2}}:\d{{2}}(?::\d{{2}}(?:\.\d+)?)?[\w/+-]*"
+        rf"|{_month}\s+\d{{1,2}}(?!\d)(?:,?\s+\d{{2,4}})?[\w/-]*"
+        rf"|\d{{1,2}}\s+{_month}(?:\s+\d{{2,4}})?[\w/-]*"
+        rf")",
+        re.I,
+    )
+    _operators = {
+        "on or before": "lte",
+        "on or after": "gte",
+        "not before": "gte",
+        "not after": "lte",
+        "no earlier than": "gte",
+        "no later than": "lte",
+        "earlier than": "lt",
+        "later than": "gt",
+        "before": "lt",
+        "after": "gt",
+        "since": "gte",
+        "until": "lte",
+        "through": "lte",
+        "from": "gte",
+        "between": "gte",
+        "to": "lte",
+        "on": "eq",
+        "at": "eq",
+        "is": "eq",
+        "equals": "eq",
+        "equal to": "eq",
+        ">=": "gte",
+        "<=": "lte",
+        ">": "gt",
+        "<": "lt",
+        "=": "eq",
+        "==": "eq",
+    }
+
+    @classmethod
+    def literal_matches(cls, question):
+        return tuple(cls._literal_pattern.finditer(question))
+
+    @classmethod
+    def reference_spans(cls, question):
+        """Protect calendar references as well as literals from entity detection."""
+        calendar = rf"\b(?:{cls._month}\s+\d{{4}}|(?:this|last|next|current|previous)\s+(?:day|week|month|quarter|year)|today|yesterday|tomorrow)\b"
+        return tuple(
+            match.span()
+            for match in (
+                *cls.literal_matches(question),
+                *re.finditer(calendar, question, re.I),
+            )
+        )
 
     def detect(self, question, field, context):
-        if FIELD_DEFINITIONS[field].storage_type == "date":
-            # Date literals are detected once below, with their target field.
-            return tuple(
-                f for f in super().detect(question, field, context) if f.kind == "field"
-            )
-        return super().detect(question, field, context)
+        # All temporal filters come from the per-literal path, including times.
+        return tuple(
+            fact
+            for fact in super().detect(question, field, context)
+            if fact.kind == "field"
+        )
 
-    def detect_literals(self, question, selected_fields, context):
-        month = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
-        pattern = rf"\b(?:\d{{4}}-\d{{1,2}}-\d{{1,2}}|\d{{1,2}}/\d{{1,2}}/\d{{4}}|{month}\s+\d{{1,2}}(?:,?\s+\d{{4}})?|\d{{1,2}}\s+{month}(?:\s+\d{{4}})?)\b"
-        fields = [
-            field
-            for field in selected_fields
-            if FIELD_DEFINITIONS[field].resolution_kind == "temporal"
-        ]
-        facts = []
-        if not fields:
-            for match in re.finditer(
-                r"\b(?:before|after|at|since|until)\s+\d{1,2}:\d{2}(?::\d{2})?\b",
-                question,
+    @classmethod
+    def _operator(cls, prefix, field_span=None):
+        before_field = prefix[: field_span[0]] if field_span else prefix
+        after_field = prefix[field_span[1] :] if field_span else ""
+        operator_text = before_field + " " + after_field if field_span else prefix
+        expression = "|".join(
+            re.escape(phrase).replace(r"\ ", r"\s+")
+            for phrase in sorted(cls._operators, key=len, reverse=True)
+        )
+        match = re.search(
+            rf"(?<!\w)(?P<operator>{expression})\s*$", operator_text, re.I
+        )
+        if match:
+            preceding = operator_text[: match.start()]
+            if re.search(
+                r"(?:\b(?:not|never|approximately|roughly|around)|[<>=!])\s*$",
+                preceding,
                 re.I,
             ):
-                facts.append(
-                    _unsupported_fact("unrepresentable_temporal_target", match.group(0))
-                )
-        for match in re.finditer(pattern, question, re.I):
+                return None, ""
+            phrase = " ".join(match.group("operator").casefold().split())
+            return cls._operators[phrase], phrase
+        if field_span and after_field.strip():
+            return None, ""
+        if re.search(
+            r"(?:\b(?:not|never|approximately|roughly|around)|[<>=!])\s*$",
+            operator_text,
+            re.I,
+        ):
+            return None, ""
+        return "eq", ""
+
+    @staticmethod
+    def _canonical_literal(field, literal, year):
+        definition = FIELD_DEFINITIONS[field]
+        if "/" in literal:
+            raise ValueError("Numeric slash dates need an explicit unambiguous format.")
+        if definition.storage_type == "date":
+            canonical = re.sub(r"\bsept\b", "Sep", literal, flags=re.I).replace(",", "")
+            if re.search(r"\b\d{4}\b", canonical) is None:
+                canonical += f" {year}"
+            for fmt in ("%Y-%m-%d", "%B %d %Y", "%b %d %Y", "%d %B %Y", "%d %b %Y"):
+                try:
+                    return datetime.strptime(canonical, fmt).date().isoformat()
+                except ValueError:
+                    continue
+            raise ValueError("Invalid date literal.")
+        if definition.storage_type == "datetime" and not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})?",
+            literal,
+        ):
+            raise ValueError("Datetime fields require a complete timestamp.")
+        return canonicalize_storage_value(field, literal)
+
+    def detect_literals(self, question, selected_fields, context):
+        del selected_fields  # Binding is local to each literal, not a global field set.
+        facts = []
+        matches = self.literal_matches(question)
+        field_spans = [
+            (start, end, field)
+            for field, definition in FIELD_DEFINITIONS.items()
+            if definition.resolution_kind == "temporal" and definition.planner_visible
+            for phrase in definition.natural_names
+            for start, end in _raw_phrase_spans(question, phrase)
+        ]
+        previous = None
+        range_start = None
+        for match in matches:
             literal = match.group(0)
-            field_occurrences = [
-                (span[1], span[1] - span[0], field)
-                for field, definition in FIELD_DEFINITIONS.items()
-                if definition.resolution_kind == "temporal"
-                and definition.planner_visible
-                for phrase in definition.natural_names
-                for span in _evidence_spans(question[: match.start()], phrase)
+            preceding_fields = [
+                item for item in field_spans if item[1] <= match.start()
             ]
-            targets = (
-                [max(field_occurrences)[2]]
-                if field_occurrences
-                else (["Date"] if "Date" in FIELD_DEFINITIONS else [])
+            target_span = (
+                max(preceding_fields, key=lambda item: (item[1], item[1] - item[0]))
+                if preceding_fields
+                else None
             )
+            target = target_span[2] if target_span else "Date"
+            segment_start = previous.end() if previous else 0
+            prefix = question[segment_start : match.start()]
+            local_field = (
+                (target_span[0] - segment_start, target_span[1] - segment_start)
+                if target_span and target_span[0] >= segment_start
+                else None
+            )
+            operator, phrase = self._operator(prefix, local_field)
+            paired = bool(
+                range_start and re.fullmatch(r"\s*(?:to|and)\s*", prefix, re.I)
+            )
+            if paired:
+                target = range_start.field
+                operator = "lte"
+            elif range_start is not None:
+                range_start = None
+            definition = FIELD_DEFINITIONS.get(target)
             if (
-                len(targets) == 1
-                and FIELD_DEFINITIONS[targets[0]].storage_type == "datetime"
-            ):
-                continue
-            if (
-                len(targets) != 1
-                or FIELD_DEFINITIONS[targets[0]].storage_type != "date"
-                or not FIELD_DEFINITIONS[targets[0]].filterable
+                definition is None
+                or not definition.filterable
+                or not definition.planner_visible
             ):
                 facts.append(
                     _unsupported_fact("unrepresentable_temporal_target", literal)
                 )
+                previous = match
                 continue
-            value = None
-            if "/" not in literal:
-                canonical_literal = literal.replace(",", "")
-                if re.search(r"\b\d{4}\b", literal) is None:
-                    canonical_literal += (
-                        f" {(context.reference_date or date.today()).year}"
+            if operator is None:
+                facts.append(
+                    _unsupported_fact(
+                        "unsupported_operator", prefix.strip() + " " + literal
                     )
-                for fmt in ("%Y-%m-%d", "%B %d %Y", "%b %d %Y", "%d %B %Y", "%d %b %Y"):
-                    try:
-                        value = (
-                            datetime.strptime(canonical_literal, fmt).date().isoformat()
-                        )
-                        break
-                    except ValueError:
-                        continue
-            if value is None:
+                )
+                previous = match
+                continue
+            # An unbound clock literal cannot borrow an unrelated date target.
+            if re.match(r"^\d{1,2}:", literal) and definition.storage_type != "time":
+                facts.append(
+                    _unsupported_fact("unrepresentable_temporal_target", literal)
+                )
+                previous = match
+                continue
+            year = (
+                int(str(range_start.values[0])[:4])
+                if paired
+                else (context.reference_date or date.today()).year
+            )
+            try:
+                value = self._canonical_literal(target, literal, year)
+            except ValueError:
                 facts.append(
                     _unsupported_fact(
                         "ambiguous_date" if "/" in literal else "malformed_value",
                         literal,
                     )
                 )
+                previous = match
                 continue
-            prefix = question[: match.start()]
-            comparator = re.search(
-                r"\b(on\s+or\s+before|on\s+or\s+after|before|after|since|until|through|on|between|from|to)\s*$",
-                prefix,
-                re.I,
+            evidence_start = (
+                target_span[0] if local_field else match.start() - len(prefix.lstrip())
             )
-            phrase = normalize_semantic_text(comparator.group(1)) if comparator else ""
-            operator = {
-                "before": "lt",
-                "after": "gt",
-                "on or before": "lte",
-                "until": "lte",
-                "through": "lte",
-                "on or after": "gte",
-                "since": "gte",
-                "between": "gte",
-                "from": "gte",
-                "to": "lte",
-            }.get(phrase, "eq")
-            if not comparator and re.search(r"\bbetween\b.*\band\s*$", prefix, re.I):
-                operator = "lte"
-            evidence = (
-                question[comparator.start() : match.end()] if comparator else literal
+            if local_field:
+                # Include an operator placed before the field as well.
+                evidence_start = segment_start
+            evidence = question[evidence_start : match.end()].strip()
+            fact = SemanticFact(
+                kind="filter",
+                field=target,
+                operator=operator,
+                values=(value,),
+                evidence_text=evidence,
+                origin="question",
+                strength="strong",
+                evidence_span=(evidence_start, match.end()),
             )
-            facts.append(
-                SemanticFact(
-                    kind="filter",
-                    field=targets[0],
-                    operator=operator,
-                    values=(value,),
-                    evidence_text=evidence,
-                    origin="question",
-                    strength="strong",
-                )
-            )
+            facts.append(fact)
+            range_start = fact if phrase in {"from", "between"} else None
             abbreviated_end = (
                 re.match(
                     r"\s+and\s+(\d{1,2})(?:,?\s+(\d{4}))?(?![\d/-])\b",
@@ -591,7 +764,7 @@ class TemporalResolver(FieldResolver):
                 if phrase == "between"
                 else None
             )
-            if abbreviated_end:
+            if abbreviated_end and definition.storage_type == "date":
                 try:
                     end = date.fromisoformat(value).replace(
                         day=int(abbreviated_end.group(1)),
@@ -600,7 +773,7 @@ class TemporalResolver(FieldResolver):
                     facts.append(
                         SemanticFact(
                             kind="filter",
-                            field=targets[0],
+                            field=target,
                             operator="lte",
                             values=(end.isoformat(),),
                             evidence_text=abbreviated_end.group(0).strip(),
@@ -614,11 +787,16 @@ class TemporalResolver(FieldResolver):
                             "malformed_value", abbreviated_end.group(0).strip()
                         )
                     )
+            previous = match
         lower_bounds = [
-            f for f in facts if f.kind == "filter" and f.operator in {"gte", "gt"}
+            fact
+            for fact in facts
+            if fact.kind == "filter" and fact.operator in {"gte", "gt"}
         ]
         upper_bounds = [
-            f for f in facts if f.kind == "filter" and f.operator in {"lte", "lt"}
+            fact
+            for fact in facts
+            if fact.kind == "filter" and fact.operator in {"lte", "lt"}
         ]
         if any(
             lo.field == hi.field
@@ -928,7 +1106,24 @@ def _select_longest_supported_facts(
     """Keep the longest supported meaning while preserving compatible facts."""
     ranked = []
     for index, fact in enumerate(facts):
-        spans = _evidence_spans(question, fact.evidence_text)
+        spans = (
+            (
+                (
+                    len(
+                        normalize_semantic_text(
+                            question[: fact.evidence_span[0]]
+                        ).split()
+                    ),
+                    len(
+                        normalize_semantic_text(
+                            question[: fact.evidence_span[1]]
+                        ).split()
+                    ),
+                ),
+            )
+            if fact.evidence_span is not None
+            else _evidence_spans(question, fact.evidence_text)
+        )
         if not spans:
             spans = ((index, index + 1),)
         for span in spans:
@@ -1096,10 +1291,16 @@ def detect_semantic_facts(
             )
     semantic_question = question
     for fact in facts:
-        if fact.kind == "entity" and fact.field == "Name":
-            name_pattern = re.escape(fact.evidence_text).replace(r"\ ", r"\s+")
-            semantic_question = re.sub(
-                rf"(?<!\w){name_pattern}(?!\w)", " ", semantic_question, flags=re.I
+        if (
+            fact.kind == "entity"
+            and fact.field == "Name"
+            and fact.evidence_span is not None
+        ):
+            start, end = fact.evidence_span
+            semantic_question = (
+                semantic_question[:start]
+                + " " * (end - start)
+                + semantic_question[end:]
             )
     field_matches = [
         (field, phrase)

@@ -20,6 +20,107 @@ PRIVATE_FIXTURES_AVAILABLE = (
 
 
 class BaselineCapabilityParityTests(unittest.TestCase):
+    def test_explicit_distributive_totals_remain_grouped(self):
+        for index, row in enumerate(self.rows):
+            row["Department"] = "Alpha" if index < 3 else "Beta"
+        for field, subject in (
+            ("Department", "department"),
+            ("Employee_ID", "employee"),
+        ):
+            for quantifier in ("each", "every"):
+                for question in (
+                    f"How many records does {quantifier} {subject} have in total?",
+                    f"In total, how many records does {quantifier} {subject} have?",
+                ):
+                    with self.subTest(question=question):
+                        _, plan, result, _ = self.answer.fetch_context(question)
+                        self.assertEqual(plan.group_by, [field])
+                        self.assertEqual(plan.answer_contract.shape, "grouped")
+                        self.assertEqual(
+                            sorted(row["value"] for row in result["rows"]), [2, 3]
+                        )
+
+    def test_collective_totals_defer_only_to_explicit_grouping(self):
+        for index, row in enumerate(self.rows):
+            row["Department"] = "Alpha" if index < 3 else "Beta"
+        for quantifier, subject, verb in (
+            ("all", "departments", "do"),
+            ("any", "department", "does"),
+        ):
+            for modifier in ("combined", "in total"):
+                with self.subTest(quantifier=quantifier, modifier=modifier):
+                    _, scalar, result, _ = self.answer.fetch_context(
+                        f"How many records {verb} {quantifier} {subject} have {modifier}?"
+                    )
+                    self.assertEqual(scalar.group_by, [])
+                    self.assertEqual(result["value"], 5)
+                    _, grouped, result, _ = self.answer.fetch_context(
+                        f"Count records by {quantifier} {subject} {modifier}"
+                    )
+                    self.assertEqual(grouped.group_by, ["Department"])
+                    self.assertEqual(
+                        sorted(row["value"] for row in result["rows"]), [2, 3]
+                    )
+
+    def test_catalog_operation_word_does_not_filter_ranked_dimension(self):
+        for index, row in enumerate(self.rows):
+            row["Position"] = "Highest" if index < 3 else "Engineer"
+        with patch.object(
+            self.answer,
+            "load_attendance_catalog_candidates",
+            return_value={"Position": ("Highest", "Engineer")},
+        ):
+            _, plan, result, _ = self.answer.fetch_context(
+                "Which Position has the highest total overtime?"
+            )
+        self.assertEqual(plan.group_by, ["Position"])
+        self.assertEqual(
+            (plan.order_by, plan.order_direction, plan.limit), ("value", "desc", 1)
+        )
+        self.assertFalse([item for item in plan.filters if item.field == "Position"])
+        self.assertEqual(result["rows"], [{"group": ["Engineer"], "value": 4.0}])
+
+    def test_categorical_constraint_matrix_preserves_implicit_and_explicit_counts(self):
+        catalog = {
+            "Department": ("Sales", "Support"),
+            "Position": ("Engineer", "Officer"),
+        }
+        for field, value, other in (
+            ("Status", "Authorized", "Draft"),
+            ("Department", "Sales", "Support"),
+            ("Position", "Engineer", "Officer"),
+            ("Day_Type", "Working Day", "OFF Day"),
+        ):
+            for index, row in enumerate(self.rows):
+                row[field] = value if index < 3 else other
+            for question in (
+                f"Count records where {field} equal to {value}",
+                f"Count records in {value}",
+                f"Count {value} records",
+            ):
+                with self.subTest(field=field, question=question):
+                    with patch.object(
+                        self.answer,
+                        "load_attendance_catalog_candidates",
+                        return_value=catalog,
+                    ):
+                        _, plan, result, _ = self.answer.fetch_context(question)
+                    self.assertEqual(plan.aggregation, "count")
+                    self.assertIn(
+                        (field, "eq", value),
+                        {
+                            (item.field, item.operator, item.value)
+                            for item in plan.filters
+                        },
+                    )
+                    self.assertEqual(result["value"], 3)
+        with patch.object(
+            self.answer, "load_attendance_catalog_candidates", return_value=catalog
+        ):
+            _, plan, result, _ = self.answer.fetch_context("Count employees in Sales")
+        self.assertEqual(plan.aggregation, "distinct_count")
+        self.assertEqual(result["value"], 1)
+
     def test_collective_quantifier_modifiers_execute_scalar_totals(self):
         for index, row in enumerate(self.rows):
             row["Department"] = "Alpha" if index < 3 else "Beta"

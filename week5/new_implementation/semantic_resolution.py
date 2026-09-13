@@ -14,9 +14,11 @@ try:
     from .attendance_schema import (
         BUSINESS_PREDICATE_DEFINITIONS,
         CALCULATION_DEFINITIONS,
+        CATEGORICAL_EQUALITY_PATTERN,
         canonicalize_storage_value,
         FIELD_DEFINITIONS,
         MEASURE_DEFINITIONS,
+        ORDERING_ROLE_PATTERNS,
         RETRIEVAL_INTENT_DEFINITIONS,
         VALUE_CONCEPT_DEFINITIONS,
         UNSUPPORTED_REQUEST_PATTERNS,
@@ -28,9 +30,11 @@ except ImportError:  # Direct execution from week5/new_implementation.
     from attendance_schema import (
         BUSINESS_PREDICATE_DEFINITIONS,
         CALCULATION_DEFINITIONS,
+        CATEGORICAL_EQUALITY_PATTERN,
         canonicalize_storage_value,
         FIELD_DEFINITIONS,
         MEASURE_DEFINITIONS,
+        ORDERING_ROLE_PATTERNS,
         RETRIEVAL_INTENT_DEFINITIONS,
         VALUE_CONCEPT_DEFINITIONS,
         UNSUPPORTED_REQUEST_PATTERNS,
@@ -212,10 +216,14 @@ class FieldResolver(ABC):
             for phrase in sorted(definition.natural_names, key=len, reverse=True)
             if evidence_occurs(question, phrase)
         )[:1]
-        if not field_facts:
+        if not field_facts and definition.resolution_kind not in {
+            "catalog",
+            "closed_value",
+        }:
             return ()
+        field_evidence = field_facts[0].evidence_text if field_facts else ""
         value_search_text = normalize_semantic_text(question).replace(
-            normalize_semantic_text(field_facts[0].evidence_text), " ", 1
+            normalize_semantic_text(field_evidence), " ", 1
         )
         values: list[tuple[object, str]] = []
         rejected_facts: list[SemanticFact] = []
@@ -310,9 +318,7 @@ class FieldResolver(ABC):
                 values.append((match.group(0), match.group(0)))
         value_facts = []
         for value, evidence in dict.fromkeys(values):
-            if _unsupported_operator_between(
-                question, field_facts[0].evidence_text, evidence
-            ):
+            if _unsupported_operator_between(question, field_evidence, evidence):
                 rejected_facts.append(
                     _unsupported_fact("unsupported_operator", evidence)
                 )
@@ -325,17 +331,26 @@ class FieldResolver(ABC):
                 continue
             evidence_span = None
             if definition.resolution_kind in {"catalog", "closed_value"}:
-                evidence_span = _field_value_evidence_span(
-                    question, field_facts[0].evidence_text, evidence
+                bound_spans = _field_value_evidence_spans(
+                    question, field_evidence, evidence
                 )
-                if (
-                    evidence_span is None
-                    and len(_raw_phrase_spans(question, evidence)) > 1
-                ):
+                if not bound_spans:
+                    bound_spans = _implicit_categorical_value_spans(question, evidence)
+                    if bound_spans and _categorical_value_owners(value, context) != {
+                        field
+                    }:
+                        rejected_facts.append(
+                            _unsupported_fact("ambiguous_value_binding", evidence)
+                        )
+                        continue
+                if len(bound_spans) > 1:
                     rejected_facts.append(
                         _unsupported_fact("ambiguous_value_binding", evidence)
                     )
                     continue
+                if not bound_spans:
+                    continue
+                evidence_span = bound_spans[0]
             value_facts.append(
                 SemanticFact(
                     kind="filter",
@@ -376,34 +391,98 @@ def _raw_phrase_spans(text: str, phrase: str) -> tuple[tuple[int, int], ...]:
     )
 
 
-def _field_value_evidence_span(question, field_evidence, value_evidence):
-    """Bind only a unique nearest occurrence in either source direction."""
+def _field_value_evidence_spans(question, field_evidence, value_evidence):
+    """Retain nearest occurrences only after proving a field/value relation."""
     value_spans = _raw_phrase_spans(question, value_evidence)
-    if len(value_spans) == 1:
-        return value_spans[0]
     field_spans = {
         span
         for form in _token_forms(field_evidence)
         for span in _raw_phrase_spans(question, form)
     }
-    candidates = [
-        (
-            len(
-                normalize_semantic_text(
-                    question[min(field_end, value_end) : max(field_start, value_start)]
-                )
-            ),
-            (value_start, value_end),
+    candidates = []
+    for field_start, field_end in field_spans:
+        field_is_subject = re.search(
+            r"\b(?:which|by|per|each|every|all|any)\s*$", question[:field_start], re.I
         )
-        for field_start, field_end in field_spans
-        for value_start, value_end in value_spans
-        if field_end <= value_start or value_end <= field_start
-    ]
+        for value_start, value_end in value_spans:
+            if not (field_end <= value_start or value_end <= field_start):
+                continue
+            gap = question[min(field_end, value_end) : max(field_start, value_start)]
+            adjacent = not gap.strip() and not (
+                field_end <= value_start and field_is_subject
+            )
+            equality = field_end <= value_start and (
+                re.fullmatch(r"\s*[=:]\s*", gap)
+                or re.fullmatch(
+                    CATEGORICAL_EQUALITY_PATTERN, normalize_semantic_text(gap)
+                )
+            )
+            if adjacent or equality:
+                candidates.append(
+                    (len(normalize_semantic_text(gap)), (value_start, value_end))
+                )
     if not candidates:
-        return None
+        return ()
     distance = min(item[0] for item in candidates)
     nearest = {span for gap, span in candidates if gap == distance}
-    return next(iter(nearest)) if len(nearest) == 1 else None
+    return tuple(sorted(nearest))
+
+
+def _categorical_value_owners(value, context):
+    return {
+        field
+        for field, definition in FIELD_DEFINITIONS.items()
+        if definition.planner_visible
+        and definition.resolution_kind in {"catalog", "closed_value"}
+        if any(
+            normalize_semantic_text(value) == normalize_semantic_text(candidate)
+            for candidate in (
+                *definition.closed_values,
+                *context.catalog.get(field, ()),
+                *(alias.canonical_value for alias in definition.value_aliases),
+            )
+        )
+    }
+
+
+def _implicit_categorical_value_spans(question, evidence):
+    """Prove membership or a nominal modifier without borrowing an operation role."""
+    subjects = {
+        form
+        for definition in MEASURE_DEFINITIONS.values()
+        for phrase in definition.natural_names
+        for form in _token_forms(phrase)
+    }
+    operation_word = any(
+        re.fullmatch(pattern, evidence, re.I)
+        for pattern in (
+            *ORDERING_ROLE_PATTERNS.values(),
+            *(
+                pattern
+                for definition in CALCULATION_DEFINITIONS.values()
+                for pattern in definition.detection_patterns
+            ),
+        )
+    ) or any(
+        normalize_semantic_text(evidence) == normalize_semantic_text(phrase)
+        for definition in FIELD_DEFINITIONS.values()
+        if definition.storage_type == "number"
+        for phrase in definition.natural_names
+    )
+    spans = []
+    for start, end in _raw_phrase_spans(question, evidence):
+        prefix = normalize_semantic_text(question[:start])
+        suffix = normalize_semantic_text(question[end:])
+        membership = any(
+            re.search(rf"\b{re.escape(subject)}s?\s+(?:in|from)(?:\s+the)?$", prefix)
+            for subject in subjects
+        )
+        modifier = not operation_word and any(
+            re.match(rf"{re.escape(subject)}s?\b", suffix) for subject in subjects
+        )
+        if membership or modifier:
+            spans.append((start, end))
+    return tuple(spans)
 
 
 class IdentifierResolver(FieldResolver):
@@ -1206,30 +1285,25 @@ def _overlapping_facts_conflict(left: SemanticFact, right: SemanticFact) -> bool
     return False
 
 
+def _fact_token_spans(question, fact):
+    if fact.evidence_span is not None:
+        start, end = fact.evidence_span
+        return (
+            (
+                len(normalize_semantic_text(question[:start]).split()),
+                len(normalize_semantic_text(question[:end]).split()),
+            ),
+        )
+    return _evidence_spans(question, fact.evidence_text)
+
+
 def _select_longest_supported_facts(
     question: str, facts: Iterable[SemanticFact]
 ) -> tuple[SemanticFact, ...]:
     """Keep the longest supported meaning while preserving compatible facts."""
     ranked = []
     for index, fact in enumerate(facts):
-        spans = (
-            (
-                (
-                    len(
-                        normalize_semantic_text(
-                            question[: fact.evidence_span[0]]
-                        ).split()
-                    ),
-                    len(
-                        normalize_semantic_text(
-                            question[: fact.evidence_span[1]]
-                        ).split()
-                    ),
-                ),
-            )
-            if fact.evidence_span is not None
-            else _evidence_spans(question, fact.evidence_text)
-        )
+        spans = _fact_token_spans(question, fact)
         if not spans:
             spans = ((index, index + 1),)
         for span in spans:
@@ -1284,19 +1358,29 @@ def _select_longest_supported_facts(
     return tuple(deduplicated)
 
 
-def _earliest_measure_facts(question: str) -> list[SemanticFact]:
+def _earliest_measure_facts(question: str, existing_facts=()) -> list[SemanticFact]:
     candidates = _facts_for_named_phrases(question, "measure", MEASURE_DEFINITIONS)
     if not candidates:
         return []
-    normalized_question = normalize_semantic_text(question)
     positions = []
+    # A bound literal owns its internal words. Registry concepts are compositional:
+    # their complete evidence phrase can independently supply the counted subject.
+    filter_spans = [
+        span
+        for fact in existing_facts
+        if fact.kind == "filter" and fact.evidence_span is not None
+        for span in _fact_token_spans(question, fact)
+    ]
     for fact in candidates:
-        position = len(normalized_question)
-        for form in _token_forms(fact.evidence_text):
-            found = normalized_question.find(form)
-            if found >= 0:
-                position = min(position, found)
-        positions.append((position, fact))
+        unbound = [
+            start
+            for start, end in _evidence_spans(question, fact.evidence_text)
+            if not any(lo <= start and end <= hi for lo, hi in filter_spans)
+        ]
+        if unbound:
+            positions.append((min(unbound), fact))
+    if not positions:
+        return []
     earliest = min(position for position, _ in positions)
     return [fact for position, fact in positions if position == earliest]
 
@@ -1326,7 +1410,7 @@ def _calculation_matches(question, definition, facts):
         span
         for fact in facts
         if fact.kind == "filter"
-        for span in _evidence_spans(question, fact.evidence_text)
+        for span in _fact_token_spans(question, fact)
     ]
     return [
         match
@@ -1435,13 +1519,17 @@ def _grouping_facts(
             r"\b(?:order(?:ed)?|sort(?:ed)?)\s*$", normalized_question[: match.start()]
         ):
             continue
-        # A collective modifier scopes the quantified population as one total;
-        # it does not cancel a separately explicit by/per grouping clause.
-        if not re.match(r"(?:by|per)\b", match.group(0)) and (
-            re.match(r"in total\b", normalized_question)
-            or re.match(
-                r"\s+(?:have\s+)?(?:combined|in total)\b",
-                normalized_question[match.end() :],
+        # Each/every explicitly distribute the operation; all/any are collective
+        # only when a total modifier scopes them and no by/per clause overrides it.
+        if (
+            re.search(r"\b(?:all|any)\b", match.group(0))
+            and not re.match(r"(?:by|per)\b", match.group(0))
+            and (
+                re.match(r"in total\b", normalized_question)
+                or re.match(
+                    r"\s+(?:have\s+)?(?:combined|in total)\b",
+                    normalized_question[match.end() :],
+                )
             )
         ):
             continue
@@ -1526,6 +1614,17 @@ def detect_semantic_facts(
                 semantic_question, field, context
             )
         )
+    for field, definition in FIELD_DEFINITIONS.items():
+        if (
+            field not in selected_fields
+            and definition.planner_visible
+            and definition.resolution_kind in {"catalog", "closed_value"}
+        ):
+            facts.extend(
+                registry.for_kind(definition.resolution_kind).detect(
+                    semantic_question, field, context
+                )
+            )
     facts.extend(
         registry.for_kind("temporal").detect_literals(
             semantic_question, selected_fields, context
@@ -1555,7 +1654,7 @@ def detect_semantic_facts(
     facts.extend(_grouping_facts(semantic_question, maximal_field_matches))
     facts.extend(_calculation_facts(semantic_question, selected_fields, facts))
     if re.search(r"\b(?:how many|count|number of|total number)\b", question, re.I):
-        facts.extend(_earliest_measure_facts(semantic_question))
+        facts.extend(_earliest_measure_facts(semantic_question, facts))
     predicate_facts = _facts_for_named_phrases(
         semantic_question, "predicate", BUSINESS_PREDICATE_DEFINITIONS
     )
@@ -1643,7 +1742,7 @@ def _executable_choice_facts(question, field_matches, facts, *, original_questio
                 concept_name="unsupported_calculation",
             )
 
-    temporal_rank = re.search(r"\b(latest|earliest)(?:\s+(\d+))?\b", normalized)
+    temporal_rank = re.search(ORDERING_ROLE_PATTERNS["temporal"], normalized)
     if temporal_rank:
         row_subject = any(
             evidence_occurs(normalized[temporal_rank.end() :], phrase)
@@ -1674,7 +1773,7 @@ def _executable_choice_facts(question, field_matches, facts, *, original_questio
                 concept_name="unsupported_constraint",
             )
 
-    superlative = re.search(r"\b(highest|lowest)\b", normalized)
+    superlative = re.search(ORDERING_ROLE_PATTERNS["aggregate"], normalized)
     if superlative:
         grouping = [f for f in facts if f.kind == "group_by"]
         if not grouping:
@@ -1723,7 +1822,7 @@ def _executable_choice_facts(question, field_matches, facts, *, original_questio
                 concept_name="unsupported_constraint",
             )
 
-    limit = re.search(r"\b(top|bottom|first|last|limit(?: to)?)\s+(\d+)\b", normalized)
+    limit = re.search(ORDERING_ROLE_PATTERNS["limit"], normalized)
     if limit:
         add("limit", limit.group(0), values=(float(limit.group(2)),))
         if limit.group(1) in {"first", "last"}:

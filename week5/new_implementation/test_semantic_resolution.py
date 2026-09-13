@@ -14,6 +14,87 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class BaselineOrderingGrammarTests(unittest.TestCase):
+    def test_categorical_cooccurrence_does_not_prove_a_filter_role(self):
+        context = ResolutionContext(
+            {"Position": ("Highest", "Average", "Total", "Engineer")}
+        )
+        for question in (
+            "Which Position has the highest total overtime?",
+            "Which Position has the average Total_OT?",
+            "Show Position and total overtime for all employees",
+            "Count records by Position and Engineer",
+        ):
+            with self.subTest(question=question):
+                facts = (
+                    ResolverRegistry.default()
+                    .for_kind("catalog")
+                    .detect(question, "Position", context)
+                )
+                self.assertFalse(
+                    [
+                        fact
+                        for fact in facts
+                        if fact.kind == "filter" and fact.strength == "strong"
+                    ]
+                )
+
+    def test_categorical_binding_matrix_preserves_positive_provenance(self):
+        context = ResolutionContext(
+            {"Department": ("Sales",), "Position": ("Engineer", "Highest")}
+        )
+        for field, value in (
+            ("Status", "Authorized"),
+            ("Department", "Sales"),
+            ("Position", "Engineer"),
+            ("Day_Type", "Working Day"),
+        ):
+            resolver = ResolverRegistry.default().for_kind(
+                FIELD_DEFINITIONS[field].resolution_kind
+            )
+            for question in (
+                f"Count records where {field} is exactly {value}",
+                f"Count records in {value}",
+                f"Count {value} records",
+            ):
+                with self.subTest(field=field, question=question):
+                    facts = resolver.detect(question, field, context)
+                    self.assertIn(
+                        (field, (value,)),
+                        {
+                            (fact.field, fact.values)
+                            for fact in facts
+                            if fact.kind == "filter" and fact.strength == "strong"
+                        },
+                    )
+        for question in (
+            "Count records where Position=Highest",
+            "Count records in the Highest position",
+        ):
+            with self.subTest(question=question):
+                facts = (
+                    ResolverRegistry.default()
+                    .for_kind("catalog")
+                    .detect(question, "Position", context)
+                )
+                self.assertIn(
+                    ("Highest",),
+                    {fact.values for fact in facts if fact.kind == "filter"},
+                )
+
+    def test_implicit_catalog_field_collision_preserves_uncertainty(self):
+        facts = detect_semantic_facts(
+            "Count Sales records",
+            ResolutionContext({"Department": ("Sales",), "Position": ("Sales",)}),
+        )
+        self.assertFalse(
+            [
+                fact
+                for fact in facts
+                if fact.kind == "filter" and fact.strength == "strong"
+            ]
+        )
+        self.assertTrue([fact for fact in facts if fact.kind == "unsupported"])
+
     def test_equidistant_value_occurrences_retain_binding_uncertainty(self):
         for question in ("Highest Position Highest", "Highest     Position Highest"):
             with self.subTest(question=question):

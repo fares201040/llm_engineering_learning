@@ -1011,6 +1011,18 @@ CALCULATION_DEFINITIONS = MappingProxyType(
     }
 )
 
+# Shared grammatical roles used before categorical literals become constraints.
+CATEGORICAL_EQUALITY_PATTERN = (
+    r"(?:is(?: exactly)?|equals?(?: to)?|equal to|has(?: the)? value)"
+)
+ORDERING_ROLE_PATTERNS = MappingProxyType(
+    {
+        "aggregate": r"\b(highest|lowest)\b",
+        "temporal": r"\b(latest|earliest)(?:\s+(\d+))?\b",
+        "limit": r"\b(top|bottom|first|last|limit(?: to)?)\s+(\d+)\b",
+    }
+)
+
 
 @dataclass(frozen=True)
 class DerivedResultDefinition:

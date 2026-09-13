@@ -10,6 +10,7 @@ try:
     from .attendance_schema import (
         BUSINESS_PREDICATE_DEFINITIONS,
         CALCULATION_DEFINITIONS,
+        DERIVED_RESULT_DEFINITIONS,
         FIELD_DEFINITIONS,
         MEASURE_DEFINITIONS,
         EvidenceOrigin,
@@ -30,6 +31,7 @@ except ImportError:  # Direct execution from week5/new_implementation.
     from attendance_schema import (
         BUSINESS_PREDICATE_DEFINITIONS,
         CALCULATION_DEFINITIONS,
+        DERIVED_RESULT_DEFINITIONS,
         FIELD_DEFINITIONS,
         MEASURE_DEFINITIONS,
         EvidenceOrigin,
@@ -84,6 +86,7 @@ class ConstraintProvenance:
     direction: Literal["asc", "desc"] | None = None
     origin: EvidenceOrigin = "question"
     evidence_text: str = ""
+    scope: Literal["population", "percentage_numerator"] = "population"
 
 
 @dataclass(frozen=True)
@@ -141,10 +144,20 @@ class SchemaInvariant(PlanInvariant):
             "group_by": "groupable",
             "order_by": "orderable",
             "calculation": "aggregatable",
+            "projection": "context",
         }
         for item in context.provenance:
             if item.field is None or item.target_kind not in role_by_kind:
                 continue
+            if (
+                item.target_kind == "order_by"
+                and item.field in DERIVED_RESULT_DEFINITIONS
+            ):
+                if (
+                    context.candidate_plan.group_by
+                    and context.candidate_plan.aggregation != "none"
+                ):
+                    continue
             if not _field_role_allowed(
                 item.field, role_by_kind[item.target_kind], item.origin
             ):
@@ -192,6 +205,8 @@ class SchemaInvariant(PlanInvariant):
 def _fact_matches_provenance(fact: SemanticFact, item: ConstraintProvenance) -> bool:
     if fact.origin != item.origin:
         return False
+    if fact.scope != item.scope:
+        return False
     if not evidence_occurs(
         fact.evidence_text, item.evidence_text
     ) and not evidence_occurs(item.evidence_text, fact.evidence_text):
@@ -224,8 +239,20 @@ def _fact_matches_provenance(fact: SemanticFact, item: ConstraintProvenance) -> 
         )
     if item.target_kind in {"measure", "predicate"}:
         return fact.kind == item.target_kind and fact.concept_name == item.name
-    if item.target_kind in {"group_by", "order_by"}:
-        return fact.field == item.field and fact.kind in {item.target_kind, "field"}
+    if item.target_kind in {"group_by", "projection"}:
+        return fact.field == item.field and fact.kind == item.target_kind
+    if item.target_kind == "order_by":
+        return (
+            fact.field == item.field
+            and fact.kind in {"order_by", "ranking"}
+            and fact.direction == item.direction
+        )
+    if item.target_kind == "percentage_denominator":
+        return (
+            fact.kind == item.target_kind
+            and fact.field == item.field
+            and fact.concept_name == item.name
+        )
     if item.target_kind == "calculation":
         return (
             fact.kind == "calculation"
@@ -280,6 +307,9 @@ class CoverageInvariant(PlanInvariant):
             "order_by",
             "limit",
             "entity",
+            "projection",
+            "ranking",
+            "percentage_denominator",
         }
         for index, fact in enumerate(context.compilation.facts):
             if fact.strength != "strong" or fact.kind not in relevant_kinds:
@@ -351,6 +381,14 @@ class AnswerContractInvariant(PlanInvariant):
         proposal = context.proposal
         if proposal is None or proposal.answer_contract is None:
             return ()
+        if proposal.answer_contract.shape == "narrative":
+            return (
+                PlanViolation(
+                    "unsupported_capability",
+                    "narrative_explanation",
+                    "Narrative explanations cannot be executed as structured calculations.",
+                ),
+            )
         expected_unit = None
         expected_subject = None
         if proposal.measure is not None:
@@ -361,12 +399,14 @@ class AnswerContractInvariant(PlanInvariant):
             expected_unit = (
                 "percentage"
                 if proposal.calculation.operation == "percentage"
-                else "hours"
-                if proposal.calculation.field
-                and FIELD_DEFINITIONS.get(proposal.calculation.field)
-                and FIELD_DEFINITIONS[proposal.calculation.field].storage_type
-                == "number"
-                else "value"
+                else (
+                    "hours"
+                    if proposal.calculation.field
+                    and FIELD_DEFINITIONS.get(proposal.calculation.field)
+                    and FIELD_DEFINITIONS[proposal.calculation.field].storage_type
+                    == "number"
+                    else "value"
+                )
             )
             expected_subject = proposal.calculation.field
         contract = proposal.answer_contract
@@ -404,6 +444,94 @@ class CapabilityInvariant(PlanInvariant):
         )
 
 
+class ExecutableChoiceInvariant(PlanInvariant):
+    """Bind actual executable choices to the provenance checked by invariants."""
+
+    def check(self, context):
+        plan = context.candidate_plan
+        required = []
+        for condition in plan.filters:
+            values = (
+                condition.value
+                if isinstance(condition.value, list)
+                else [condition.value]
+            )
+            required.append(
+                dict(
+                    target_kind="filter",
+                    field=condition.field,
+                    operator=condition.operator,
+                    values=tuple(values),
+                    scope="population",
+                )
+            )
+        for kind, fields in (
+            ("group_by", plan.group_by),
+            ("projection", plan.projection),
+        ):
+            required.extend(dict(target_kind=kind, field=field) for field in fields)
+        if plan.order_by:
+            required.append(
+                dict(
+                    target_kind="order_by",
+                    field=plan.order_by,
+                    direction=plan.order_direction,
+                )
+            )
+        if plan.limit is not None:
+            required.append(dict(target_kind="limit", values=(float(plan.limit),)))
+        if plan.measure:
+            definition = MEASURE_DEFINITIONS[plan.measure]
+            if (plan.aggregation, plan.aggregation_field) != (
+                definition.aggregation,
+                definition.aggregation_field,
+            ):
+                return (
+                    PlanViolation(
+                        "ungrounded_constraint",
+                        "calculation",
+                        "The executable measure was changed.",
+                    ),
+                )
+            required.append(dict(target_kind="measure", name=plan.measure))
+        elif plan.aggregation != "none":
+            required.append(
+                dict(
+                    target_kind="calculation",
+                    name=plan.aggregation,
+                    field=plan.aggregation_field,
+                )
+            )
+        if plan.percentage_condition:
+            condition = plan.percentage_condition
+            values = (
+                condition.value
+                if isinstance(condition.value, list)
+                else [condition.value]
+            )
+            required.append(
+                dict(
+                    target_kind="filter",
+                    field=condition.field,
+                    operator=condition.operator,
+                    values=tuple(values),
+                    scope="percentage_numerator",
+                )
+            )
+        return tuple(
+            PlanViolation(
+                "ungrounded_constraint",
+                item["target_kind"],
+                "An executable choice does not match its verified provenance.",
+            )
+            for item in required
+            if not any(
+                all(getattr(provenance, key) == value for key, value in item.items())
+                for provenance in context.provenance
+            )
+        )
+
+
 PLAN_INVARIANTS: tuple[PlanInvariant, ...] = (
     SchemaInvariant(),
     GroundingInvariant(),
@@ -411,6 +539,7 @@ PLAN_INVARIANTS: tuple[PlanInvariant, ...] = (
     ContradictionInvariant(),
     AnswerContractInvariant(),
     CapabilityInvariant(),
+    ExecutableChoiceInvariant(),
 )
 
 
@@ -446,10 +575,21 @@ def _canonicalize_filter(proposed, context, resolver_registry):
 
 
 def _choice_origin(
-    context, *, kind, evidence_text, field=None, operator=None, values=(), name=None
+    context,
+    *,
+    kind,
+    evidence_text,
+    field=None,
+    operator=None,
+    values=(),
+    name=None,
+    scope="population",
+    direction=None,
 ):
     for fact in context.facts:
         if fact.strength != "strong" or fact.kind != kind:
+            continue
+        if fact.scope != scope or fact.direction != direction:
             continue
         if field is not None and (
             fact.field != field
@@ -474,6 +614,7 @@ def _candidate_plan(proposal, context):
         or proposal.business_predicates
         or proposal.calculation
         or proposal.group_by
+        or proposal.projection
         or proposal.order_by
         or proposal.limit
     )
@@ -599,9 +740,11 @@ def compile_proposal(
             if condition is None:
                 early_violations.append(
                     PlanViolation(
-                        "ambiguous_value"
-                        if status == "ambiguous"
-                        else "invalid_schema",
+                        (
+                            "ambiguous_value"
+                            if status == "ambiguous"
+                            else "invalid_schema"
+                        ),
                         calculation.percentage_condition.field,
                         "The percentage condition could not be resolved uniquely.",
                         clarification_possible=status == "ambiguous",
@@ -639,10 +782,36 @@ def compile_proposal(
                             field=condition.field,
                             operator=condition.operator,
                             values=tuple(values),
+                            scope="percentage_numerator",
                         ),
                         evidence_text=calculation.percentage_condition.evidence_text,
+                        scope="percentage_numerator",
                     )
                 )
+        if calculation.operation == "percentage":
+            denominator_name = next(
+                (
+                    name
+                    for name, definition in MEASURE_DEFINITIONS.items()
+                    if definition.aggregation_field == calculation.field
+                ),
+                None,
+            )
+            provenance.append(
+                ConstraintProvenance(
+                    target_kind="percentage_denominator",
+                    field=calculation.field,
+                    name=denominator_name,
+                    evidence_text=calculation.evidence_text,
+                    origin=_choice_origin(
+                        context,
+                        kind="percentage_denominator",
+                        evidence_text=calculation.evidence_text,
+                        field=calculation.field,
+                        name=denominator_name,
+                    ),
+                )
+            )
         provenance.append(
             ConstraintProvenance(
                 target_kind="calculation",
@@ -704,6 +873,27 @@ def compile_proposal(
                 target_kind="group_by",
                 field=proposed.field,
                 evidence_text=proposed.evidence_text,
+                origin=_choice_origin(
+                    context,
+                    kind="group_by",
+                    evidence_text=proposed.evidence_text,
+                    field=proposed.field,
+                ),
+            )
+        )
+    for proposed in proposal.projection:
+        candidate.projection.append(proposed.field)
+        provenance.append(
+            ConstraintProvenance(
+                target_kind="projection",
+                field=proposed.field,
+                evidence_text=proposed.evidence_text,
+                origin=_choice_origin(
+                    context,
+                    kind="projection",
+                    evidence_text=proposed.evidence_text,
+                    field=proposed.field,
+                ),
             )
         )
     if proposal.order_by is not None:
@@ -715,6 +905,13 @@ def compile_proposal(
                 field=proposal.order_by.field,
                 direction=proposal.order_by.direction,
                 evidence_text=proposal.order_by.evidence_text,
+                origin=_choice_origin(
+                    context,
+                    kind="order_by",
+                    evidence_text=proposal.order_by.evidence_text,
+                    field=proposal.order_by.field,
+                    direction=proposal.order_by.direction,
+                ),
             )
         )
     if proposal.limit is not None:
@@ -724,6 +921,12 @@ def compile_proposal(
                 target_kind="limit",
                 values=(float(proposal.limit.value),),
                 evidence_text=proposal.limit.evidence_text,
+                origin=_choice_origin(
+                    context,
+                    kind="limit",
+                    evidence_text=proposal.limit.evidence_text,
+                    values=(float(proposal.limit.value),),
+                ),
             )
         )
 

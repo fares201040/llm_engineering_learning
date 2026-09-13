@@ -161,6 +161,108 @@ def _executable_plan(**values):
     return answer.ExecutableQueryPlan(**values)
 
 
+class ProposalOperationNormalizationTests(unittest.TestCase):
+    def test_overlay_retains_nonredundant_provider_order_for_rejection(self):
+        question = "Count records with Status equal to Authorized"
+        resolution = answer.ResolutionContext({})
+        facts = answer.detect_semantic_facts(question, resolution)
+        raw = dict(
+            status="ready",
+            measure=dict(name="attendance_records", evidence_text="records"),
+            order_by=dict(field="Date", direction="desc", evidence_text="records"),
+            answer_contract=dict(shape="scalar", unit="records"),
+        )
+        proposal = answer.PlannerProposal.model_validate(
+            answer._overlay_authoritative_facts(raw, facts)
+        )
+        result = answer.compile_proposal(
+            proposal, answer.CompilationContext(question, facts, resolution)
+        )
+        self.assertFalse(result.ready)
+        self.assertIn("ungrounded_constraint", {v.code for v in result.violations})
+
+    def test_record_projection_controls_returned_columns_without_model(self):
+        plan = _executable_plan(projection=["Date", "Status"], aggregation="none")
+        chunk = answer.Result(
+            page_content="Secret: hidden",
+            metadata={
+                "Date": "2026-09-03",
+                "Status": "Authorized",
+                "Department": "Hidden",
+            },
+        )
+        with patch.object(
+            answer,
+            "completion",
+            side_effect=AssertionError("Projection is deterministic"),
+        ):
+            text, _ = answer._answer_from_context(
+                "Show Date and Status from records", [], [chunk], plan, None, 1
+            )
+        self.assertIn("2026-09-03", text)
+        self.assertIn("Authorized", text)
+        self.assertNotIn("Hidden", text)
+
+    def test_authorized_count_normalizes_redundant_calculation(self):
+        question = "Count Authorized records"
+        facts = answer.detect_semantic_facts(question, answer.ResolutionContext({}))
+        raw = dict(
+            status="ready",
+            measure=dict(name="attendance_records", evidence_text="records"),
+            calculation=dict(operation="count", evidence_text="Count"),
+            answer_contract=dict(shape="scalar", unit="records"),
+        )
+        proposal = answer.PlannerProposal.model_validate(
+            answer._overlay_authoritative_facts(raw, facts)
+        )
+        self.assertIsNone(proposal.calculation)
+        self.assertEqual(proposal.measure.name, "attendance_records")
+
+    def test_pending_percentage_normalizes_conflicting_measure(self):
+        question = (
+            "What percentage of records have Status equal to Pending For Authorization?"
+        )
+        facts = answer.detect_semantic_facts(question, answer.ResolutionContext({}))
+        condition = dict(
+            field="Status",
+            operator="eq",
+            value="Pending For Authorization",
+            evidence_text="Status equal to Pending For Authorization",
+        )
+        raw = dict(
+            status="ready",
+            measure=dict(name="attendance_records", evidence_text="records"),
+            calculation=dict(
+                operation="percentage",
+                percentage_condition=condition,
+                evidence_text="percentage",
+            ),
+            answer_contract=dict(shape="scalar", unit="percentage"),
+        )
+        proposal = answer.PlannerProposal.model_validate(
+            answer._overlay_authoritative_facts(raw, facts)
+        )
+        self.assertIsNone(proposal.measure)
+        self.assertEqual(
+            proposal.calculation.percentage_condition.value, "Pending For Authorization"
+        )
+        self.assertEqual(proposal.filters, [])
+
+    def test_real_measure_calculation_conflict_is_not_silently_discarded(self):
+        question = "Count records and average worked hours"
+        facts = answer.detect_semantic_facts(question, answer.ResolutionContext({}))
+        raw = dict(
+            status="ready",
+            measure=dict(name="attendance_records", evidence_text="records"),
+            calculation=dict(
+                operation="average", field="Total_Worked_Hrs", evidence_text="average"
+            ),
+            answer_contract=dict(shape="scalar", unit="records"),
+        )
+        prepared = answer._overlay_authoritative_facts(raw, facts)
+        self.assertIn(prepared["status"], {"unsupported", "ambiguous"})
+
+
 class TemporalCompositionRuntimeTests(unittest.TestCase):
     def test_prior_constraints_reach_retrieval_with_temporal_bound(self):
         for question, expected in (
@@ -1140,7 +1242,9 @@ class ExecutablePlanSafetyTests(unittest.TestCase):
             prepared["calculation"]["percentage_condition"]["value"], "Authorized"
         )
 
-    def test_authoritative_facts_replace_invented_constraints_for_simple_request(self):
+    def test_authoritative_facts_preserve_unrelated_choices_for_compiler_rejection(
+        self,
+    ):
         raw_proposal = {
             "status": "ready",
             "filters": [],
@@ -1196,9 +1300,19 @@ class ExecutablePlanSafetyTests(unittest.TestCase):
 
         prepared = answer._overlay_authoritative_facts(raw_proposal, facts)
 
-        self.assertIsNone(prepared["name_hint"])
-        self.assertEqual(prepared["business_predicates"], [])
+        self.assertEqual(prepared["name_hint"]["value"], "/")
+        self.assertEqual(
+            prepared["business_predicates"][0]["name"], "scheduled_working_day"
+        )
         self.assertEqual(prepared["measure"]["name"], "distinct_dates")
+        result = answer.compile_proposal(
+            answer.PlannerProposal.model_validate(prepared),
+            answer.CompilationContext(
+                "Count off days for A11017", facts, answer.ResolutionContext({})
+            ),
+        )
+        self.assertFalse(result.ready)
+        self.assertIn("ungrounded_constraint", {v.code for v in result.violations})
         self.assertEqual(
             prepared["filters"],
             [

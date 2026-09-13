@@ -6,6 +6,7 @@ from datetime import date, datetime
 from collections.abc import Iterable, Mapping
 import re
 import unicodedata
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -18,6 +19,7 @@ try:
         MEASURE_DEFINITIONS,
         RETRIEVAL_INTENT_DEFINITIONS,
         VALUE_CONCEPT_DEFINITIONS,
+        UNSUPPORTED_REQUEST_PATTERNS,
         EvidenceOrigin,
         FilterOperator,
         ResolutionKind,
@@ -31,6 +33,7 @@ except ImportError:  # Direct execution from week5/new_implementation.
         MEASURE_DEFINITIONS,
         RETRIEVAL_INTENT_DEFINITIONS,
         VALUE_CONCEPT_DEFINITIONS,
+        UNSUPPORTED_REQUEST_PATTERNS,
         EvidenceOrigin,
         FilterOperator,
         ResolutionKind,
@@ -170,6 +173,8 @@ class SemanticFact(BaseModel):
     origin: EvidenceOrigin
     strength: str
     evidence_span: tuple[int, int] | None = None
+    direction: Literal["asc", "desc"] | None = None
+    scope: Literal["population", "percentage_numerator"] = "population"
 
 
 @dataclass(frozen=True)
@@ -722,9 +727,11 @@ class TemporalResolver(FieldResolver):
             operator, phrase, operator_start = self._operator(prefix, local_field)
             evidence_start = min(
                 match.start(),
-                segment_start + operator_start
-                if operator_start is not None
-                else match.start(),
+                (
+                    segment_start + operator_start
+                    if operator_start is not None
+                    else match.start()
+                ),
                 target_span[0] if local_field else match.start(),
             )
             paired = bool(
@@ -1046,6 +1053,8 @@ def _facts_have_same_meaning(left: SemanticFact, right: SemanticFact) -> bool:
         left.values,
         left.concept_name,
         left.origin,
+        left.direction,
+        left.scope,
     ) == (
         right.kind,
         right.field,
@@ -1053,6 +1062,8 @@ def _facts_have_same_meaning(left: SemanticFact, right: SemanticFact) -> bool:
         right.values,
         right.concept_name,
         right.origin,
+        right.direction,
+        right.scope,
     )
 
 
@@ -1296,6 +1307,10 @@ def _grouping_facts(
         )
         if match is None:
             continue
+        if re.search(
+            r"\b(?:order(?:ed)?|sort(?:ed)?)\s*$", normalized_question[: match.start()]
+        ):
+            continue
         facts.append(
             SemanticFact(
                 kind="group_by",
@@ -1416,7 +1431,172 @@ def detect_semantic_facts(
             question, "semantic_intent", RETRIEVAL_INTENT_DEFINITIONS
         )
     )
-    return merge_semantic_facts(_select_longest_supported_facts(question, facts))
+    selected = list(_select_longest_supported_facts(question, facts))
+    selected = _executable_choice_facts(question, maximal_field_matches, selected)
+    return merge_semantic_facts(selected)
+
+
+def _executable_choice_facts(question, field_matches, facts):
+    """Compose executable roles from recognized fields and operation clauses."""
+    normalized = normalize_semantic_text(question)
+
+    def add(kind, evidence, **values):
+        facts.append(
+            SemanticFact(
+                kind=kind,
+                evidence_text=evidence,
+                origin="question",
+                strength="strong",
+                **values,
+            )
+        )
+
+    for capability, patterns in UNSUPPORTED_REQUEST_PATTERNS.items():
+        for pattern in patterns:
+            if match := re.search(pattern, question, re.I):
+                add("unsupported", match.group(0), concept_name=capability)
+                break
+
+    for name, definition in CALCULATION_DEFINITIONS.items():
+        matches = [
+            match
+            for pattern in definition.detection_patterns
+            if (match := re.search(pattern, question, re.I)) is not None
+        ]
+        represented = any(
+            f.kind == "calculation" and f.concept_name == name for f in facts
+        )
+        named_count = name == "sum" and any(f.kind == "measure" for f in facts)
+        if matches and not represented and not named_count:
+            add(
+                "unsupported",
+                matches[0].group(0),
+                concept_name="unsupported_calculation",
+            )
+
+    limit = re.search(r"\b(top|bottom|first|last|limit(?: to)?)\s+(\d+)\b", normalized)
+    if limit:
+        add("limit", limit.group(0), values=(float(limit.group(2)),))
+    rank = limit if limit and limit.group(1) in {"top", "bottom"} else None
+    if rank:
+        direction = "desc" if rank.group(1) == "top" else "asc"
+        if any(f.kind in {"measure", "calculation"} for f in facts):
+            add("order_by", rank.group(0), field="value", direction=direction)
+            add("ranking", rank.group(0), field="value", direction=direction)
+            tail = normalized[rank.end() :]
+            for field, phrase in field_matches:
+                if re.match(
+                    rf"\s+{re.escape(normalize_semantic_text(phrase))}s?\b", tail
+                ):
+                    add("group_by", phrase, field=field)
+
+    for field, phrase in field_matches:
+        token = re.escape(normalize_semantic_text(phrase))
+        order = re.search(
+            rf"\b(?:order(?:ed)?|sort(?:ed)?)\s+by\s+({token})\s+(ascending|descending|asc|desc)\b",
+            normalized,
+        )
+        if order:
+            direction = "asc" if order.group(2) in {"ascending", "asc"} else "desc"
+            add("order_by", order.group(0), field=field, direction=direction)
+
+    order_clause = re.search(r"\b(?:order(?:ed)?|sort(?:ed)?)\s+by\b", normalized)
+    if order_clause and not any(f.kind == "order_by" for f in facts):
+        add("unsupported", order_clause.group(0), concept_name="unsupported_constraint")
+    rank_clause = re.search(r"\b(?:rank|ranking|leaderboard)\b", normalized)
+    if rank_clause and not any(f.kind == "ranking" for f in facts):
+        add("unsupported", rank_clause.group(0), concept_name="unsupported_constraint")
+
+    projection = re.search(
+        r"\b(?:show|list|display|select)\s+(.+?)(?:\s+(?:from|for|where|with|ordered|sorted)\b|$)",
+        normalized,
+    )
+    if projection and not any(
+        f.kind in {"measure", "calculation", "group_by"} for f in facts
+    ):
+        projection_fields = [
+            (field, phrase)
+            for field, phrase in field_matches
+            if evidence_occurs(projection.group(1), phrase)
+        ]
+        remainder = projection.group(1)
+        for _, phrase in sorted(
+            projection_fields, key=lambda item: len(item[1]), reverse=True
+        ):
+            remainder = re.sub(
+                rf"\b{re.escape(normalize_semantic_text(phrase))}s?\b", " ", remainder
+            )
+        if not re.sub(r"\b(?:and|the|only)\b|\s+", "", remainder):
+            for field, phrase in projection_fields:
+                add("projection", phrase, field=field)
+        elif projection_fields and re.search(
+            r"\bfrom\b", normalized[projection.end() - 5 :]
+        ):
+            add(
+                "unsupported",
+                projection.group(1),
+                concept_name="unsupported_constraint",
+            )
+
+    percentage = next(
+        (
+            f
+            for f in facts
+            if f.kind == "calculation" and f.concept_name == "percentage"
+        ),
+        None,
+    )
+    if percentage:
+        add(
+            "percentage_denominator",
+            percentage.evidence_text,
+            field=percentage.field,
+            concept_name=next(
+                name
+                for name, definition in MEASURE_DEFINITIONS.items()
+                if definition.aggregation_field == percentage.field
+            ),
+        )
+        conditions = [f for f in facts if f.kind == "filter"]
+        predicates = [f for f in facts if f.kind == "predicate"]
+        # The language supports one numerator condition. Compound populations
+        # require an explicit future representation, never provider inference.
+        if len(conditions) == 1 and not predicates:
+            condition = conditions[0]
+            facts[facts.index(condition)] = condition.model_copy(
+                update={"scope": "percentage_numerator"}
+            )
+        elif len(predicates) == 1 and not conditions:
+            predicate = predicates[0]
+            required = BUSINESS_PREDICATE_DEFINITIONS[
+                predicate.concept_name
+            ].required_filters
+            if len(required) == 1:
+                item = required[0]
+                facts.remove(predicate)
+                add(
+                    "filter",
+                    predicate.evidence_text,
+                    field=item.field,
+                    operator=item.operator,
+                    values=(
+                        item.value if isinstance(item.value, tuple) else (item.value,)
+                    ),
+                    scope="percentage_numerator",
+                )
+            else:
+                add(
+                    "unsupported",
+                    percentage.evidence_text,
+                    concept_name="percentage_population",
+                )
+        else:
+            add(
+                "unsupported",
+                percentage.evidence_text,
+                concept_name="percentage_population",
+            )
+    return facts
 
 
 def _fact_target(fact: SemanticFact):
@@ -1427,6 +1607,8 @@ def _fact_target(fact: SemanticFact):
         fact.concept_name,
         normalize_semantic_text(fact.evidence_text),
         fact.origin,
+        fact.direction,
+        fact.scope,
     )
 
 

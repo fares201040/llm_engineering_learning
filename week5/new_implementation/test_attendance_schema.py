@@ -5,6 +5,16 @@ from pydantic import ValidationError
 
 
 class SemanticSchemaContractTests(unittest.TestCase):
+    def test_projection_is_rows_only_and_has_unique_fields(self):
+        schema = importlib.import_module("week5.new_implementation.attendance_schema")
+        for shape, projection in (("scalar", ["Date"]), ("rows", ["Date", "Date"])):
+            with self.subTest(shape=shape), self.assertRaises(ValidationError):
+                schema.PlannerProposal(
+                    status="ready",
+                    projection=[dict(field=f, evidence_text=f) for f in projection],
+                    answer_contract=dict(shape=shape, unit="value"),
+                )
+
     def test_filter_operator_controls_value_shape_at_model_boundary(self):
         schema = importlib.import_module("week5.new_implementation.attendance_schema")
         invalid = (

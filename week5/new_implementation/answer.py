@@ -629,23 +629,60 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
         for fact in strong_facts
         if fact.kind == "measure" and fact.concept_name in MEASURE_DEFINITIONS
     }
-    deterministic_complete = bool(
-        len(measure_facts) == 1
-        and any(fact.kind == "filter" for fact in strong_facts)
-        and not any(fact.kind == "semantic_intent" for fact in strong_facts)
-        and all(
-            fact.kind in {"field", "filter", "measure", "predicate"}
-            for fact in strong_facts
+    calculation_facts = {
+        (fact.concept_name, fact.field): fact
+        for fact in strong_facts
+        if fact.kind == "calculation"
+    }
+    unsupported = [fact for fact in strong_facts if fact.kind == "unsupported"]
+    if unsupported:
+        return {
+            "status": "unsupported",
+            "unsupported_capabilities": ["unsupported_constraint"],
+        }
+    if (
+        len(measure_facts) > 1
+        or len(calculation_facts) > 1
+        or (measure_facts and calculation_facts)
+    ):
+        return {
+            "status": "unsupported",
+            "unsupported_capabilities": ["multi_stage_aggregation"],
+        }
+    raw_calculation = prepared.get("calculation") or {}
+    if len(measure_facts) == 1 and raw_calculation:
+        definition = MEASURE_DEFINITIONS[next(iter(measure_facts))]
+        if (raw_calculation.get("operation"), raw_calculation.get("field")) != (
+            definition.aggregation,
+            definition.aggregation_field,
+        ):
+            return {
+                "status": "unsupported",
+                "unsupported_capabilities": ["multi_stage_aggregation"],
+            }
+    if len(calculation_facts) == 1:
+        (operation, field), fact = next(iter(calculation_facts.items()))
+        calculation = dict(raw_calculation)
+        calculation.update(
+            operation=operation, field=field, evidence_text=fact.evidence_text
         )
-    )
-    if deterministic_complete:
-        prepared.update(
-            name_hint=None,
-            group_by=[],
-            order_by=None,
-            limit=None,
-        )
-    filters = [] if deterministic_complete else list(prepared.get("filters") or [])
+        prepared["calculation"] = calculation
+        prepared["measure"] = None
+        prepared["answer_contract"] = {
+            "shape": "grouped" if prepared.get("group_by") else "scalar",
+            "unit": (
+                "percentage"
+                if operation == "percentage"
+                else (
+                    "hours"
+                    if field and FIELD_DEFINITIONS[field].storage_type == "number"
+                    else "value"
+                )
+            ),
+            "subject_field": field,
+            "grain": [field] if field else [],
+        }
+    filters = list(prepared.get("filters") or [])
     calculation = prepared.get("calculation") or {}
     nested_filters = [
         item
@@ -661,6 +698,11 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
             "value": (list(fact.values) if fact.operator == "in" else fact.values[0]),
             "evidence_text": fact.evidence_text,
         }
+        if fact.scope == "percentage_numerator":
+            if calculation.get("operation") == "percentage":
+                calculation["percentage_condition"] = authoritative
+                prepared["calculation"] = calculation
+            continue
         if not any(
             item.get("field") == fact.field
             and item.get("operator") == fact.operator
@@ -692,11 +734,7 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
             ),
         }
 
-    predicates = (
-        []
-        if deterministic_complete
-        else list(prepared.get("business_predicates") or [])
-    )
+    predicates = list(prepared.get("business_predicates") or [])
     existing_predicates = {item.get("name") for item in predicates}
     for fact in facts:
         if (
@@ -710,6 +748,31 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
             )
             existing_predicates.add(fact.concept_name)
     prepared["business_predicates"] = predicates
+    for kind in ("group_by", "projection"):
+        choices = list(prepared.get(kind) or [])
+        for fact in strong_facts:
+            if fact.kind == kind and not any(
+                item.get("field") == fact.field for item in choices
+            ):
+                choices.append(
+                    {"field": fact.field, "evidence_text": fact.evidence_text}
+                )
+        prepared[kind] = choices
+    if prepared.get("group_by") and prepared.get("answer_contract"):
+        prepared["answer_contract"]["shape"] = "grouped"
+    for kind in ("order_by", "limit"):
+        choices = [fact for fact in strong_facts if fact.kind == kind]
+        if len(choices) == 1 and not prepared.get(kind):
+            fact = choices[0]
+            prepared[kind] = (
+                {
+                    "field": fact.field,
+                    "direction": fact.direction,
+                    "evidence_text": fact.evidence_text,
+                }
+                if kind == "order_by"
+                else {"value": int(fact.values[0]), "evidence_text": fact.evidence_text}
+            )
     return prepared
 
 
@@ -843,13 +906,11 @@ def load_employee_directory_postgres():
     psycopg, dict_row = _import_psycopg()
     with psycopg.connect(POSTGRES_DSN, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                f"""
+            cur.execute(f"""
                 SELECT DISTINCT employee_id, name
                 FROM {POSTGRES_ATTENDANCE_TABLE}
                 ORDER BY name, employee_id
-                """
-            )
+                """)
             return [
                 EmployeeCandidate(
                     employee_id=row["employee_id"],
@@ -2644,9 +2705,7 @@ def _fetch_context_result(
                     outcome=(
                         "unique"
                         if len(matches) == 1
-                        else "ambiguous"
-                        if matches
-                        else "none"
+                        else "ambiguous" if matches else "none"
                     ),
                     candidates=matches,
                     reference=fact.evidence_text,
@@ -3078,6 +3137,29 @@ def _answer_from_context(
     matched_count: int | None,
 ) -> tuple[str, list[Result]]:
     started = perf_counter()
+
+    if plan.projection:
+
+        def cell(value):
+            return (
+                str(value if value is not None else "")
+                .replace("|", "\\|")
+                .replace("\n", " ")
+            )
+
+        rows = [
+            "| " + " | ".join(plan.projection) + " |",
+            "| " + " | ".join("---" for _ in plan.projection) + " |",
+        ]
+        rows.extend(
+            "| "
+            + " | ".join(cell(chunk.metadata.get(field)) for field in plan.projection)
+            + " |"
+            for chunk in chunks
+        )
+        if matched_count is not None and matched_count > len(chunks):
+            rows.append(f"\nShowing {len(chunks)} of {matched_count} matching records.")
+        return "\n".join(rows), chunks
 
     if aggregation is not None:
         deterministic_answer = _format_aggregation_answer(

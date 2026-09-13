@@ -11,7 +11,6 @@ from typing import Literal, get_args
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-
 ResolutionKind = Literal[
     "identifier",
     "entity",
@@ -29,6 +28,10 @@ UnsupportedCapability = Literal[
     "window_calculation",
     "cross_period_comparison",
     "multi_stage_aggregation",
+    "unsupported_calculation",
+    "narrative_explanation",
+    "percentage_population",
+    "unsupported_constraint",
 ]
 FilterOperator = Literal[
     "eq",
@@ -115,6 +118,7 @@ class QueryPlan(BaseModel):
     ] = "none"
     aggregation_field: str | None = None
     group_by: list[str] = Field(default_factory=list, max_length=2)
+    projection: list[str] = Field(default_factory=list)
     percentage_condition: FilterCondition | None = None
     order_by: str | None = None
     order_direction: Literal["asc", "desc"] = "desc"
@@ -123,7 +127,7 @@ class QueryPlan(BaseModel):
     business_predicates: list[BusinessPredicateName] = Field(default_factory=list)
     interpretation_candidates: list[InterpretationName] = Field(default_factory=list)
 
-    @field_validator("group_by")
+    @field_validator("group_by", "projection")
     @classmethod
     def _grouping_fields_must_be_unique(cls, value: list[str]) -> list[str]:
         if len(value) != len(set(value)):
@@ -223,6 +227,7 @@ class PlannerProposal(_StrictPlannerModel):
     business_predicates: list[ProposedPredicateChoice] = Field(default_factory=list)
     calculation: ProposedCalculation | None = None
     group_by: list[ProposedFieldChoice] = Field(default_factory=list, max_length=2)
+    projection: list[ProposedFieldChoice] = Field(default_factory=list)
     order_by: ProposedOrderChoice | None = None
     limit: ProposedLimit | None = None
     answer_contract: AnswerContract | None = None
@@ -230,7 +235,7 @@ class PlannerProposal(_StrictPlannerModel):
     unsupported_capabilities: list[UnsupportedCapability] = Field(default_factory=list)
     explanation: str | None = None
 
-    @field_validator("group_by")
+    @field_validator("group_by", "projection")
     @classmethod
     def _proposed_grouping_fields_must_be_unique(
         cls, value: list[ProposedFieldChoice]
@@ -263,6 +268,7 @@ class PlannerProposal(_StrictPlannerModel):
                 or self.business_predicates
                 or self.calculation is not None
                 or self.group_by
+                or self.projection
                 or self.order_by is not None
                 or self.limit is not None
                 or self.answer_contract is not None
@@ -274,6 +280,14 @@ class PlannerProposal(_StrictPlannerModel):
                 )
         if self.measure is not None and self.calculation is not None:
             raise ValueError("measure and calculation are mutually exclusive")
+        if self.projection and (self.measure or self.calculation or self.group_by):
+            raise ValueError("record projection cannot be combined with aggregation")
+        if (
+            self.projection
+            and self.answer_contract
+            and self.answer_contract.shape != "rows"
+        ):
+            raise ValueError("record projection requires rows answer shape")
         if self.answer_contract is not None:
             grouped = self.answer_contract.shape == "grouped"
             if grouped != bool(self.group_by):
@@ -964,6 +978,31 @@ CALCULATION_DEFINITIONS = MappingProxyType(
     }
 )
 
+
+@dataclass(frozen=True)
+class DerivedResultDefinition:
+    description: str
+    requires_grouping: bool = True
+
+
+DERIVED_RESULT_DEFINITIONS = MappingProxyType(
+    {
+        "value": DerivedResultDefinition("The typed aggregate result for each group."),
+    }
+)
+
+UNSUPPORTED_REQUEST_PATTERNS = MappingProxyType(
+    {
+        "nested_boolean_filters": (r"\bor\b", r"\bnot\s*\("),
+        "unsupported_calculation": (
+            r"\b(?:median|percentile|standard deviation|variance)\b",
+        ),
+        "narrative_explanation": (
+            r"\b(?:explain why|why did|why were|recommend|predict|forecast)\b",
+        ),
+    }
+)
+
 VALUE_CONCEPT_DEFINITIONS = MappingProxyType(
     {
         "off_day": ValueConceptDefinition(
@@ -1093,6 +1132,15 @@ def render_planner_schema() -> str:
                 "default_answer_shape": definition.default_answer_shape,
             }
             for name, definition in _named_registry_items(MEASURE_DEFINITIONS)
+        ],
+        "derived_results": [
+            {
+                "name": name,
+                "description": definition.description,
+                "role": "order_by",
+                "requires_grouping": definition.requires_grouping,
+            }
+            for name, definition in DERIVED_RESULT_DEFINITIONS.items()
         ],
         "calculations": [
             {

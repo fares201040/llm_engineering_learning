@@ -13,11 +13,212 @@ from week5.new_implementation.plan_compiler import (
     PLAN_INVARIANTS,
     CompilationContext,
     compile_proposal,
+    revalidate_executable_plan,
 )
 from week5.new_implementation.semantic_resolution import (
     ResolutionContext,
+    SemanticFact,
     detect_semantic_facts,
 )
+
+
+class ExecutableChoiceCoverageTests(unittest.TestCase):
+    def test_unbound_calculation_cannot_disappear_from_request(self):
+        for question in (
+            "Calculate average attendance records",
+            "What percentage have Status equal to Authorized?",
+        ):
+            with self.subTest(question=question):
+                result = self.compile(
+                    question, answer_contract=dict(shape="rows", unit="value")
+                )
+                self.assertFalse(result.ready)
+                self.assertIn(
+                    "unsupported_capability", {v.code for v in result.violations}
+                )
+
+    def test_unresolved_executable_clauses_do_not_compile_empty_rows(self):
+        for question in (
+            "Show records ordered by Date",
+            "Show Date and Salary from records",
+            "Rank Departments by attendance",
+        ):
+            with self.subTest(question=question):
+                result = self.compile(
+                    question, answer_contract=dict(shape="rows", unit="value")
+                )
+                self.assertFalse(result.ready)
+                self.assertIn(
+                    "unsupported_capability", {v.code for v in result.violations}
+                )
+
+    def test_explicit_order_and_direction_compile(self):
+        result = self.compile(
+            "Show records ordered by Date ascending",
+            order_by=dict(
+                field="Date", direction="asc", evidence_text="Date ascending"
+            ),
+            answer_contract=dict(shape="rows", unit="value"),
+        )
+        self.assertTrue(result.ready, result.violations)
+
+    def test_revalidation_rejects_changed_executable_order_direction(self):
+        question = "Show records ordered by Date ascending"
+        resolution = ResolutionContext({})
+        context = CompilationContext(
+            question,
+            (
+                SemanticFact(
+                    kind="order_by",
+                    field="Date",
+                    direction="asc",
+                    evidence_text="Date ascending",
+                    origin="question",
+                    strength="strong",
+                ),
+            ),
+            resolution,
+        )
+        proposal = PlannerProposal.model_validate(
+            dict(
+                status="ready",
+                order_by=dict(
+                    field="Date", direction="asc", evidence_text="Date ascending"
+                ),
+                answer_contract=dict(shape="rows", unit="value"),
+            )
+        )
+        result = compile_proposal(proposal, context)
+        self.assertTrue(result.ready, result.violations)
+        changed = result.executable_plan.model_copy(update={"order_direction": "desc"})
+        checked = revalidate_executable_plan(changed, context, result.provenance)
+        self.assertFalse(checked.ready)
+
+    def test_narrative_contract_cannot_execute_structured_subset(self):
+        result = self.compile(
+            "Count records",
+            measure=dict(name="attendance_records", evidence_text="records"),
+            answer_contract=dict(shape="narrative", unit="records"),
+        )
+        self.assertFalse(result.ready)
+
+    def test_arbitrary_field_cannot_become_percentage_denominator(self):
+        result = self.compile(
+            "What percentage of records have Status equal to Authorized?",
+            calculation=dict(
+                operation="percentage",
+                field="Department",
+                evidence_text="percentage",
+                percentage_condition=dict(
+                    field="Status",
+                    operator="eq",
+                    value="Authorized",
+                    evidence_text="Authorized",
+                ),
+            ),
+            answer_contract=dict(
+                shape="scalar", unit="percentage", subject_field="Department"
+            ),
+        )
+        self.assertFalse(result.ready)
+
+    def compile(self, question, **choices):
+        resolution = ResolutionContext({})
+        proposal = PlannerProposal.model_validate(dict(status="ready", **choices))
+        return compile_proposal(
+            proposal,
+            CompilationContext(
+                question, detect_semantic_facts(question, resolution), resolution
+            ),
+        )
+
+    def test_field_mention_does_not_authorize_grouping(self):
+        result = self.compile(
+            "Count records with Department equal to Finance",
+            measure=dict(name="attendance_records", evidence_text="records"),
+            group_by=[dict(field="Department", evidence_text="Department")],
+            answer_contract=dict(shape="grouped", unit="records"),
+        )
+        self.assertIn("ungrounded_constraint", {v.code for v in result.violations})
+
+    def test_order_direction_must_match_request(self):
+        result = self.compile(
+            "Show records ordered by Date ascending",
+            order_by=dict(
+                field="Date", direction="desc", evidence_text="Date ascending"
+            ),
+            answer_contract=dict(shape="rows", unit="value"),
+        )
+        self.assertFalse(result.ready)
+
+    def test_grouped_ranking_has_grounded_derived_order_and_limit(self):
+        result = self.compile(
+            "Top 3 Departments by count of records",
+            measure=dict(name="attendance_records", evidence_text="records"),
+            group_by=[dict(field="Department", evidence_text="Departments")],
+            order_by=dict(field="value", direction="desc", evidence_text="Top 3"),
+            limit=dict(value=3, evidence_text="Top 3"),
+            answer_contract=dict(shape="grouped", unit="records"),
+        )
+        self.assertTrue(result.ready, result.violations)
+        self.assertEqual(result.executable_plan.order_by, "value")
+
+    def test_record_projection_is_preserved(self):
+        result = self.compile(
+            "Show Date and Status from records",
+            projection=[
+                dict(field="Date", evidence_text="Date"),
+                dict(field="Status", evidence_text="Status"),
+            ],
+            answer_contract=dict(shape="rows", unit="value"),
+        )
+        self.assertTrue(result.ready, result.violations)
+        self.assertEqual(result.executable_plan.projection, ["Date", "Status"])
+
+    def test_omitted_requested_projection_and_limit_are_rejected(self):
+        for question in ("Show Date and Status from records", "Show first 3 records"):
+            with self.subTest(question=question):
+                result = self.compile(
+                    question, answer_contract=dict(shape="rows", unit="value")
+                )
+                self.assertFalse(result.ready)
+                self.assertIn("uncovered_fact", {v.code for v in result.violations})
+
+    def test_percentage_numerator_cannot_become_denominator_filter(self):
+        condition = dict(
+            field="Status",
+            operator="eq",
+            value="Authorized",
+            evidence_text="Status equal to Authorized",
+        )
+        result = self.compile(
+            "What percentage of records have Status equal to Authorized?",
+            filters=[condition],
+            calculation=dict(
+                operation="percentage",
+                evidence_text="percentage",
+                percentage_condition=condition,
+            ),
+            answer_contract=dict(shape="scalar", unit="percentage"),
+        )
+        self.assertFalse(result.ready)
+
+    def test_partial_boolean_calculation_and_narrative_are_rejected(self):
+        for question in (
+            "Count records where Status is Authorized or Date is 2026-09-03",
+            "Count records and calculate median worked hours",
+            "Count records and explain why employees were absent",
+        ):
+            with self.subTest(question=question):
+                result = self.compile(
+                    question,
+                    measure=dict(name="attendance_records", evidence_text="records"),
+                    answer_contract=dict(shape="scalar", unit="records"),
+                )
+                self.assertFalse(result.ready)
+                self.assertIn(
+                    "unsupported_capability", {v.code for v in result.violations}
+                )
 
 
 class TemporalCompositionCompilerTests(unittest.TestCase):
@@ -458,6 +659,7 @@ class PlanCompilerTests(unittest.TestCase):
                 "ContradictionInvariant",
                 "AnswerContractInvariant",
                 "CapabilityInvariant",
+                "ExecutableChoiceInvariant",
             ],
         )
 

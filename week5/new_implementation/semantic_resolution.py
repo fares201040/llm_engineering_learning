@@ -450,7 +450,11 @@ class EntityResolver(FieldResolver):
             r"\b(?P<name>[^\W\d_][\w'-]*(?:\s+[^\W\d_][\w'-]*)*)['’]s\b", question
         ):
             name = match.group("name")
-            command = re.match(r"(?:count|show|list|find|summarize)\s+", name, re.I)
+            command = re.match(
+                r"(?:(?:what|how)\s+(?:is|are|was|were)|count|show|list|find|summarize)\s+",
+                name,
+                re.I,
+            )
             syntax_spans.append(
                 (
                     match.start("name") + (command.end() if command else 0),
@@ -458,7 +462,7 @@ class EntityResolver(FieldResolver):
                 )
             )
         for match in re.finditer(
-            r"\b(?:for|did|named)\s+(?P<name>[^\W\d_][\w'-]*(?:\s+[^\W\d_][\w'-]*)*)",
+            r"\b(?:for|did|does|do|named|belong(?:s)?\s+to)\s+(?P<name>[^\W\d_][\w'-]*(?:\s+[^\W\d_][\w'-]*)*)",
             question,
             re.I,
         ):
@@ -1290,10 +1294,19 @@ def _calculation_facts(
             continue
         evidence = min(matches, key=lambda match: match.start()).group(0)
         if name == "percentage":
+            population_text = question[
+                min(matches, key=lambda match: match.start()).end() :
+            ]
+            population_text = re.split(
+                r"\b(?:have|has|with|where|that|are|were|is)\b",
+                population_text,
+                maxsplit=1,
+                flags=re.I,
+            )[0]
             subjects = []
             for measure in MEASURE_DEFINITIONS.values():
                 if any(
-                    evidence_occurs(question, phrase)
+                    evidence_occurs(population_text, phrase)
                     for phrase in measure.natural_names
                 ):
                     subjects.append(measure.aggregation_field)
@@ -1499,7 +1512,17 @@ def _executable_choice_facts(question, field_matches, facts, *, original_questio
             f.kind == "calculation" and f.concept_name == name for f in facts
         )
         named_count = name == "sum" and all(
-            any(
+            (
+                normalize_semantic_text(match.group(0)) in {"combined", "total"}
+                and any(f.kind == "measure" for f in facts)
+                and not any(
+                    f.kind == "field"
+                    and f.field in FIELD_DEFINITIONS
+                    and FIELD_DEFINITIONS[f.field].storage_type == "number"
+                    for f in facts
+                )
+            )
+            or any(
                 re.match(
                     rf"^(?:of\s+)?(?:the\s+)?{re.escape(form)}\b",
                     normalize_semantic_text(question[match.end() :]),
@@ -1721,6 +1744,10 @@ def _executable_choice_facts(question, field_matches, facts, *, original_questio
                 percentage.evidence_text,
                 concept_name="percentage_population",
             )
+    if not any(f.kind in {"measure", "calculation", "semantic_intent"} for f in facts):
+        row_request = re.search(r"\b(?:show|list|display|select)\b", normalized)
+        if row_request:
+            add("result_shape", row_request.group(0), concept_name="rows")
     return facts
 
 

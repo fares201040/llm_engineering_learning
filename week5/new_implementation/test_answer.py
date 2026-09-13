@@ -288,6 +288,292 @@ class RetrievalBoundaryTests(unittest.TestCase):
 
 
 class ProposalOperationNormalizationTests(unittest.TestCase):
+    def test_global_complete_facts_remove_only_default_interpretation_ambiguity(self):
+        for question in (
+            "Find unusual attendance records",
+            "What is total overtime?",
+            "What percentage of records are Authorized?",
+        ):
+            with self.subTest(question=question):
+                resolution = answer.ResolutionContext({})
+                facts = answer.detect_semantic_facts(question, resolution)
+                raw = dict(
+                    status="ambiguous",
+                    interpretation_candidates=["worked_days", "scheduled_working_days"],
+                )
+                proposal = answer.PlannerProposal.model_validate(
+                    answer._overlay_authoritative_facts(raw, facts)
+                )
+                result = answer.compile_proposal(
+                    proposal, answer.CompilationContext(question, facts, resolution)
+                )
+                self.assertTrue(result.ready, result.violations)
+
+    def test_entity_and_incomplete_interpretation_ambiguity_are_preserved(self):
+        for question in (
+            "Find unusual attendance records for Rowan",
+            "What percentage of records?",
+            "How many attendance days were there?",
+        ):
+            with self.subTest(question=question):
+                facts = answer.detect_semantic_facts(
+                    question, answer.ResolutionContext({})
+                )
+                raw = dict(
+                    status="ambiguous",
+                    interpretation_candidates=["worked_days", "scheduled_working_days"],
+                )
+                proposal = answer.PlannerProposal.model_validate(
+                    answer._overlay_authoritative_facts(raw, facts)
+                )
+                self.assertEqual(proposal.status, "ambiguous")
+                self.assertEqual(
+                    proposal.interpretation_candidates, raw["interpretation_candidates"]
+                )
+
+    def test_employee_measure_is_a_qualifier_for_a_grounded_scoped_sum(self):
+        question = "What is total worked hours for A10001?"
+        resolution = answer.ResolutionContext({})
+        facts = answer.detect_semantic_facts(question, resolution)
+        raw = dict(
+            status="ready",
+            measure=dict(name="employees", evidence_text="A10001"),
+            calculation=dict(
+                operation="sum",
+                field="Total_Worked_Hrs",
+                evidence_text="total worked hours",
+            ),
+            answer_contract=dict(
+                shape="scalar", unit="hours", subject_field="Total_Worked_Hrs"
+            ),
+        )
+        proposal = answer.PlannerProposal.model_validate(
+            answer._overlay_authoritative_facts(raw, facts)
+        )
+        result = answer.compile_proposal(
+            proposal, answer.CompilationContext(question, facts, resolution)
+        )
+        self.assertTrue(result.ready, result.violations)
+        self.assertEqual(result.executable_plan.aggregation, "sum")
+        self.assertIsNone(result.executable_plan.measure)
+
+    def test_distinct_count_default_cannot_replace_registered_narrative_intent(self):
+        question = "Which employees show unusual attendance patterns?"
+        resolution = answer.ResolutionContext({})
+        facts = answer.detect_semantic_facts(question, resolution)
+        raw = dict(
+            status="ready",
+            measure=dict(name="employees", evidence_text="employees"),
+            calculation=dict(
+                operation="distinct_count",
+                field="Employee_ID",
+                evidence_text="employees",
+            ),
+            answer_contract=dict(
+                shape="scalar", unit="employees", subject_field="Employee_ID"
+            ),
+        )
+        proposal = answer.PlannerProposal.model_validate(
+            answer._overlay_authoritative_facts(raw, facts)
+        )
+        result = answer.compile_proposal(
+            proposal, answer.CompilationContext(question, facts, resolution)
+        )
+        self.assertTrue(result.ready, result.violations)
+        self.assertEqual(result.executable_plan.mode, "semantic")
+        self.assertEqual(result.executable_plan.answer_contract.shape, "narrative")
+
+    def test_registered_narrative_intent_corrects_only_narrative_capability_default(
+        self,
+    ):
+        question = "Find unusual attendance records"
+        resolution = answer.ResolutionContext({})
+        facts = answer.detect_semantic_facts(question, resolution)
+        for capability, ready in (
+            ("narrative_explanation", True),
+            ("nested_boolean_filters", False),
+        ):
+            with self.subTest(capability=capability):
+                raw = dict(status="unsupported", unsupported_capabilities=[capability])
+                proposal = answer.PlannerProposal.model_validate(
+                    answer._overlay_authoritative_facts(raw, facts)
+                )
+                result = answer.compile_proposal(
+                    proposal, answer.CompilationContext(question, facts, resolution)
+                )
+                self.assertEqual(result.ready, ready, result.violations)
+
+    def test_percentage_predicate_duplicate_is_only_a_numerator(self):
+        question = "What percentage of records are Authorized?"
+        resolution = answer.ResolutionContext({})
+        facts = answer.detect_semantic_facts(question, resolution)
+        raw = dict(
+            status="ready",
+            calculation=dict(
+                operation="percentage",
+                evidence_text="percentage",
+                percentage_condition=dict(
+                    field="Status",
+                    operator="eq",
+                    value="Authorized",
+                    evidence_text="Authorized",
+                ),
+            ),
+            business_predicates=[dict(name="authorized", evidence_text="Authorized")],
+            answer_contract=dict(shape="scalar", unit="percentage"),
+        )
+        proposal = answer.PlannerProposal.model_validate(
+            answer._overlay_authoritative_facts(raw, facts)
+        )
+        result = answer.compile_proposal(
+            proposal, answer.CompilationContext(question, facts, resolution)
+        )
+        self.assertTrue(result.ready, result.violations)
+        self.assertEqual(result.executable_plan.filters, [])
+
+    def test_generic_provider_count_cannot_replace_grounded_operation(self):
+        for question, operation, field, shape in (
+            ("How many dates were worked?", "distinct_count", "Date", "scalar"),
+            ("What is total overtime?", "sum", "Total_OT", "scalar"),
+            ("Show attendance on 2026-09-01", "none", None, "rows"),
+            ("Find unusual attendance records", "none", None, "narrative"),
+        ):
+            with self.subTest(question=question):
+                resolution = answer.ResolutionContext({})
+                facts = answer.detect_semantic_facts(question, resolution)
+                raw = dict(
+                    status="ready",
+                    measure=dict(name="attendance_records", evidence_text=question),
+                    calculation=dict(
+                        operation="count", field=None, evidence_text=question
+                    ),
+                    answer_contract=dict(shape="scalar", unit="records"),
+                )
+                proposal = answer.PlannerProposal.model_validate(
+                    answer._overlay_authoritative_facts(raw, facts)
+                )
+                result = answer.compile_proposal(
+                    proposal, answer.CompilationContext(question, facts, resolution)
+                )
+                self.assertTrue(result.ready, result.violations)
+                plan = result.executable_plan
+                self.assertEqual(
+                    (
+                        plan.aggregation,
+                        plan.aggregation_field,
+                        plan.answer_contract.shape,
+                    ),
+                    (operation, field, shape),
+                )
+
+    def test_group_field_projection_is_redundant_with_grouped_result(self):
+        question = "Count attendance records by department"
+        resolution = answer.ResolutionContext({})
+        facts = answer.detect_semantic_facts(question, resolution)
+        raw = dict(
+            status="ready",
+            measure=dict(name="attendance_records", evidence_text="records"),
+            calculation=dict(operation="count", evidence_text="Count"),
+            group_by=[dict(field="Department", evidence_text="by department")],
+            projection=[dict(field="Department", evidence_text="department")],
+            answer_contract=dict(shape="scalar", unit="records"),
+        )
+        proposal = answer.PlannerProposal.model_validate(
+            answer._overlay_authoritative_facts(raw, facts)
+        )
+        result = answer.compile_proposal(
+            proposal, answer.CompilationContext(question, facts, resolution)
+        )
+        self.assertTrue(result.ready, result.violations)
+        self.assertEqual(result.executable_plan.answer_contract.grain, ["Department"])
+        self.assertEqual(result.executable_plan.projection, [])
+
+    def test_grouped_measure_subject_projection_is_redundant_with_contract(self):
+        question = "How many distinct employees are in each department?"
+        resolution = answer.ResolutionContext({})
+        facts = answer.detect_semantic_facts(question, resolution)
+        raw = dict(
+            status="ready",
+            measure=dict(name="employees", evidence_text="employees"),
+            calculation=dict(
+                operation="distinct_count",
+                field="Employee_ID",
+                evidence_text="distinct employees",
+            ),
+            group_by=[dict(field="Department", evidence_text="each department")],
+            projection=[
+                dict(field="Employee_ID", evidence_text="employees"),
+                dict(field="Department", evidence_text="department"),
+            ],
+            answer_contract=dict(
+                shape="scalar", unit="employees", subject_field="Employee_ID"
+            ),
+        )
+        proposal = answer.PlannerProposal.model_validate(
+            answer._overlay_authoritative_facts(raw, facts)
+        )
+        result = answer.compile_proposal(
+            proposal, answer.CompilationContext(question, facts, resolution)
+        )
+        self.assertTrue(result.ready, result.violations)
+        self.assertEqual(result.executable_plan.projection, [])
+        self.assertEqual(
+            result.executable_plan.answer_contract.grain, ["Department", "Employee_ID"]
+        )
+
+    def test_percentage_duplicate_numerator_does_not_narrow_population(self):
+        question = "What percentage of all records have Status equal to Authorized?"
+        resolution = answer.ResolutionContext({})
+        facts = answer.detect_semantic_facts(question, resolution)
+        condition = dict(
+            field="Status",
+            operator="eq",
+            value="Authorized",
+            evidence_text="Status equal to Authorized",
+        )
+        raw = dict(
+            status="ready",
+            measure=dict(name="attendance_records", evidence_text="records"),
+            calculation=dict(
+                operation="percentage",
+                evidence_text="percentage",
+                percentage_condition=condition,
+            ),
+            filters=[condition],
+            answer_contract=dict(shape="scalar", unit="percentage"),
+        )
+        proposal = answer.PlannerProposal.model_validate(
+            answer._overlay_authoritative_facts(raw, facts)
+        )
+        result = answer.compile_proposal(
+            proposal, answer.CompilationContext(question, facts, resolution)
+        )
+        self.assertTrue(result.ready, result.violations)
+        self.assertEqual(result.executable_plan.filters, [])
+        self.assertEqual(
+            result.executable_plan.percentage_condition.value, "Authorized"
+        )
+
+    def test_provider_absent_predicate_is_not_discarded_on_authorized_request(self):
+        question = "Count Authorized records"
+        resolution = answer.ResolutionContext({})
+        facts = answer.detect_semantic_facts(question, resolution)
+        raw = dict(
+            status="ready",
+            measure=dict(name="attendance_records", evidence_text="records"),
+            calculation=dict(operation="count", evidence_text="Count"),
+            business_predicates=[dict(name="absent", evidence_text="Authorized")],
+            answer_contract=dict(shape="scalar", unit="records"),
+        )
+        proposal = answer.PlannerProposal.model_validate(
+            answer._overlay_authoritative_facts(raw, facts)
+        )
+        result = answer.compile_proposal(
+            proposal, answer.CompilationContext(question, facts, resolution)
+        )
+        self.assertFalse(result.ready)
+        self.assertIn("ungrounded_constraint", {v.code for v in result.violations})
+
     def test_percentage_rejects_different_provider_population_measure(self):
         question = "What percentage of records have Status equal to Authorized?"
         facts = answer.detect_semantic_facts(question, answer.ResolutionContext({}))

@@ -35,6 +35,7 @@ try:
         FilterCondition,
         LOCAL_DEMO_ACCESS,
         QueryPlan,
+        RETRIEVAL_INTENT_DEFINITIONS,
         VALUE_CONCEPT_DEFINITIONS,
         ExecutableQueryPlan,
         effective_grouping_fields,
@@ -91,6 +92,7 @@ except ImportError:  # Running answer.py directly from its directory.
         FilterCondition,
         LOCAL_DEMO_ACCESS,
         QueryPlan,
+        RETRIEVAL_INTENT_DEFINITIONS,
         VALUE_CONCEPT_DEFINITIONS,
         ExecutableQueryPlan,
         effective_grouping_fields,
@@ -626,9 +628,6 @@ Return unsupported with controlled capability identifiers when the typed proposa
 def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, ...]):
     """Ensure independently detected strong facts survive an untrusted proposal."""
     prepared = dict(raw_proposal)
-    if prepared.get("status") != "ready":
-        return prepared
-
     strong_facts = tuple(fact for fact in facts if fact.strength == "strong")
     measure_facts = {
         fact.concept_name: fact
@@ -641,6 +640,36 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
         if fact.kind == "calculation"
     }
     unsupported = [fact for fact in strong_facts if fact.kind == "unsupported"]
+    grounded_narrative = any(
+        fact.kind == "semantic_intent"
+        and fact.concept_name in RETRIEVAL_INTENT_DEFINITIONS
+        for fact in strong_facts
+    )
+    complete_calculation = len(calculation_facts) == 1 and (
+        next(iter(calculation_facts))[0] != "percentage"
+        or any(fact.scope == "percentage_numerator" for fact in strong_facts)
+    )
+    if (
+        prepared.get("status") == "ambiguous"
+        and not (measure_facts or unsupported)
+        and (complete_calculation or (grounded_narrative and not calculation_facts))
+        and not any(
+            fact.kind == "entity" or fact.strength != "strong" for fact in facts
+        )
+    ):
+        # Only a fully specified global operation can disprove a provider's
+        # default interpretation menu. Entity and unresolved scope facts survive.
+        prepared.update(status="ready", interpretation_candidates=[])
+    if (
+        prepared.get("status") == "unsupported"
+        and set(prepared.get("unsupported_capabilities") or [])
+        == {"narrative_explanation"}
+        and grounded_narrative
+        and not (measure_facts or calculation_facts or unsupported)
+    ):
+        prepared.update(status="ready", unsupported_capabilities=[])
+    if prepared.get("status") != "ready":
+        return prepared
     if unsupported:
         return {
             "status": "unsupported",
@@ -656,6 +685,46 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
             "unsupported_capabilities": ["multi_stage_aggregation"],
         }
     raw_calculation = prepared.get("calculation") or {}
+    raw_measure = prepared.get("measure") or {}
+    requested_shape = next(
+        (fact.concept_name for fact in strong_facts if fact.kind == "result_shape"),
+        "narrative" if grounded_narrative else None,
+    )
+    nonaggregate_shape = requested_shape is not None and not (
+        measure_facts or calculation_facts
+    )
+    generic_count = (
+        raw_calculation.get("operation") == "count"
+        and raw_calculation.get("field") is None
+        and raw_calculation.get("percentage_condition") is None
+    )
+    raw_definition = MEASURE_DEFINITIONS.get(raw_measure.get("name"))
+    nonaggregate_count = (
+        nonaggregate_shape
+        and raw_definition is not None
+        and raw_definition.aggregation in {"count", "distinct_count"}
+        and (raw_calculation.get("operation"), raw_calculation.get("field"))
+        == (raw_definition.aggregation, raw_definition.aggregation_field)
+    )
+    if nonaggregate_count or (
+        generic_count and (measure_facts or calculation_facts or nonaggregate_shape)
+    ):
+        # A fieldless provider count is a redundant default when the request
+        # already grounds the complete operation or an explicit nonaggregate shape.
+        prepared["calculation"] = None
+        raw_calculation = {}
+    if nonaggregate_count or (
+        raw_measure.get("name") == "attendance_records"
+        and (calculation_facts or nonaggregate_shape)
+    ):
+        prepared["measure"] = None
+    if nonaggregate_shape:
+        prepared["answer_contract"] = {
+            "shape": requested_shape,
+            "unit": "value",
+            "subject_field": None,
+            "grain": [],
+        }
     if len(measure_facts) == 1 and raw_calculation:
         definition = MEASURE_DEFINITIONS[next(iter(measure_facts))]
         if (raw_calculation.get("operation"), raw_calculation.get("field")) != (
@@ -676,7 +745,20 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
                 == (operation, field)
                 or (operation == "percentage" and definition.aggregation_field == field)
             )
-            if not equivalent:
+            scoped_subject = (
+                operation != "percentage"
+                and definition is not None
+                and definition.aggregation == "distinct_count"
+                and (raw_calculation.get("operation"), raw_calculation.get("field"))
+                == (operation, field)
+                and any(
+                    item.kind == "filter"
+                    and item.field == definition.aggregation_field
+                    and item.scope != "percentage_numerator"
+                    for item in strong_facts
+                )
+            )
+            if not (equivalent or scoped_subject):
                 return {
                     "status": "unsupported",
                     "unsupported_capabilities": ["multi_stage_aggregation"],
@@ -719,6 +801,14 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
             if calculation.get("operation") == "percentage":
                 calculation["percentage_condition"] = authoritative
                 prepared["calculation"] = calculation
+                filters = [
+                    item
+                    for item in filters
+                    if not all(
+                        item.get(key) == authoritative[key]
+                        for key in ("field", "operator", "value")
+                    )
+                ]
             continue
         if not any(
             item.get("field") == fact.field
@@ -752,6 +842,27 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
         }
 
     predicates = list(prepared.get("business_predicates") or [])
+    numerator_conditions = {
+        (fact.field, fact.operator, tuple(fact.values))
+        for fact in strong_facts
+        if fact.kind == "filter" and fact.scope == "percentage_numerator"
+    }
+    if calculation.get("operation") == "percentage" and numerator_conditions:
+        predicates = [
+            item
+            for item in predicates
+            if item.get("name") not in BUSINESS_PREDICATE_DEFINITIONS
+            or any(
+                fact.kind == "predicate" and fact.concept_name == item.get("name")
+                for fact in strong_facts
+            )
+            or not {
+                (condition.field, condition.operator, (condition.value,))
+                for condition in BUSINESS_PREDICATE_DEFINITIONS[
+                    item["name"]
+                ].required_filters
+            }.issubset(numerator_conditions)
+        ]
     existing_predicates = {item.get("name") for item in predicates}
     for fact in facts:
         if (
@@ -775,6 +886,22 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
                     {"field": fact.field, "evidence_text": fact.evidence_text}
                 )
         prepared[kind] = choices
+    grounded_groups = {fact.field for fact in strong_facts if fact.kind == "group_by"}
+    if (measure_facts or calculation_facts) and grounded_groups:
+        intrinsic_fields = (
+            grounded_groups
+            | {MEASURE_DEFINITIONS[name].aggregation_field for name in measure_facts}
+            | {field for _, field in calculation_facts}
+        )
+        prepared["projection"] = [
+            choice
+            for choice in prepared["projection"]
+            if choice.get("field") not in intrinsic_fields
+            or any(
+                fact.kind == "projection" and fact.field == choice.get("field")
+                for fact in strong_facts
+            )
+        ]
     if prepared.get("group_by") and prepared.get("answer_contract"):
         prepared["answer_contract"]["shape"] = "grouped"
         subject = prepared["answer_contract"].get("subject_field")

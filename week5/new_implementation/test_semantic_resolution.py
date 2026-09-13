@@ -14,6 +14,65 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class BaselineOrderingGrammarTests(unittest.TestCase):
+    def test_question_verb_prefix_is_not_part_of_possessive_employee_name(self):
+        facts = detect_semantic_facts(
+            "What were Morgan River's total worked hours?", ResolutionContext({})
+        )
+        self.assertEqual(
+            [
+                f.evidence_text
+                for f in facts
+                if f.kind == "entity" and f.field == "Name"
+            ],
+            ["Morgan River"],
+        )
+
+    def test_subject_relation_grammar_masks_employee_concept_words(self):
+        for question in (
+            "How many Authorized records does Absent River have?",
+            "Count Authorized records that belong to Absent River",
+        ):
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(question, ResolutionContext({}))
+                self.assertEqual(
+                    [
+                        f.evidence_text
+                        for f in facts
+                        if f.kind == "entity" and f.field == "Name"
+                    ],
+                    ["Absent River"],
+                )
+                self.assertEqual(
+                    {f.concept_name for f in facts if f.kind == "predicate"},
+                    {"authorized"},
+                )
+
+    def test_combined_count_population_is_not_an_extra_numeric_sum(self):
+        facts = detect_semantic_facts(
+            "How many attendance records belong to employees A10001 and A10002 combined?",
+            ResolutionContext({}),
+        )
+        self.assertFalse([f for f in facts if f.kind == "unsupported"], facts)
+        self.assertEqual(
+            {f.concept_name for f in facts if f.kind == "measure"},
+            {"attendance_records"},
+        )
+
+    def test_percentage_population_ignores_day_word_in_numerator(self):
+        facts = detect_semantic_facts(
+            "What percentage of all attendance records have Day Type equal to Working Day?",
+            ResolutionContext({}),
+        )
+        self.assertIn(
+            ("calculation", "percentage", None),
+            {(f.kind, f.concept_name, f.field) for f in facts},
+        )
+        self.assertIn(
+            ("Day_Type", "percentage_numerator"),
+            {(f.field, f.scope) for f in facts if f.kind == "filter"},
+        )
+        self.assertFalse([f for f in facts if f.kind == "unsupported"], facts)
+
     def test_temporal_superlatives_derive_date_order_and_explicit_limit(self):
         for phrase, direction in (("latest", "desc"), ("earliest", "asc")):
             facts = detect_semantic_facts(

@@ -514,6 +514,14 @@ def _resolve_complete_operand(question, field, operator, span, context):
         if lo == hi:
             return None
         raw = question[lo:hi]
+        if FIELD_DEFINITIONS[field].resolution_kind == "identifier" and not any(
+            fact.kind == "filter"
+            and fact.field == field
+            and fact.strength == "strong"
+            and fact.evidence_text == raw
+            for fact in registry.for_kind("identifier").detect(raw, field, context)
+        ):
+            return None
         result = registry.canonicalize(field, raw, raw, context, operator=operator)
         if result.status == "resolved" and len(result.values) == 1:
             return result.values[0], (lo, hi)
@@ -609,10 +617,9 @@ def _clause_operand_ends(question, start, fields, context, field, operator, cach
         recognized, next_operator, operand_start = _operator_prefix(
             question, field_end, len(question), next_field
         )
-        if (
-            not recognized
-            or next_operator not in FIELD_DEFINITIONS[next_field].operators
-        ):
+        if not recognized:
+            next_operator, operand_start = "eq", field_end
+        if next_operator not in FIELD_DEFINITIONS[next_field].operators:
             continue
         suffix_ends = _clause_operand_ends(
             question, operand_start, fields, context, next_field, next_operator, cache

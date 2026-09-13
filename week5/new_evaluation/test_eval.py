@@ -20,6 +20,105 @@ PRIVATE_FIXTURES_AVAILABLE = (
 
 
 class BaselineCapabilityParityTests(unittest.TestCase):
+    def test_implicit_typed_suffixes_execute_the_same_constraints_as_explicit_eq(self):
+        catalog = {
+            "Department": ("Sales", "Sales and Job Services", "Support"),
+            "Position": ("Engineer", "Officer"),
+        }
+        for department in ("Sales", "Sales and Job Services"):
+            for row, location, position in zip(
+                self.rows,
+                (department, department, "Support", department, department),
+                ("Engineer", "Officer", "Engineer", "Engineer", "Officer"),
+            ):
+                row.update(Department=location, Position=position)
+            for field, operand, expected, count in (
+                ("Position", "Engineer", "Engineer", 2),
+                ("Status", "Authorized", "Authorized", 3),
+                ("Day_Type", "Working Day", "Working Day", 3),
+                ("Employee_ID", "A10001", "A10001", 2),
+                ("Date", "2026-09-01", "2026-09-01", 2),
+                ("Total_OT", "2", 2.0, 1),
+            ):
+                for introducer in ("", "where "):
+                    for operator_text in ("", "equals "):
+                        field_phrase = (
+                            "overtime"
+                            if field == "Total_OT"
+                            else field.replace("_", " ")
+                        )
+                        with self.subTest(
+                            department=department,
+                            field=field,
+                            introducer=introducer,
+                            operator_text=operator_text,
+                        ):
+                            with patch.object(
+                                self.answer,
+                                "load_attendance_catalog_candidates",
+                                return_value=catalog,
+                            ):
+                                _, plan, result, _ = self.answer.fetch_context(
+                                    f"Count records {introducer}Department equals {department} and {field_phrase} {operator_text}{operand}"
+                                )
+                            self.assertEqual(result["value"], count)
+                            condition = next(
+                                item for item in plan.filters if item.field == field
+                            )
+                            self.assertEqual(
+                                (condition.operator, condition.value), ("eq", expected)
+                            )
+                            self.assertEqual(
+                                next(
+                                    item.value
+                                    for item in plan.filters
+                                    if item.field == "Department"
+                                ),
+                                department,
+                            )
+            with patch.object(
+                self.answer, "load_attendance_catalog_candidates", return_value=catalog
+            ):
+                _, plan, result, _ = self.answer.fetch_context(
+                    f"Count records Department equals {department} and Position Engineer and Status Authorized and Date 2026-09-01"
+                )
+            self.assertEqual(result["value"], 1)
+            self.assertEqual(
+                {item.field for item in plan.filters},
+                {"Department", "Position", "Status", "Date", "chunk_type"},
+            )
+
+    def test_malformed_implicit_suffix_never_authorizes_retrieval(self):
+        catalog = {"Department": ("Sales",), "Position": ("Engineer",)}
+        for introducer in ("", "where "):
+            for suffix in (
+                "Position Unknown",
+                "Position Engineer North",
+                "Position sounds like Engineer",
+                "Status Authorizd",
+                "Employee_ID A1",
+                "Employee_ID Unknown",
+                "Employee_ID sounds like A10001",
+                "Employee_ID A10001 extra",
+                "Date 2026-02-30",
+                "Date 2026-09-01 extra",
+                "Date sounds like 2026-09-01",
+                "Total_OT 2 extra",
+                "Total_OT sounds like 2",
+            ):
+                with self.subTest(introducer=introducer, suffix=suffix):
+                    self.store.get.reset_mock()
+                    with patch.object(
+                        self.answer,
+                        "load_attendance_catalog_candidates",
+                        return_value=catalog,
+                    ):
+                        with self.assertRaises(self.answer.PlanValidationError):
+                            self.answer.fetch_context(
+                                f"Count records {introducer}Department equals Sales and {suffix}"
+                            )
+                    self.store.get.assert_not_called()
+
     def test_catalog_alias_conjunctions_execute_as_complete_literals(self):
         for field, value, prefix in (
             ("Department", "Sales and Job Services", "Sales"),

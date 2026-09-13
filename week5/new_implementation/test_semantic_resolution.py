@@ -14,6 +14,80 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class BaselineOrderingGrammarTests(unittest.TestCase):
+    def test_implicit_equality_suffixes_require_complete_typed_operands(self):
+        context = ResolutionContext(
+            {
+                "Department": ("Sales", "Sales and Job Services"),
+                "Position": ("Engineer", "Officer"),
+            }
+        )
+        for department in ("Sales", "Sales and Job Services"):
+            for field, operand, expected in (
+                ("Position", "Engineer", "Engineer"),
+                ("Status", "Authorized", "Authorized"),
+                ("Day_Type", "Working Day", "Working Day"),
+                ("Employee_ID", "A10001", "A10001"),
+                ("Date", "2026-09-01", "2026-09-01"),
+                ("Total_OT", "2", 2.0),
+            ):
+                for introducer in ("", "where "):
+                    for operator_text in ("", "equals "):
+                        field_phrase = (
+                            "overtime"
+                            if field == "Total_OT"
+                            else field.replace("_", " ")
+                        )
+                        question = f"Count records {introducer}Department equals {department} and {field_phrase} {operator_text}{operand}"
+                        with self.subTest(
+                            department=department,
+                            field=field,
+                            introducer=introducer,
+                            operator_text=operator_text,
+                        ):
+                            facts = detect_semantic_facts(question, context)
+                            filters = {
+                                (fact.field, fact.operator, fact.values)
+                                for fact in facts
+                                if fact.kind == "filter"
+                            }
+                            self.assertIn(("Department", "eq", (department,)), filters)
+                            self.assertIn((field, "eq", (expected,)), filters)
+                            self.assertFalse(
+                                [fact for fact in facts if fact.kind == "unsupported"]
+                            )
+
+    def test_implicit_suffix_validation_does_not_accept_unknown_relations(self):
+        context = ResolutionContext(
+            {"Department": ("Sales",), "Position": ("Engineer",)}
+        )
+        for suffix in (
+            "Position Unknown",
+            "Position Engineer North",
+            "Position sounds like Engineer",
+            "Status Authorizd",
+            "Employee_ID A1",
+            "Employee_ID Unknown",
+            "Employee_ID sounds like A10001",
+            "Employee_ID A10001 extra",
+            "Date 2026-02-30",
+            "Date 2026-09-01 extra",
+            "Date sounds like 2026-09-01",
+            "Total_OT 2 extra",
+            "Total_OT sounds like 2",
+        ):
+            with self.subTest(suffix=suffix):
+                facts = detect_semantic_facts(
+                    f"Count records Department equals Sales and {suffix}", context
+                )
+                self.assertTrue([fact for fact in facts if fact.kind == "unsupported"])
+                self.assertFalse(
+                    [
+                        fact
+                        for fact in facts
+                        if fact.kind == "filter" and fact.field == "Department"
+                    ]
+                )
+
     def test_catalog_operands_keep_conjoined_field_aliases_atomic(self):
         for field, value, prefix in (
             ("Department", "Sales and Job Services", "Sales"),

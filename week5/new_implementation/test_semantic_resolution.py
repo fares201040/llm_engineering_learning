@@ -14,6 +14,44 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class TemporalCompositionDetectorTests(unittest.TestCase):
+    def test_non_temporal_on_preserves_employee_and_catalog_constraint(self):
+        for question, field, value in (
+            (
+                "Count records for morgan river on Leave Type Annual Leave",
+                "Leave_Type",
+                "Annual Leave",
+            ),
+            (
+                "Count records for morgan river on Department Human Resources",
+                "Department",
+                "Human Resources",
+            ),
+        ):
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(
+                    question,
+                    ResolutionContext(
+                        {field: (value,)},
+                        employees=(
+                            EmployeeReference(
+                                employee_id="A10018", name="Morgan River"
+                            ),
+                        ),
+                    ),
+                )
+                self.assertEqual(
+                    [(f.evidence_text, f.values) for f in facts if f.kind == "entity"],
+                    [("morgan river", ("A10018",))],
+                )
+                self.assertIn(
+                    (field, "eq", (value,)),
+                    {
+                        (f.field, f.operator, f.values)
+                        for f in facts
+                        if f.kind == "filter"
+                    },
+                )
+
     def test_temporal_evidence_preserves_prior_constraints(self):
         for question, expected in (
             (

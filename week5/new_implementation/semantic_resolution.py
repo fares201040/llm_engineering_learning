@@ -459,7 +459,7 @@ class EntityResolver(FieldResolver):
         ):
             start, end = match.span("name")
             boundary = re.search(
-                r"\s+(?:have|has|had|work|worked|attend|attended|in|and|with|who|whose|that|which)\b",
+                r"\s+(?:have|has|had|work|worked|attend|attended|on|in|and|with|who|whose|that|which)\b",
                 question[start:end],
                 re.I,
             )

@@ -64,6 +64,7 @@ try:
         CompiledPostgresQuery,
         compile_aggregation_queries,
         compile_count_query,
+        compile_chunk_where,
         compile_coverage_query,
         compile_sample_query,
     )
@@ -119,6 +120,7 @@ except ImportError:  # Running answer.py directly from its directory.
         CompiledPostgresQuery,
         compile_aggregation_queries,
         compile_count_query,
+        compile_chunk_where,
         compile_coverage_query,
         compile_sample_query,
     )
@@ -690,7 +692,9 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
             "unit": (
                 "percentage"
                 if operation == "percentage"
-                else FIELD_DEFINITIONS[field].output_unit if field else "value"
+                else FIELD_DEFINITIONS[field].output_unit
+                if field
+                else "value"
             ),
             "subject_field": field,
             "grain": [field] if field else [],
@@ -1493,20 +1497,22 @@ def fetch_split_parts_chroma(record_ids: list[str], *, domain="attendance"):
     ]
 
 
-def fetch_split_parts_postgres(record_ids: list[str]):
+def fetch_split_parts_postgres(record_ids: list[str], *, domain="attendance"):
     if not record_ids:
         return []
+    scope = compile_chunk_where([], domain=domain)
     psycopg, dict_row = _import_psycopg()
     with psycopg.connect(POSTGRES_DSN, row_factory=dict_row) as conn:
         with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION READ ONLY")
             cur.execute(
                 f"""
                 SELECT content, metadata
                 FROM {POSTGRES_CHUNKS_TABLE}
-                WHERE record_id = ANY(%s)
+                WHERE record_id = ANY(%s) AND {scope.sql}
                 ORDER BY record_id, (metadata ->> 'embedding_part')::integer
                 """,
-                (record_ids,),
+                (record_ids, *scope.params),
             )
             return [
                 Result(
@@ -1536,7 +1542,7 @@ def expand_related_split_parts(
         return chunks
 
     siblings = (
-        fetch_split_parts_postgres(record_ids)
+        fetch_split_parts_postgres(record_ids, domain=domain)
         if backend == "postgres+pgvector"
         else fetch_split_parts_chroma(record_ids, domain=domain)
     )
@@ -1988,104 +1994,18 @@ def execute_exact_postgres(plan: ExecutableQueryPlan):
 # ---------------------------------------------------------------------------
 
 
-def _build_postgres_chunk_where(
-    filters: list[FilterCondition],
-):
-    clauses = []
-    params = []
-
-    for condition in filters:
-        _require_filter_value_shape(condition)
-        field = condition.field
-
-        if field == "Name":
-            key = "Name"
-        else:
-            key = field
-
-        if condition.operator == "eq":
-            if field in NUMERIC_FILTER_FIELDS:
-                clauses.append("(metadata ->> %s)::double precision = %s")
-            else:
-                clauses.append("metadata ->> %s = %s")
-            params.extend(
-                [
-                    key,
-                    _normalize_typed_filter_value(field, condition.value),
-                ]
-            )
-
-        elif condition.operator == "ne":
-            if field in NUMERIC_FILTER_FIELDS:
-                clauses.append("(metadata ->> %s)::double precision <> %s")
-            else:
-                clauses.append("metadata ->> %s <> %s")
-            params.extend(
-                [
-                    key,
-                    _normalize_typed_filter_value(field, condition.value),
-                ]
-            )
-
-        elif condition.operator in {"gt", "gte", "lt", "lte"}:
-            sql_op = {
-                "gt": ">",
-                "gte": ">=",
-                "lt": "<",
-                "lte": "<=",
-            }[condition.operator]
-
-            if field in NUMERIC_FILTER_FIELDS:
-                clauses.append(f"(metadata ->> %s)::double precision {sql_op} %s")
-            else:
-                # ISO YYYY-MM-DD dates sort correctly as text.
-                clauses.append(f"metadata ->> %s {sql_op} %s")
-
-            params.extend(
-                [
-                    key,
-                    _normalize_typed_filter_value(field, condition.value),
-                ]
-            )
-
-        elif condition.operator == "in":
-            values = [
-                _normalize_typed_filter_value(field, value) for value in condition.value
-            ]
-
-            if field in NUMERIC_FILTER_FIELDS:
-                clauses.append(
-                    "(metadata ->> %s)::double precision = ANY(%s::double precision[])"
-                )
-            else:
-                clauses.append("metadata ->> %s = ANY(%s::text[])")
-                values = [str(value) for value in values]
-
-            params.extend([key, values])
-
-        elif condition.operator == "contains":
-            clauses.append("metadata ->> %s ILIKE %s")
-            params.extend([key, f"%{condition.value}%"])
-
-        elif condition.operator == "starts_with":
-            clauses.append("metadata ->> %s ILIKE %s")
-            params.extend([key, f"{condition.value}%"])
-
-    return (
-        " AND ".join(clauses) if clauses else "TRUE",
-        params,
-    )
-
-
 def fetch_semantic_postgres(
     query: str,
     filters: list[FilterCondition] | None = None,
     n_results: int = SEMANTIC_K,
+    *,
+    domain="attendance",
 ):
     """
     Improvement 21:
     PostgreSQL applies structured filters BEFORE pgvector similarity ordering.
     """
+    scope = compile_chunk_where(filters or [], domain=domain)
     psycopg, dict_row = _import_psycopg()
 
     query_vector = (
@@ -2100,15 +2020,13 @@ def fetch_semantic_postgres(
 
     vector_literal = "[" + ",".join(str(value) for value in query_vector) + "]"
 
-    where_sql, params = _build_postgres_chunk_where(filters or [])
-
     sql = f"""
         SELECT
             content,
             metadata,
             embedding <=> %s::vector AS distance
         FROM {POSTGRES_CHUNKS_TABLE}
-        WHERE {where_sql}
+        WHERE {scope.sql}
         ORDER BY embedding <=> %s::vector
         LIMIT %s
     """
@@ -2118,11 +2036,12 @@ def fetch_semantic_postgres(
         row_factory=dict_row,
     ) as conn:
         with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION READ ONLY")
             cur.execute(
                 sql,
                 [
                     vector_literal,
-                    *params,
+                    *scope.params,
                     vector_literal,
                     n_results,
                 ],
@@ -2750,11 +2669,7 @@ def _format_aggregation_answer(plan: QueryPlan, aggregation: dict):
             if predicate_labels
             else " matched the requested criteria"
         )
-        return (
-            f"{count} {label}{qualifier}."
-            f"{scope}"
-            f"{_coverage_warning(aggregation)}"
-        )
+        return f"{count} {label}{qualifier}.{scope}{_coverage_warning(aggregation)}"
 
     if value is None:
         return (
@@ -2891,7 +2806,9 @@ def _fetch_context_result(
                     outcome=(
                         "unique"
                         if len(matches) == 1
-                        else "ambiguous" if matches else "none"
+                        else "ambiguous"
+                        if matches
+                        else "none"
                     ),
                     candidates=matches,
                     reference=fact.evidence_text,
@@ -3166,6 +3083,7 @@ def _fetch_context_result(
             chunks = fetch_semantic_postgres(
                 plan.search_query,
                 filters=plan.filters,
+                domain=trusted_access.domain,
             )
         else:
             chunks = fetch_semantic_chroma(
@@ -3189,6 +3107,7 @@ def _fetch_context_result(
         if _postgres_vector_enabled():
             chunks = fetch_semantic_postgres(
                 plan.search_query,
+                domain=trusted_access.domain,
             )
         else:
             chunks = fetch_semantic_chroma(
@@ -3239,7 +3158,7 @@ def fetch_context(
     request_id: str | None = None,
     *,
     access_context: AccessContext | None = None,
-) -> tuple[list[Result], QueryPlan, dict | None, int | None]:
+) -> tuple[list[Result], ExecutableQueryPlan, dict | None, int | None]:
     """Fetch evidence while preserving the original four-item public contract."""
     result = _fetch_context_result(
         question,

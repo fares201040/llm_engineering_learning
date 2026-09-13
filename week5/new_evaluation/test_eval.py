@@ -19,6 +19,215 @@ PRIVATE_FIXTURES_AVAILABLE = (
 )
 
 
+class BaselineCapabilityParityTests(unittest.TestCase):
+    """Synthetic baseline behaviors through proposal, gate, retrieval and evaluator."""
+
+    def setUp(self):
+        from contextlib import ExitStack
+        from types import SimpleNamespace
+        from week5.new_implementation import answer
+
+        self.answer = answer
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "status": "ready",
+                                "answer_contract": {"shape": "rows", "unit": "value"},
+                            }
+                        )
+                    )
+                )
+            ]
+        )
+        for name, kwargs in (
+            ("completion", {"return_value": response}),
+            ("_postgres_enabled", {"return_value": False}),
+            ("load_attendance_catalog_candidates", {"return_value": {}}),
+            (
+                "load_employee_directory",
+                {
+                    "return_value": [
+                        EmployeeCandidate(employee_id="A10001", name="Morgan River"),
+                        EmployeeCandidate(employee_id="A10002", name="Morgan Lake"),
+                    ]
+                },
+            ),
+        ):
+            self.stack.enter_context(patch.object(answer, name, **kwargs))
+        self.store = self.stack.enter_context(patch.object(answer, "collection"))
+        self.rows = [
+            {
+                "record_id": "r1",
+                "Employee_ID": "A10001",
+                "Name": "Morgan River",
+                "Date": "2026-09-01",
+                "Total_Worked_Hrs": 8.0,
+                "Total_OT": 2.0,
+                "Day_Type": "Working Day",
+                "Status": "Authorized",
+            },
+            {
+                "record_id": "r2",
+                "Employee_ID": "A10001",
+                "Name": "Morgan River",
+                "Date": "2026-09-01",
+                "Total_Worked_Hrs": 2.0,
+                "Total_OT": 1.0,
+                "Day_Type": "Working Day",
+                "Status": "Authorized",
+            },
+            {
+                "record_id": "r3",
+                "Employee_ID": "A10001",
+                "Name": "Morgan River",
+                "Date": "2026-09-02",
+                "Total_Worked_Hrs": 0.0,
+                "Total_OT": 0.0,
+                "Day_Type": "Working Day",
+                "Status": "Draft",
+            },
+            {
+                "record_id": "r4",
+                "Employee_ID": "A10002",
+                "Name": "Morgan Lake",
+                "Date": "2026-09-03",
+                "Total_Worked_Hrs": 0.0,
+                "Total_OT": 0.0,
+                "Day_Type": "OFF Day",
+                "Status": "Draft",
+            },
+            {
+                "record_id": "r5",
+                "Employee_ID": "A10002",
+                "Name": "Morgan Lake",
+                "Date": "2026-09-04",
+                "Total_Worked_Hrs": 7.0,
+                "Total_OT": 4.0,
+                "Day_Type": "Working Day",
+                "Status": "Authorized",
+            },
+        ]
+        for row in self.rows:
+            row.update(domain="attendance", chunk_type="attendance_record")
+        self.store.get.return_value = {
+            "documents": ["Synthetic attendance evidence"] * len(self.rows),
+            "metadatas": self.rows,
+        }
+
+    def test_baseline_counts_and_percentage_use_verified_plans(self):
+        cases = (
+            ("How many days were worked?", "distinct_count", "Date", 2, "dates"),
+            ("How many days did not work?", "distinct_count", "Date", 2, "dates"),
+            (
+                "How many scheduled days did not attend?",
+                "distinct_count",
+                "Date",
+                1,
+                "dates",
+            ),
+            ("Count attendance records", "count", None, 5, "records"),
+            ("Count Authorized records", "count", None, 3, "records"),
+            (
+                "What percentage of records are Authorized?",
+                "percentage",
+                None,
+                60.0,
+                "percentage",
+            ),
+            ("Count records on 2026-09-01", "count", None, 2, "records"),
+            ("Count records before 2026-09-03", "count", None, 3, "records"),
+        )
+        for question, operation, field, value, unit in cases:
+            with self.subTest(question=question):
+                chunks, plan, calculation, _count = self.answer.fetch_context(question)
+                self.assertIsInstance(plan, self.answer.ExecutableQueryPlan)
+                self.assertEqual(
+                    (plan.aggregation, plan.aggregation_field), (operation, field)
+                )
+                self.assertEqual(plan.answer_contract.unit, unit)
+                self.assertEqual(calculation["value"], value)
+                self.assertTrue(chunks)
+
+    def test_equivalent_worked_wording_compiles_the_same_operation_and_scope(self):
+        plans = [
+            self.answer.fetch_context(question)[1]
+            for question in (
+                "How many days were worked?",
+                "How many dates attended?",
+                "Count dates with positive worked hours",
+            )
+        ]
+        for plan in plans:
+            self.assertIsInstance(plan, self.answer.ExecutableQueryPlan)
+            self.assertEqual(plan.aggregation, "distinct_count")
+            self.assertEqual(plan.aggregation_field, "Date")
+            self.assertEqual(
+                {(f.field, f.operator, f.value) for f in plan.filters},
+                {
+                    ("Total_Worked_Hrs", "gt", 0.0),
+                    ("chunk_type", "eq", "attendance_record"),
+                },
+            )
+
+    def test_latest_records_and_projection_preserve_requested_rows(self):
+        chunks, plan, _, _ = self.answer.fetch_context(
+            "Show latest 2 attendance records"
+        )
+        self.assertIsInstance(plan, self.answer.ExecutableQueryPlan)
+        self.assertEqual(
+            (plan.order_by, plan.order_direction, plan.limit), ("Date", "desc", 2)
+        )
+        self.assertEqual(
+            [chunk.metadata["record_id"] for chunk in chunks], ["r5", "r4"]
+        )
+        _, projection, _, _ = self.answer.fetch_context("Show employee ID and overtime")
+        self.assertEqual(projection.projection, ["Employee_ID", "Total_OT"])
+        self.assertEqual(projection.answer_contract.grain, ["Employee_ID", "Total_OT"])
+
+    def test_grouped_highest_aggregate_is_evaluated_through_current_pipeline(self):
+        case = TestQuestion(
+            question="Which employee has the highest total overtime?",
+            keywords=[],
+            reference_answer="Synthetic grouped overtime result.",
+            category="grouped_aggregate",
+            expected_plan={
+                "aggregation": "sum",
+                "aggregation_field": "Total_OT",
+                "order_by": "value",
+                "order_direction": "desc",
+                "limit": 1,
+            },
+            expected_group_values=[{"group": ["A10002"], "value": 4.0}],
+        )
+        result = evaluation.evaluate_behavior(case)
+        self.assertTrue(all(result.model_dump().values()), result.model_dump())
+
+    def test_employee_clarification_and_followup_preserve_scope(self):
+        text, chunks, state = self.answer.answer_question_with_state(
+            "Count Morgan's records", [], self.answer.ConversationState()
+        )
+        self.assertEqual(chunks, [])
+        self.assertEqual(len(state.pending_candidates), 2)
+        self.store.get.assert_not_called()
+        text, _, state = self.answer.answer_question_with_state("A10001", [], state)
+        self.assertIn("3", text)
+        self.assertEqual([e.employee_id for e in state.selected_employees], ["A10001"])
+        _, plan, calculation, _ = self.answer.fetch_context(
+            "How many of his days were worked?",
+            default_employees=state.selected_employees,
+        )
+        self.assertIsInstance(plan, self.answer.ExecutableQueryPlan)
+        self.assertIn(
+            ("Employee_ID", "A10001"), {(f.field, f.value) for f in plan.filters}
+        )
+        self.assertEqual(calculation["value"], 1)
+
+
 class EvaluationWiringTests(unittest.TestCase):
     def test_missing_private_corpus_has_an_actionable_error(self):
         missing = Path(__file__).with_name("missing-private-corpus.jsonl")

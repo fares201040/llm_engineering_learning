@@ -134,6 +134,53 @@ def compile_count_query(
     return _query(sql, where.params, "count")
 
 
+def compile_chunk_where(filters, *, domain: str = "attendance") -> SqlFragment:
+    """Compile metadata constraints inside the trusted attendance domain."""
+    if domain != "attendance":
+        raise ValueError("Semantic retrieval supports the attendance domain only.")
+    clauses = ["metadata ->> %s = %s"]
+    params: list[object] = ["domain", domain]
+    operators = {"eq": "=", "ne": "<>", "gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
+    casts = {
+        "number": "double precision",
+        "date": "date",
+        "time": "time",
+        "datetime": "timestamp",
+        "text": "text",
+    }
+    for condition in filters:
+        if not isinstance(condition, FilterCondition):
+            raise TypeError("Filters must be executable FilterCondition objects.")
+        definition = FIELD_DEFINITIONS.get(condition.field)
+        if definition is None or condition.operator not in definition.operators:
+            raise ValueError("Unsupported semantic metadata field or operator.")
+        cast = casts[definition.storage_type]
+        expression = "metadata ->> %s"
+        if cast != "text":
+            expression = f"({expression})::{cast}"
+        if condition.operator == "in":
+            if not isinstance(condition.value, list) or not condition.value:
+                raise ValueError("Operator 'in' requires a non-empty list.")
+            value = [
+                canonicalize_storage_value(condition.field, item)
+                for item in condition.value
+            ]
+            clauses.append(f"{expression} = ANY(%s::{cast}[])")
+        else:
+            if isinstance(condition.value, list):
+                raise ValueError("Scalar operators require one value.")
+            value = canonicalize_storage_value(condition.field, condition.value)
+            if condition.operator in operators:
+                clauses.append(f"{expression} {operators[condition.operator]} %s")
+            else:
+                clauses.append(f"{expression} ILIKE %s")
+                value = (
+                    f"%{value}%" if condition.operator == "contains" else f"{value}%"
+                )
+        params.extend((condition.field, value))
+    return SqlFragment(" AND ".join(clauses), tuple(params))
+
+
 def compile_sample_query(
     plan: ExecutableQueryPlan,
     table_name: str = "attendance_records",

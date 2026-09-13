@@ -16,13 +16,19 @@ from week5.new_implementation.postgres_compiler import (
 
 
 class PostgresCompilerTests(unittest.TestCase):
+    def test_semantic_metadata_scope_always_binds_trusted_domain(self):
+        from week5.new_implementation import postgres_compiler
+
+        self.assertTrue(hasattr(postgres_compiler, "compile_chunk_where"))
+        fragment = postgres_compiler.compile_chunk_where([])
+        self.assertEqual(fragment.sql, "metadata ->> %s = %s")
+        self.assertEqual(fragment.params, ("domain", "attendance"))
+        with self.assertRaises(ValueError):
+            postgres_compiler.compile_chunk_where([], domain="payroll")
+
     def test_question_value_is_a_bound_parameter(self):
         fragment = compile_where(
-            [
-                FilterCondition(
-                    field="Department", operator="eq", value="HR' OR 1=1 --"
-                )
-            ]
+            [FilterCondition(field="Department", operator="eq", value="HR' OR 1=1 --")]
         )
         self.assertNotIn("HR' OR 1=1 --", fragment.sql)
         self.assertEqual(fragment.params, ("HR' OR 1=1 --",))
@@ -48,7 +54,9 @@ class PostgresCompilerTests(unittest.TestCase):
             FilterCondition(field="Total_OT", operator="gte", value=2.0),
             FilterCondition(field="Total_OT", operator="lt", value=8.0),
             FilterCondition(field="Total_OT", operator="lte", value=7.0),
-            FilterCondition(field="Status", operator="in", value=["Draft", "Authorized"]),
+            FilterCondition(
+                field="Status", operator="in", value=["Draft", "Authorized"]
+            ),
             FilterCondition(field="Name", operator="contains", value="Ali"),
             FilterCondition(field="Name", operator="starts_with", value="A"),
         ]
@@ -91,7 +99,9 @@ class PostgresCompilerTests(unittest.TestCase):
         return ExecutableQueryPlan(
             mode="exact",
             search_query="records",
-            filters=[FilterCondition(field="Department", operator="eq", value=department)],
+            filters=[
+                FilterCondition(field="Department", operator="eq", value=department)
+            ],
             answer_contract=AnswerContract(
                 shape="scalar", unit="records", subject_field=None, grain=[]
             ),

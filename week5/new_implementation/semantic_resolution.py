@@ -1518,6 +1518,78 @@ def _executable_choice_facts(question, field_matches, facts, *, original_questio
                 concept_name="unsupported_calculation",
             )
 
+    temporal_rank = re.search(r"\b(latest|earliest)(?:\s+(\d+))?\b", normalized)
+    if temporal_rank:
+        row_subject = any(
+            evidence_occurs(normalized[temporal_rank.end() :], phrase)
+            for definition in MEASURE_DEFINITIONS.values()
+            if definition.aggregation == "count"
+            and definition.aggregation_field is None
+            for phrase in definition.natural_names
+        )
+        if row_subject and not any(
+            f.kind in {"calculation", "measure", "group_by"} for f in facts
+        ):
+            add(
+                "order_by",
+                temporal_rank.group(0),
+                field="Date",
+                direction="desc" if temporal_rank.group(1) == "latest" else "asc",
+            )
+            if temporal_rank.group(2):
+                add(
+                    "limit",
+                    temporal_rank.group(0),
+                    values=(float(temporal_rank.group(2)),),
+                )
+        else:
+            add(
+                "unsupported",
+                temporal_rank.group(0),
+                concept_name="unsupported_constraint",
+            )
+
+    superlative = re.search(r"\b(highest|lowest)\b", normalized)
+    if superlative:
+        grouping = [f for f in facts if f.kind == "group_by"]
+        if not grouping:
+            subject_aliases = [
+                (field, phrase)
+                for field, definition in FIELD_DEFINITIONS.items()
+                if definition.planner_visible and definition.groupable
+                for phrase in definition.natural_names
+            ] + [
+                (definition.aggregation_field, phrase)
+                for definition in MEASURE_DEFINITIONS.values()
+                if definition.aggregation_field is not None
+                and FIELD_DEFINITIONS[definition.aggregation_field].groupable
+                for phrase in definition.natural_names
+            ]
+            subjects = {}
+            for field, phrase in subject_aliases:
+                subject = re.search(
+                    rf"\bwhich\s+({re.escape(normalize_semantic_text(phrase))})\b",
+                    normalized[: superlative.start()],
+                )
+                if subject:
+                    subjects[field] = subject.group(0)
+            if len(subjects) == 1:
+                field, evidence = next(iter(subjects.items()))
+                add("group_by", evidence, field=field)
+                grouping = [f for f in facts if f.kind == "group_by"]
+        operations = [f for f in facts if f.kind in {"calculation", "measure"}]
+        if grouping and len(operations) == 1:
+            direction = "desc" if superlative.group(1) == "highest" else "asc"
+            add("order_by", superlative.group(0), field="value", direction=direction)
+            add("ranking", superlative.group(0), field="value", direction=direction)
+            add("limit", superlative.group(0), values=(1.0,))
+        else:
+            add(
+                "unsupported",
+                superlative.group(0),
+                concept_name="unsupported_constraint",
+            )
+
     limit = re.search(r"\b(top|bottom|first|last|limit(?: to)?)\s+(\d+)\b", normalized)
     if limit:
         add("limit", limit.group(0), values=(float(limit.group(2)),))

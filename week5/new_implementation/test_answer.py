@@ -12,7 +12,10 @@ from week5.new_implementation.attendance_schema import (
     ProposedNameHint,
     ProposedOrderChoice,
 )
-from week5.new_implementation.postgres_compiler import compile_where
+from week5.new_implementation.postgres_compiler import (
+    compile_chunk_where,
+    compile_where,
+)
 
 
 def _compile_where(filters):
@@ -174,6 +177,114 @@ def _executable_plan(**values):
         ),
     )
     return answer.ExecutableQueryPlan(**values)
+
+
+class RetrievalBoundaryTests(unittest.TestCase):
+    def test_facade_exposes_only_gated_retrieval(self):
+        from week5.new_implementation import retrieval
+
+        self.assertEqual(set(retrieval.__all__), {"Result", "fetch_context"})
+        for name in (
+            "execute_exact_postgres",
+            "fetch_exact_chroma",
+            "fetch_semantic_chroma",
+            "fetch_semantic_postgres",
+        ):
+            self.assertFalse(hasattr(retrieval, name), name)
+
+    def test_semantic_postgres_binds_domain_and_starts_read_only(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        driver = MagicMock()
+        driver.connect.return_value.__enter__.return_value = connection
+        embeddings = SimpleNamespace(data=[SimpleNamespace(embedding=[0.1, 0.2])])
+        with (
+            patch.object(answer, "_import_psycopg", return_value=(driver, None)),
+            patch.object(answer, "openai") as provider,
+        ):
+            provider.embeddings.create.return_value = embeddings
+            self.assertEqual(answer.fetch_semantic_postgres("attendance"), [])
+        statements = cursor.execute.call_args_list
+        self.assertEqual(statements[0].args[0], "SET TRANSACTION READ ONLY")
+        sql, params = statements[-1].args
+        self.assertIn("metadata ->> %s = %s", sql)
+        self.assertNotIn("attendance", sql)
+        self.assertIn("domain", params)
+        self.assertIn("attendance", params)
+
+    def test_postgres_split_siblings_cannot_cross_domain(self):
+        cursor = MagicMock()
+        cursor.fetchall.return_value = []
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        driver = MagicMock()
+        driver.connect.return_value.__enter__.return_value = connection
+        with patch.object(answer, "_import_psycopg", return_value=(driver, None)):
+            self.assertEqual(
+                answer.fetch_split_parts_postgres(["synthetic-record"]), []
+            )
+        self.assertEqual(
+            cursor.execute.call_args_list[0].args[0], "SET TRANSACTION READ ONLY"
+        )
+        sql, params = cursor.execute.call_args.args
+        self.assertIn("metadata ->> %s = %s", sql)
+        self.assertIn("domain", params)
+        self.assertIn("attendance", params)
+
+    def test_chroma_semantic_and_hybrid_queries_bind_domain(self):
+        for filters in (
+            None,
+            [answer.FilterCondition(field="Status", operator="eq", value="Authorized")],
+        ):
+            with (
+                self.subTest(filters=filters),
+                patch.object(answer, "collection") as store,
+                patch.object(answer, "openai") as provider,
+            ):
+                provider.embeddings.create.return_value = SimpleNamespace(
+                    data=[SimpleNamespace(embedding=[1.0, 0.0])]
+                )
+                store.query.return_value = {"documents": [[]], "metadatas": [[]]}
+                store.get.return_value = {
+                    "documents": [],
+                    "metadatas": [],
+                    "embeddings": [],
+                }
+                self.assertEqual(
+                    answer.fetch_semantic_chroma("attendance", filters=filters), []
+                )
+                request = store.get if filters else store.query
+                self.assertEqual(
+                    request.call_args.kwargs["where"], {"domain": "attendance"}
+                )
+
+    def test_ungrounded_proposal_stops_before_every_retrieval_backend(self):
+        proposal = answer.PlannerProposal(
+            status="ready",
+            filters=[
+                answer.ProposedFilter(
+                    field="Status",
+                    operator="eq",
+                    value="Authorized",
+                    evidence_text="records",
+                )
+            ],
+            answer_contract=answer.AnswerContract(shape="rows", unit="value"),
+        )
+        with (
+            patch.object(answer, "propose_query", return_value=proposal),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "execute_exact_postgres") as exact_pg,
+            patch.object(answer, "fetch_exact_chroma") as exact_chroma,
+            patch.object(answer, "fetch_semantic_postgres") as semantic_pg,
+            patch.object(answer, "fetch_semantic_chroma") as semantic_chroma,
+        ):
+            with self.assertRaises(answer.PlanValidationError):
+                answer.fetch_context("Show attendance records")
+        for backend in (exact_pg, exact_chroma, semantic_pg, semantic_chroma):
+            backend.assert_not_called()
 
 
 class ProposalOperationNormalizationTests(unittest.TestCase):
@@ -2791,7 +2902,7 @@ class PostgresResultTests(unittest.TestCase):
             )
 
     def test_chunk_numeric_in_operator_uses_typed_values(self):
-        where_sql, params = answer._build_postgres_chunk_where(
+        fragment = compile_chunk_where(
             [
                 answer.FilterCondition(
                     field="Total_OT",
@@ -2802,10 +2913,12 @@ class PostgresResultTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            where_sql,
-            "(metadata ->> %s)::double precision = ANY(%s::double precision[])",
+            fragment.sql,
+            "metadata ->> %s = %s AND (metadata ->> %s)::double precision = ANY(%s::double precision[])",
         )
-        self.assertEqual(params, ["Total_OT", [1.0, 2.5]])
+        self.assertEqual(
+            fragment.params, ("domain", "attendance", "Total_OT", [1.0, 2.5])
+        )
 
     def test_exact_result_includes_source_metadata_for_the_app(self):
         row = {

@@ -13,6 +13,47 @@ from week5.new_implementation.semantic_resolution import (
 )
 
 
+class BaselineOrderingGrammarTests(unittest.TestCase):
+    def test_temporal_superlatives_derive_date_order_and_explicit_limit(self):
+        for phrase, direction in (("latest", "desc"), ("earliest", "asc")):
+            facts = detect_semantic_facts(
+                f"Show {phrase} 2 attendance records", ResolutionContext({})
+            )
+            self.assertIn(
+                ("order_by", "Date", direction),
+                {(f.kind, f.field, f.direction) for f in facts},
+            )
+            self.assertIn(("limit", (2.0,)), {(f.kind, f.values) for f in facts})
+
+    def test_superlatives_rank_one_grounded_aggregate_by_subject(self):
+        for phrase, direction in (("highest", "desc"), ("lowest", "asc")):
+            for field_phrase, field in (
+                ("total overtime", "Total_OT"),
+                ("total lateness", "Lateness_Hrs"),
+            ):
+                with self.subTest(phrase=phrase, field=field):
+                    facts = detect_semantic_facts(
+                        f"Which employee has the {phrase} {field_phrase}?",
+                        ResolutionContext({}),
+                    )
+                    roles = {(f.kind, f.field, f.direction) for f in facts}
+                    self.assertIn(("group_by", "Employee_ID", None), roles)
+                    self.assertIn(("ranking", "value", direction), roles)
+                    self.assertIn(
+                        ("limit", (1.0,)), {(f.kind, f.values) for f in facts}
+                    )
+
+    def test_ambiguous_superlative_bases_fail_closed(self):
+        for question in (
+            "Which employee is highest?",
+            "Which employee has the highest total overtime and lateness?",
+            "Show latest 2 total overtime",
+        ):
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(question, ResolutionContext({}))
+                self.assertTrue(any(f.kind == "unsupported" for f in facts), facts)
+
+
 class TemporalCompositionDetectorTests(unittest.TestCase):
     def test_projection_delimiters_do_not_leak_from_correction_prefix(self):
         facts = detect_semantic_facts(

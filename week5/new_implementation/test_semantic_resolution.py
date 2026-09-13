@@ -2,6 +2,7 @@ import unittest
 
 from week5.new_implementation.attendance_schema import FIELD_DEFINITIONS
 from week5.new_implementation.semantic_resolution import (
+    EmployeeReference,
     ResolutionContext,
     ResolverRegistry,
     SemanticFact,
@@ -12,6 +13,173 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class SemanticResolutionTests(unittest.TestCase):
+    def test_named_employee_reference_survives_authorized_count_planning(self):
+        context = ResolutionContext(
+            catalog={},
+            employees=(
+                EmployeeReference(employee_id="A10017", name="Selected Employee"),
+            ),
+        )
+        facts = detect_semantic_facts(
+            "Count Selected Employee's Authorized records.", context
+        )
+        self.assertIn(
+            ("entity", ("A10017",), "Selected Employee"),
+            {(fact.kind, fact.values, fact.evidence_text) for fact in facts},
+        )
+
+    def test_unresolved_possessive_name_is_an_entity_candidate(self):
+        facts = detect_semantic_facts(
+            "Count Morgan River's records.", ResolutionContext({})
+        )
+        self.assertIn(
+            ("entity", "Morgan River", "candidate"),
+            {(fact.kind, fact.evidence_text, fact.strength) for fact in facts},
+        )
+
+    def test_identifier_candidates_reject_malformed_tokens(self):
+        for token in ("A10017", "A1001", "AA10017", "A10017extra", "A-10017"):
+            with self.subTest(token=token):
+                facts = detect_semantic_facts(
+                    f"Count records for {token}.", ResolutionContext({})
+                )
+                if token == "A10017":
+                    self.assertTrue(
+                        any(f.kind == "entity" and f.values == (token,) for f in facts)
+                    )
+
+                else:
+                    self.assertTrue(
+                        any(
+                            f.kind == "unsupported" and f.strength == "strong"
+                            for f in facts
+                        )
+                    )
+
+    def test_possessive_id_does_not_create_an_unresolved_name(self):
+        facts = detect_semantic_facts(
+            "Count A10017's Authorized records.", ResolutionContext({})
+        )
+        self.assertEqual(
+            [(fact.field, fact.values) for fact in facts if fact.kind == "entity"],
+            [("Employee_ID", ("A10017",))],
+        )
+
+    def test_before_date_emits_temporal_comparison_fact(self):
+        facts = detect_semantic_facts(
+            "Count records before 2026-09-03", ResolutionContext(catalog={})
+        )
+        self.assertIn(
+            ("Date", "lt", ("2026-09-03",)),
+            {(f.field, f.operator, f.values) for f in facts},
+        )
+
+    def test_temporal_literals_and_comparisons_are_canonical(self):
+        for phrase, operator, value in (
+            ("on 2026-09-03", "eq", "2026-09-03"),
+            ("after September 3, 2026", "gt", "2026-09-03"),
+            ("on or before 3 September 2026", "lte", "2026-09-03"),
+            ("on or after 2026-09-03", "gte", "2026-09-03"),
+        ):
+            with self.subTest(phrase=phrase):
+                facts = detect_semantic_facts(
+                    f"Count records {phrase}.", ResolutionContext({})
+                )
+                self.assertEqual(
+                    [
+                        (f.field, f.operator, f.values)
+                        for f in facts
+                        if f.kind == "filter"
+                    ],
+                    [("Date", operator, (value,))],
+                )
+
+    def test_ambiguous_and_invalid_temporal_literals_fail_closed(self):
+        for literal in ("09/03/2026", "2026-02-30", "February 30, 2026", "2026-13-03"):
+            with self.subTest(literal=literal):
+                facts = detect_semantic_facts(
+                    f"Count records before {literal}.", ResolutionContext({})
+                )
+                self.assertTrue(
+                    any(
+                        f.kind == "unsupported" and f.strength == "strong"
+                        for f in facts
+                    )
+                )
+
+    def test_named_subject_without_possession_is_detected(self):
+        facts = detect_semantic_facts(
+            "Count records for Morgan River.", ResolutionContext({})
+        )
+        self.assertTrue(
+            any(f.kind == "entity" and f.evidence_text == "Morgan River" for f in facts)
+        )
+
+    def test_entity_span_does_not_erase_a_prefix_of_a_catalog_value(self):
+        context = ResolutionContext(
+            {"Leave_Type": ("Annual Leave",)},
+            employees=(EmployeeReference(employee_id="A10017", name="Ann"),),
+        )
+        facts = detect_semantic_facts("Count Ann's Annual Leave records.", context)
+        self.assertTrue(
+            any(
+                f.field == "Leave_Type" and f.values == ("Annual Leave",) for f in facts
+            )
+        )
+
+    def test_explicit_date_field_and_range_bind_their_operators(self):
+        for question, expected in (
+            (
+                "Count records with Actual_From_Date before 2026-09-03",
+                [("Actual_From_Date", "lt", ("2026-09-03",))],
+            ),
+            (
+                "Count records from 2026-09-01 to 2026-09-03",
+                [("Date", "gte", ("2026-09-01",)), ("Date", "lte", ("2026-09-03",))],
+            ),
+        ):
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(question, ResolutionContext({}))
+                self.assertEqual(
+                    [
+                        (f.field, f.operator, f.values)
+                        for f in facts
+                        if f.kind == "filter"
+                    ],
+                    expected,
+                )
+
+    def test_unrepresentable_and_reversed_temporal_constraints_fail_closed(self):
+        for question in (
+            "Count records after 09:00",
+            "Count records from 2026-09-03 to 2026-09-01",
+        ):
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(question, ResolutionContext({}))
+                self.assertTrue(any(f.kind == "unsupported" for f in facts))
+
+    def test_yearless_invalid_and_reversed_dates_do_not_disappear(self):
+        for question in (
+            "Count records before February 30",
+            "Count records between September 8 and September 3",
+        ):
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(question, ResolutionContext({}))
+                self.assertTrue(any(f.kind == "unsupported" for f in facts))
+
+    def test_temporal_literals_bind_to_their_own_field_occurrences(self):
+        facts = detect_semantic_facts(
+            "Count records with Date before 2026-09-03 and Actual_From_Date after 2026-09-01",
+            ResolutionContext({}),
+        )
+        self.assertEqual(
+            [(f.field, f.operator, f.values) for f in facts if f.kind == "filter"],
+            [
+                ("Date", "lt", ("2026-09-03",)),
+                ("Actual_From_Date", "gt", ("2026-09-01",)),
+            ],
+        )
+
     def test_worked_hours_numeric_constraint_outranks_embedded_work_predicate(self):
         facts = detect_semantic_facts(
             "How many days had worked hours above 2?",

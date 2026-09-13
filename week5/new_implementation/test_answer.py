@@ -93,11 +93,13 @@ def _proposal_side_effect(*plans):
                 unit = (
                     "percentage"
                     if calculation.operation == "percentage"
-                    else "hours"
-                    if calculation.field
-                    and answer.FIELD_DEFINITIONS[calculation.field].storage_type
-                    == "number"
-                    else "value"
+                    else (
+                        "hours"
+                        if calculation.field
+                        and answer.FIELD_DEFINITIONS[calculation.field].storage_type
+                        == "number"
+                        else "value"
+                    )
                 )
                 subject = calculation.field
                 grain = [subject] if subject else []
@@ -109,7 +111,7 @@ def _proposal_side_effect(*plans):
                 subject_field=subject,
                 grain=grain,
             )
-        return answer.PlannerProposal(
+        proposal = answer.PlannerProposal(
             status=status,
             filters=filters,
             name_hint=(
@@ -137,6 +139,11 @@ def _proposal_side_effect(*plans):
             ),
             answer_contract=answer_contract,
             interpretation_candidates=plan.interpretation_candidates,
+        )
+        return answer.PlannerProposal.model_validate(
+            answer._overlay_authoritative_facts(
+                proposal.model_dump(), kwargs.get("semantic_facts", ())
+            )
         )
 
     return propose
@@ -376,12 +383,11 @@ class DateRangeResolutionTests(unittest.TestCase):
         )
 
     def test_reversed_explicit_range_does_not_create_an_impossible_query(self):
-        filters = answer.resolve_relative_date_filters(
-            "Between September 8 and September 3",
-            reference_date=date(2026, 9, 11),
-        )
-
-        self.assertEqual(filters, [])
+        with self.assertRaises(answer.PlanValidationError):
+            answer.resolve_relative_date_filters(
+                "Between September 8 and September 3",
+                reference_date=date(2026, 9, 11),
+            )
 
     def test_datetime_reference_is_normalized_to_its_local_calendar_date(self):
         filters = answer.resolve_relative_date_filters(
@@ -772,6 +778,157 @@ class EmployeeResolutionTests(unittest.TestCase):
 
 
 class ExecutablePlanSafetyTests(unittest.TestCase):
+    def test_unresolved_possessive_name_never_reaches_retrieval(self):
+        proposal = answer.PlannerProposal(
+            status="ready",
+            answer_contract=answer.AnswerContract(shape="rows", unit="value"),
+        )
+        with (
+            patch.object(answer, "propose_query", return_value=proposal),
+            patch.object(answer, "load_employee_directory", return_value=[]),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "execute_exact_postgres") as postgres,
+            patch.object(answer, "fetch_exact_chroma") as chroma,
+            patch.object(answer, "fetch_semantic_chroma") as semantic,
+        ):
+            with self.assertRaises(answer.EmployeeClarificationRequired) as raised:
+                answer.fetch_context("Count Morgan River's Authorized records.")
+        self.assertEqual(raised.exception.resolution.outcome, "none")
+        postgres.assert_not_called()
+        chroma.assert_not_called()
+        semantic.assert_not_called()
+
+    def test_explicit_department_population_does_not_inherit_trusted_selection(self):
+        employee = answer.EmployeeCandidate(
+            employee_id="A10017", name="Selected Employee"
+        )
+
+        def propose(question, *args, **kwargs):
+            return answer.PlannerProposal.model_validate(
+                answer._overlay_authoritative_facts(
+                    {
+                        "status": "ready",
+                        "answer_contract": {"shape": "rows", "unit": "value"},
+                    },
+                    kwargs["semantic_facts"],
+                )
+            )
+
+        with (
+            patch.object(answer, "propose_query", side_effect=propose),
+            patch.object(
+                answer,
+                "load_attendance_catalog_candidates",
+                return_value={"Department": ("Services",)},
+            ),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "execute_exact_postgres", return_value=([], None, 0)),
+        ):
+            result = answer._fetch_context_result(
+                "Show Department Services attendance records",
+                default_employees=[employee],
+            )
+        self.assertNotIn("Employee_ID", {f.field for f in result.plan.filters})
+
+    def test_explicit_id_is_directory_grounded_before_provider_planning(self):
+        employee = answer.EmployeeCandidate(
+            employee_id="A10017", name="Selected Employee"
+        )
+        events = []
+
+        def directory():
+            events.append("directory")
+            return [employee]
+
+        def propose(question, *args, **kwargs):
+            events.append("planner")
+            self.assertTrue(
+                any(
+                    f.field == "Employee_ID" and f.origin == "trusted_state"
+                    for f in kwargs["semantic_facts"]
+                )
+            )
+            return answer.PlannerProposal.model_validate(
+                answer._overlay_authoritative_facts(
+                    {"status": "ready"}, kwargs["semantic_facts"]
+                )
+            )
+
+        with (
+            patch.object(answer, "load_employee_directory", side_effect=directory),
+            patch.object(answer, "propose_query", side_effect=propose),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "execute_exact_postgres", return_value=([], None, 0)),
+        ):
+            result = answer._fetch_context_result("Count records for a10017.")
+        self.assertEqual(events[:2], ["directory", "planner"])
+        self.assertIn(
+            ("Employee_ID", "A10017"), {(f.field, f.value) for f in result.plan.filters}
+        )
+
+    def test_invalid_identity_and_date_literals_stop_before_planning_and_retrieval(
+        self,
+    ):
+        proposal = answer.PlannerProposal(
+            status="ready",
+            answer_contract=answer.AnswerContract(shape="rows", unit="value"),
+        )
+        for literal in ("A10017extra", "AA10017", "A1001", "09/03/2026", "2026-02-30"):
+            with (
+                self.subTest(literal=literal),
+                patch.object(answer, "propose_query", return_value=proposal) as planner,
+                patch.object(
+                    answer, "load_attendance_catalog_candidates", return_value={}
+                ),
+                patch.object(answer, "execute_exact_postgres") as postgres,
+                patch.object(answer, "fetch_exact_chroma") as chroma,
+                patch.object(answer, "fetch_semantic_chroma") as semantic,
+            ):
+                with self.assertRaises(answer.PlanValidationError):
+                    answer.fetch_context(f"Show attendance records for {literal}.")
+                planner.assert_not_called()
+                postgres.assert_not_called()
+                chroma.assert_not_called()
+                semantic.assert_not_called()
+
+    def test_named_authorized_count_retains_directory_grounded_employee(self):
+        employee = answer.EmployeeCandidate(
+            employee_id="A10017", name="Selected Employee"
+        )
+        captured = []
+
+        def propose(question, *args, **kwargs):
+            captured.extend(kwargs["semantic_facts"])
+            return answer.PlannerProposal.model_validate(
+                answer._overlay_authoritative_facts(
+                    {"status": "ready", "filters": []}, kwargs["semantic_facts"]
+                )
+            )
+
+        with (
+            patch.object(answer, "propose_query", side_effect=propose),
+            patch.object(answer, "load_employee_directory", return_value=[employee]),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "execute_exact_postgres", return_value=([], None, 0)),
+        ):
+            result = answer._fetch_context_result(
+                "Count Selected Employee's Authorized records.",
+                default_employees=[employee],
+            )
+        self.assertIn(
+            ("Employee_ID", "eq", "A10017"),
+            {(f.field, f.operator, f.value) for f in result.plan.filters},
+        )
+        self.assertTrue(
+            any(
+                f.field == "Employee_ID" and f.origin == "trusted_state"
+                for f in captured
+            )
+        )
+        self.assertEqual(result.plan.measure, "attendance_records")
+
     def test_postgres_catalog_lookup_filters_and_limits_in_sql(self):
         psycopg = MagicMock()
         connection = MagicMock()
@@ -963,7 +1120,15 @@ class ExecutablePlanSafetyTests(unittest.TestCase):
                 "load_attendance_catalog_candidates",
                 return_value={"Exception": ("Absent", "Lateness", "OK")},
             ),
-            patch.object(answer, "load_employee_directory") as employees,
+            patch.object(
+                answer,
+                "load_employee_directory",
+                return_value=[
+                    answer.EmployeeCandidate(
+                        employee_id="A11017", name="Directory Employee"
+                    )
+                ],
+            ) as employees,
             patch.object(answer, "execute_exact_postgres") as postgres,
             patch.object(answer, "fetch_exact_chroma") as chroma,
             patch.object(answer, "rerank") as rerank,
@@ -975,7 +1140,7 @@ class ExecutablePlanSafetyTests(unittest.TestCase):
             {item.code for item in raised.exception.violations},
             {"ungrounded_constraint", "uncovered_fact"},
         )
-        employees.assert_not_called()
+        employees.assert_called_once()
         postgres.assert_not_called()
         chroma.assert_not_called()
         rerank.assert_not_called()
@@ -1131,6 +1296,69 @@ class ExecutablePlanSafetyTests(unittest.TestCase):
 
 
 class TrustedClarificationStateTests(unittest.TestCase):
+    def test_possessive_count_clarification_preserves_scope_until_population_request(
+        self,
+    ):
+        employees = [
+            answer.EmployeeCandidate(employee_id="A10017", name="Selected Employee"),
+            answer.EmployeeCandidate(employee_id="A10018", name="Selected Employee"),
+        ]
+
+        def propose(question, *args, **kwargs):
+            return answer.PlannerProposal.model_validate(
+                answer._overlay_authoritative_facts(
+                    {
+                        "status": "ready",
+                        "answer_contract": {"shape": "rows", "unit": "value"},
+                    },
+                    kwargs["semantic_facts"],
+                )
+            )
+
+        with (
+            patch.object(answer, "propose_query", side_effect=propose),
+            patch.object(answer, "load_employee_directory", return_value=employees),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=([], {"operation": "count", "value": 3}, 3),
+            ) as retrieve,
+        ):
+            text, chunks, state = answer.answer_question_with_state(
+                "Count Selected Employee's Authorized records.",
+                [],
+                answer.ConversationState(),
+            )
+            self.assertIn("Which employee", text)
+            self.assertEqual(chunks, [])
+            retrieve.assert_not_called()
+            _text, _chunks, state = answer.answer_question_with_state("1", [], state)
+            self.assertEqual(state.selected_employees, [employees[0]])
+            self.assertIn(
+                answer.FilterCondition(
+                    field="Employee_ID", operator="eq", value="A10017"
+                ),
+                retrieve.call_args.args[0].filters,
+            )
+            _text, _chunks, state = answer.answer_question_with_state(
+                "Count Authorized records.", [], state
+            )
+            self.assertIn(
+                answer.FilterCondition(
+                    field="Employee_ID", operator="eq", value="A10017"
+                ),
+                retrieve.call_args.args[0].filters,
+            )
+            _text, _chunks, state = answer.answer_question_with_state(
+                "Count employees.", [], state
+            )
+            self.assertNotIn(
+                "Employee_ID", {f.field for f in retrieve.call_args.args[0].filters}
+            )
+            self.assertEqual(state.selected_employees, [])
+
     def test_catalog_ambiguity_stores_proposal_and_selected_values_recompile(self):
         question = "Show department Op"
         proposal = answer.PlannerProposal(

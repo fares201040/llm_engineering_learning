@@ -49,6 +49,8 @@ try:
         merge_semantic_facts,
     )
     from .plan_compiler import (
+        CapabilityInvariant,
+        InvariantContext,
         CompilationContext,
         ConstraintProvenance,
         PendingConstraintData,
@@ -100,6 +102,8 @@ except ImportError:  # Running answer.py directly from its directory.
         merge_semantic_facts,
     )
     from plan_compiler import (
+        CapabilityInvariant,
+        InvariantContext,
         CompilationContext,
         ConstraintProvenance,
         PendingConstraintData,
@@ -344,146 +348,6 @@ def _current_local_date():
     return datetime.now(ZoneInfo(APP_TIMEZONE)).date()
 
 
-_DATE_TOKEN_PATTERN = (
-    r"(?:"
-    r"\d{4}-\d{1,2}-\d{1,2}"
-    r"|\d{1,2}/\d{1,2}/\d{4}"
-    r"|(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
-    r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|"
-    r"oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
-    r"\s+\d{1,2}(?!\d)(?:,?\s+\d{4})?"
-    r")"
-)
-
-
-def _parse_date_token(token: str, default_year: int) -> date:
-    text = " ".join(token.strip().split()).replace(",", "")
-
-    for date_format in ("%Y-%m-%d", "%m/%d/%Y"):
-        try:
-            return datetime.strptime(text, date_format).date()
-        except ValueError:
-            continue
-
-    month_match = re.fullmatch(
-        r"(?P<month>[a-z]+)\s+(?P<day>\d{1,2})(?:\s+(?P<year>\d{4}))?",
-        text.casefold(),
-    )
-    if not month_match:
-        raise ValueError(f"Unsupported date token: {token!r}")
-
-    month_names = {
-        "jan": 1,
-        "january": 1,
-        "feb": 2,
-        "february": 2,
-        "mar": 3,
-        "march": 3,
-        "apr": 4,
-        "april": 4,
-        "may": 5,
-        "jun": 6,
-        "june": 6,
-        "jul": 7,
-        "july": 7,
-        "aug": 8,
-        "august": 8,
-        "sep": 9,
-        "sept": 9,
-        "september": 9,
-        "oct": 10,
-        "october": 10,
-        "nov": 11,
-        "november": 11,
-        "dec": 12,
-        "december": 12,
-    }
-
-    month = month_names.get(month_match.group("month"))
-    if month is None:
-        raise ValueError(f"Unsupported month in date token: {token!r}")
-
-    return date(
-        int(month_match.group("year") or default_year),
-        month,
-        int(month_match.group("day")),
-    )
-
-
-def _date_token_has_year(token: str) -> bool:
-    return bool(re.search(r"\b\d{4}\b", token))
-
-
-def _resolve_explicit_date_range(
-    question: str,
-    reference_date: date,
-):
-    abbreviated_end = re.search(
-        rf"\bbetween\s+(?P<start>{_DATE_TOKEN_PATTERN})\s+and\s+"
-        r"(?P<end_day>\d{1,2})(?:,?\s+(?P<end_year>\d{4}))?\b",
-        question,
-        flags=re.IGNORECASE,
-    )
-    if abbreviated_end:
-        start_token = abbreviated_end.group("start")
-        try:
-            start = _parse_date_token(start_token, reference_date.year)
-            end = date(
-                int(abbreviated_end.group("end_year") or start.year),
-                start.month,
-                int(abbreviated_end.group("end_day")),
-            )
-        except (TypeError, ValueError):
-            return []
-        if end < start:
-            return []
-        return [
-            FilterCondition(field="Date", operator="gte", value=start.isoformat()),
-            FilterCondition(field="Date", operator="lte", value=end.isoformat()),
-        ]
-
-    range_pattern = re.compile(
-        rf"\b(?:between\s+(?P<between_start>{_DATE_TOKEN_PATTERN})\s+"
-        rf"and\s+(?P<between_end>{_DATE_TOKEN_PATTERN})|"
-        rf"from\s+(?P<from_start>{_DATE_TOKEN_PATTERN})\s+"
-        rf"to\s+(?P<from_end>{_DATE_TOKEN_PATTERN}))\b",
-        flags=re.IGNORECASE,
-    )
-    match = range_pattern.search(question)
-    if not match:
-        return []
-
-    start_token = match.group("between_start") or match.group("from_start")
-    end_token = match.group("between_end") or match.group("from_end")
-
-    try:
-        start = _parse_date_token(start_token, reference_date.year)
-        end_default_year = (
-            start.year if _date_token_has_year(start_token) else reference_date.year
-        )
-        end = _parse_date_token(end_token, end_default_year)
-    except (TypeError, ValueError):
-        return []
-
-    # A reversed range is never useful for retrieval. A year boundary may be
-    # intentional when both month names omit the year, so resolve that case
-    # only when the end month is earlier than the start month.
-    if end < start:
-        if (
-            not _date_token_has_year(start_token)
-            and not _date_token_has_year(end_token)
-            and end.month < start.month
-        ):
-            end = end.replace(year=start.year + 1)
-        else:
-            return []
-
-    return [
-        FilterCondition(field="Date", operator="gte", value=start.isoformat()),
-        FilterCondition(field="Date", operator="lte", value=end.isoformat()),
-    ]
-
-
 def resolve_relative_date_filters(
     question: str,
     reference_date=None,
@@ -521,9 +385,31 @@ def resolve_relative_date_filters(
             ),
         ]
 
-    explicit_range = _resolve_explicit_date_range(text, today)
-    if explicit_range:
-        return explicit_range
+    explicit_facts = detect_semantic_facts(
+        question, ResolutionContext({}, reference_date=today)
+    )
+    if any(
+        fact.kind == "unsupported"
+        and fact.concept_name
+        in {
+            "ambiguous_date",
+            "malformed_value",
+            "reversed_temporal_range",
+            "unrepresentable_temporal_target",
+        }
+        for fact in explicit_facts
+    ):
+        raise PlanValidationError(
+            "The date constraint is invalid or ambiguous; please use an unambiguous date and range."
+        )
+    explicit_dates = [
+        FilterCondition(field=fact.field, operator=fact.operator, value=fact.values[0])
+        for fact in explicit_facts
+        if fact.kind == "filter"
+        and FIELD_DEFINITIONS[fact.field].storage_type == "date"
+    ]
+    if explicit_dates:
+        return explicit_dates
 
     month_match = re.search(
         r"\b(?P<month>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
@@ -794,14 +680,16 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
         prepared["calculation"] = None
         prepared["interpretation_candidates"] = []
         prepared["answer_contract"] = {
-            "shape": "grouped"
-            if prepared.get("group_by")
-            else definition.default_answer_shape,
+            "shape": (
+                "grouped"
+                if prepared.get("group_by")
+                else definition.default_answer_shape
+            ),
             "unit": definition.answer_unit,
             "subject_field": definition.aggregation_field,
-            "grain": [definition.aggregation_field]
-            if definition.aggregation_field
-            else [],
+            "grain": (
+                [definition.aggregation_field] if definition.aggregation_field else []
+            ),
         }
 
     predicates = (
@@ -1116,8 +1004,17 @@ def resolve_employee_plan(
     plan: QueryPlan,
     directory: list[EmployeeCandidate] | None = None,
     default_candidates: list[EmployeeCandidate] | None = None,
+    trusted_scope: bool = False,
 ):
     prepared = plan.model_copy(deep=True)
+    if trusted_scope and default_candidates:
+        return _plan_for_selected_employees(
+            plan, default_candidates
+        ), EmployeeResolution(
+            outcome="unique",
+            candidates=default_candidates,
+            reference="directory-validated request selection",
+        )
     explicit_tokens = re.findall(r"\b[A-Za-z]\d{5}\b", question)
     normalized_question = _normalize_name(question)
     planned_names = [
@@ -1806,7 +1703,26 @@ def _is_employee_followup(question: str, plan: QueryPlan | None = None) -> bool:
             text,
         )
     )
-    if explicit_population or structured_population or structured_population_filter:
+    explicit_scope_field = not has_anaphora and any(
+        evidence_occurs(question, phrase)
+        for field in (
+            "Organization_Unit",
+            "Country",
+            "Work_Location",
+            "Department",
+            "Position",
+            "Job",
+            "Gradeset",
+            "Grade",
+        )
+        for phrase in FIELD_DEFINITIONS[field].natural_names
+    )
+    if (
+        explicit_population
+        or structured_population
+        or structured_population_filter
+        or explicit_scope_field
+    ):
         return False
     if grouped_or_ranked and not has_anaphora:
         return False
@@ -2686,8 +2602,84 @@ def _fetch_context_result(
     pre_context = ResolutionContext(
         catalog=pre_catalog,
         employees=_employee_references(default_employees),
+        reference_date=_current_local_date(),
     )
     detected_facts = detect_semantic_facts(question, pre_context)
+    if any(
+        fact.kind == "unsupported" and fact.strength == "strong"
+        for fact in detected_facts
+    ):
+        violations = CapabilityInvariant().check(
+            InvariantContext(
+                CompilationContext(question, detected_facts, pre_context),
+                None,
+                QueryPlan(mode="exact", search_query=question),
+                (),
+            )
+        )
+        raise SemanticPlanValidationError(violations)
+    entity_resolution = None
+    directory = None
+    entity_facts = [fact for fact in detected_facts if fact.kind == "entity"]
+    trusted_selection = any(
+        fact.field == "Employee_ID" and fact.origin == "trusted_state"
+        for fact in prepared_facts
+    )
+    if entity_facts and not trusted_selection:
+        directory = load_employee_directory()
+        selected = []
+        for fact in entity_facts:
+            if fact.field == "Employee_ID":
+                matches = [
+                    item
+                    for item in directory
+                    if item.employee_id.casefold() == str(fact.values[0]).casefold()
+                ]
+                entity_resolution = EmployeeResolution(
+                    outcome=(
+                        "unique"
+                        if len(matches) == 1
+                        else "ambiguous" if matches else "none"
+                    ),
+                    candidates=matches,
+                    reference=fact.evidence_text,
+                )
+            else:
+                entity_resolution = resolve_employee_reference(
+                    fact.evidence_text, directory
+                )
+            if entity_resolution.outcome != "unique":
+                break
+            selected.extend(entity_resolution.candidates)
+        if entity_resolution.outcome == "unique":
+            default_employees = list(
+                {item.employee_id: item for item in selected}.values()
+            )
+    if (
+        default_employees
+        and (entity_facts or trusted_selection or _is_employee_followup(question))
+        and (entity_resolution is None or entity_resolution.outcome == "unique")
+    ):
+        ids = tuple(item.employee_id for item in default_employees)
+        prepared_facts = merge_semantic_facts(
+            prepared_facts,
+            (
+                SemanticFact(
+                    kind="filter",
+                    field="Employee_ID",
+                    operator="eq" if len(ids) == 1 else "in",
+                    values=ids,
+                    evidence_text=" ".join(ids),
+                    origin="trusted_state",
+                    strength="strong",
+                ),
+            ),
+        )
+        detected_facts = tuple(
+            fact
+            for fact in detected_facts
+            if not (fact.kind == "filter" and fact.field in {"Employee_ID", "Name"})
+        )
     relative_dates = resolve_relative_date_filters(question)
     date_facts = tuple(
         SemanticFact(
@@ -2717,6 +2709,8 @@ def _fetch_context_result(
         semantic_facts=initial_facts,
         candidate_catalog=pre_catalog,
     )
+    if entity_resolution is not None and entity_resolution.outcome != "unique":
+        raise EmployeeClarificationRequired(proposal, initial_facts, entity_resolution)
     event_logger.emit(
         "planner_proposal_received",
         request_id=request_id,
@@ -2753,10 +2747,20 @@ def _fetch_context_result(
     resolution_context = ResolutionContext(
         catalog=catalog,
         employees=_employee_references(default_employees),
+        reference_date=pre_context.reference_date,
     )
-    facts = merge_semantic_facts(
-        initial_facts, detect_semantic_facts(question, resolution_context)
+    refreshed_facts = detect_semantic_facts(question, resolution_context)
+    trusted_scope = any(
+        fact.field == "Employee_ID" and fact.origin == "trusted_state"
+        for fact in initial_facts
     )
+    if trusted_scope:
+        refreshed_facts = tuple(
+            fact
+            for fact in refreshed_facts
+            if not (fact.kind == "filter" and fact.field in {"Employee_ID", "Name"})
+        )
+    facts = merge_semantic_facts(initial_facts, refreshed_facts)
     compilation_context = CompilationContext(question, facts, resolution_context)
     compilation = compile_proposal(proposal, compilation_context)
     if compilation.clarification is not None:
@@ -2796,6 +2800,8 @@ def _fetch_context_result(
         question,
         plan,
         default_candidates=default_employees,
+        directory=directory,
+        trusted_scope=trusted_scope,
     )
     if employee_resolution is not None and employee_resolution.outcome != "unique":
         raise EmployeeClarificationRequired(proposal, facts, employee_resolution)
@@ -3357,9 +3363,9 @@ def answer_question_with_state(
             ProposedFilter(
                 field=pending.field,
                 operator="eq" if len(selected_values) == 1 else "in",
-                value=selected_values[0]
-                if len(selected_values) == 1
-                else selected_values,
+                value=(
+                    selected_values[0] if len(selected_values) == 1 else selected_values
+                ),
                 evidence_text=pending.reference,
             )
         )
@@ -3520,6 +3526,8 @@ def answer_question_with_state(
     state.pending_interpretations = []
     if resolved_employees:
         state.selected_employees = resolved_employees
+    elif not _is_employee_followup(effective_question, plan):
+        state.selected_employees = []
     text, chunks = _answer_from_context(
         effective_question,
         history,

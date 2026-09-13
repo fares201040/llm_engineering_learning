@@ -13,6 +13,62 @@ from week5.new_implementation.semantic_resolution import (
 )
 
 
+class TemporalCompositionDetectorTests(unittest.TestCase):
+    def test_temporal_evidence_preserves_prior_constraints(self):
+        for question, expected in (
+            (
+                "Count Authorized records before 2026-09-03",
+                ("predicate", "authorized", None, ()),
+            ),
+            (
+                "Count records for Department Human Resources before 2026-09-03",
+                ("filter", None, "Department", ("Human Resources",)),
+            ),
+        ):
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(
+                    question, ResolutionContext({"Department": ("Human Resources",)})
+                )
+                self.assertIn(
+                    expected,
+                    {(f.kind, f.concept_name, f.field, f.values) for f in facts},
+                )
+                date_fact = next(
+                    f for f in facts if f.kind == "filter" and f.field == "Date"
+                )
+                self.assertEqual(date_fact.evidence_text, "before 2026-09-03")
+                self.assertEqual(
+                    question[slice(*date_fact.evidence_span)], date_fact.evidence_text
+                )
+
+    def test_name_boundary_preserves_complete_temporal_negation(self):
+        question = "Count records for morgan river not before 2026-09-03"
+        facts = detect_semantic_facts(question, ResolutionContext({}))
+        self.assertEqual(
+            [f.evidence_text for f in facts if f.kind == "entity"], ["morgan river"]
+        )
+        self.assertIn(
+            ("Date", "gte", ("2026-09-03",)),
+            {(f.field, f.operator, f.values) for f in facts},
+        )
+
+    def test_name_boundary_handles_field_positions_and_calendar_references(self):
+        for expression in (
+            "not before Date 2026-09-03",
+            "Date on or after 2026-09-03",
+            "before today",
+        ):
+            with self.subTest(expression=expression):
+                facts = detect_semantic_facts(
+                    f"Count records for morgan river {expression}",
+                    ResolutionContext({}),
+                )
+                self.assertEqual(
+                    [f.evidence_text for f in facts if f.kind == "entity"],
+                    ["morgan river"],
+                )
+
+
 class EntityTemporalReviewRegressionTests(unittest.TestCase):
     def test_temporal_reference_spans_are_not_lowercase_employee_names(self):
         for phrase in ("last month", "September 2026", "this week"):

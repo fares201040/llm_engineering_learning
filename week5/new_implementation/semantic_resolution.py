@@ -412,6 +412,7 @@ class EntityResolver(FieldResolver):
 
     def detect(self, question, field, context):
         temporal_spans = TemporalResolver.reference_spans(question)
+        temporal_fields = TemporalResolver.field_spans(question)
         protected_spans = [
             span
             for definition in (
@@ -458,11 +459,30 @@ class EntityResolver(FieldResolver):
         ):
             start, end = match.span("name")
             boundary = re.search(
-                r"\s+(?:have|has|had|work|worked|attend|attended|before|after|on|in|and|with|who|whose|that|which)\b",
+                r"\s+(?:have|has|had|work|worked|attend|attended|in|and|with|who|whose|that|which)\b",
                 question[start:end],
                 re.I,
             )
-            syntax_spans.append((start, start + boundary.start() if boundary else end))
+            name_end = start + boundary.start() if boundary else end
+            for reference_start, _ in temporal_spans:
+                if reference_start < start:
+                    continue
+                preceding_fields = [
+                    (begin - start, stop - start)
+                    for begin, stop, _ in temporal_fields
+                    if start <= begin and stop <= reference_start
+                ]
+                local_field = max(preceding_fields, default=None)
+                _, _, operator_start = TemporalResolver._operator(
+                    question[start:reference_start], local_field
+                )
+                if operator_start is not None:
+                    name_end = min(name_end, start + operator_start)
+                if local_field is not None:
+                    name_end = min(name_end, start + local_field[0])
+            while name_end > start and question[name_end - 1].isspace():
+                name_end -= 1
+            syntax_spans.append((start, name_end))
         known_spans = [
             span
             for employee in context.employees
@@ -581,6 +601,16 @@ class TemporalResolver(FieldResolver):
     def literal_matches(cls, question):
         return tuple(cls._literal_pattern.finditer(question))
 
+    @staticmethod
+    def field_spans(question):
+        return tuple(
+            (start, end, field)
+            for field, definition in FIELD_DEFINITIONS.items()
+            if definition.resolution_kind == "temporal" and definition.planner_visible
+            for phrase in definition.natural_names
+            for start, end in _raw_phrase_spans(question, phrase)
+        )
+
     @classmethod
     def reference_spans(cls, question):
         """Protect calendar references as well as literals from entity detection."""
@@ -603,9 +633,16 @@ class TemporalResolver(FieldResolver):
 
     @classmethod
     def _operator(cls, prefix, field_span=None):
-        before_field = prefix[: field_span[0]] if field_span else prefix
         after_field = prefix[field_span[1] :] if field_span else ""
-        operator_text = before_field + " " + after_field if field_span else prefix
+        # Mask the field without changing offsets: entity boundaries and temporal
+        # evidence must refer to the same complete source operator occurrence.
+        operator_text = (
+            prefix[: field_span[0]]
+            + " " * (field_span[1] - field_span[0])
+            + after_field
+            if field_span
+            else prefix
+        )
         expression = "|".join(
             re.escape(phrase).replace(r"\ ", r"\s+")
             for phrase in sorted(cls._operators, key=len, reverse=True)
@@ -615,23 +652,25 @@ class TemporalResolver(FieldResolver):
         )
         if match:
             preceding = operator_text[: match.start()]
-            if re.search(
+            modifier = re.search(
                 r"(?:\b(?:not|never|approximately|roughly|around)|[<>=!])\s*$",
                 preceding,
                 re.I,
-            ):
-                return None, ""
+            )
+            if modifier:
+                return None, "", modifier.start()
             phrase = " ".join(match.group("operator").casefold().split())
-            return cls._operators[phrase], phrase
+            return cls._operators[phrase], phrase, match.start()
         if field_span and after_field.strip():
-            return None, ""
-        if re.search(
+            return None, "", field_span[1]
+        modifier = re.search(
             r"(?:\b(?:not|never|approximately|roughly|around)|[<>=!])\s*$",
             operator_text,
             re.I,
-        ):
-            return None, ""
-        return "eq", ""
+        )
+        if modifier:
+            return None, "", modifier.start()
+        return "eq", "", None
 
     @staticmethod
     def _canonical_literal(field, literal, year):
@@ -659,13 +698,7 @@ class TemporalResolver(FieldResolver):
         del selected_fields  # Binding is local to each literal, not a global field set.
         facts = []
         matches = self.literal_matches(question)
-        field_spans = [
-            (start, end, field)
-            for field, definition in FIELD_DEFINITIONS.items()
-            if definition.resolution_kind == "temporal" and definition.planner_visible
-            for phrase in definition.natural_names
-            for start, end in _raw_phrase_spans(question, phrase)
-        ]
+        field_spans = self.field_spans(question)
         previous = None
         range_start = None
         for match in matches:
@@ -686,7 +719,14 @@ class TemporalResolver(FieldResolver):
                 if target_span and target_span[0] >= segment_start
                 else None
             )
-            operator, phrase = self._operator(prefix, local_field)
+            operator, phrase, operator_start = self._operator(prefix, local_field)
+            evidence_start = min(
+                match.start(),
+                segment_start + operator_start
+                if operator_start is not None
+                else match.start(),
+                target_span[0] if local_field else match.start(),
+            )
             paired = bool(
                 range_start and re.fullmatch(r"\s*(?:to|and)\s*", prefix, re.I)
             )
@@ -709,7 +749,7 @@ class TemporalResolver(FieldResolver):
             if operator is None:
                 facts.append(
                     _unsupported_fact(
-                        "unsupported_operator", prefix.strip() + " " + literal
+                        "unsupported_operator", question[evidence_start : match.end()]
                     )
                 )
                 previous = match
@@ -737,12 +777,6 @@ class TemporalResolver(FieldResolver):
                 )
                 previous = match
                 continue
-            evidence_start = (
-                target_span[0] if local_field else match.start() - len(prefix.lstrip())
-            )
-            if local_field:
-                # Include an operator placed before the field as well.
-                evidence_start = segment_start
             evidence = question[evidence_start : match.end()].strip()
             fact = SemanticFact(
                 kind="filter",

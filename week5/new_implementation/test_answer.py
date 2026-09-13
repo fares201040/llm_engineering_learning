@@ -161,6 +161,72 @@ def _executable_plan(**values):
     return answer.ExecutableQueryPlan(**values)
 
 
+class TemporalCompositionRuntimeTests(unittest.TestCase):
+    def test_prior_constraints_reach_retrieval_with_temporal_bound(self):
+        for question, expected in (
+            (
+                "Count Authorized records before 2026-09-03",
+                ("Status", "eq", "Authorized"),
+            ),
+            (
+                "Count records for Department Human Resources before 2026-09-03",
+                ("Department", "eq", "Human Resources"),
+            ),
+        ):
+            with self.subTest(question=question):
+                self._assert_runtime_constraints(
+                    question, {expected, ("Date", "lt", "2026-09-03")}
+                )
+
+    def test_named_employee_and_negated_date_bound_reach_retrieval(self):
+        self._assert_runtime_constraints(
+            "Count records for morgan river not before 2026-09-03",
+            {("Employee_ID", "eq", "A10018"), ("Date", "gte", "2026-09-03")},
+        )
+
+    def _assert_runtime_constraints(self, question, expected):
+        def propose(question, *args, **kwargs):
+            return answer.PlannerProposal.model_validate(
+                answer._overlay_authoritative_facts(
+                    {
+                        "status": "ready",
+                        "answer_contract": {"shape": "rows", "unit": "value"},
+                    },
+                    kwargs["semantic_facts"],
+                )
+            )
+
+        with (
+            patch.object(answer, "propose_query", side_effect=propose),
+            patch.object(
+                answer,
+                "load_attendance_catalog_candidates",
+                return_value={"Department": ("Human Resources",)},
+            ),
+            patch.object(
+                answer,
+                "load_employee_directory",
+                return_value=[
+                    answer.EmployeeCandidate(employee_id="A10018", name="Morgan River")
+                ],
+            ),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(
+                answer, "execute_exact_postgres", return_value=([], None, 0)
+            ) as retrieval,
+        ):
+            try:
+                result = answer._fetch_context_result(question)
+            except (
+                answer.PlanValidationError,
+                answer.PlanningClarificationRequired,
+            ) as exc:
+                self.fail(f"The independent constraints should compile: {exc}")
+        actual = {(f.field, f.operator, f.value) for f in result.plan.filters}
+        self.assertTrue(expected <= actual, actual)
+        self.assertEqual(retrieval.call_args.args[0].filters, result.plan.filters)
+
+
 class EntityTemporalAnswerReviewTests(unittest.TestCase):
     def test_trusted_scope_cannot_override_an_explicit_new_name_hint(self):
         old = answer.EmployeeCandidate(employee_id="A10017", name="Prior Employee")

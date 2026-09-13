@@ -7,6 +7,7 @@ from week5.new_implementation.attendance_schema import (
     ProposedFilter,
     ProposedMeasureChoice,
     ProposedPredicateChoice,
+    ProposedNameHint,
 )
 from week5.new_implementation.plan_compiler import (
     PLAN_INVARIANTS,
@@ -17,6 +18,90 @@ from week5.new_implementation.semantic_resolution import (
     ResolutionContext,
     detect_semantic_facts,
 )
+
+
+class TemporalCompositionCompilerTests(unittest.TestCase):
+    def test_prior_constraints_and_temporal_bound_compile_together(self):
+        for question, predicates, other_filters in (
+            (
+                "Count Authorized records before 2026-09-03",
+                [
+                    ProposedPredicateChoice(
+                        name="authorized", evidence_text="Authorized"
+                    )
+                ],
+                [],
+            ),
+            (
+                "Count records for Department Human Resources before 2026-09-03",
+                [],
+                [
+                    ProposedFilter(
+                        field="Department",
+                        operator="eq",
+                        value="Human Resources",
+                        evidence_text="Human Resources",
+                    )
+                ],
+            ),
+        ):
+            with self.subTest(question=question):
+                resolution = ResolutionContext({"Department": ("Human Resources",)})
+                proposal = PlannerProposal(
+                    status="ready",
+                    filters=other_filters
+                    + [
+                        ProposedFilter(
+                            field="Date",
+                            operator="lt",
+                            value="2026-09-03",
+                            evidence_text="before 2026-09-03",
+                        )
+                    ],
+                    business_predicates=predicates,
+                    measure=ProposedMeasureChoice(
+                        name="attendance_records", evidence_text="records"
+                    ),
+                    answer_contract=AnswerContract(shape="scalar", unit="records"),
+                )
+                result = compile_proposal(
+                    proposal,
+                    CompilationContext(
+                        question,
+                        detect_semantic_facts(question, resolution),
+                        resolution,
+                    ),
+                )
+                self.assertTrue(result.ready, result.violations)
+
+    def test_name_hint_and_complete_temporal_negation_compile_together(self):
+        question = "Count records for morgan river not before 2026-09-03"
+        resolution = ResolutionContext({})
+        proposal = PlannerProposal(
+            status="ready",
+            name_hint=ProposedNameHint(
+                value="morgan river", evidence_text="morgan river"
+            ),
+            filters=[
+                ProposedFilter(
+                    field="Date",
+                    operator="gte",
+                    value="2026-09-03",
+                    evidence_text="not before 2026-09-03",
+                )
+            ],
+            measure=ProposedMeasureChoice(
+                name="attendance_records", evidence_text="records"
+            ),
+            answer_contract=AnswerContract(shape="scalar", unit="records"),
+        )
+        result = compile_proposal(
+            proposal,
+            CompilationContext(
+                question, detect_semantic_facts(question, resolution), resolution
+            ),
+        )
+        self.assertTrue(result.ready, result.violations)
 
 
 class PlanCompilerTests(unittest.TestCase):

@@ -54,7 +54,10 @@ class SessionStateTests(unittest.TestCase):
         original = answer.ConversationState(
             selected_employees=[selected],
             pending_question="Which employee?",
-            pending_plan=answer.QueryPlan(mode="exact", search_query="employee"),
+            pending_proposal=answer.PlannerProposal(
+                status="unsupported",
+                unsupported_capabilities=["nested_boolean_filters"],
+            ),
             pending_candidates=[selected],
         )
 

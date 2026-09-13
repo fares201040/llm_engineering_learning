@@ -3,24 +3,20 @@ import html
 
 import gradio as gr
 
-try:
+if __package__:
+    from .new_implementation.answer import (
+        ConversationState,
+        LOCAL_DEMO_ACCESS,
+        answer_question_with_state,
+    )
+    from .new_implementation.config import settings
+else:
     from new_implementation.answer import (
         ConversationState,
         LOCAL_DEMO_ACCESS,
         answer_question_with_state,
     )
     from new_implementation.config import settings
-except ModuleNotFoundError as exc:
-    # Also support ``import week5.new_app`` from the repository root while
-    # keeping ``uv run new_app.py`` from week5 backward compatible.
-    if exc.name != "new_implementation":
-        raise
-    from week5.new_implementation.answer import (
-        ConversationState,
-        LOCAL_DEMO_ACCESS,
-        answer_question_with_state,
-    )
-    from week5.new_implementation.config import settings
 
 
 logger = logging.getLogger(__name__)

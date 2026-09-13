@@ -5,6 +5,61 @@ from pydantic import ValidationError
 
 
 class SemanticSchemaContractTests(unittest.TestCase):
+    def test_filter_operator_controls_value_shape_at_model_boundary(self):
+        schema = importlib.import_module("week5.new_implementation.attendance_schema")
+        invalid = (
+            {"field": "Status", "operator": "in", "value": "Authorized"},
+            {"field": "Status", "operator": "eq", "value": ["Authorized"]},
+            {"field": "Status", "operator": "in", "value": []},
+        )
+
+        for values in invalid:
+            with self.subTest(values=values), self.assertRaises(ValidationError):
+                schema.ProposedFilter(evidence_text="Authorized", **values)
+
+    def test_percentage_of_rows_does_not_require_an_identity_field(self):
+        schema = importlib.import_module("week5.new_implementation.attendance_schema")
+        calculation = schema.ProposedCalculation(
+            operation="percentage",
+            field=None,
+            percentage_condition=schema.ProposedFilter(
+                field="Status",
+                operator="eq",
+                value="Authorized",
+                evidence_text="Status equal to Authorized",
+            ),
+            evidence_text="percentage",
+        )
+
+        self.assertIsNone(calculation.field)
+
+        result = schema.PercentageCalculationResult(
+            field=None,
+            numerator=2,
+            denominator=4,
+            value=50.0,
+        )
+        self.assertIsNone(result.field)
+
+    def test_grouping_shape_is_bounded_and_has_no_duplicates(self):
+        schema = importlib.import_module("week5.new_implementation.attendance_schema")
+        contract = schema.AnswerContract(
+            shape="grouped", unit="records", subject_field=None, grain=[]
+        )
+        for fields in (
+            ["Department", "Department"],
+            ["Department", "Shift", "Work_Location"],
+        ):
+            with self.subTest(fields=fields), self.assertRaises(ValidationError):
+                schema.PlannerProposal(
+                    status="ready",
+                    group_by=[
+                        schema.ProposedFieldChoice(field=field, evidence_text=field)
+                        for field in fields
+                    ],
+                    answer_contract=contract,
+                )
+
     def test_planner_proposal_is_not_an_executable_plan(self):
         schema = importlib.import_module("week5.new_implementation.attendance_schema")
         proposal = schema.PlannerProposal(
@@ -46,7 +101,9 @@ class SemanticSchemaContractTests(unittest.TestCase):
             self.assertTrue(set(definition.operators) <= schema.FILTER_OPERATORS, field)
             for alias in definition.value_aliases:
                 if definition.resolution_kind == "closed_value":
-                    self.assertIn(alias.canonical_value, definition.closed_values, field)
+                    self.assertIn(
+                        alias.canonical_value, definition.closed_values, field
+                    )
                 else:
                     self.assertEqual(definition.resolution_kind, "catalog", field)
 
@@ -69,7 +126,9 @@ class SemanticSchemaContractTests(unittest.TestCase):
             self.assertNotIn(name, definition.incompatible_with)
             for incompatible in definition.incompatible_with:
                 self.assertIn(incompatible, schema.BUSINESS_PREDICATE_DEFINITIONS)
-            for required in definition.required_filters + definition.incompatible_filters:
+            for required in (
+                definition.required_filters + definition.incompatible_filters
+            ):
                 self.assertIn(required.field, schema.FIELD_DEFINITIONS)
                 self.assertIn(
                     required.operator,
@@ -91,233 +150,6 @@ class SemanticSchemaContractTests(unittest.TestCase):
         self.assertIn('"name":"Schedule_From_Date"', rendered)
         self.assertNotIn('"name":"chunk_type"', rendered)
         self.assertNotIn("record_json ->>", rendered)
-
-
-class ComposableIntentTests(unittest.TestCase):
-    def test_scheduled_non_attendance_compiles_compositionally(self):
-        schema = importlib.import_module("week5.new_implementation.attendance_schema")
-        plan = schema.QueryPlan(
-            mode="exact",
-            search_query="not attended",
-            measure="distinct_dates",
-            business_predicates=["scheduled_working_day", "not_worked"],
-        )
-
-        compiled = schema.compile_business_intent(plan)
-
-        self.assertEqual(compiled.aggregation, "distinct_count")
-        self.assertEqual(compiled.aggregation_field, "Date")
-        self.assertIn(
-            {"field": "Day_Type", "operator": "eq", "value": "Working Day"},
-            [condition.model_dump() for condition in compiled.filters],
-        )
-        self.assertIn(
-            {"field": "Total_Worked_Hrs", "operator": "lte", "value": 0.0},
-            [condition.model_dump() for condition in compiled.filters],
-        )
-
-    def test_measure_and_predicate_definitions_cover_supported_business_intents(self):
-        schema = importlib.import_module("week5.new_implementation.attendance_schema")
-
-        self.assertEqual(
-            set(schema.MEASURE_DEFINITIONS),
-            {"distinct_dates", "attendance_records", "employees"},
-        )
-        self.assertEqual(
-            set(schema.BUSINESS_PREDICATE_DEFINITIONS),
-            {
-                "scheduled_working_day",
-                "worked",
-                "not_worked",
-                "absent",
-                "authorized",
-            },
-        )
-
-    def test_business_predicates_compile_to_their_independent_filters(self):
-        schema = importlib.import_module("week5.new_implementation.attendance_schema")
-        expected = {
-            "scheduled_working_day": {
-                "field": "Day_Type",
-                "operator": "eq",
-                "value": "Working Day",
-            },
-            "worked": {
-                "field": "Total_Worked_Hrs",
-                "operator": "gt",
-                "value": 0.0,
-            },
-            "not_worked": {
-                "field": "Total_Worked_Hrs",
-                "operator": "lte",
-                "value": 0.0,
-            },
-            "absent": {
-                "field": "Exception",
-                "operator": "eq",
-                "value": "Absent",
-            },
-            "authorized": {
-                "field": "Status",
-                "operator": "eq",
-                "value": "Authorized",
-            },
-        }
-
-        for predicate, required_filter in expected.items():
-            with self.subTest(predicate=predicate):
-                plan = schema.QueryPlan(
-                    mode="exact",
-                    search_query=predicate,
-                    measure="distinct_dates",
-                    business_predicates=[predicate],
-                )
-                compiled = schema.compile_business_intent(plan)
-                self.assertIn(
-                    required_filter,
-                    [condition.model_dump() for condition in compiled.filters],
-                )
-
-    def test_row_and_employee_measures_compile_authoritatively(self):
-        schema = importlib.import_module("week5.new_implementation.attendance_schema")
-
-        records = schema.compile_business_intent(
-            schema.QueryPlan(
-                mode="semantic",
-                search_query="records",
-                measure="attendance_records",
-                aggregation="distinct_count",
-                aggregation_field="Employee_ID",
-            )
-        )
-        employees = schema.compile_business_intent(
-            schema.QueryPlan(
-                mode="semantic",
-                search_query="employees",
-                measure="employees",
-                aggregation="count",
-            )
-        )
-
-        self.assertEqual((records.mode, records.aggregation), ("exact", "count"))
-        self.assertIsNone(records.aggregation_field)
-        self.assertEqual(employees.aggregation, "distinct_count")
-        self.assertEqual(employees.aggregation_field, "Employee_ID")
-
-    def test_incompatible_work_predicates_are_rejected(self):
-        schema = importlib.import_module("week5.new_implementation.attendance_schema")
-        plan = schema.QueryPlan(
-            mode="exact",
-            search_query="contradictory",
-            measure="distinct_dates",
-            business_predicates=["worked", "not_worked"],
-        )
-
-        with self.assertRaisesRegex(ValueError, "worked.*not_worked"):
-            schema.compile_business_intent(plan)
-
-    def test_worked_and_absent_predicates_are_rejected(self):
-        schema = importlib.import_module("week5.new_implementation.attendance_schema")
-        plan = schema.QueryPlan(
-            mode="exact",
-            search_query="contradictory",
-            measure="distinct_dates",
-            business_predicates=["worked", "absent"],
-        )
-
-        with self.assertRaisesRegex(ValueError, "worked.*absent"):
-            schema.compile_business_intent(plan)
-
-    def test_worked_predicate_rejects_explicit_absent_filter(self):
-        schema = importlib.import_module("week5.new_implementation.attendance_schema")
-        plan = schema.QueryPlan(
-            mode="exact",
-            search_query="contradictory",
-            filters=[
-                schema.FilterCondition(field="Exception", operator="eq", value="Absent")
-            ],
-            measure="distinct_dates",
-            business_predicates=["worked"],
-        )
-
-        with self.assertRaisesRegex(ValueError, "worked.*Absent"):
-            schema.compile_business_intent(plan)
-
-    def test_business_compiler_preserves_unrelated_filters(self):
-        schema = importlib.import_module("week5.new_implementation.attendance_schema")
-        plan = schema.QueryPlan(
-            mode="exact",
-            search_query="authorized absence",
-            filters=[
-                schema.FilterCondition(
-                    field="Employee_ID", operator="eq", value="A11017"
-                )
-            ],
-            measure="distinct_dates",
-            business_predicates=["absent", "authorized"],
-        )
-
-        compiled = schema.compile_business_intent(plan)
-
-        self.assertIn(
-            {"field": "Employee_ID", "operator": "eq", "value": "A11017"},
-            [condition.model_dump() for condition in compiled.filters],
-        )
-
-    def test_semantic_attendance_record_question_is_not_forced_to_count(self):
-        schema = importlib.import_module("week5.new_implementation.attendance_schema")
-        plan = schema.QueryPlan(
-            mode="semantic",
-            search_query="abnormal attendance records",
-            aggregation="none",
-        )
-
-        compiled = schema.compile_business_intent(plan)
-
-        self.assertEqual(compiled.mode, "semantic")
-        self.assertEqual(compiled.aggregation, "none")
-
-    def test_percentage_of_attendance_records_keeps_percentage_semantics(self):
-        schema = importlib.import_module("week5.new_implementation.attendance_schema")
-        percentage_condition = schema.FilterCondition(
-            field="Status", operator="eq", value="Authorized"
-        )
-        plan = schema.QueryPlan(
-            mode="exact",
-            search_query="attendance percentage",
-            aggregation="percentage",
-            aggregation_field="Employee_ID",
-            percentage_condition=percentage_condition,
-        )
-
-        compiled = schema.compile_business_intent(plan)
-
-        self.assertEqual(compiled.aggregation, "percentage")
-        self.assertEqual(compiled.percentage_condition, percentage_condition)
-
-    def test_listing_attendance_records_does_not_become_a_count(self):
-        schema = importlib.import_module("week5.new_implementation.attendance_schema")
-        plan = schema.QueryPlan(
-            mode="exact",
-            search_query="attendance records",
-            aggregation="none",
-        )
-
-        compiled = schema.compile_business_intent(plan)
-
-        self.assertEqual(compiled.aggregation, "none")
-
-    def test_listing_authorized_records_does_not_become_a_count(self):
-        schema = importlib.import_module("week5.new_implementation.attendance_schema")
-        plan = schema.QueryPlan(
-            mode="exact",
-            search_query="authorized attendance records",
-            aggregation="none",
-        )
-
-        compiled = schema.compile_business_intent(plan)
-
-        self.assertEqual(compiled.aggregation, "none")
 
 
 class RelevantDefinitionTests(unittest.TestCase):

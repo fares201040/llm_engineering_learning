@@ -2,7 +2,6 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation
 from collections.abc import Iterable, Mapping
 import re
 import unicodedata
@@ -12,6 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field
 try:
     from .attendance_schema import (
         BUSINESS_PREDICATE_DEFINITIONS,
+        CALCULATION_DEFINITIONS,
+        canonicalize_storage_value,
         FIELD_DEFINITIONS,
         MEASURE_DEFINITIONS,
         RETRIEVAL_INTENT_DEFINITIONS,
@@ -23,6 +24,8 @@ try:
 except ImportError:  # Direct execution from week5/new_implementation.
     from attendance_schema import (
         BUSINESS_PREDICATE_DEFINITIONS,
+        CALCULATION_DEFINITIONS,
+        canonicalize_storage_value,
         FIELD_DEFINITIONS,
         MEASURE_DEFINITIONS,
         RETRIEVAL_INTENT_DEFINITIONS,
@@ -44,7 +47,10 @@ def normalize_semantic_text(value: object) -> str:
 def _token_forms(value: object) -> tuple[str, ...]:
     normalized = normalize_semantic_text(value)
     tokens = normalized.split()
-    singular = [token[:-1] if len(token) > 3 and token.endswith("s") else token for token in tokens]
+    singular = [
+        token[:-1] if len(token) > 3 and token.endswith("s") else token
+        for token in tokens
+    ]
     return tuple(dict.fromkeys((normalized, " ".join(singular))))
 
 
@@ -57,6 +63,29 @@ def evidence_occurs(text: str, evidence: str) -> bool:
         for needle in evidence_forms
         if needle
     )
+
+
+def _numeric_operator(comparator: str | None) -> FilterOperator:
+    normalized = normalize_semantic_text(comparator or "")
+    return {
+        "not more than": "lte",
+        "no more than": "lte",
+        "at most": "lte",
+        "not less than": "gte",
+        "no less than": "gte",
+        "at least": "gte",
+        "more than": "gt",
+        "greater than": "gt",
+        "above": "gt",
+        "over": "gt",
+        "less than": "lt",
+        "below": "lt",
+        "under": "lt",
+        "equal to": "eq",
+        "equals": "eq",
+        "is": "eq",
+        "exactly": "eq",
+    }.get(normalized, "eq")
 
 
 class EmployeeReference(BaseModel):
@@ -145,21 +174,49 @@ class FieldResolver(ABC):
                 if evidence_occurs(question, employee.name)
             )
         elif definition.resolution_kind == "numeric":
+            number = r"[-+]?\d+(?:\.\d+)?"
             match = re.search(
-                r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?(?![A-Za-z])",
+                r"(?<![A-Za-z0-9_])(?P<comparator>not\s+more\s+than|no\s+more\s+than|at\s+most|"
+                r"not\s+less\s+than|no\s+less\s+than|at\s+least|more\s+than|"
+                r"greater\s+than|less\s+than|equal\s+to|above|below|over|under|"
+                rf"equals?|is|exactly)\s+(?P<number>{number})(?![A-Za-z0-9_])",
                 value_search_text,
+                re.I,
             )
+            if match is None:
+                field_phrase = re.escape(field_facts[0].evidence_text).replace(
+                    r"\ ", r"\s+"
+                )
+                match = re.search(
+                    rf"\b{field_phrase}\b\s+(?:(?P<comparator>equals?|is)\s+)?"
+                    rf"(?P<number>{number})(?![A-Za-z0-9_])",
+                    question,
+                    re.I,
+                )
             if match:
-                values.append((float(match.group(0)), match.group(0)))
+                values.append((float(match.group("number")), match.group(0)))
         elif definition.resolution_kind == "temporal":
-            match = re.search(r"\b\d{4}-\d{2}-\d{2}\b", question)
+            pattern = (
+                r"\b\d{4}-(?:0[1-9]|1[0-2])\b"
+                if field == "Period"
+                else r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?\b"
+                if definition.storage_type == "datetime"
+                else r"\b\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?\b"
+                if definition.storage_type == "time"
+                else r"\b\d{4}-\d{2}-\d{2}\b"
+            )
+            match = re.search(pattern, question)
             if match:
                 values.append((match.group(0), match.group(0)))
         value_facts = tuple(
             SemanticFact(
                 kind="filter",
                 field=field,
-                operator="eq",
+                operator=(
+                    _numeric_operator(match.group("comparator"))
+                    if definition.resolution_kind == "numeric" and match
+                    else "eq"
+                ),
                 values=(value,),
                 evidence_text=evidence,
                 origin="question",
@@ -185,7 +242,11 @@ class IdentifierResolver(FieldResolver):
 
     def canonicalize(self, field, raw_value, evidence_text, context):
         value = str(raw_value).strip()
-        return ResolutionOutcome("resolved", (value,)) if value else ResolutionOutcome("unknown")
+        return (
+            ResolutionOutcome("resolved", (value,))
+            if value
+            else ResolutionOutcome("unknown")
+        )
 
 
 class EntityResolver(FieldResolver):
@@ -194,7 +255,9 @@ class EntityResolver(FieldResolver):
     def canonicalize(self, field, raw_value, evidence_text, context):
         key = normalize_semantic_text(raw_value)
         matches = tuple(
-            item.name for item in context.employees if normalize_semantic_text(item.name) == key
+            item.name
+            for item in context.employees
+            if normalize_semantic_text(item.name) == key
         )
         if len(matches) == 1:
             return ResolutionOutcome("resolved", matches)
@@ -207,8 +270,11 @@ class TemporalResolver(FieldResolver):
     kinds = frozenset({"temporal"})
 
     def canonicalize(self, field, raw_value, evidence_text, context):
-        value = str(raw_value).strip()
-        return ResolutionOutcome("resolved", (value,)) if value else ResolutionOutcome("unknown")
+        try:
+            value = canonicalize_storage_value(field, raw_value)
+        except ValueError:
+            return ResolutionOutcome("unknown")
+        return ResolutionOutcome("resolved", (value,))
 
 
 class NumericResolver(FieldResolver):
@@ -216,8 +282,8 @@ class NumericResolver(FieldResolver):
 
     def canonicalize(self, field, raw_value, evidence_text, context):
         try:
-            number = float(Decimal(str(raw_value).strip()))
-        except (InvalidOperation, ValueError):
+            number = canonicalize_storage_value(field, raw_value)
+        except ValueError:
             return ResolutionOutcome("unknown")
         return ResolutionOutcome("resolved", (number,))
 
@@ -226,7 +292,9 @@ def _closed_value_outcome(field: str, raw_value: object) -> ResolutionOutcome:
     definition = FIELD_DEFINITIONS[field]
     key = normalize_semantic_text(raw_value)
     exact = tuple(
-        value for value in definition.closed_values if normalize_semantic_text(value) == key
+        value
+        for value in definition.closed_values
+        if normalize_semantic_text(value) == key
     )
     if len(exact) == 1:
         return ResolutionOutcome("resolved", exact)
@@ -238,7 +306,11 @@ def _closed_value_outcome(field: str, raw_value: object) -> ResolutionOutcome:
     aliases = tuple(dict.fromkeys(aliases))
     if len(aliases) == 1:
         return ResolutionOutcome("resolved", aliases)
-    return ResolutionOutcome("ambiguous", candidates=aliases) if aliases else ResolutionOutcome("unknown")
+    return (
+        ResolutionOutcome("ambiguous", candidates=aliases)
+        if aliases
+        else ResolutionOutcome("unknown")
+    )
 
 
 class ClosedValueResolver(FieldResolver):
@@ -294,7 +366,11 @@ class FreeTextResolver(FieldResolver):
 
     def canonicalize(self, field, raw_value, evidence_text, context):
         value = str(raw_value).strip()
-        return ResolutionOutcome("semantic_only", (value,)) if value else ResolutionOutcome("unknown")
+        return (
+            ResolutionOutcome("semantic_only", (value,))
+            if value
+            else ResolutionOutcome("unknown")
+        )
 
 
 @dataclass(frozen=True)
@@ -371,6 +447,85 @@ def _earliest_measure_facts(question: str) -> list[SemanticFact]:
     return [fact for position, fact in positions if position == earliest]
 
 
+def _calculation_facts(
+    question: str,
+    selected_fields: tuple[str, ...],
+    existing_facts: list[SemanticFact],
+) -> list[SemanticFact]:
+    facts = []
+    for name, definition in CALCULATION_DEFINITIONS.items():
+        matches = [
+            match
+            for pattern in definition.detection_patterns
+            if (match := re.search(pattern, question, re.I)) is not None
+        ]
+        if not matches:
+            continue
+        evidence = min(matches, key=lambda match: match.start()).group(0)
+        if name == "percentage":
+            subjects = []
+            for measure in MEASURE_DEFINITIONS.values():
+                if any(
+                    evidence_occurs(question, phrase)
+                    for phrase in measure.natural_names
+                ):
+                    subjects.append(measure.aggregation_field)
+            subjects = list(dict.fromkeys(subjects))
+            if len(subjects) != 1:
+                continue
+            field = subjects[0]
+        else:
+            numeric_fields = [
+                field
+                for field in selected_fields
+                if FIELD_DEFINITIONS[field].storage_type == "number"
+                and FIELD_DEFINITIONS[field].aggregatable
+                and not any(
+                    fact.kind == "filter" and fact.field == field
+                    for fact in existing_facts
+                )
+            ]
+            if len(numeric_fields) != 1:
+                continue
+            field = numeric_fields[0]
+        facts.append(
+            SemanticFact(
+                kind="calculation",
+                field=field,
+                concept_name=name,
+                evidence_text=evidence,
+                origin="question",
+                strength="strong",
+            )
+        )
+    return facts
+
+
+def _grouping_facts(
+    question: str, field_matches: list[tuple[str, str]]
+) -> list[SemanticFact]:
+    normalized_question = normalize_semantic_text(question)
+    facts = []
+    for field, phrase in field_matches:
+        normalized_phrase = normalize_semantic_text(phrase)
+        match = re.search(
+            rf"\b(?:by|per|for each|in each|each)\s+(?:the\s+)?{re.escape(normalized_phrase)}\b",
+            normalized_question,
+        )
+        if match is None:
+            continue
+        facts.append(
+            SemanticFact(
+                kind="group_by",
+                field=field,
+                evidence_text=match.group(0),
+                origin="question",
+                strength="strong",
+            )
+        )
+    return facts
+
+
 def detect_semantic_facts(
     question: str, context: ResolutionContext
 ) -> tuple[SemanticFact, ...]:
@@ -436,6 +591,8 @@ def detect_semantic_facts(
                 )
             )
             break
+    facts.extend(_grouping_facts(question, maximal_field_matches))
+    facts.extend(_calculation_facts(question, selected_fields, facts))
     if re.search(r"\b(?:how many|count|number of|total number)\b", question, re.I):
         facts.extend(_earliest_measure_facts(question))
     predicate_facts = _facts_for_named_phrases(
@@ -454,7 +611,11 @@ def detect_semantic_facts(
             for field_phrase in selected_phrases
         )
     )
-    facts.extend(_facts_for_named_phrases(question, "semantic_intent", RETRIEVAL_INTENT_DEFINITIONS))
+    facts.extend(
+        _facts_for_named_phrases(
+            question, "semantic_intent", RETRIEVAL_INTENT_DEFINITIONS
+        )
+    )
     return merge_semantic_facts(facts)
 
 

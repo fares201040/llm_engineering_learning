@@ -27,7 +27,7 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIsNotNone(report["dataset_fingerprint"])
         self.assertTrue(
             {
-                "plan_normalization",
+                "plan_compilation",
                 "python_grouped_calculation",
                 "context_projection",
                 "postgres_exact_snapshot",

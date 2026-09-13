@@ -1,5 +1,4 @@
 from datetime import date, datetime, time as dt_time, timedelta
-from contextlib import contextmanager
 from collections.abc import Mapping
 from difflib import SequenceMatcher
 from time import perf_counter
@@ -31,20 +30,13 @@ try:
         POSTGRES_FIELD_MAP,
         PlannerProposal,
         ProposedFilter,
-        ProposedCalculation,
-        ProposedFieldChoice,
-        ProposedLimit,
         ProposedMeasureChoice,
-        ProposedNameHint,
-        ProposedOrderChoice,
         ProposedPredicateChoice,
         FilterCondition,
         LOCAL_DEMO_ACCESS,
         QueryPlan,
-        RETRIEVAL_INTENT_DEFINITIONS,
         VALUE_CONCEPT_DEFINITIONS,
         ExecutableQueryPlan,
-        compile_business_intent,
         relevant_field_definitions,
         render_planner_schema,
     )
@@ -89,20 +81,13 @@ except ImportError:  # Running answer.py directly from its directory.
         POSTGRES_FIELD_MAP,
         PlannerProposal,
         ProposedFilter,
-        ProposedCalculation,
-        ProposedFieldChoice,
-        ProposedLimit,
         ProposedMeasureChoice,
-        ProposedNameHint,
-        ProposedOrderChoice,
         ProposedPredicateChoice,
         FilterCondition,
         LOCAL_DEMO_ACCESS,
         QueryPlan,
-        RETRIEVAL_INTENT_DEFINITIONS,
         VALUE_CONCEPT_DEFINITIONS,
         ExecutableQueryPlan,
-        compile_business_intent,
         relevant_field_definitions,
         render_planner_schema,
     )
@@ -273,18 +258,6 @@ class ContextFetchResult(NamedTuple):
     aggregation: dict | None
     matched_count: int | None
     resolved_employees: list[EmployeeCandidate]
-
-
-class ConstraintCandidate(BaseModel):
-    field: str
-    value: str
-    label: str | None = None
-
-
-class PendingConstraint(BaseModel):
-    field: str
-    reference: str
-    candidates: list[ConstraintCandidate] = Field(default_factory=list)
 
 
 class EmployeeResolution(BaseModel):
@@ -560,12 +533,30 @@ def resolve_relative_date_filters(
     )
     if month_match:
         month = {
-            "jan": 1, "january": 1, "feb": 2, "february": 2,
-            "mar": 3, "march": 3, "apr": 4, "april": 4, "may": 5,
-            "jun": 6, "june": 6, "jul": 7, "july": 7, "aug": 8,
-            "august": 8, "sep": 9, "sept": 9, "september": 9,
-            "oct": 10, "october": 10, "nov": 11, "november": 11,
-            "dec": 12, "december": 12,
+            "jan": 1,
+            "january": 1,
+            "feb": 2,
+            "february": 2,
+            "mar": 3,
+            "march": 3,
+            "apr": 4,
+            "april": 4,
+            "may": 5,
+            "jun": 6,
+            "june": 6,
+            "jul": 7,
+            "july": 7,
+            "aug": 8,
+            "august": 8,
+            "sep": 9,
+            "sept": 9,
+            "september": 9,
+            "oct": 10,
+            "october": 10,
+            "nov": 11,
+            "november": 11,
+            "dec": 12,
+            "december": 12,
         }[month_match.group("month")]
         year = int(month_match.group("year"))
         start = date(year, month, 1)
@@ -673,20 +664,6 @@ def _field_definition_context_text(question: str):
     )
 
 
-def _business_intent_context_text():
-    measures = "\n".join(
-        f"- {name}: {definition.description} Canonical execution: "
-        f"aggregation={definition.aggregation}, "
-        f"aggregation_field={definition.aggregation_field}."
-        for name, definition in MEASURE_DEFINITIONS.items()
-    )
-    predicates = "\n".join(
-        f"- {name}: {definition.description}"
-        for name, definition in BUSINESS_PREDICATE_DEFINITIONS.items()
-    )
-    return f"Measures:\n{measures}\n\nBusiness predicates:\n{predicates}"
-
-
 # ---------------------------------------------------------------------------
 # Improvement 18 — stronger query planner
 # ---------------------------------------------------------------------------
@@ -736,9 +713,7 @@ Return unsupported with controlled capability identifiers when the typed proposa
             "DETERMINISTIC CONTEXT\n"
             + json.dumps(fact_context, ensure_ascii=False, separators=(",", ":")),
             "BOUNDED CANDIDATE CONTEXT\n"
-            + json.dumps(
-                candidate_context, ensure_ascii=False, separators=(",", ":")
-            )
+            + json.dumps(candidate_context, ensure_ascii=False, separators=(",", ":"))
             + f"\nQUESTION\n{question}",
         )
     )
@@ -785,24 +760,26 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
             limit=None,
         )
     filters = [] if deterministic_complete else list(prepared.get("filters") or [])
+    calculation = prepared.get("calculation") or {}
+    nested_filters = [
+        item
+        for item in (calculation.get("percentage_condition"),)
+        if isinstance(item, dict)
+    ]
     for fact in facts:
         if fact.strength != "strong" or fact.kind != "filter" or not fact.field:
             continue
         authoritative = {
             "field": fact.field,
             "operator": fact.operator,
-            "value": (
-                list(fact.values)
-                if fact.operator == "in"
-                else fact.values[0]
-            ),
+            "value": (list(fact.values) if fact.operator == "in" else fact.values[0]),
             "evidence_text": fact.evidence_text,
         }
         if not any(
             item.get("field") == fact.field
             and item.get("operator") == fact.operator
             and item.get("value") == authoritative["value"]
-            for item in filters
+            for item in [*filters, *nested_filters]
         ):
             filters.append(authoritative)
     prepared["filters"] = filters
@@ -817,14 +794,20 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
         prepared["calculation"] = None
         prepared["interpretation_candidates"] = []
         prepared["answer_contract"] = {
-            "shape": "grouped" if prepared.get("group_by") else definition.default_answer_shape,
+            "shape": "grouped"
+            if prepared.get("group_by")
+            else definition.default_answer_shape,
             "unit": definition.answer_unit,
             "subject_field": definition.aggregation_field,
-            "grain": [definition.aggregation_field] if definition.aggregation_field else [],
+            "grain": [definition.aggregation_field]
+            if definition.aggregation_field
+            else [],
         }
 
-    predicates = [] if deterministic_complete else list(
-        prepared.get("business_predicates") or []
+    predicates = (
+        []
+        if deterministic_complete
+        else list(prepared.get("business_predicates") or [])
     )
     existing_predicates = {item.get("name") for item in predicates}
     for fact in facts:
@@ -840,101 +823,6 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
             existing_predicates.add(fact.concept_name)
     prepared["business_predicates"] = predicates
     return prepared
-
-
-@_retry()
-def plan_query(
-    question: str,
-    history: list[dict] | None = None,
-    trusted_employees: list[EmployeeCandidate] | None = None,
-) -> QueryPlan:
-    recent_history = (history or [])[-4:]
-    date_context = _date_context_text(question)
-    field_context = _field_definition_context_text(question)
-    business_intent_context = _business_intent_context_text()
-    employee_context = [
-        {"name": candidate.name, "employee_id": candidate.employee_id}
-        for candidate in trusted_employees or []
-    ] or "No employee is selected in trusted conversation state."
-
-    prompt = f"""
-Plan retrieval for this APDC HR attendance question.
-
-Retrieval modes:
-- exact: exact employee/date/department/shift/status/exception/leave/overtime
-  filtering, comparisons, counts, sums, averages, min or max.
-- semantic: meaning is fuzzy, such as "problematic attendance", "unusual
-  behavior", or "similar attendance pattern".
-- hybrid: the question has exact structured constraints AND fuzzy semantic
-  meaning.
-
-Allowed filter fields:
-{sorted(FILTERABLE_FIELDS)}
-
-Allowed operators:
-eq, ne, gt, gte, lt, lte, in, contains, starts_with
-
-Relevant attendance field definitions:
-{field_context}
-
-Composable attendance intent:
-{business_intent_context}
-
-Rules:
-1. Preserve Employee_ID exactly.
-2. If the question contains an employee name, put the user's name text into
-   name_hint. Do NOT invent a longer/full name.
-3. Do not add a Name filter yourself when name_hint is used; code will resolve
-   exact/partial/fuzzy names safely.
-4. Numeric comparisons must use numeric values.
-5. Normalize explicit dates to YYYY-MM-DD.
-6. For date ranges use two Date filters: gte start and lte end.
-7. Relative date hints below are authoritative; use those exact Date filters.
-8. Select fields, measures, and predicates only from their supplied definitions.
-9. If the requested meaning is genuinely ambiguous, leave measure null,
-    aggregation none, and set interpretation_candidates to two or more
-    plausible interpretation preset identifiers. Do not guess a row count.
-10. For monthly employee pattern/summary questions, semantic/hybrid retrieval
-    may use employee_period chunks.
-11. search_query must be short and retain important employee/attendance terms.
-
-Date context:
-{date_context}
-
-Recent conversation:
-{recent_history}
-
-Trusted selected employees:
-{employee_context}
-
-Question:
-{question}
-"""
-
-    response = completion(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        response_format=QueryPlan,
-        temperature=0,
-        timeout=settings.planner_timeout_seconds,
-    )
-
-    plan = QueryPlan.model_validate_json(response.choices[0].message.content)
-
-    plan.filters = [
-        condition for condition in plan.filters if condition.field in FILTERABLE_FIELDS
-    ]
-
-    # Deterministic relative dates override LLM-generated Date filters.
-    relative_dates = resolve_relative_date_filters(question)
-
-    if relative_dates:
-        plan.filters = [
-            condition for condition in plan.filters if condition.field != "Date"
-        ]
-        plan.filters.extend(relative_dates)
-
-    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -1089,7 +977,12 @@ def load_employee_directory():
     return load_employee_directory_chroma()
 
 
-def load_attendance_catalog(fields: Sequence[str] | None = None):
+def load_attendance_catalog(
+    fields: Sequence[str] | None = None,
+    *,
+    references: Mapping[str, Sequence[str]] | None = None,
+    limit: int | None = None,
+):
     allowed_fields = [
         field
         for field, definition in FIELD_DEFINITIONS.items()
@@ -1097,6 +990,10 @@ def load_attendance_catalog(fields: Sequence[str] | None = None):
     ]
     fields = list(fields) if fields is not None else allowed_fields
     fields = [field for field in fields if field in allowed_fields]
+    references = references or {}
+    limit = settings.constraint_candidate_limit if limit is None else limit
+    if limit < 1:
+        raise ValueError("Catalog candidate limit must be positive.")
     catalog = {field: set() for field in fields}
     if _postgres_enabled():
         psycopg, dict_row = _import_psycopg()
@@ -1104,10 +1001,29 @@ def load_attendance_catalog(fields: Sequence[str] | None = None):
             with connection.cursor() as cursor:
                 for field in fields:
                     expression = POSTGRES_FIELD_MAP[field]
+                    field_references = tuple(
+                        reference.strip()
+                        for reference in references.get(field, ())
+                        if reference.strip()
+                    )
+                    match_sql = ""
+                    params: list[object] = []
+                    if field_references:
+                        comparisons = []
+                        for reference in field_references:
+                            comparisons.append(
+                                f"(CAST({expression} AS TEXT) ILIKE %s "
+                                f"OR %s ILIKE '%%' || CAST({expression} AS TEXT) || '%%')"
+                            )
+                            params.extend((f"%{reference}%", reference))
+                        match_sql = " AND (" + " OR ".join(comparisons) + ")"
+                    params.append(limit)
                     cursor.execute(
                         f"SELECT DISTINCT {expression} AS value "
                         f"FROM {POSTGRES_ATTENDANCE_TABLE} "
-                        f"WHERE {expression} IS NOT NULL ORDER BY value"
+                        f"WHERE {expression} IS NOT NULL{match_sql} "
+                        f"ORDER BY value LIMIT %s",
+                        params,
                     )
                     catalog[field].update(
                         str(row["value"]) for row in cursor.fetchall()
@@ -1139,7 +1055,9 @@ def load_attendance_catalog_candidates(
         for field, definition in FIELD_DEFINITIONS.items()
         if definition.planner_visible
         and definition.resolution_kind == "catalog"
-        and any(evidence_occurs(question, phrase) for phrase in definition.natural_names)
+        and any(
+            evidence_occurs(question, phrase) for phrase in definition.natural_names
+        )
     }
     filters_by_field: dict[str, list[str]] = {}
     for proposed in proposed_filters:
@@ -1153,11 +1071,17 @@ def load_attendance_catalog_candidates(
         ):
             continue
         fields.add(proposed.field)
-        raw_values = proposed.value if isinstance(proposed.value, list) else [proposed.value]
+        raw_values = (
+            proposed.value if isinstance(proposed.value, list) else [proposed.value]
+        )
         filters_by_field.setdefault(proposed.field, []).extend(map(str, raw_values))
     if not fields:
         return {}
-    catalog = load_attendance_catalog(sorted(fields))
+    catalog = load_attendance_catalog(
+        sorted(fields),
+        references=filters_by_field,
+        limit=settings.constraint_candidate_limit,
+    )
     bounded = {}
     for field in sorted(fields):
         values = catalog.get(field, [])
@@ -1185,78 +1109,6 @@ def _employee_references(
         EmployeeReference(employee_id=item.employee_id, name=item.name)
         for item in candidates or ()
     )
-
-
-def resolve_catalog_constraints(plan: QueryPlan, catalog=None, question: str = ""):
-    relevant = [
-        condition
-        for condition in plan.filters
-        if FIELD_DEFINITIONS[condition.field].resolution_kind == "catalog"
-        and condition.operator in {"eq", "in"}
-    ]
-    if not relevant:
-        return plan
-    catalog = catalog if catalog is not None else load_attendance_catalog()
-    prepared = plan.model_copy(deep=True)
-    for condition in prepared.filters:
-        if condition not in relevant:
-            continue
-        values = (
-            condition.value if isinstance(condition.value, list) else [condition.value]
-        )
-        mentioned = [
-            choice
-            for choice in catalog.get(condition.field, [])
-            if choice.casefold() in question.casefold()
-        ]
-        if mentioned and not any(
-            str(requested).casefold() in {choice.casefold() for choice in mentioned}
-            for requested in values
-        ):
-            raise PlanValidationError(
-                f"The planned {condition.field} conflicts with the explicit value "
-                f"in the question: {', '.join(mentioned)}."
-            )
-        canonical = []
-        for requested in values:
-            choices = catalog.get(condition.field, [])
-            exact = [
-                choice
-                for choice in choices
-                if choice.casefold() == str(requested).casefold()
-            ]
-            if exact:
-                canonical.append(exact[0])
-                continue
-            partial = [
-                choice
-                for choice in choices
-                if str(requested).casefold() in choice.casefold()
-            ][: settings.constraint_candidate_limit]
-            if len(partial) == 1:
-                canonical.append(partial[0])
-                continue
-            if partial:
-                raise ConstraintClarificationRequired(
-                    prepared,
-                    PendingConstraint(
-                        field=condition.field,
-                        reference=str(requested),
-                        candidates=[
-                            ConstraintCandidate(
-                                field=condition.field,
-                                value=choice,
-                                label=choice,
-                            )
-                            for choice in partial
-                        ],
-                    ),
-                )
-            raise PlanValidationError(f"Unknown {condition.field} value {requested!r}.")
-        condition.value = (
-            canonical if isinstance(condition.value, list) else canonical[0]
-        )
-    return prepared
 
 
 def resolve_employee_plan(
@@ -1812,7 +1664,10 @@ def format_plan_violations(violations: tuple[PlanViolation, ...]) -> str:
         "ambiguous_value": "a value needs clarification",
     }
     messages = list(
-        dict.fromkeys(labels.get(item.code, "the request could not be verified") for item in violations)
+        dict.fromkeys(
+            labels.get(item.code, "the request could not be verified")
+            for item in violations
+        )
     )
     return "; ".join(messages) + "."
 
@@ -1889,28 +1744,6 @@ def _numeric_comparison_value(question: str):
     return comparison_value
 
 
-_STRUCTURED_QUESTION_FIELDS = {
-    "department": "Department",
-    "work location": "Work_Location",
-    "location": "Work_Location",
-    "shift": "Shift",
-    "status": "Status",
-    "exception": "Exception",
-    "leave type": "Leave_Type",
-}
-
-_CANONICAL_QUESTION_FILTERS = (
-    (r"\bworking day\b", "Day_Type", "Working Day"),
-    (r"\bmissing in\b", "Exception", "Missing In"),
-    (r"\bdraft records?\b", "Status", "Draft"),
-    (
-        r"\bauthorized (?:attendance )?records?\b|\bauthorized status\b",
-        "Status",
-        "Authorized",
-    ),
-)
-
-
 def _references_selected_employee(question: str) -> bool:
     return bool(
         re.search(
@@ -1982,869 +1815,6 @@ def _is_employee_followup(question: str, plan: QueryPlan | None = None) -> bool:
     return True
 
 
-def _field_mention_is_projection(question: str, phrase: str) -> bool:
-    """Return true when a field name asks for output rather than filtering."""
-    return bool(
-        re.search(
-            rf"\b(?:what|which)\s+(?:(?:is|was|are|were)\s+)?"
-            rf"(?:the\s+)?{re.escape(phrase)}\b",
-            question,
-            re.I,
-        )
-    )
-
-
-def _compile_required_constraints(question: str, plan: QueryPlan) -> QueryPlan:
-    """Prove that explicit structured intent survived planning before retrieval."""
-    compiled = plan.model_copy(deep=True)
-    present_fields = {condition.field for condition in compiled.filters} | set(
-        compiled.group_by
-    )
-
-    if re.search(
-        r"\bauthorized (?:attendance )?records?\b|\bauthorized status\b",
-        question,
-        flags=re.IGNORECASE,
-    ):
-        mentioned_fields = set(relevant_field_definitions(question))
-        overtime_scope_requested = bool(
-            {"Total_OT", "OT_Authorized", "OT_Not_Authorized"} & mentioned_fields
-        )
-        conflicting_fields = (
-            set()
-            if overtime_scope_requested
-            else {"OT_Authorized", "OT_Not_Authorized"}
-        )
-        compiled.filters = [
-            condition
-            for condition in compiled.filters
-            if condition.field not in conflicting_fields
-            and not (
-                condition.field == "Exception"
-                and condition.operator == "eq"
-                and str(condition.value).casefold() == "authorized"
-            )
-        ]
-        present_fields = {condition.field for condition in compiled.filters} | set(
-            compiled.group_by
-        )
-
-    for pattern, field, value in _CANONICAL_QUESTION_FILTERS:
-        if field not in present_fields and re.search(
-            pattern, question, flags=re.IGNORECASE
-        ):
-            compiled.filters.append(
-                FilterCondition(field=field, operator="eq", value=value)
-            )
-            present_fields.add(field)
-
-    if re.search(r"\bempty employee name\b", question, flags=re.IGNORECASE):
-        raise PlanValidationError("Please provide a concrete employee name or ID.")
-
-    for match in re.finditer(
-        r"\b(?P<label>employee(?:\s+id)?|id)\s+"
-        r"(?P<token>[A-Za-z0-9-]+)",
-        question,
-        flags=re.IGNORECASE,
-    ):
-        label = match.group("label").casefold()
-        token = match.group("token")
-        looks_like_id = "id" in label or any(character.isdigit() for character in token)
-        if looks_like_id and not re.fullmatch(r"[A-Za-z]\d{5}", token):
-            raise PlanValidationError(
-                f"Employee ID {token!r} is invalid; use one letter and five digits."
-            )
-
-    attendance_for_token = re.search(
-        r"\battendance\s+for\s+(?P<token>[A-Za-z0-9-]+)\b",
-        question,
-        flags=re.IGNORECASE,
-    )
-    if attendance_for_token is not None:
-        token = attendance_for_token.group("token")
-        if any(character.isdigit() for character in token) and not re.fullmatch(
-            r"[A-Za-z]\d{5}", token
-        ):
-            raise PlanValidationError(
-                f"Employee ID {token!r} is invalid; use one letter and five digits."
-            )
-
-    for id_token in re.findall(r"\b[A-Za-z]\d+\b", question):
-        if not re.fullmatch(r"[A-Za-z]\d{5}", id_token):
-            raise PlanValidationError(
-                f"Employee ID {id_token!r} is invalid; use one letter and five digits."
-            )
-
-    if re.search(r"\b\d{1,2}/\d{1,2}(?:/(?:\d{2}|\d{4}))?\b", question):
-        raise PlanValidationError(
-            "Numeric slash dates are ambiguous; use YYYY-MM-DD or a month name."
-        )
-
-    resolved_dates = resolve_relative_date_filters(question)
-    has_range_words = bool(
-        re.search(r"\b(?:between|from)\b.+\b(?:and|to)\b", question, re.I)
-    )
-    if resolved_dates:
-        compiled.filters = [c for c in compiled.filters if c.field != "Date"]
-        compiled.filters.extend(resolved_dates)
-        present_fields.add("Date")
-    elif has_range_words:
-        raise PlanValidationError(
-            "The date range is invalid or reversed; use an inclusive valid range."
-        )
-
-    def replace_explicit_date(value: str):
-        question_words = question.casefold().replace("_", " ")
-        named_temporal_fields = [
-            condition.field
-            for condition in compiled.filters
-            if condition.field != "Date"
-            and FIELD_DEFINITIONS[condition.field].storage_type in {"date", "datetime"}
-            and condition.field.casefold().replace("_", " ") in question_words
-        ]
-        target_field = named_temporal_fields[0] if named_temporal_fields else "Date"
-        if re.search(r"\b(?:on or before|no later than|through)\b", question, re.I):
-            operator = "lte"
-        elif re.search(r"\b(?:before|earlier than)\b", question, re.I):
-            operator = "lt"
-        elif re.search(r"\b(?:on or after|no earlier than)\b", question, re.I):
-            operator = "gte"
-        elif re.search(r"\b(?:after|later than)\b", question, re.I):
-            operator = "gt"
-        else:
-            operator = "eq"
-        replaced_fields = {target_field}
-        if target_field != "Date":
-            replaced_fields.add("Date")
-        compiled.filters = [
-            condition
-            for condition in compiled.filters
-            if condition.field not in replaced_fields
-        ]
-        compiled.filters.append(
-            FilterCondition(field=target_field, operator=operator, value=value)
-        )
-        present_fields.update(replaced_fields)
-
-    explicit_iso_dates = re.findall(r"\b\d{4}-\d{2}-\d{2}\b", question)
-    if explicit_iso_dates:
-        try:
-            normalized_dates = [
-                date.fromisoformat(value).isoformat() for value in explicit_iso_dates
-            ]
-        except ValueError as exc:
-            raise PlanValidationError("The supplied calendar date is invalid.") from exc
-        if len(normalized_dates) == 1 and not resolved_dates:
-            replace_explicit_date(normalized_dates[0])
-
-    explicit_date_tokens = re.findall(_DATE_TOKEN_PATTERN, question, flags=re.I)
-    if explicit_date_tokens and not resolved_dates:
-        if len(explicit_date_tokens) != 1:
-            raise PlanValidationError(
-                "Multiple explicit dates require a clear 'between ... and ...' or "
-                "'from ... to ...' range."
-            )
-        try:
-            explicit_date = _parse_date_token(
-                explicit_date_tokens[0], _current_local_date().year
-            )
-        except ValueError as exc:
-            raise PlanValidationError("The supplied calendar date is invalid.") from exc
-        replace_explicit_date(explicit_date.isoformat())
-
-    if (
-        compiled.name_hint is None
-        and "Employee_ID" not in present_fields
-        and not re.search(r"\b[A-Za-z]\d{5}\b", question)
-    ):
-        name_match = re.search(
-            r"\b(?:find|show|count)\s+"
-            r"(?P<name>[A-Za-z][A-Za-z .'-]+?)'s\s+"
-            r"(?:attendance|records?|worked days?|overtime)\b",
-            question,
-            flags=re.IGNORECASE,
-        )
-        if name_match is None:
-            name_match = re.search(
-                r"\b(?:attendance|records?)\s+for\s+"
-                r"(?P<name>[A-Za-z][A-Za-z'-]*(?:\s+[A-Za-z][A-Za-z'-]*)+)"
-                r"[?.]?\s*$",
-                question,
-                flags=re.IGNORECASE,
-            )
-        if name_match is not None:
-            compiled.name_hint = name_match.group("name").strip()
-
-    lowered = question.casefold()
-    for phrase, field in _STRUCTURED_QUESTION_FIELDS.items():
-        if (
-            re.search(rf"\b{re.escape(phrase)}\b", lowered)
-            and field not in present_fields
-            and not _field_mention_is_projection(question, phrase)
-        ):
-            raise PlanValidationError(
-                f"The requested {phrase} constraint was not resolved; please provide its exact value."
-            )
-
-    return compiled
-
-
-_ZERO_WORK_PATTERNS = (
-    r"\b(?:zero|no)\s+(?:actual\s+)?(?:worked|work)\s+hours?\b",
-    r"\b(?:work(?:ed)?|have)\s+(?:zero|no)\s+(?:worked\s+)?hours?\b",
-    r"\bwithout\s+(?:positive\s+)?(?:worked|work)\s+hours?\b",
-    r"\bnot\s+(?:(?:have|record|log)\s+)?(?:any\s+)?(?:worked|work)\s+hours?\b",
-)
-
-_NEGATIVE_ATTENDANCE_PATTERNS = (
-    r"\bnot\s+(?:attend(?:ed|ing)?|present|work(?:ed|ing)?)\b",
-    r"\bdid\s+not\s+(?:attend|work)\b",
-    r"\bnever\s+(?:attend(?:ed)?|worked)\b",
-    r"\bnot\s+(?:in\s+)?attendance\b",
-)
-
-
-def _matches_any(patterns, text: str) -> bool:
-    return any(re.search(pattern, text) for pattern in patterns)
-
-
-def _explicit_attendance_contract(question: str):
-    """Return only high-confidence business predicates stated by the user."""
-    text = question.casefold()
-    required = set()
-    if re.search(r"\babs(?:ent|ence)\b", text):
-        required.add("absent")
-
-    zero_work = _matches_any(_ZERO_WORK_PATTERNS, text)
-    negative_attendance = _matches_any(_NEGATIVE_ATTENDANCE_PATTERNS, text)
-    if zero_work or negative_attendance:
-        required.add("not_worked")
-    if negative_attendance and re.search(
-        r"\b(?:attend(?:ed|ance|ing)?|present|scheduled\s+working\s+days?)\b",
-        text,
-    ):
-        required.add("scheduled_working_day")
-    positive_attendance = bool(
-        not negative_attendance
-        and not (
-            _NUMERIC_COMPARISON_PATTERN.search(text)
-            and re.search(r"\bwork(?:ed|ing)?\b", text)
-            and re.search(r"\bhours?\b", text)
-        )
-        and (
-            re.search(
-                r"\battend(?:ed|ing)?\b"
-                r"|\b(?:am|are|is|was|were|been)\s+present\b",
-                text,
-            )
-            or re.search(r"\bdays?\b[^?.!]{0,60}\bwork(?:ed|ing)?\b", text)
-        )
-    )
-    if positive_attendance:
-        required.add("worked")
-    return required
-
-
-def _explicit_measure_contract(question: str):
-    text = question.casefold()
-    count_request = re.search(
-        r"\bhow many\b|\bnumber of\b|\bcount(?:\s+distinct)?\b", text
-    )
-    if count_request is None:
-        return None
-    tail = text[count_request.end() :]
-    candidates = []
-    for pattern, measure in (
-        (r"\bemployees?\b", "employees"),
-        (r"\b(?:attendance\s+)?(?:records?|rows?|entries)\b", "attendance_records"),
-        (r"\b(?:days?|dates?)\b", "distinct_dates"),
-    ):
-        match = re.search(pattern, tail)
-        if match is not None:
-            candidates.append((match.start(), measure))
-    if not candidates:
-        return None
-    return min(candidates, key=lambda item: item[0])[1]
-
-
-def _explicit_numeric_aggregation_contract(question: str):
-    """Compile explicit numeric calculations independently of planner labels."""
-    text = question.casefold()
-    operations = (
-        (r"\btotal\b", "sum", True),
-        (r"\bsum(?:\s+of)?\b", "sum", False),
-        (r"\b(?:average|avg|mean)\b", "average", False),
-        (r"\b(?:maximum|max)\b", "max", False),
-        (r"\b(?:minimum|min)\b", "min", False),
-    )
-    fields = (
-        (r"\b(?:total\s+)?worked\s+hours?\b", "Total_Worked_Hrs"),
-        (r"\b(?:total\s+)?overtime(?:\s+hours?)?\b", "Total_OT"),
-        (r"\blateness(?:\s+hours?)?\b", "Lateness_Hrs"),
-        (r"\bearly[ -]out(?:\s+hours?)?\b", "Early_Out_Hrs"),
-        (r"\bregular(?:\s+units?|\s+hours?)\b", "Regular_Units"),
-        (r"\bpre[ -]?overtime(?:\s+hours?)?\b", "pre_ot_hrs"),
-        (r"\bpost[ -]?overtime(?:\s+hours?)?\b", "Post_OT_hrs"),
-        (r"\bauthorized\s+overtime(?:\s+hours?)?\b", "OT_Authorized"),
-        (
-            r"\b(?:unauthorized|not[ -]authorized)\s+overtime(?:\s+hours?)?\b",
-            "OT_Not_Authorized",
-        ),
-    )
-    operation_matches = [
-        (match.start(), match.end(), name, weak)
-        for pattern, name, weak in operations
-        if (match := re.search(pattern, text)) is not None
-    ]
-    if not operation_matches:
-        return None
-    strong_matches = [match for match in operation_matches if not match[3]]
-    operation_start, operation_end, operation, _weak = min(
-        strong_matches or operation_matches
-    )
-    field_matches = [
-        (match.start(), match.end(), name)
-        for pattern, name in fields
-        for match in re.finditer(pattern, text)
-    ]
-    if not field_matches:
-        return None
-
-    def distance(candidate):
-        field_start, field_end, _name = candidate
-        if field_start >= operation_end:
-            return field_start - operation_end
-        if field_end <= operation_start:
-            return operation_start - field_end
-        return 0
-
-    _field_start, _field_end, field = min(field_matches, key=distance)
-    return operation, field
-
-
-def _scheduled_attendance_percentage_operator(question: str):
-    text = question.casefold()
-    if not (
-        re.search(r"\b(?:percentage|percent|rate)\b", text)
-        and re.search(r"\bscheduled(?:\s+working)?\s+days?\b", text)
-        and re.search(r"\b(?:attend\w*|present|work\w*)\b", text)
-    ):
-        return None
-    if _matches_any(_NEGATIVE_ATTENDANCE_PATTERNS, text) or _matches_any(
-        _ZERO_WORK_PATTERNS, text
-    ):
-        return "lte"
-    return "gt"
-
-
-def _is_numeric_field_projection(question: str) -> bool:
-    text = question.casefold()
-    asks_to_show = re.search(
-        r"\b(?:show|display|list)\b|\bwhat\s+(?:is|are|was|were)\b|\bhow much\b",
-        text,
-    ) or re.search(
-        r"\bdid\b[^?.!]*\b(?:have|show)\b|\b(?:has|have|had)\s+any\b",
-        text,
-    )
-    mentions_numeric_field = re.search(
-        r"\bworked\s+hours?\b|\bovertime\b|\blateness\b|\bearly[ -]out\b"
-        r"|\bregular\s+(?:units?|hours?)\b",
-        text,
-    )
-    return bool(asks_to_show and mentions_numeric_field)
-
-
-def _is_employee_identity_projection(question: str) -> bool:
-    return bool(
-        re.search(
-            r"\bwho\s+(?:is|are|was|were)\s+(?:this|that|the)\s+employee\b"
-            r"|\b(?:identify|identity of)\s+(?:this|that|the)\s+employee\b",
-            question,
-            re.I,
-        )
-    )
-
-
-def _is_attendance_field_projection(question: str) -> bool:
-    text = question.casefold()
-    if re.search(
-        r"\b(?:percentage|percent|rate|total|sum|average|avg|mean|maximum|max|minimum|min|count)\b",
-        text,
-    ):
-        return False
-    return bool(
-        re.search(r"\b(?:what|which|show|list|display)\b", text)
-        and re.search(
-            r"\b(?:attendance\s+)?status(?:es)?\b|\bexceptions?\b"
-            r"|\bshifts?\b|\bdepartments?\b|\bwork\s+locations?\b"
-            r"|\bleave\s+types?\b|\bpositions?\b|\bjobs?\b|\bgrades?\b",
-            text,
-        )
-    )
-
-
-_SMALL_NUMBER_WORDS = {
-    "one": 1,
-    "two": 2,
-    "three": 3,
-    "four": 4,
-    "five": 5,
-    "six": 6,
-    "seven": 7,
-    "eight": 8,
-    "nine": 9,
-    "ten": 10,
-}
-
-
-def _explicit_grouped_ranking_contract(question: str):
-    text = question.casefold()
-    if not re.search(
-        r"\b(?:rank|ranking|top|bottom|most|least|highest|lowest)\b", text
-    ):
-        return None
-    group_field = next(
-        (
-            field
-            for pattern, field in (
-                (r"\b(?:days?|dates?)\b", "Date"),
-                (r"\bemployees?\b", "Employee_ID"),
-                (r"\bdepartments?\b", "Department"),
-                (r"\bwork\s+locations?\b", "Work_Location"),
-                (r"\bshifts?\b", "Shift"),
-            )
-            if re.search(pattern, text)
-        ),
-        None,
-    )
-    value_field = next(
-        (
-            field
-            for pattern, field in (
-                (r"\bovertime\b", "Total_OT"),
-                (r"\bworked\s+hours?\b", "Total_Worked_Hrs"),
-                (r"\blateness\b", "Lateness_Hrs"),
-            )
-            if re.search(pattern, text)
-        ),
-        None,
-    )
-    if group_field is None or value_field is None:
-        return None
-    limit_match = re.search(
-        r"\b(?:top|bottom|first|last|which)\s+"
-        r"(?P<limit>\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
-        text,
-    )
-    limit = None
-    if limit_match:
-        token = limit_match.group("limit")
-        limit = int(token) if token.isdigit() else _SMALL_NUMBER_WORDS[token]
-    direction = "asc" if re.search(r"\b(?:bottom|least|lowest)\b", text) else "desc"
-    singular_group = re.search(
-        r"\bwhich\s+(?:employee|department|work\s+location|shift|day|date)\b",
-        text,
-    )
-    if limit is None and (group_field == "Date" or singular_group):
-        limit = 1
-    operation = "sum"
-    return group_field, value_field, operation, direction, limit
-
-
-def _explicit_record_projection_contract(question: str):
-    text = question.casefold()
-    if not (
-        re.search(r"\b(?:show|list|display)\b", text)
-        and re.search(r"\b(?:attendance\s+)?(?:records?|rows?|entries)\b", text)
-        and re.search(r"\b(?:last|latest|most recent|first|earliest)\b", text)
-    ):
-        return None
-    limit_match = re.search(
-        r"\b(?:last|latest|most recent|first|earliest)\s+"
-        r"(?P<limit>\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
-        text,
-    )
-    if limit_match is None:
-        return None
-    token = limit_match.group("limit")
-    limit = int(token) if token.isdigit() else _SMALL_NUMBER_WORDS[token]
-    direction = "asc" if re.search(r"\b(?:first|earliest)\b", text) else "desc"
-    return direction, limit
-
-
-def _is_semantic_narrative_request(question: str) -> bool:
-    return bool(
-        any(
-            evidence_occurs(question, phrase)
-            for definition in RETRIEVAL_INTENT_DEFINITIONS.values()
-            for phrase in definition.natural_names
-        )
-        and not re.search(
-            r"\b(?:how many|number of|count|percentage|percent|rate|total|sum|average|avg|mean|maximum|max|minimum|min)\b",
-            question,
-            re.I,
-        )
-    )
-
-
-def _apply_explicit_attendance_contract(question: str, plan: QueryPlan) -> QueryPlan:
-    required = _explicit_attendance_contract(question)
-    if not required:
-        return plan
-
-    proposed = set(plan.business_predicates)
-    if {"worked", "absent"} <= required:
-        raise PlanValidationError(
-            "The request combines positive attendance with an absent outcome."
-        )
-    if "worked" in required and "not_worked" in proposed:
-        raise PlanValidationError(
-            "The planner selected negative work for an explicit positive attendance request."
-        )
-    if "not_worked" in required and "worked" in proposed:
-        raise PlanValidationError(
-            "The planner selected positive work for an explicit negative attendance request."
-        )
-    if "absent" in required and "worked" in proposed:
-        raise PlanValidationError(
-            "The explicit absent request conflicts with worked attendance semantics."
-        )
-
-    compiled = plan.model_copy(deep=True)
-    if "worked" in required and not re.search(
-        r"\b(?:scheduled|working\s+days?)\b", question, re.I
-    ):
-        compiled.business_predicates = [
-            predicate
-            for predicate in compiled.business_predicates
-            if predicate != "scheduled_working_day"
-        ]
-        compiled.filters = [
-            condition
-            for condition in compiled.filters
-            if not (
-                condition.field == "Day_Type"
-                and str(condition.value).casefold() == "working day"
-            )
-        ]
-    compiled.business_predicates = list(
-        dict.fromkeys([*compiled.business_predicates, *sorted(required)])
-    )
-    return compiled
-
-
-def normalize_query_plan(question: str, plan: QueryPlan):
-    """Validate and normalize an LLM plan before choosing a backend."""
-    proposed = plan.model_copy(deep=True)
-    proposed.interpretation_candidates = list(
-        dict.fromkeys(proposed.interpretation_candidates)
-    )
-    explicit_measure = _explicit_measure_contract(question)
-    numeric_aggregation = _explicit_numeric_aggregation_contract(question)
-    grouped_ranking = _explicit_grouped_ranking_contract(question)
-    record_projection = _explicit_record_projection_contract(question)
-    if record_projection is not None:
-        direction, limit = record_projection
-        proposed.measure = None
-        proposed.aggregation = "none"
-        proposed.aggregation_field = None
-        proposed.order_by = "Date"
-        proposed.order_direction = direction
-        proposed.limit = limit
-        proposed.interpretation_candidates = []
-    elif grouped_ranking is not None:
-        group_field, value_field, operation, direction, limit = grouped_ranking
-        proposed.measure = None
-        proposed.aggregation = operation
-        proposed.aggregation_field = value_field
-        proposed.group_by = [group_field]
-        proposed.order_by = "value"
-        proposed.order_direction = direction
-        proposed.limit = limit
-        proposed.interpretation_candidates = []
-    elif _is_employee_identity_projection(question):
-        proposed.measure = None
-        proposed.aggregation = "none"
-        proposed.aggregation_field = None
-        proposed.interpretation_candidates = []
-    elif _is_semantic_narrative_request(question):
-        proposed.measure = None
-        proposed.aggregation = "none"
-        proposed.aggregation_field = None
-        proposed.interpretation_candidates = []
-    elif numeric_aggregation is not None:
-        proposed.measure = None
-        proposed.aggregation, proposed.aggregation_field = numeric_aggregation
-        proposed.interpretation_candidates = []
-    elif explicit_measure is None and (
-        _is_numeric_field_projection(question)
-        or _is_attendance_field_projection(question)
-    ):
-        proposed.measure = None
-        proposed.aggregation = "none"
-        proposed.aggregation_field = None
-        proposed.interpretation_candidates = []
-    if record_projection is None and not proposed.group_by:
-        proposed.order_by = None
-        proposed.limit = None
-    if proposed.measure is not None or proposed.business_predicates:
-        proposed.interpretation_candidates = []
-    elif len(proposed.interpretation_candidates) == 1:
-        selected_interpretation = proposed.interpretation_candidates[0]
-        definition = INTERPRETATION_PRESETS[selected_interpretation]
-        if explicit_measure is not None and definition.measure != explicit_measure:
-            raise PlanValidationError(
-                "The proposed attendance interpretation conflicts with the "
-                "explicit counted subject in the question."
-            )
-        proposed.measure = definition.measure
-        proposed.business_predicates = list(definition.business_predicates)
-        proposed.interpretation_candidates = []
-    if explicit_measure is not None and not proposed.interpretation_candidates:
-        proposed.measure = explicit_measure
-    proposed = _apply_explicit_attendance_contract(question, proposed)
-    attendance_percentage_operator = _scheduled_attendance_percentage_operator(question)
-    if attendance_percentage_operator is not None:
-        proposed.measure = None
-        proposed.aggregation = "percentage"
-        proposed.aggregation_field = "Date"
-        proposed.business_predicates = [
-            predicate
-            for predicate in proposed.business_predicates
-            if predicate not in {"worked", "not_worked"}
-        ]
-        if "scheduled_working_day" not in proposed.business_predicates:
-            proposed.business_predicates.append("scheduled_working_day")
-        proposed.filters = [
-            condition
-            for condition in proposed.filters
-            if condition.field != "Total_Worked_Hrs"
-        ]
-        proposed.percentage_condition = FilterCondition(
-            field="Total_Worked_Hrs",
-            operator=attendance_percentage_operator,
-            value=0.0,
-        )
-    try:
-        normalized = compile_business_intent(proposed)
-    except ValueError as exc:
-        raise PlanValidationError(str(exc)) from exc
-    normalized = _compile_required_constraints(question, normalized)
-    normalized.filters = [
-        _normalize_filter_condition(condition) for condition in normalized.filters
-    ]
-    if normalized.percentage_condition is not None:
-        normalized.percentage_condition = _normalize_filter_condition(
-            normalized.percentage_condition
-        )
-
-    record_percentage = bool(
-        normalized.aggregation == "percentage"
-        and re.search(
-            r"\bpercentage\b.*\battendance records?\b",
-            question,
-            flags=re.IGNORECASE,
-        )
-    )
-    if record_percentage:
-        normalized.aggregation_field = None
-        if normalized.percentage_condition is None and len(normalized.filters) == 1:
-            normalized.percentage_condition = normalized.filters.pop()
-        elif normalized.percentage_condition is not None:
-            normalized.filters = [
-                condition
-                for condition in normalized.filters
-                if condition != normalized.percentage_condition
-            ]
-
-    semantic_intent = any(
-        evidence_occurs(question, phrase)
-        for definition in RETRIEVAL_INTENT_DEFINITIONS.values()
-        for phrase in definition.natural_names
-    )
-    normalized.mode = (
-        "hybrid"
-        if semantic_intent and normalized.filters
-        else "semantic"
-        if semantic_intent
-        else "exact"
-    )
-
-    comparison_value = _numeric_comparison_value(question)
-    if comparison_value is not None:
-        has_numeric_comparison = any(
-            condition.field in NUMERIC_FILTER_FIELDS
-            and condition.operator in {"gt", "gte", "lt", "lte"}
-            for condition in normalized.filters
-        )
-        if not has_numeric_comparison:
-            raise PlanValidationError(
-                "The numeric comparison could not be mapped to an attendance field."
-            )
-
-    if normalized.aggregation == "distinct_count":
-        if normalized.aggregation_field not in FILTERABLE_FIELDS:
-            raise PlanValidationError(
-                "distinct_count requires a supported aggregation field."
-            )
-    elif normalized.aggregation in {"sum", "average", "min", "max"}:
-        if normalized.aggregation_field not in NUMERIC_FILTER_FIELDS:
-            raise PlanValidationError(
-                f"{normalized.aggregation} requires a numeric aggregation field."
-            )
-
-    if len(normalized.group_by) > 2:
-        raise PlanValidationError("At most two grouping fields are supported.")
-    if any(field not in FILTERABLE_FIELDS for field in normalized.group_by):
-        raise PlanValidationError("Every grouping field must be an attendance field.")
-    valid_order_fields = (
-        {"group", "value"} if normalized.group_by else set(FILTERABLE_FIELDS)
-    )
-    if (
-        normalized.order_by is not None
-        and normalized.order_by not in valid_order_fields
-    ):
-        raise PlanValidationError("The requested ordering field is not supported.")
-    explicit_group_limit = re.search(
-        r"\b(?:top|bottom|first|last|which|limit(?:ed)?(?:\s+to)?)\s+"
-        r"(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b",
-        question,
-        flags=re.IGNORECASE,
-    ) or (
-        normalized.limit == 1
-        and re.search(r"\b(?:highest|lowest|most|least)\b", question, re.I)
-    )
-    if (
-        normalized.group_by
-        and normalized.limit is not None
-        and not explicit_group_limit
-    ):
-        normalized.limit = None
-    if (
-        normalized.limit is not None
-        and not 1 <= normalized.limit <= settings.max_groups
-    ):
-        raise PlanValidationError(
-            f"The group limit must be between 1 and {settings.max_groups}."
-        )
-    if normalized.aggregation == "percentage":
-        if (
-            normalized.aggregation_field is not None
-            and normalized.aggregation_field not in FILTERABLE_FIELDS
-        ):
-            raise PlanValidationError(
-                "Percentage requires an explicit denominator identity field."
-            )
-        if normalized.aggregation_field is None and not record_percentage:
-            raise PlanValidationError(
-                "Percentage requires an explicit denominator identity field."
-            )
-        if normalized.percentage_condition is None:
-            raise PlanValidationError(
-                "Percentage requires an explicit numerator condition."
-            )
-
-    return normalized
-
-
-def _build_postgres_where(
-    filters: list[FilterCondition],
-):
-    clauses = []
-    params = []
-
-    operator_map = {
-        "eq": "=",
-        "ne": "<>",
-        "gt": ">",
-        "gte": ">=",
-        "lt": "<",
-        "lte": "<=",
-    }
-
-    for condition in filters:
-        _require_filter_value_shape(condition)
-
-        if condition.field == "chunk_type":
-            # Structured table contains attendance records only.
-            if condition.operator == "eq" and condition.value == "attendance_record":
-                continue
-            raise ValueError(
-                "PostgreSQL attendance_records contains only attendance_record rows."
-            )
-
-        column = POSTGRES_FIELD_MAP.get(condition.field)
-
-        if not column:
-            raise ValueError(
-                f"Field {condition.field!r} is not supported "
-                "for structured PostgreSQL exact queries."
-            )
-
-        if condition.operator in operator_map:
-            sql_operator = operator_map[condition.operator]
-
-            if condition.field == "Date":
-                clauses.append(f"{column} {sql_operator} %s::date")
-            else:
-                clauses.append(f"{column} {sql_operator} %s")
-
-            params.append(
-                _normalize_typed_filter_value(
-                    condition.field,
-                    condition.value,
-                )
-            )
-
-        elif condition.operator == "in":
-            values = [
-                _normalize_typed_filter_value(condition.field, value)
-                for value in condition.value
-            ]
-
-            storage_type = FIELD_DEFINITIONS[condition.field].storage_type
-            array_types = {
-                "number": "double precision[]",
-                "date": "date[]",
-                "time": "time[]",
-                "datetime": "timestamp[]",
-                "text": "text[]",
-            }
-            array_type = array_types[storage_type]
-            if storage_type == "text":
-                array_type = "text[]"
-                values = [str(value) for value in values]
-
-            clauses.append(f"{column} = ANY(%s::{array_type})")
-            params.append(values)
-
-        elif condition.operator == "contains":
-            text_column = (
-                f"CAST({column} AS TEXT)"
-                if condition.field in NUMERIC_FILTER_FIELDS or condition.field == "Date"
-                else column
-            )
-            clauses.append(f"{text_column} ILIKE %s")
-            params.append(f"%{condition.value}%")
-
-        elif condition.operator == "starts_with":
-            text_column = (
-                f"CAST({column} AS TEXT)"
-                if condition.field in NUMERIC_FILTER_FIELDS or condition.field == "Date"
-                else column
-            )
-            clauses.append(f"{text_column} ILIKE %s")
-            params.append(f"{condition.value}%")
-
-        else:
-            raise ValueError(f"Unsupported operator: {condition.operator}")
-
-    return (
-        " AND ".join(clauses) if clauses else "TRUE",
-        params,
-    )
-
-
 def _postgres_row_to_result(row):
     record = dict(row.get("record_json") or {})
     metadata = {
@@ -2878,239 +1848,6 @@ def _postgres_row_to_result(row):
         page_content=content or row["search_text"],
         metadata=metadata,
     )
-
-
-@contextmanager
-def _postgres_connection(existing=None):
-    if existing is not None:
-        yield existing
-        return
-    psycopg, dict_row = _import_psycopg()
-    with psycopg.connect(POSTGRES_DSN, row_factory=dict_row) as connection:
-        yield connection
-
-
-def fetch_exact_postgres(
-    filters: list[FilterCondition],
-    limit: int = MAX_EXACT_RESULTS,
-    order_by: str | None = None,
-    order_direction: str = "asc",
-    connection=None,
-):
-    where_sql, params = _build_postgres_where(filters)
-    order_field = (
-        order_by
-        if order_by in POSTGRES_FIELD_MAP and order_by != "chunk_type"
-        else "Date"
-    )
-    order_column = POSTGRES_FIELD_MAP[order_field]
-    direction = "DESC" if order_direction == "desc" else "ASC"
-
-    sql = f"""
-        SELECT
-            record_id,
-            employee_id,
-            name,
-            attendance_date,
-            department,
-            work_location,
-            position,
-            shift,
-            status,
-            exception,
-            total_worked_hrs,
-            lateness_hrs,
-            early_out_hrs,
-            total_ot,
-            leave_type,
-            leave_hrs,
-            source_file,
-            search_text,
-            record_json
-        FROM {POSTGRES_ATTENDANCE_TABLE}
-        WHERE {where_sql}
-        ORDER BY {order_column} {direction}, employee_id ASC, record_id ASC
-        LIMIT %s
-    """
-
-    with _postgres_connection(connection) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                sql,
-                [*params, limit],
-            )
-
-            return [_postgres_row_to_result(row) for row in cur.fetchall()]
-
-
-def count_exact_postgres(filters, connection=None):
-    where_sql, params = _build_postgres_where(filters)
-
-    with _postgres_connection(connection) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT COUNT(*) AS value
-                FROM {POSTGRES_ATTENDANCE_TABLE}
-                WHERE {where_sql}
-                """,
-                params,
-            )
-            return int(cur.fetchone()["value"])
-
-
-def calculate_aggregation_postgres(
-    plan: QueryPlan,
-    filters: list[FilterCondition],
-    connection=None,
-):
-    if plan.aggregation == "none":
-        return None
-
-    where_sql, params = _build_postgres_where(filters)
-
-    if plan.aggregation == "percentage":
-        field_name = plan.aggregation_field
-        count_expression = (
-            f"COUNT(DISTINCT {POSTGRES_FIELD_MAP[field_name]})"
-            if field_name is not None
-            else "COUNT(*)"
-        )
-        numerator_where, numerator_params = _build_postgres_where(
-            [*filters, plan.percentage_condition]
-        )
-        with _postgres_connection(connection) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT {count_expression} AS value "
-                    f"FROM {POSTGRES_ATTENDANCE_TABLE} WHERE {where_sql}",
-                    params,
-                )
-                denominator = int(cur.fetchone()["value"])
-                cur.execute(
-                    f"SELECT {count_expression} AS value "
-                    f"FROM {POSTGRES_ATTENDANCE_TABLE} WHERE {numerator_where}",
-                    numerator_params,
-                )
-                numerator = int(cur.fetchone()["value"])
-        return {
-            "operation": "percentage",
-            "field": field_name or "attendance_records",
-            "numerator": numerator,
-            "denominator": denominator,
-            "value": (numerator / denominator * 100.0) if denominator else None,
-        }
-
-    if plan.aggregation == "count":
-        expression = "COUNT(*)"
-        field_name = None
-
-    elif plan.aggregation == "distinct_count":
-        column = POSTGRES_FIELD_MAP.get(plan.aggregation_field or "")
-
-        if not column:
-            raise ValueError("distinct_count requires a supported aggregation field.")
-
-        expression = f"COUNT(DISTINCT {column})"
-        field_name = plan.aggregation_field
-
-    else:
-        field_name = plan.aggregation_field
-
-        if field_name not in NUMERIC_FILTER_FIELDS:
-            raise ValueError(
-                f"{plan.aggregation} requires a numeric field; got {field_name!r}."
-            )
-
-        column = POSTGRES_FIELD_MAP.get(field_name)
-
-        if not column:
-            raise ValueError(
-                f"Aggregation field {field_name!r} is not available in PostgreSQL."
-            )
-
-        sql_function = {
-            "sum": "SUM",
-            "average": "AVG",
-            "min": "MIN",
-            "max": "MAX",
-        }[plan.aggregation]
-
-        expression = f"{sql_function}({column})"
-
-    group_by = list(plan.group_by)
-    if "Name" in group_by and "Employee_ID" not in group_by:
-        group_by.insert(0, "Employee_ID")
-    if group_by:
-        group_columns = [POSTGRES_FIELD_MAP[field] for field in group_by]
-        select_groups = ", ".join(
-            f"{column} AS group_{index}" for index, column in enumerate(group_columns)
-        )
-        with _postgres_connection(connection) as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"SELECT {select_groups}, {expression} AS value "
-                    f"FROM {POSTGRES_ATTENDANCE_TABLE} WHERE {where_sql} "
-                    f"GROUP BY {', '.join(group_columns)}",
-                    params,
-                )
-                rows = [
-                    {
-                        "group": [
-                            row[f"group_{index}"] for index in range(len(group_by))
-                        ],
-                        "value": float(row["value"])
-                        if row["value"] is not None
-                        else None,
-                    }
-                    for row in cur.fetchall()
-                ]
-        return _order_grouped_result(plan, field_name, group_by, rows)
-
-    with _postgres_connection(connection) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT {expression} AS value
-                FROM {POSTGRES_ATTENDANCE_TABLE}
-                WHERE {where_sql}
-                """,
-                params,
-            )
-            value = cur.fetchone()["value"]
-
-    if value is not None and hasattr(value, "__float__"):
-        if plan.aggregation not in {
-            "count",
-            "distinct_count",
-        }:
-            value = float(value)
-
-    result = {
-        "operation": plan.aggregation,
-        "value": value,
-    }
-
-    if field_name:
-        result["field"] = field_name
-
-    return result
-
-
-def fetch_postgres_coverage(connection=None) -> CoverageWindow | None:
-    with _postgres_connection(connection) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT MIN(attendance_date) AS date_min,
-                       MAX(attendance_date) AS date_max
-                FROM {POSTGRES_ATTENDANCE_TABLE}
-                """
-            )
-            row = cur.fetchone()
-    if not row or row.get("date_min") is None or row.get("date_max") is None:
-        return None
-    return CoverageWindow(date_min=row["date_min"], date_max=row["date_max"])
 
 
 def _execute_rows_query(query: CompiledPostgresQuery, connection) -> list[dict]:
@@ -3203,7 +1940,11 @@ def execute_exact_postgres(plan: ExecutableQueryPlan):
                 coverage_row = _execute_scalar_query(
                     compile_coverage_query(POSTGRES_ATTENDANCE_TABLE), connection
                 )
-                if coverage_row and coverage_row.get("date_min") is not None and coverage_row.get("date_max") is not None:
+                if (
+                    coverage_row
+                    and coverage_row.get("date_min") is not None
+                    and coverage_row.get("date_max") is not None
+                ):
                     available = CoverageWindow(
                         date_min=coverage_row["date_min"],
                         date_max=coverage_row["date_max"],
@@ -3700,7 +2441,11 @@ def attach_coverage_metadata(
     matched_concepts = []
     for name, concept in VALUE_CONCEPT_DEFINITIONS.items():
         for condition in plan.filters:
-            values = condition.value if isinstance(condition.value, list) else [condition.value]
+            values = (
+                condition.value
+                if isinstance(condition.value, list)
+                else [condition.value]
+            )
             if (
                 condition.field == concept.field
                 and condition.operator in {"eq", "in"}
@@ -3809,7 +2554,11 @@ def _format_aggregation_answer(question: str, aggregation: dict):
         value_concepts = aggregation.get("value_concepts", [])
         if len(value_concepts) == 1:
             definition = VALUE_CONCEPT_DEFINITIONS[value_concepts[0]]
-            label = definition.natural_names[0] if singular else definition.natural_names[-1]
+            label = (
+                definition.natural_names[0]
+                if singular
+                else definition.natural_names[-1]
+            )
             return f"{count} {label} matched the requested criteria.{_coverage_warning(aggregation)}"
         if predicates == {"scheduled_working_day", "not_worked"}:
             verb = "was" if singular else "were"
@@ -4024,7 +2773,8 @@ def _fetch_context_result(
             violation_count=len(compilation.violations),
         )
         raise SemanticPlanValidationError(compilation.violations)
-    assert compilation.executable_plan is not None
+    if compilation.executable_plan is None:
+        raise RuntimeError("Plan compiler reported ready without an executable plan.")
     plan = compilation.executable_plan
     event_logger.emit(
         "executable_plan_compiled",
@@ -4038,7 +2788,9 @@ def _fetch_context_result(
     provenance = list(compilation.provenance)
     planning_seconds = perf_counter() - planning_started
     employee_fields_before = {
-        condition.field for condition in plan.filters if condition.field in {"Employee_ID", "Name"}
+        condition.field
+        for condition in plan.filters
+        if condition.field in {"Employee_ID", "Name"}
     }
     plan, employee_resolution = resolve_employee_plan(
         question,
@@ -4049,9 +2801,14 @@ def _fetch_context_result(
         raise EmployeeClarificationRequired(proposal, facts, employee_resolution)
 
     for condition in plan.filters:
-        if condition.field not in {"Employee_ID", "Name"} or condition.field in employee_fields_before:
+        if (
+            condition.field not in {"Employee_ID", "Name"}
+            or condition.field in employee_fields_before
+        ):
             continue
-        values = condition.value if isinstance(condition.value, list) else [condition.value]
+        values = (
+            condition.value if isinstance(condition.value, list) else [condition.value]
+        )
         provenance.append(
             ConstraintProvenance(
                 target_kind="filter",
@@ -4095,7 +2852,10 @@ def _fetch_context_result(
     )
     if not revalidated.ready:
         raise SemanticPlanValidationError(revalidated.violations)
-    assert revalidated.executable_plan is not None
+    if revalidated.executable_plan is None:
+        raise RuntimeError(
+            "Plan revalidation reported ready without an executable plan."
+        )
     plan = revalidated.executable_plan
 
     backend = _retrieval_backend(plan.mode)
@@ -4760,22 +3520,6 @@ def answer_question_with_state(
     state.pending_interpretations = []
     if resolved_employees:
         state.selected_employees = resolved_employees
-    if (
-        _is_employee_identity_projection(effective_question)
-        and state.selected_employees
-    ):
-        if len(state.selected_employees) == 1:
-            employee = state.selected_employees[0]
-            return (
-                f"This employee is {employee.name} ({employee.employee_id}).",
-                chunks,
-                state,
-            )
-        identities = ", ".join(
-            f"{employee.name} ({employee.employee_id})"
-            for employee in state.selected_employees
-        )
-        return f"The selected employees are {identities}.", chunks, state
     text, chunks = _answer_from_context(
         effective_question,
         history,

@@ -1,8 +1,10 @@
 """Canonical APDC attendance fields and deterministic calculation semantics."""
 
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, datetime, time
+from decimal import Decimal, InvalidOperation
 import json
+import math
 import re
 from types import MappingProxyType
 from typing import Literal, get_args
@@ -45,10 +47,24 @@ FilterValue = FilterScalar | list[FilterScalar]
 RegistryFilterValue = FilterScalar | tuple[FilterScalar, ...]
 
 
+def _validate_filter_value_shape(operator: FilterOperator, value: FilterValue):
+    if operator == "in":
+        if not isinstance(value, list) or not value:
+            raise ValueError("operator 'in' requires a non-empty list")
+    elif isinstance(value, list):
+        raise ValueError(f"operator {operator!r} requires a single value")
+    return value
+
+
 class FilterCondition(BaseModel):
     field: str
     operator: FilterOperator
     value: FilterValue
+
+    @model_validator(mode="after")
+    def _validate_value_shape(self):
+        _validate_filter_value_shape(self.operator, self.value)
+        return self
 
 
 # Counts unique attendance dates after all filters are applied; duplicate rows for the same date are counted once (for example, three matching records on 2026-09-01 count as one date).
@@ -98,7 +114,7 @@ class QueryPlan(BaseModel):
         "percentage",
     ] = "none"
     aggregation_field: str | None = None
-    group_by: list[str] = Field(default_factory=list)
+    group_by: list[str] = Field(default_factory=list, max_length=2)
     percentage_condition: FilterCondition | None = None
     order_by: str | None = None
     order_direction: Literal["asc", "desc"] = "desc"
@@ -106,6 +122,13 @@ class QueryPlan(BaseModel):
     measure: MeasureName | None = None
     business_predicates: list[BusinessPredicateName] = Field(default_factory=list)
     interpretation_candidates: list[InterpretationName] = Field(default_factory=list)
+
+    @field_validator("group_by")
+    @classmethod
+    def _grouping_fields_must_be_unique(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("group_by fields must be unique")
+        return value
 
 
 class _StrictPlannerModel(BaseModel):
@@ -127,6 +150,11 @@ class ProposedFilter(_EvidenceChoice):
     field: str = Field(min_length=1)
     operator: FilterOperator
     value: FilterValue
+
+    @model_validator(mode="after")
+    def _validate_value_shape(self):
+        _validate_filter_value_shape(self.operator, self.value)
+        return self
 
 
 class ProposedMeasureChoice(_EvidenceChoice):
@@ -168,7 +196,6 @@ class ProposedCalculation(_EvidenceChoice):
             "average",
             "min",
             "max",
-            "percentage",
         }
         if field_required and not self.field:
             raise ValueError(f"{self.operation} requires a field")
@@ -195,7 +222,7 @@ class PlannerProposal(_StrictPlannerModel):
     measure: ProposedMeasureChoice | None = None
     business_predicates: list[ProposedPredicateChoice] = Field(default_factory=list)
     calculation: ProposedCalculation | None = None
-    group_by: list[ProposedFieldChoice] = Field(default_factory=list)
+    group_by: list[ProposedFieldChoice] = Field(default_factory=list, max_length=2)
     order_by: ProposedOrderChoice | None = None
     limit: ProposedLimit | None = None
     answer_contract: AnswerContract | None = None
@@ -203,18 +230,32 @@ class PlannerProposal(_StrictPlannerModel):
     unsupported_capabilities: list[UnsupportedCapability] = Field(default_factory=list)
     explanation: str | None = None
 
+    @field_validator("group_by")
+    @classmethod
+    def _proposed_grouping_fields_must_be_unique(
+        cls, value: list[ProposedFieldChoice]
+    ) -> list[ProposedFieldChoice]:
+        fields = [item.field for item in value]
+        if len(fields) != len(set(fields)):
+            raise ValueError("group_by fields must be unique")
+        return value
+
     @model_validator(mode="after")
     def _validate_status_and_shape(self):
         if self.status == "ready":
             if self.answer_contract is None:
                 raise ValueError("ready proposals require answer_contract")
             if self.interpretation_candidates:
-                raise ValueError("ready proposals cannot contain interpretation candidates")
+                raise ValueError(
+                    "ready proposals cannot contain interpretation candidates"
+                )
         if self.status != "unsupported" and self.unsupported_capabilities:
             raise ValueError("capability identifiers require unsupported status")
         if self.status == "unsupported":
             if not self.unsupported_capabilities:
-                raise ValueError("unsupported proposals require a capability identifier")
+                raise ValueError(
+                    "unsupported proposals require a capability identifier"
+                )
             execution_choices = (
                 self.filters
                 or self.name_hint is not None
@@ -228,7 +269,9 @@ class PlannerProposal(_StrictPlannerModel):
                 or self.interpretation_candidates
             )
             if execution_choices:
-                raise ValueError("unsupported proposals cannot contain execution choices")
+                raise ValueError(
+                    "unsupported proposals cannot contain execution choices"
+                )
         if self.measure is not None and self.calculation is not None:
             raise ValueError("measure and calculation are mutually exclusive")
         if self.answer_contract is not None:
@@ -283,7 +326,7 @@ class GroupedCalculationResult(BaseModel):
 
 class PercentageCalculationResult(BaseModel):
     operation: Literal["percentage"] = "percentage"
-    field: str
+    field: str | None
     numerator: int
     denominator: int
     value: float | None
@@ -331,6 +374,14 @@ class MeasureDefinition:
     natural_names: tuple[str, ...] = ()
     answer_unit: Literal["dates", "records", "employees"] = "records"
     default_answer_shape: Literal["scalar", "grouped"] = "scalar"
+
+
+@dataclass(frozen=True)
+class CalculationDefinition:
+    description: str
+    natural_names: tuple[str, ...]
+    detection_patterns: tuple[str, ...]
+    requires_numeric_field: bool = False
 
 
 @dataclass(frozen=True)
@@ -553,10 +604,21 @@ _FIELD_NATURAL_NAMES = {
     "Position": ("position", "positions"),
     "Job": ("job", "jobs"),
     "Grade": ("grade", "grades"),
-    "Day_Type": ("day type", "day types", "scheduled working day", "scheduled working days"),
+    "Day_Type": (
+        "day type",
+        "day types",
+        "scheduled working day",
+        "scheduled working days",
+    ),
     "Holiday_Type": ("holiday", "holidays", "holiday type", "holiday types"),
     "Shift": ("shift", "shifts"),
-    "Status": ("status", "authorized record", "authorized records", "draft record", "draft records"),
+    "Status": (
+        "status",
+        "authorized record",
+        "authorized records",
+        "draft record",
+        "draft records",
+    ),
     "Exception": ("exception", "exceptions", "absent", "absence"),
     "Total_Worked_Hrs": ("worked hour", "worked hours", "hours worked", "work hours"),
     "Lateness_Hrs": ("late", "lateness", "late in", "late-in"),
@@ -564,7 +626,12 @@ _FIELD_NATURAL_NAMES = {
     "Overbreak_Hrs": ("over break", "over-break", "overbreak"),
     "Regular_Units": ("regular unit", "regular units"),
     "Total_OT": ("overtime", "total ot"),
-    "OT_Authorized": ("authorized overtime", "overtime authorized", "authorized ot", "ot authorized"),
+    "OT_Authorized": (
+        "authorized overtime",
+        "overtime authorized",
+        "authorized ot",
+        "ot authorized",
+    ),
     "OT_Not_Authorized": (
         "unauthorized overtime",
         "overtime not authorized",
@@ -594,6 +661,41 @@ def _resolution_kind(field: str, definition: FieldDefinition) -> ResolutionKind:
     if field == "Employee_Remarks":
         return "free_text"
     return "catalog"
+
+
+def canonicalize_storage_value(field: str, raw_value: object) -> str | float:
+    """Return the canonical database value declared by the field registry."""
+    definition = FIELD_DEFINITIONS.get(field)
+    if definition is None:
+        raise ValueError(f"Unknown attendance field {field!r}.")
+    value = str(raw_value).strip()
+    if field == "Period":
+        if re.fullmatch(r"\d{4}-(?:0[1-9]|1[0-2])", value) is None:
+            raise ValueError(f"{field} requires an ISO year-month value.")
+        return value
+    if definition.storage_type == "number":
+        try:
+            number = float(Decimal(value))
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError(f"{field} requires a finite numeric value.") from exc
+        if not math.isfinite(number):
+            raise ValueError(f"{field} requires a finite numeric value.")
+        return number
+    try:
+        if definition.storage_type == "date":
+            return date.fromisoformat(value).isoformat()
+        if definition.storage_type == "time":
+            return time.fromisoformat(value).isoformat()
+        if definition.storage_type == "datetime":
+            return datetime.fromisoformat(value).isoformat()
+    except ValueError as exc:
+        label = (
+            "ISO date"
+            if definition.storage_type == "date"
+            else f"ISO {definition.storage_type}"
+        )
+        raise ValueError(f"{field} requires a valid {label} value.") from exc
+    return value
 
 
 for _field, _definition in tuple(_FIELD_DEFINITIONS.items()):
@@ -628,8 +730,7 @@ for _field, _definition in tuple(_FIELD_DEFINITIONS.items()):
         ),
         resolution_kind=_resolution_kind(_field, _definition),
         aggregatable=(
-            _definition.storage_type == "number"
-            or _field in {"Date", "Employee_ID"}
+            _definition.storage_type == "number" or _field in {"Date", "Employee_ID"}
         ),
         planner_visible=_field != "chunk_type",
     )
@@ -743,6 +844,48 @@ INTERPRETATION_PRESETS = MappingProxyType(
         ),
         "employees": InterpretationDefinition(
             "Distinct employees in matching attendance rows.", "employees"
+        ),
+    }
+)
+
+CALCULATION_DEFINITIONS = MappingProxyType(
+    {
+        "sum": CalculationDefinition(
+            description="Sum a numeric attendance field.",
+            natural_names=("sum", "combined total", "total"),
+            detection_patterns=(
+                r"\bsum(?:\s+of)?\b",
+                r"\bcombined\b",
+                r"\btotal\b(?!\s+(?:number|count)\b)",
+                r"\b(?:what\s+is|calculate|show\s+me)\s+(?:the\s+)?total\b",
+            ),
+            requires_numeric_field=True,
+        ),
+        "average": CalculationDefinition(
+            description="Average a numeric attendance field.",
+            natural_names=("average", "avg", "mean"),
+            detection_patterns=(r"\b(?:average|avg|mean)\b",),
+            requires_numeric_field=True,
+        ),
+        "min": CalculationDefinition(
+            description="Find the minimum of a numeric attendance field.",
+            natural_names=("minimum", "min"),
+            detection_patterns=(r"\b(?:minimum|min)\b",),
+            requires_numeric_field=True,
+        ),
+        "max": CalculationDefinition(
+            description="Find the maximum of a numeric attendance field.",
+            natural_names=("maximum", "max"),
+            detection_patterns=(r"\b(?:maximum|max)\b",),
+            requires_numeric_field=True,
+        ),
+        "percentage": CalculationDefinition(
+            description=(
+                "Calculate the percentage of a record, date, or employee population "
+                "that matches one numerator condition."
+            ),
+            natural_names=("percentage", "percent", "rate"),
+            detection_patterns=(r"\b(?:percentage|percent|rate)\b",),
         ),
     }
 )
@@ -870,6 +1013,15 @@ def render_planner_schema() -> str:
             }
             for name, definition in _named_registry_items(MEASURE_DEFINITIONS)
         ],
+        "calculations": [
+            {
+                "name": name,
+                "description": definition.description,
+                "natural_names": list(definition.natural_names),
+                "requires_numeric_field": definition.requires_numeric_field,
+            }
+            for name, definition in _named_registry_items(CALCULATION_DEFINITIONS)
+        ],
         "predicates": [
             {
                 "name": name,
@@ -909,102 +1061,9 @@ def render_planner_schema() -> str:
             for name, definition in _named_registry_items(VALUE_CONCEPT_DEFINITIONS)
         ],
     }
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-
-INCOMPATIBLE_BUSINESS_PREDICATE_SETS = tuple(
-    sorted(
-        {
-            frozenset((name, incompatible))
-            for name, definition in BUSINESS_PREDICATE_DEFINITIONS.items()
-            for incompatible in definition.incompatible_with
-        },
-        key=lambda item: tuple(sorted(item)),
+    return json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
     )
-)
-
-
-def _matches_registry_filter(condition: FilterCondition, required: RequiredFilter) -> bool:
-    values = condition.value if isinstance(condition.value, list) else [condition.value]
-    required_values = required.value if isinstance(required.value, tuple) else (required.value,)
-    return condition.field == required.field and condition.operator == required.operator and {
-        str(value).casefold() for value in values
-    } == {str(value).casefold() for value in required_values}
-
-
-def compile_business_intent(plan: QueryPlan) -> QueryPlan:
-    """Compile orthogonal measure and predicate choices into executable fields."""
-    compiled = plan.model_copy(deep=True)
-    predicate_names = list(dict.fromkeys(compiled.business_predicates))
-    predicate_set = set(predicate_names)
-    for incompatible in INCOMPATIBLE_BUSINESS_PREDICATE_SETS:
-        if incompatible <= predicate_set:
-            first, second = sorted(incompatible, reverse=True)
-            raise ValueError(
-                f"Business predicates {first} and {second} are incompatible."
-            )
-    for name in predicate_names:
-        for incompatible in BUSINESS_PREDICATE_DEFINITIONS[name].incompatible_filters:
-            if any(
-                _matches_registry_filter(condition, incompatible)
-                for condition in compiled.filters
-            ):
-                raise ValueError(
-                    f"Business predicate {name} conflicts with an explicit "
-                    f"{incompatible.field}={incompatible.value} filter."
-                )
-
-    if compiled.measure is not None:
-        definition = MEASURE_DEFINITIONS[compiled.measure]
-        compiled.mode = "exact"
-        compiled.aggregation = definition.aggregation
-        compiled.aggregation_field = definition.aggregation_field
-        if definition.aggregation_field is not None:
-            compiled.group_by = [
-                field
-                for field in compiled.group_by
-                if field != definition.aggregation_field
-            ]
-
-    for name in predicate_names:
-        compiled.mode = "exact"
-        for required in BUSINESS_PREDICATE_DEFINITIONS[name].required_filters:
-            existing = [
-                condition
-                for condition in compiled.filters
-                if condition.field == required.field
-            ]
-            if existing:
-
-                def matches_required(condition):
-                    same_value = (
-                        str(condition.value).casefold()
-                        == str(required.value).casefold()
-                        if isinstance(condition.value, str)
-                        and isinstance(required.value, str)
-                        else condition.value == required.value
-                    )
-                    return condition.operator == required.operator and same_value
-
-                if any(not matches_required(condition) for condition in existing):
-                    raise ValueError(
-                        f"Business predicate {name} conflicts with an explicit "
-                        f"{required.field} filter."
-                    )
-                for condition in existing:
-                    if isinstance(condition.value, str) and isinstance(
-                        required.value, str
-                    ):
-                        condition.value = required.value
-                continue
-            compiled.filters.append(
-                FilterCondition(
-                    field=required.field,
-                    operator=required.operator,
-                    value=required.value,
-                )
-            )
-    compiled.business_predicates = predicate_names
-    return compiled
 
 
 def relevant_field_definitions(question: str):

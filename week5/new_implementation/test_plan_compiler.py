@@ -3,6 +3,7 @@ import unittest
 from week5.new_implementation.attendance_schema import (
     AnswerContract,
     PlannerProposal,
+    ProposedCalculation,
     ProposedFilter,
     ProposedMeasureChoice,
 )
@@ -18,6 +19,153 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class PlanCompilerTests(unittest.TestCase):
+    def test_percentage_condition_is_canonicalized_grounded_and_preserved(self):
+        question = (
+            "What percentage of all attendance records have Status equal to Authorized?"
+        )
+        resolution = ResolutionContext({})
+        facts = detect_semantic_facts(question, resolution)
+        proposal = PlannerProposal(
+            status="ready",
+            calculation=ProposedCalculation(
+                operation="percentage",
+                field=None,
+                percentage_condition=ProposedFilter(
+                    field="Status",
+                    operator="eq",
+                    value="authorized",
+                    evidence_text="Status equal to Authorized",
+                ),
+                evidence_text="percentage",
+            ),
+            answer_contract=AnswerContract(
+                shape="scalar", unit="percentage", subject_field=None, grain=[]
+            ),
+        )
+
+        result = compile_proposal(
+            proposal, CompilationContext(question, facts, resolution)
+        )
+
+        self.assertTrue(result.ready, result.violations)
+        self.assertEqual(
+            result.executable_plan.percentage_condition.model_dump(),
+            {"field": "Status", "operator": "eq", "value": "Authorized"},
+        )
+
+    def test_unresolvable_percentage_condition_fails_during_compilation(self):
+        question = "What percentage have Status equal to Not A Real Status?"
+        resolution = ResolutionContext({})
+        proposal = PlannerProposal(
+            status="ready",
+            calculation=ProposedCalculation(
+                operation="percentage",
+                field=None,
+                percentage_condition=ProposedFilter(
+                    field="Status",
+                    operator="eq",
+                    value="Not A Real Status",
+                    evidence_text="Status equal to Not A Real Status",
+                ),
+                evidence_text="percentage",
+            ),
+            answer_contract=AnswerContract(
+                shape="scalar", unit="percentage", subject_field=None, grain=[]
+            ),
+        )
+
+        result = compile_proposal(
+            proposal,
+            CompilationContext(
+                question, detect_semantic_facts(question, resolution), resolution
+            ),
+        )
+
+        self.assertFalse(result.ready)
+        self.assertIn("invalid_schema", {item.code for item in result.violations})
+
+    def test_wrong_calculation_operation_is_rejected(self):
+        question = "What is average Lateness_Hrs?"
+        resolution = ResolutionContext({})
+        proposal = PlannerProposal(
+            status="ready",
+            calculation=ProposedCalculation(
+                operation="max",
+                field="Lateness_Hrs",
+                evidence_text="average Lateness_Hrs",
+            ),
+            answer_contract=AnswerContract(
+                shape="scalar",
+                unit="hours",
+                subject_field="Lateness_Hrs",
+                grain=["Lateness_Hrs"],
+            ),
+        )
+
+        result = compile_proposal(
+            proposal,
+            CompilationContext(
+                question, detect_semantic_facts(question, resolution), resolution
+            ),
+        )
+
+        self.assertFalse(result.ready)
+        self.assertEqual(
+            {item.code for item in result.violations},
+            {"ungrounded_constraint", "uncovered_fact"},
+        )
+
+    def test_requested_grouping_cannot_be_omitted(self):
+        question = "What is average Lateness_Hrs by Department?"
+        resolution = ResolutionContext({})
+        proposal = PlannerProposal(
+            status="ready",
+            calculation=ProposedCalculation(
+                operation="average",
+                field="Lateness_Hrs",
+                evidence_text="average Lateness_Hrs",
+            ),
+            answer_contract=AnswerContract(
+                shape="scalar",
+                unit="hours",
+                subject_field="Lateness_Hrs",
+                grain=["Lateness_Hrs"],
+            ),
+        )
+
+        result = compile_proposal(
+            proposal,
+            CompilationContext(
+                question, detect_semantic_facts(question, resolution), resolution
+            ),
+        )
+
+        self.assertFalse(result.ready)
+        self.assertIn("uncovered_fact", {item.code for item in result.violations})
+
+    def test_numeric_calculation_rejects_non_numeric_field_before_execution(self):
+        question = "What is the sum of Date?"
+        resolution = ResolutionContext({})
+        proposal = PlannerProposal(
+            status="ready",
+            calculation=ProposedCalculation(
+                operation="sum", field="Date", evidence_text="sum of Date"
+            ),
+            answer_contract=AnswerContract(
+                shape="scalar", unit="value", subject_field="Date", grain=["Date"]
+            ),
+        )
+
+        result = compile_proposal(
+            proposal,
+            CompilationContext(
+                question, detect_semantic_facts(question, resolution), resolution
+            ),
+        )
+
+        self.assertFalse(result.ready)
+        self.assertIn("invalid_schema", {item.code for item in result.violations})
+
     def setUp(self):
         self.question = "how many off days for A11017"
         self.resolution = ResolutionContext(
@@ -119,9 +267,7 @@ class PlanCompilerTests(unittest.TestCase):
                     evidence_text="A11017",
                 ),
             ],
-            measure=ProposedMeasureChoice(
-                name="distinct_dates", evidence_text="days"
-            ),
+            measure=ProposedMeasureChoice(name="distinct_dates", evidence_text="days"),
             answer_contract=AnswerContract(
                 shape="scalar", unit="dates", subject_field="Date", grain=["Date"]
             ),

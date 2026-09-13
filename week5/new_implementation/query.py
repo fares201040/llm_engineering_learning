@@ -1,15 +1,12 @@
-"""Planning and executable-query façade."""
+"""Planning and verified executable-query façade."""
 
-from .answer import (
-    PlanValidationError,
-    normalize_query_plan,
-    plan_query,
-    resolve_relative_date_filters,
-)
+from .answer import PlanValidationError, propose_query, resolve_relative_date_filters
+from .plan_compiler import CompilationContext, compile_proposal
 
 __all__ = [
+    "CompilationContext",
     "PlanValidationError",
-    "normalize_query_plan",
-    "plan_query",
+    "compile_proposal",
+    "propose_query",
     "resolve_relative_date_filters",
 ]

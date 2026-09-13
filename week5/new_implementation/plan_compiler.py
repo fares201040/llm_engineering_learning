@@ -9,9 +9,9 @@ from pydantic import BaseModel, Field
 try:
     from .attendance_schema import (
         BUSINESS_PREDICATE_DEFINITIONS,
+        CALCULATION_DEFINITIONS,
         FIELD_DEFINITIONS,
         MEASURE_DEFINITIONS,
-        AnswerContract,
         EvidenceOrigin,
         ExecutableQueryPlan,
         FilterCondition,
@@ -29,9 +29,9 @@ try:
 except ImportError:  # Direct execution from week5/new_implementation.
     from attendance_schema import (
         BUSINESS_PREDICATE_DEFINITIONS,
+        CALCULATION_DEFINITIONS,
         FIELD_DEFINITIONS,
         MEASURE_DEFINITIONS,
-        AnswerContract,
         EvidenceOrigin,
         ExecutableQueryPlan,
         FilterCondition,
@@ -156,12 +156,34 @@ class SchemaInvariant(PlanInvariant):
                     )
                 )
                 continue
-            if item.operator is not None and item.operator not in FIELD_DEFINITIONS[item.field].operators:
+            if (
+                item.operator is not None
+                and item.operator not in FIELD_DEFINITIONS[item.field].operators
+            ):
                 violations.append(
                     PlanViolation(
                         "invalid_schema",
                         item.field,
                         f"Operator {item.operator!r} is not valid for {item.field!r}.",
+                    )
+                )
+        calculation = context.proposal.calculation if context.proposal else None
+        if calculation is not None:
+            definition = CALCULATION_DEFINITIONS.get(calculation.operation)
+            field_definition = FIELD_DEFINITIONS.get(calculation.field or "")
+            if (
+                definition is not None
+                and definition.requires_numeric_field
+                and (
+                    field_definition is None
+                    or field_definition.storage_type != "number"
+                )
+            ):
+                violations.append(
+                    PlanViolation(
+                        "invalid_schema",
+                        calculation.field or "calculation",
+                        f"{calculation.operation} requires a numeric field.",
                     )
                 )
         return tuple(violations)
@@ -170,13 +192,30 @@ class SchemaInvariant(PlanInvariant):
 def _fact_matches_provenance(fact: SemanticFact, item: ConstraintProvenance) -> bool:
     if fact.origin != item.origin:
         return False
-    if not evidence_occurs(fact.evidence_text, item.evidence_text) and not evidence_occurs(
-        item.evidence_text, fact.evidence_text
-    ):
+    if not evidence_occurs(
+        fact.evidence_text, item.evidence_text
+    ) and not evidence_occurs(item.evidence_text, fact.evidence_text):
         return False
     if item.target_kind == "filter":
         if item.name is not None and fact.kind == "predicate":
             return fact.concept_name == item.name
+        if (
+            fact.kind == "predicate"
+            and fact.concept_name in BUSINESS_PREDICATE_DEFINITIONS
+        ):
+            return any(
+                item.field == required.field
+                and item.operator == required.operator
+                and set(item.values)
+                == set(
+                    required.value
+                    if isinstance(required.value, tuple)
+                    else (required.value,)
+                )
+                for required in BUSINESS_PREDICATE_DEFINITIONS[
+                    fact.concept_name
+                ].required_filters
+            )
         return (
             fact.kind == "filter"
             and fact.field == item.field
@@ -185,8 +224,14 @@ def _fact_matches_provenance(fact: SemanticFact, item: ConstraintProvenance) -> 
         )
     if item.target_kind in {"measure", "predicate"}:
         return fact.kind == item.target_kind and fact.concept_name == item.name
-    if item.target_kind in {"group_by", "order_by", "calculation"}:
+    if item.target_kind in {"group_by", "order_by"}:
         return fact.field == item.field and fact.kind in {item.target_kind, "field"}
+    if item.target_kind == "calculation":
+        return (
+            fact.kind == "calculation"
+            and fact.field == item.field
+            and fact.concept_name == item.name
+        )
     if item.target_kind == "entity":
         return fact.kind == "entity" and set(fact.values) == set(item.values)
     if item.target_kind == "limit":
@@ -200,9 +245,10 @@ class GroundingInvariant(PlanInvariant):
         for index, item in enumerate(context.provenance):
             if item.origin == "deterministic_default":
                 continue
-            evidence_present = evidence_occurs(
-                context.compilation.question, item.evidence_text
-            ) or item.origin == "trusted_state"
+            evidence_present = (
+                evidence_occurs(context.compilation.question, item.evidence_text)
+                or item.origin == "trusted_state"
+            )
             grounded = any(
                 fact.strength == "strong" and _fact_matches_provenance(fact, item)
                 for fact in context.compilation.facts
@@ -238,7 +284,9 @@ class CoverageInvariant(PlanInvariant):
         for index, fact in enumerate(context.compilation.facts):
             if fact.strength != "strong" or fact.kind not in relevant_kinds:
                 continue
-            if not any(_fact_matches_provenance(fact, item) for item in context.provenance):
+            if not any(
+                _fact_matches_provenance(fact, item) for item in context.provenance
+            ):
                 violations.append(
                     PlanViolation(
                         "uncovered_fact",
@@ -252,7 +300,9 @@ class CoverageInvariant(PlanInvariant):
 
 def _filter_matches_required(condition: FilterCondition, required) -> bool:
     values = condition.value if isinstance(condition.value, list) else [condition.value]
-    required_values = required.value if isinstance(required.value, tuple) else (required.value,)
+    required_values = (
+        required.value if isinstance(required.value, tuple) else (required.value,)
+    )
     return (
         condition.field == required.field
         and condition.operator == required.operator
@@ -314,7 +364,8 @@ class AnswerContractInvariant(PlanInvariant):
                 else "hours"
                 if proposal.calculation.field
                 and FIELD_DEFINITIONS.get(proposal.calculation.field)
-                and FIELD_DEFINITIONS[proposal.calculation.field].storage_type == "number"
+                and FIELD_DEFINITIONS[proposal.calculation.field].storage_type
+                == "number"
                 else "value"
             )
             expected_subject = proposal.calculation.field
@@ -358,7 +409,9 @@ PLAN_INVARIANTS: tuple[PlanInvariant, ...] = (
 
 
 def _canonicalize_filter(proposed, context, resolver_registry):
-    raw_values = proposed.value if isinstance(proposed.value, list) else [proposed.value]
+    raw_values = (
+        proposed.value if isinstance(proposed.value, list) else [proposed.value]
+    )
     canonical = []
     candidates = []
     for raw_value in raw_values:
@@ -370,20 +423,33 @@ def _canonicalize_filter(proposed, context, resolver_registry):
         )
         if outcome.status == "resolved":
             canonical.extend(outcome.values)
-        elif outcome.status == "semantic_only" and proposed.operator in {"contains", "starts_with"}:
+        elif outcome.status == "semantic_only" and proposed.operator in {
+            "contains",
+            "starts_with",
+        }:
             canonical.extend(outcome.values)
         else:
             candidates.extend(outcome.candidates)
             return None, tuple(candidates), outcome.status
     value = canonical if proposed.operator == "in" else canonical[0]
-    return FilterCondition(field=proposed.field, operator=proposed.operator, value=value), (), "resolved"
+    return (
+        FilterCondition(field=proposed.field, operator=proposed.operator, value=value),
+        (),
+        "resolved",
+    )
 
 
-def _choice_origin(context, *, kind, evidence_text, field=None, operator=None, values=(), name=None):
+def _choice_origin(
+    context, *, kind, evidence_text, field=None, operator=None, values=(), name=None
+):
     for fact in context.facts:
         if fact.strength != "strong" or fact.kind != kind:
             continue
-        if field is not None and (fact.field != field or fact.operator != operator or set(fact.values) != set(values)):
+        if field is not None and (
+            fact.field != field
+            or fact.operator != operator
+            or set(fact.values) != set(values)
+        ):
             continue
         if name is not None and fact.concept_name != name:
             continue
@@ -465,7 +531,9 @@ def compile_proposal(
                 )
             continue
         candidate.filters.append(condition)
-        values = condition.value if isinstance(condition.value, list) else [condition.value]
+        values = (
+            condition.value if isinstance(condition.value, list) else [condition.value]
+        )
         provenance.append(
             ConstraintProvenance(
                 target_kind="filter",
@@ -519,15 +587,68 @@ def compile_proposal(
         candidate.aggregation = calculation.operation
         candidate.aggregation_field = calculation.field
         if calculation.percentage_condition is not None:
-            condition, _, _ = _canonicalize_filter(
+            condition, candidates, status = _canonicalize_filter(
                 calculation.percentage_condition, context, resolver_registry
             )
-            candidate.percentage_condition = condition
+            if condition is None:
+                early_violations.append(
+                    PlanViolation(
+                        "ambiguous_value"
+                        if status == "ambiguous"
+                        else "invalid_schema",
+                        calculation.percentage_condition.field,
+                        "The percentage condition could not be resolved uniquely.",
+                        clarification_possible=status == "ambiguous",
+                    )
+                )
+                if candidates:
+                    clarification = PendingConstraintData(
+                        field=calculation.percentage_condition.field,
+                        reference=calculation.percentage_condition.evidence_text,
+                        candidates=[
+                            ConstraintCandidateData(
+                                field=calculation.percentage_condition.field,
+                                value=value,
+                            )
+                            for value in candidates
+                        ],
+                    )
+            else:
+                candidate.percentage_condition = condition
+                values = (
+                    condition.value
+                    if isinstance(condition.value, list)
+                    else [condition.value]
+                )
+                provenance.append(
+                    ConstraintProvenance(
+                        target_kind="filter",
+                        field=condition.field,
+                        operator=condition.operator,
+                        values=tuple(values),
+                        origin=_choice_origin(
+                            context,
+                            kind="filter",
+                            evidence_text=calculation.percentage_condition.evidence_text,
+                            field=condition.field,
+                            operator=condition.operator,
+                            values=tuple(values),
+                        ),
+                        evidence_text=calculation.percentage_condition.evidence_text,
+                    )
+                )
         provenance.append(
             ConstraintProvenance(
                 target_kind="calculation",
                 field=calculation.field,
                 name=calculation.operation,
+                origin=_choice_origin(
+                    context,
+                    kind="calculation",
+                    evidence_text=calculation.evidence_text,
+                    field=calculation.field,
+                    name=calculation.operation,
+                ),
                 evidence_text=calculation.evidence_text,
             )
         )
@@ -548,9 +669,15 @@ def compile_proposal(
             )
         )
         for required in BUSINESS_PREDICATE_DEFINITIONS[proposed.name].required_filters:
-            value = list(required.value) if isinstance(required.value, tuple) else required.value
+            value = (
+                list(required.value)
+                if isinstance(required.value, tuple)
+                else required.value
+            )
             candidate.filters.append(
-                FilterCondition(field=required.field, operator=required.operator, value=value)
+                FilterCondition(
+                    field=required.field, operator=required.operator, value=value
+                )
             )
             values = value if isinstance(value, list) else [value]
             provenance.append(
@@ -624,4 +751,6 @@ def revalidate_executable_plan(
         for invariant in PLAN_INVARIANTS
         for violation in invariant.check(invariant_context)
     )
-    return PlanCompilationResult(plan if not violations else None, provenance, violations)
+    return PlanCompilationResult(
+        plan if not violations else None, provenance, violations
+    )

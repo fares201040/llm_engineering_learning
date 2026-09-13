@@ -12,6 +12,82 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class SemanticResolutionTests(unittest.TestCase):
+    def test_numeric_comparison_operator_is_detected_generically(self):
+        facts = detect_semantic_facts(
+            "How many attendance records have Lateness_Hrs at least 2?",
+            ResolutionContext({}),
+        )
+
+        self.assertIn(
+            ("Lateness_Hrs", "gte", (2.0,)),
+            {(fact.field, fact.operator, fact.values) for fact in facts},
+        )
+
+    def test_invalid_temporal_and_non_finite_numeric_values_do_not_resolve(self):
+        registry = ResolverRegistry.default()
+        context = ResolutionContext({})
+
+        invalid_date = registry.canonicalize(
+            "Date", "2026-02-30", "2026-02-30", context
+        )
+        non_finite = registry.canonicalize("Total_OT", "NaN", "NaN", context)
+
+        self.assertEqual(invalid_date.status, "unknown")
+        self.assertEqual(non_finite.status, "unknown")
+
+    def test_calculation_operation_and_subject_are_detected(self):
+        percentage = detect_semantic_facts(
+            "What percentage of all attendance records have Status equal to Authorized?",
+            ResolutionContext({}),
+        )
+        average = detect_semantic_facts(
+            "What is average Lateness_Hrs by Department?",
+            ResolutionContext({}),
+        )
+
+        self.assertTrue(
+            any(
+                fact.kind == "calculation"
+                and fact.concept_name == "percentage"
+                and fact.field is None
+                for fact in percentage
+            )
+        )
+        self.assertTrue(
+            any(
+                fact.kind == "calculation"
+                and fact.concept_name == "average"
+                and fact.field == "Lateness_Hrs"
+                for fact in average
+            )
+        )
+
+    def test_grouping_is_a_distinct_strong_fact(self):
+        facts = detect_semantic_facts(
+            "What is average Lateness_Hrs by Department?",
+            ResolutionContext({}),
+        )
+
+        self.assertTrue(
+            any(
+                fact.kind == "group_by" and fact.field == "Department" for fact in facts
+            )
+        )
+
+    def test_total_numeric_field_is_detected_as_sum_not_count(self):
+        facts = detect_semantic_facts(
+            "What was total overtime for A10017?",
+            ResolutionContext({}),
+        )
+
+        calculations = [fact for fact in facts if fact.kind == "calculation"]
+        self.assertEqual(len(calculations), 1)
+        self.assertEqual(calculations[0].concept_name, "sum")
+        self.assertEqual(calculations[0].field, "Total_OT")
+        self.assertFalse(
+            any(fact.kind == "filter" and fact.field == "Total_OT" for fact in facts)
+        )
+
     def test_value_concept_uses_generic_resolver(self):
         context = ResolutionContext(
             catalog={"Day_Type": ("Working Day", "OFF Day", "OFF Day (ZAS)")}

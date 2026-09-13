@@ -11,6 +11,7 @@ try:
         POSTGRES_FIELD_MAP,
         ExecutableQueryPlan,
         FilterCondition,
+        canonicalize_storage_value,
     )
 except ImportError:  # Direct execution from week5/new_implementation.
     from attendance_schema import (
@@ -18,6 +19,7 @@ except ImportError:  # Direct execution from week5/new_implementation.
         POSTGRES_FIELD_MAP,
         ExecutableQueryPlan,
         FilterCondition,
+        canonicalize_storage_value,
     )
 
 
@@ -45,7 +47,10 @@ def _query(sql, params, purpose):
 
 
 def _require_table_name(table_name: str) -> str:
-    if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?", table_name) is None:
+    if (
+        re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)?", table_name)
+        is None
+    ):
         raise ValueError("Invalid configured PostgreSQL table name.")
     return table_name
 
@@ -79,20 +84,33 @@ def compile_where(filters) -> SqlFragment:
         if condition.field == "chunk_type":
             if condition.operator == "eq" and condition.value == "attendance_record":
                 continue
-            raise ValueError("The attendance table contains attendance_record rows only.")
+            raise ValueError(
+                "The attendance table contains attendance_record rows only."
+            )
         if condition.operator == "in":
             if not isinstance(condition.value, list) or not condition.value:
                 raise ValueError("Operator 'in' requires a non-empty list.")
-            clauses.append(f"{expression} = ANY(%s::{array_types[definition.storage_type]})")
-            params.append(condition.value)
+            clauses.append(
+                f"{expression} = ANY(%s::{array_types[definition.storage_type]})"
+            )
+            params.append(
+                [
+                    canonicalize_storage_value(condition.field, value)
+                    for value in condition.value
+                ]
+            )
         elif isinstance(condition.value, list):
             raise ValueError(f"Operator {condition.operator!r} requires one value.")
         elif condition.operator in operators:
             cast = "::date" if definition.storage_type == "date" else ""
             clauses.append(f"{expression} {operators[condition.operator]} %s{cast}")
-            params.append(condition.value)
+            params.append(canonicalize_storage_value(condition.field, condition.value))
         elif condition.operator in {"contains", "starts_with"}:
-            text_expression = expression if definition.storage_type == "text" else f"CAST({expression} AS TEXT)"
+            text_expression = (
+                expression
+                if definition.storage_type == "text"
+                else f"CAST({expression} AS TEXT)"
+            )
             clauses.append(f"{text_expression} ILIKE %s")
             params.append(
                 f"%{condition.value}%"
@@ -124,7 +142,11 @@ def compile_sample_query(
     if not isinstance(limit, int) or limit < 1:
         raise ValueError("Sample limit must be a positive integer.")
     where = compile_where(plan.filters)
-    order_field = plan.order_by if plan.order_by in POSTGRES_FIELD_MAP and plan.order_by != "chunk_type" else "Date"
+    order_field = (
+        plan.order_by
+        if plan.order_by in POSTGRES_FIELD_MAP and plan.order_by != "chunk_type"
+        else "Date"
+    )
     order_expression = POSTGRES_FIELD_MAP[order_field]
     direction = "DESC" if plan.order_direction == "desc" else "ASC"
     sql = f"""SELECT record_id, employee_id, name, attendance_date,
@@ -141,16 +163,25 @@ def _aggregation_expression(plan: ExecutableQueryPlan) -> tuple[str, str | None]
         return "COUNT(*)", None
     if plan.aggregation == "distinct_count":
         expression = POSTGRES_FIELD_MAP.get(plan.aggregation_field or "")
-        if expression is None or not FIELD_DEFINITIONS[plan.aggregation_field].aggregatable:
+        if (
+            expression is None
+            or not FIELD_DEFINITIONS[plan.aggregation_field].aggregatable
+        ):
             raise ValueError("distinct_count requires an aggregatable field.")
         return f"COUNT(DISTINCT {expression})", plan.aggregation_field
     if plan.aggregation in {"sum", "average", "min", "max"}:
         field = plan.aggregation_field or ""
         definition = FIELD_DEFINITIONS.get(field)
         expression = POSTGRES_FIELD_MAP.get(field)
-        if definition is None or expression is None or definition.storage_type != "number":
+        if (
+            definition is None
+            or expression is None
+            or definition.storage_type != "number"
+        ):
             raise ValueError(f"{plan.aggregation} requires a numeric field.")
-        function = {"sum": "SUM", "average": "AVG", "min": "MIN", "max": "MAX"}[plan.aggregation]
+        function = {"sum": "SUM", "average": "AVG", "min": "MIN", "max": "MAX"}[
+            plan.aggregation
+        ]
         return f"{function}({expression})", field
     raise ValueError(f"Unsupported aggregation {plan.aggregation!r}.")
 
@@ -175,18 +206,31 @@ def compile_aggregation_queries(
             expression = f"COUNT(DISTINCT {field_expression})"
         numerator = compile_where([*plan.filters, plan.percentage_condition])
         return (
-            _query(f"SELECT {expression} AS value FROM {table} WHERE {where.sql}", where.params, "aggregation"),
-            _query(f"SELECT {expression} AS value FROM {table} WHERE {numerator.sql}", numerator.params, "aggregation"),
+            _query(
+                f"SELECT {expression} AS value FROM {table} WHERE {where.sql}",
+                where.params,
+                "aggregation",
+            ),
+            _query(
+                f"SELECT {expression} AS value FROM {table} WHERE {numerator.sql}",
+                numerator.params,
+                "aggregation",
+            ),
         )
     expression, _field = _aggregation_expression(plan)
     group_by = list(plan.group_by)
     if "Name" in group_by and "Employee_ID" not in group_by:
         group_by.insert(0, "Employee_ID")
     if group_by:
-        if any(field not in POSTGRES_FIELD_MAP or not FIELD_DEFINITIONS[field].groupable for field in group_by):
+        if any(
+            field not in POSTGRES_FIELD_MAP or not FIELD_DEFINITIONS[field].groupable
+            for field in group_by
+        ):
             raise ValueError("Unsupported grouping field.")
         columns = [POSTGRES_FIELD_MAP[field] for field in group_by]
-        groups = ", ".join(f"{column} AS group_{index}" for index, column in enumerate(columns))
+        groups = ", ".join(
+            f"{column} AS group_{index}" for index, column in enumerate(columns)
+        )
         sql = f"SELECT {groups}, {expression} AS value FROM {table} WHERE {where.sql} GROUP BY {', '.join(columns)}"
     else:
         sql = f"SELECT {expression} AS value FROM {table} WHERE {where.sql}"

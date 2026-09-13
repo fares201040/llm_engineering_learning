@@ -66,7 +66,15 @@ def generate_registry_cases() -> tuple[SemanticMatrixCase, ...]:
         elif definition.resolution_kind == "numeric":
             value = 2.0
         else:
-            value = "2026-09-01"
+            value = (
+                "2026-09"
+                if field == "Period"
+                else "08:30:00"
+                if definition.storage_type == "time"
+                else "2026-09-01T08:30:00"
+                if definition.storage_type == "datetime"
+                else "2026-09-01"
+            )
         evidence = str(value)
         question = f"show {phrase} {evidence}"
         proposal = PlannerProposal(
@@ -129,7 +137,10 @@ class SemanticMatrixTests(unittest.TestCase):
                 with self.subTest(field=field, phrase=phrase):
                     facts = detect_semantic_facts(phrase, ResolutionContext({}))
                     self.assertTrue(
-                        any(item.kind == "field" and item.field == field for item in facts)
+                        any(
+                            item.kind == "field" and item.field == field
+                            for item in facts
+                        )
                     )
 
     def test_internal_field_cannot_cross_planner_boundary(self):
@@ -151,7 +162,9 @@ class SemanticMatrixTests(unittest.TestCase):
         result = compile_proposal(
             proposal,
             CompilationContext(
-                "chunk type record", detect_semantic_facts("chunk type record", context), context
+                "chunk type record",
+                detect_semantic_facts("chunk type record", context),
+                context,
             ),
         )
         self.assertFalse(result.ready)
@@ -168,7 +181,9 @@ class SemanticMatrixTests(unittest.TestCase):
         )
         result = compile_proposal(
             proposal,
-            CompilationContext(question, detect_semantic_facts(question, context), context),
+            CompilationContext(
+                question, detect_semantic_facts(question, context), context
+            ),
         )
         self.assertTrue(result.ready, result.violations)
         self.assertEqual(result.executable_plan.mode, "semantic")

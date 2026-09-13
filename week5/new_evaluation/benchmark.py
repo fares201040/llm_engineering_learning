@@ -55,24 +55,58 @@ def build_benchmark_report(*, warmups=2, runs=10, manifest_path: Path | None = N
     """Measure real, read-only APDC components without touching live sinks."""
     from ..new_implementation.answer import (
         POSTGRES_DSN,
-        QueryPlan,
         Result,
         _postgres_enabled,
         _question_specific_context_fields,
         _select_context_content,
         calculate_aggregation_chroma,
         execute_exact_postgres,
-        normalize_query_plan,
     )
-    from ..new_implementation.attendance_schema import FilterCondition
+    from ..new_implementation.attendance_schema import (
+        AnswerContract,
+        ExecutableQueryPlan,
+        FilterCondition,
+        PlannerProposal,
+        ProposedCalculation,
+        ProposedFieldChoice,
+    )
+    from ..new_implementation.plan_compiler import CompilationContext, compile_proposal
+    from ..new_implementation.semantic_resolution import (
+        ResolutionContext,
+        detect_semantic_facts,
+    )
 
     question = "What is average lateness by department?"
-    grouped_plan = QueryPlan(
+    grouped_plan = ExecutableQueryPlan(
         mode="exact",
         search_query="average lateness",
         aggregation="average",
         aggregation_field="Lateness_Hrs",
         group_by=["Department"],
+        answer_contract=AnswerContract(
+            shape="grouped",
+            unit="hours",
+            subject_field="Lateness_Hrs",
+            grain=["Department"],
+        ),
+    )
+    proposal = PlannerProposal(
+        status="ready",
+        calculation=ProposedCalculation(
+            operation="average",
+            field="Lateness_Hrs",
+            evidence_text="average lateness",
+        ),
+        group_by=[
+            ProposedFieldChoice(field="Department", evidence_text="by department")
+        ],
+        answer_contract=grouped_plan.answer_contract,
+    )
+    resolution_context = ResolutionContext(catalog={})
+    compilation_context = CompilationContext(
+        question=question,
+        facts=tuple(detect_semantic_facts(question, resolution_context)),
+        resolution_context=resolution_context,
     )
     rows = [
         Result(
@@ -95,7 +129,7 @@ def build_benchmark_report(*, warmups=2, runs=10, manifest_path: Path | None = N
     fields = _question_specific_context_fields(question, grouped_plan)
 
     stages = {
-        "plan_normalization": lambda: normalize_query_plan(question, grouped_plan),
+        "plan_compilation": lambda: compile_proposal(proposal, compilation_context),
         "python_grouped_calculation": lambda: calculate_aggregation_chroma(
             grouped_plan, rows
         ),
@@ -109,7 +143,7 @@ def build_benchmark_report(*, warmups=2, runs=10, manifest_path: Path | None = N
     }
 
     if _postgres_enabled():
-        sql_plan = QueryPlan(
+        sql_plan = ExecutableQueryPlan(
             mode="exact",
             search_query="synthetic employee attendance",
             filters=[
@@ -119,6 +153,12 @@ def build_benchmark_report(*, warmups=2, runs=10, manifest_path: Path | None = N
                 ),
             ],
             aggregation="count",
+            answer_contract=AnswerContract(
+                shape="scalar",
+                unit="records",
+                subject_field=None,
+                grain=[],
+            ),
         )
         results["postgres_exact_snapshot"] = run_benchmark(
             lambda: execute_exact_postgres(sql_plan), warmups=warmups, runs=runs
@@ -174,7 +214,7 @@ def main(argv=None):
                 f"failures={result['failures']}"
             )
     local_names = {
-        "plan_normalization",
+        "plan_compilation",
         "python_grouped_calculation",
         "context_projection",
     }

@@ -14,6 +14,60 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class BaselineOrderingGrammarTests(unittest.TestCase):
+    def test_catalog_operands_keep_conjoined_field_aliases_atomic(self):
+        for field, value, prefix in (
+            ("Department", "Sales and Job Services", "Sales"),
+            ("Position", "Engineer and Department Services", "Engineer"),
+            ("Job", "Analyst and Status Services", "Analyst"),
+        ):
+            context = ResolutionContext({field: (prefix, value)})
+            for grammar, operator in (
+                ("equals", "eq"),
+                ("is not", "ne"),
+                ("in", "in"),
+                ("contains", "contains"),
+                ("starts with", "starts_with"),
+            ):
+                for introducer in ("", "where "):
+                    question = f"Count records {introducer}{field} {grammar} {value}"
+                    with self.subTest(
+                        field=field, grammar=grammar, introducer=introducer
+                    ):
+                        facts = detect_semantic_facts(question, context)
+                        self.assertEqual(
+                            [
+                                (fact.field, fact.operator, fact.values)
+                                for fact in facts
+                                if fact.kind == "filter"
+                            ],
+                            [(field, operator, (value,))],
+                        )
+                        self.assertFalse(
+                            [fact for fact in facts if fact.kind == "unsupported"]
+                        )
+                        fact = next(fact for fact in facts if fact.kind == "filter")
+                        self.assertEqual(question[slice(*fact.evidence_span)], value)
+
+    def test_invalid_suffix_cannot_leave_a_partial_catalog_filter(self):
+        context = ResolutionContext(
+            {"Department": ("Sales", "Sales and Job Services"), "Job": ("Services",)}
+        )
+        for clause in (
+            "Department in Sales and Job Services and Unknown",
+            "Department equals Sales and Job Services and Job sounds like Services",
+            "Department equals Sales and Job Services and Job equals Unknown",
+        ):
+            with self.subTest(clause=clause):
+                facts = detect_semantic_facts(f"Count records {clause}", context)
+                self.assertTrue([fact for fact in facts if fact.kind == "unsupported"])
+                self.assertFalse(
+                    [
+                        fact
+                        for fact in facts
+                        if fact.kind == "filter" and fact.field == "Department"
+                    ]
+                )
+
     def test_explicit_categorical_operand_is_never_prefix_truncated(self):
         context = ResolutionContext({"Department": ("Sales", "Support")})
         for clause in (

@@ -20,6 +20,115 @@ PRIVATE_FIXTURES_AVAILABLE = (
 
 
 class BaselineCapabilityParityTests(unittest.TestCase):
+    def test_catalog_alias_conjunctions_execute_as_complete_literals(self):
+        for field, value, prefix in (
+            ("Department", "Sales and Job Services", "Sales"),
+            ("Position", "Engineer and Department Services", "Engineer"),
+            ("Job", "Analyst and Status Services", "Analyst"),
+        ):
+            population = (value, value + " East", prefix, "Field " + value, "Other")
+            for row, entry in zip(self.rows, population):
+                row[field] = entry
+            for grammar, operator, scalar_count, restricted_count in (
+                ("equals", "eq", 1, 1),
+                ("is not", "ne", 4, 2),
+                ("in", "in", 1, 1),
+                ("contains", "contains", 3, 2),
+                ("starts with", "starts_with", 2, 2),
+            ):
+                for introducer in ("", "where "):
+                    for suffix, expected in (
+                        ("", scalar_count),
+                        (" and Status is Authorized", restricted_count),
+                    ):
+                        with self.subTest(
+                            field=field,
+                            grammar=grammar,
+                            introducer=introducer,
+                            suffix=suffix,
+                        ):
+                            with patch.object(
+                                self.answer,
+                                "load_attendance_catalog_candidates",
+                                return_value={field: population},
+                            ):
+                                _, plan, result, _ = self.answer.fetch_context(
+                                    f"Count records {introducer}{field} {grammar} {value}{suffix}"
+                                )
+                            self.assertEqual(result["value"], expected)
+                            condition = next(
+                                item for item in plan.filters if item.field == field
+                            )
+                            self.assertEqual(
+                                (condition.operator, condition.value),
+                                (operator, [value] if operator == "in" else value),
+                            )
+                            self.assertEqual(
+                                {item.field for item in plan.filters},
+                                {field, "chunk_type", "Status"}
+                                if suffix
+                                else {field, "chunk_type"},
+                            )
+
+    def test_atomic_catalog_members_compose_with_real_following_clauses(self):
+        value = "Sales and Job Services"
+        for row, department in zip(
+            self.rows, (value, value, "Sales", "Other", "Other")
+        ):
+            row["Department"] = department
+            row["Job"] = "Services"
+        catalog = {"Department": (value, "Sales", "Other"), "Job": ("Services",)}
+        for clause, expected in (
+            (f"Department in {value} and Sales and Status is Authorized", 2),
+            (
+                f"Department equals {value} and Job equals Services and Status is Authorized",
+                2,
+            ),
+            (f"Department equals {value} and Total_OT greater than 1", 1),
+            (f"Department equals {value} and Date before 2026-09-02", 2),
+        ):
+            with self.subTest(clause=clause):
+                with patch.object(
+                    self.answer,
+                    "load_attendance_catalog_candidates",
+                    return_value=catalog,
+                ):
+                    _, plan, result, _ = self.answer.fetch_context(
+                        f"Count records {clause}"
+                    )
+                self.assertEqual(result["value"], expected)
+                condition = next(
+                    item for item in plan.filters if item.field == "Department"
+                )
+                self.assertEqual(
+                    condition.value,
+                    [value, "Sales"] if condition.operator == "in" else value,
+                )
+
+    def test_invalid_suffix_after_atomic_catalog_member_never_retrieves(self):
+        catalog = {
+            "Department": ("Sales", "Sales and Job Services"),
+            "Job": ("Services",),
+        }
+        for introducer in ("", "where "):
+            for clause in (
+                "Department in Sales and Job Services and Unknown",
+                "Department equals Sales and Job Services and Job sounds like Services",
+                "Department equals Sales and Job Services and Job equals Unknown",
+            ):
+                with self.subTest(introducer=introducer, clause=clause):
+                    self.store.get.reset_mock()
+                    with patch.object(
+                        self.answer,
+                        "load_attendance_catalog_candidates",
+                        return_value=catalog,
+                    ):
+                        with self.assertRaises(self.answer.SemanticPlanValidationError):
+                            self.answer.fetch_context(
+                                f"Count records {introducer}{clause}"
+                            )
+                    self.store.get.assert_not_called()
+
     def test_incomplete_or_unsupported_catalog_clause_never_retrieves(self):
         for introducer in ("", "where "):
             for clause in (

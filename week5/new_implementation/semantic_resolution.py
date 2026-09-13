@@ -473,11 +473,19 @@ def _registry_field_occurrences(question):
     )
 
 
-def _operator_prefix(question, start, end):
+def _operator_prefix(question, start, end, field=None):
     matches = []
     for token in re.finditer(r"\w+|[^\w\s]+", question[start:end]):
         stop = start + token.end()
         recognized, operator = _registered_filter_operator(question[start:stop])
+        if (
+            not recognized
+            and field is not None
+            and FIELD_DEFINITIONS[field].resolution_kind == "temporal"
+        ):
+            phrase = " ".join(question[start:stop].casefold().split())
+            operator = TemporalResolver._operators.get(phrase)
+            recognized = operator is not None
         if recognized:
             matches.append((stop, operator))
     if not matches:
@@ -563,17 +571,60 @@ def _resolve_complete_operand(question, field, operator, span, context):
     )
 
 
-def _clause_operand_ends(question, start, fields):
-    """Separate clauses only at independently registered field or scope roles."""
+def _clause_operand_ends(question, start, fields, context, field, operator, cache=None):
+    """Keep grounded atoms whole and split only before complete native clauses."""
+    cache = {} if cache is None else cache
+    key = (start, field, operator)
+    if key in cache:
+        return cache[key]
+    definition = FIELD_DEFINITIONS[field]
+    literal_values = (
+        *definition.closed_values,
+        *context.catalog.get(field, ()),
+        *(alias.natural_name for alias in definition.value_aliases),
+    )
+    if (
+        operator in FILTER_OPERATOR_DEFINITIONS
+        and FILTER_OPERATOR_DEFINITIONS[operator].uses_text_pattern
+    ):
+        literal_values = _categorical_literal_fragments(field, context)
+    atomic_spans = {
+        (lo, hi)
+        for value in literal_values
+        for lo, hi in _raw_phrase_spans(question, value)
+        if start <= lo
+    }
     hard_end = len(question)
-    for _, field_start, field_end in fields:
+    for next_field, field_start, field_end in fields:
         if field_start <= start or not question[field_end:].strip(" \t\r\n?.!"):
             continue
         separator = re.search(
             CONSTRAINT_CLAUSE_GRAMMAR["coordinator"], question[start:field_start], re.I
         )
-        if separator:
-            hard_end = min(hard_end, start + separator.start())
+        if not separator:
+            continue
+        boundary = start + separator.start()
+        if any(lo < boundary and field_end <= hi for lo, hi in atomic_spans):
+            continue
+        recognized, next_operator, operand_start = _operator_prefix(
+            question, field_end, len(question), next_field
+        )
+        if (
+            not recognized
+            or next_operator not in FIELD_DEFINITIONS[next_field].operators
+        ):
+            continue
+        suffix_ends = _clause_operand_ends(
+            question, operand_start, fields, context, next_field, next_operator, cache
+        )
+        if any(
+            _resolve_complete_operand(
+                question, next_field, next_operator, (operand_start, end), context
+            )[2]
+            is None
+            for end in suffix_ends
+        ):
+            hard_end = min(hard_end, boundary)
     ends = {hard_end}
     ends.update(
         start + match.start()
@@ -595,7 +646,8 @@ def _clause_operand_ends(question, start, fields):
             )
             if operator_start is not None:
                 ends.add(start + operator_start)
-    return tuple(sorted(ends, reverse=True))
+    cache[key] = tuple(sorted(ends, reverse=True))
+    return cache[key]
 
 
 def _parse_categorical_clauses(question, context, *, excluded_spans=()):
@@ -659,7 +711,9 @@ def _parse_categorical_clauses(question, context, *, excluded_spans=()):
             continue
         operator = operator if recognized else "eq"
         operand_start = operator_end if recognized else end
-        candidates = _clause_operand_ends(question, operand_start, fields)
+        candidates = _clause_operand_ends(
+            question, operand_start, fields, context, field, operator
+        )
         resolved = []
         for candidate_end in candidates:
             span = _trim_operand_span(question, operand_start, candidate_end)

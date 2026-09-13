@@ -283,7 +283,7 @@ def evaluate_behavior(test: TestQuestion) -> BehaviorEval:
     answer_facts_ok = True
     if test.expected_answer_facts:
         if calculation is not None:
-            generated_answer = _format_aggregation_answer(test.question, calculation)
+            generated_answer = _format_aggregation_answer(plan, calculation)
         else:
             generated_answer, _documents = answer_question(test.question)
         answer_facts_ok = all(
@@ -329,9 +329,11 @@ def evaluate_behavior(test: TestQuestion) -> BehaviorEval:
         answer_contract_ok=(
             test.expected_answer_contract is None
             or _expected_subset(
-                getattr(plan, "answer_contract", None).model_dump()
-                if getattr(plan, "answer_contract", None) is not None
-                else None,
+                (
+                    getattr(plan, "answer_contract", None).model_dump()
+                    if getattr(plan, "answer_contract", None) is not None
+                    else None
+                ),
                 test.expected_answer_contract,
             )
         ),

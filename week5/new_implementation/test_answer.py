@@ -2035,6 +2035,55 @@ class CoverageMetadataTests(unittest.TestCase):
 
 
 class DeterministicAggregationAnswerTests(unittest.TestCase):
+    def test_employee_count_uses_measure_noun_and_predicate_qualifier(self):
+        plan = _executable_plan(
+            measure="employees",
+            business_predicates=["worked"],
+            aggregation="distinct_count",
+            aggregation_field="Employee_ID",
+            answer_contract=answer.AnswerContract(
+                shape="scalar",
+                unit="employees",
+                subject_field="Employee_ID",
+                grain=["Employee_ID"],
+            ),
+        )
+
+        text = answer._format_aggregation_answer(
+            plan,
+            {"operation": "distinct_count", "field": "Employee_ID", "value": 2},
+        )
+
+        self.assertIn("employees", text.casefold())
+        self.assertIn("worked", text.casefold())
+        self.assertNotIn("days", text.casefold())
+
+    def test_scope_keeps_additional_date_constraints_beyond_window(self):
+        plan = _executable_plan(
+            filters=[
+                answer.FilterCondition(
+                    field="Date", operator="gte", value="2026-09-01"
+                ),
+                answer.FilterCondition(
+                    field="Date", operator="lte", value="2026-09-30"
+                ),
+                answer.FilterCondition(field="Date", operator="gt", value="2026-09-10"),
+            ],
+            measure="attendance_records",
+            aggregation="count",
+            answer_contract=answer.AnswerContract(
+                shape="scalar", unit="records", subject_field=None, grain=[]
+            ),
+        )
+
+        text = answer._format_aggregation_answer(
+            plan,
+            {"operation": "count", "field": None, "value": 12},
+        )
+
+        self.assertIn("September 1-30, 2026", text)
+        self.assertIn("Date greater than 2026-09-10", text)
+
     def test_scalar_count_identifies_verified_employee_and_temporal_scope(self):
         plan = _executable_plan(
             filters=[

@@ -12,6 +12,7 @@ try:
         ExecutableQueryPlan,
         FilterCondition,
         canonicalize_storage_value,
+        effective_grouping_fields,
     )
 except ImportError:  # Direct execution from week5/new_implementation.
     from attendance_schema import (
@@ -20,6 +21,7 @@ except ImportError:  # Direct execution from week5/new_implementation.
         ExecutableQueryPlan,
         FilterCondition,
         canonicalize_storage_value,
+        effective_grouping_fields,
     )
 
 
@@ -218,9 +220,7 @@ def compile_aggregation_queries(
             ),
         )
     expression, _field = _aggregation_expression(plan)
-    group_by = list(plan.group_by)
-    if "Name" in group_by and "Employee_ID" not in group_by:
-        group_by.insert(0, "Employee_ID")
+    group_by = effective_grouping_fields(plan.group_by)
     if group_by:
         if any(
             field not in POSTGRES_FIELD_MAP or not FIELD_DEFINITIONS[field].groupable

@@ -1,6 +1,7 @@
 """Canonical APDC attendance fields and deterministic calculation semantics."""
 
 from dataclasses import dataclass, replace
+from collections.abc import Sequence
 from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation
 import json
@@ -298,6 +299,14 @@ class PlannerProposal(_StrictPlannerModel):
 
 class ExecutableQueryPlan(QueryPlan):
     answer_contract: AnswerContract
+
+
+def effective_grouping_fields(group_by: Sequence[str]) -> list[str]:
+    """Return the row identity used by every aggregate execution backend."""
+    effective = list(group_by)
+    if "Name" in effective and "Employee_ID" not in effective:
+        effective.insert(0, "Employee_ID")
+    return effective
 
 
 @dataclass(frozen=True)

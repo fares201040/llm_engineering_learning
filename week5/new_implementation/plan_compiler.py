@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 try:
     from .attendance_schema import (
@@ -16,6 +16,7 @@ try:
         MEASURE_DEFINITIONS,
         EvidenceOrigin,
         ExecutableQueryPlan,
+        effective_grouping_fields,
         FilterCondition,
         FilterOperator,
         PlannerProposal,
@@ -38,6 +39,7 @@ except ImportError:  # Direct execution from week5/new_implementation.
         MEASURE_DEFINITIONS,
         EvidenceOrigin,
         ExecutableQueryPlan,
+        effective_grouping_fields,
         FilterCondition,
         FilterOperator,
         PlannerProposal,
@@ -414,7 +416,8 @@ class AnswerContractInvariant(PlanInvariant):
 def derive_expected_answer_contract(plan: QueryPlan) -> AnswerContract:
     """Derive the only answer shape allowed for a compiled operation."""
     if plan.aggregation != "none":
-        shape = "grouped" if plan.group_by else "scalar"
+        effective_group_by = effective_grouping_fields(plan.group_by)
+        shape = "grouped" if effective_group_by else "scalar"
         if plan.measure is not None:
             definition = MEASURE_DEFINITIONS[plan.measure]
             unit = definition.answer_unit
@@ -430,7 +433,9 @@ def derive_expected_answer_contract(plan: QueryPlan) -> AnswerContract:
             definition = FIELD_DEFINITIONS.get(subject_field or "")
             unit = definition.output_unit if definition is not None else "value"
         grain = list(
-            dict.fromkeys([*plan.group_by, *([subject_field] if subject_field else [])])
+            dict.fromkeys(
+                [*effective_group_by, *([subject_field] if subject_field else [])]
+            )
         )
         return AnswerContract(
             shape=shape,
@@ -1044,7 +1049,20 @@ def revalidate_executable_plan(
     context: CompilationContext,
     provenance: tuple[ConstraintProvenance, ...],
 ) -> PlanCompilationResult:
-    candidate = plan
+    try:
+        candidate = ExecutableQueryPlan.model_validate(plan.model_dump())
+    except ValidationError:
+        return PlanCompilationResult(
+            None,
+            provenance,
+            (
+                PlanViolation(
+                    "invalid_schema",
+                    "executable_plan",
+                    "The executable plan failed structural validation.",
+                ),
+            ),
+        )
     invariant_context = InvariantContext(context, None, candidate, provenance)
     violations = tuple(
         violation
@@ -1052,5 +1070,5 @@ def revalidate_executable_plan(
         for violation in invariant.check(invariant_context)
     )
     return PlanCompilationResult(
-        plan if not violations else None, provenance, violations
+        candidate if not violations else None, provenance, violations
     )

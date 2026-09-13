@@ -5,6 +5,7 @@ from week5.new_implementation.attendance_schema import (
     AnswerContract,
     PlannerProposal,
     ProposedCalculation,
+    ProposedFieldChoice,
     ProposedFilter,
     ProposedMeasureChoice,
     ProposedPredicateChoice,
@@ -316,6 +317,68 @@ class ExecutableChoiceCoverageTests(unittest.TestCase):
 
 
 class CompleteAnswerContractTests(unittest.TestCase):
+    def test_revalidation_rejects_structurally_malformed_executable_plan(self):
+        question = "Count attendance records by Department."
+        resolution = ResolutionContext({})
+        context = CompilationContext(
+            question,
+            detect_semantic_facts(question, resolution),
+            resolution,
+        )
+        proposal = PlannerProposal(
+            status="ready",
+            measure=ProposedMeasureChoice(
+                name="attendance_records", evidence_text="attendance records"
+            ),
+            group_by=[
+                ProposedFieldChoice(field="Department", evidence_text="Department")
+            ],
+            answer_contract=AnswerContract(
+                shape="grouped",
+                unit="records",
+                subject_field=None,
+                grain=["Department"],
+            ),
+        )
+        compiled = compile_proposal(proposal, context)
+        self.assertTrue(compiled.ready, compiled.violations)
+
+        malformed_plans = (
+            compiled.executable_plan.model_copy(update={"answer_contract": None}),
+            compiled.executable_plan.model_copy(
+                update={"group_by": ["Department", "Department"]}
+            ),
+        )
+        for malformed in malformed_plans:
+            with self.subTest(malformed=malformed.model_dump()):
+                checked = revalidate_executable_plan(
+                    malformed, context, compiled.provenance
+                )
+                self.assertFalse(checked.ready)
+                self.assertIn(
+                    "invalid_schema",
+                    {violation.code for violation in checked.violations},
+                )
+
+    def test_contract_grain_uses_effective_employee_grouping(self):
+        plan = QueryPlan(
+            mode="exact",
+            search_query="total overtime by employee name",
+            aggregation="sum",
+            aggregation_field="Total_OT",
+            group_by=["Name"],
+        )
+
+        self.assertEqual(
+            plan_compiler.derive_expected_answer_contract(plan).model_dump(),
+            {
+                "shape": "grouped",
+                "unit": "hours",
+                "subject_field": "Total_OT",
+                "grain": ["Employee_ID", "Name", "Total_OT"],
+            },
+        )
+
     def test_expected_contract_is_derived_from_the_complete_operation(self):
         cases = (
             (

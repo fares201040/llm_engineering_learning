@@ -350,6 +350,41 @@ class EvaluationWiringTests(unittest.TestCase):
 
         self.assertFalse(result.answer_facts_ok)
 
+    def test_behavior_evaluation_renders_calculation_with_retrieved_plan(self):
+        test = TestQuestion(
+            question="How many employees worked?",
+            keywords=[],
+            reference_answer="Two employees worked.",
+            category="exact_filter",
+            expected_answer_facts=["employees", "worked"],
+        )
+        plan = evaluation.QueryPlan(
+            mode="exact",
+            search_query="employees worked",
+            measure="employees",
+            business_predicates=["worked"],
+            aggregation="distinct_count",
+            aggregation_field="Employee_ID",
+        )
+
+        with patch.object(
+            evaluation,
+            "fetch_context",
+            return_value=(
+                [],
+                plan,
+                {
+                    "operation": "distinct_count",
+                    "field": "Employee_ID",
+                    "value": 2,
+                },
+                2,
+            ),
+        ):
+            result = evaluation.evaluate_behavior(test)
+
+        self.assertTrue(result.answer_facts_ok)
+
     def test_semantic_category_requires_semantic_plan_mode(self):
         test = TestQuestion(
             question="Find unusual patterns.",

@@ -37,6 +37,7 @@ try:
         QueryPlan,
         VALUE_CONCEPT_DEFINITIONS,
         ExecutableQueryPlan,
+        effective_grouping_fields,
         relevant_field_definitions,
         render_planner_schema,
     )
@@ -91,6 +92,7 @@ except ImportError:  # Running answer.py directly from its directory.
         QueryPlan,
         VALUE_CONCEPT_DEFINITIONS,
         ExecutableQueryPlan,
+        effective_grouping_fields,
         relevant_field_definitions,
         render_planner_schema,
     )
@@ -1907,9 +1909,7 @@ def _map_compiled_aggregation(plan: ExecutableQueryPlan, queries, connection):
             "value": (numerator / denominator * 100.0) if denominator else None,
         }
     field_name = plan.aggregation_field
-    group_by = list(plan.group_by)
-    if "Name" in group_by and "Employee_ID" not in group_by:
-        group_by.insert(0, "Employee_ID")
+    group_by = effective_grouping_fields(plan.group_by)
     if group_by:
         rows = _execute_rows_query(queries[0], connection)
         values = [
@@ -2279,9 +2279,7 @@ def calculate_aggregation_chroma(
             "value": numerator / denominator * 100.0 if denominator else None,
         }
 
-    group_by = list(plan.group_by)
-    if "Name" in group_by and "Employee_ID" not in group_by:
-        group_by.insert(0, "Employee_ID")
+    group_by = effective_grouping_fields(plan.group_by)
     if group_by:
         buckets = {}
         for chunk in chunks:
@@ -2556,6 +2554,7 @@ def _verified_scope_suffix(plan: QueryPlan) -> str:
     date_conditions = [
         condition for condition in plan.filters if condition.field == "Date"
     ]
+    rendered_conditions = []
     if requested is not None:
         parts.append(
             "during "
@@ -2563,24 +2562,26 @@ def _verified_scope_suffix(plan: QueryPlan) -> str:
                 requested.date_min.isoformat(), requested.date_max.isoformat()
             )
         )
-    elif date_conditions:
-        parts.append(
-            "where "
-            + " and ".join(
-                _format_verified_condition(condition) for condition in date_conditions
-            )
+        rendered_conditions.extend(
+            condition
+            for condition in date_conditions
+            if condition.operator not in {"gte", "lte"}
         )
+    else:
+        rendered_conditions.extend(date_conditions)
 
     other_conditions = [
         condition
         for condition in plan.filters
         if condition.field not in {"Employee_ID", "Name", "Date", "chunk_type"}
     ]
-    if other_conditions:
+    rendered_conditions.extend(other_conditions)
+    if rendered_conditions:
         parts.append(
             "where "
             + " and ".join(
-                _format_verified_condition(condition) for condition in other_conditions
+                _format_verified_condition(condition)
+                for condition in rendered_conditions
             )
         )
     if not parts:
@@ -2595,9 +2596,10 @@ def _format_aggregation_answer(plan: QueryPlan, aggregation: dict):
     value = aggregation.get("value")
     field = plan.aggregation_field
     scope = _verified_scope_suffix(plan)
+    contract = derive_expected_answer_contract(plan)
 
     if operation == "percentage":
-        denominator_field = derive_expected_answer_contract(plan).subject_field
+        denominator_field = contract.subject_field
         denominator_label = (
             "attendance records"
             if denominator_field is None
@@ -2670,62 +2672,86 @@ def _format_aggregation_answer(plan: QueryPlan, aggregation: dict):
         predicates = set(plan.business_predicates)
         count = _format_number(value)
         singular = value == 1
-        value_concepts = [
-            name
-            for name, definition in VALUE_CONCEPT_DEFINITIONS.items()
-            if any(
-                condition.field == definition.field
-                and condition.operator in {"eq", "in"}
-                and set(
-                    map(
-                        str,
-                        (
-                            condition.value
-                            if isinstance(condition.value, list)
-                            else [condition.value]
-                        ),
+        if contract.unit == "dates":
+            value_concepts = [
+                name
+                for name, definition in VALUE_CONCEPT_DEFINITIONS.items()
+                if any(
+                    condition.field == definition.field
+                    and condition.operator in {"eq", "in"}
+                    and set(
+                        map(
+                            str,
+                            (
+                                condition.value
+                                if isinstance(condition.value, list)
+                                else [condition.value]
+                            ),
+                        )
                     )
+                    == set(definition.members)
+                    for condition in plan.filters
                 )
-                == set(definition.members)
-                for condition in plan.filters
-            )
-        ]
-        if len(value_concepts) == 1:
-            definition = VALUE_CONCEPT_DEFINITIONS[value_concepts[0]]
+            ]
+            if len(value_concepts) == 1:
+                definition = VALUE_CONCEPT_DEFINITIONS[value_concepts[0]]
+                label = (
+                    definition.natural_names[0]
+                    if singular
+                    else definition.natural_names[-1]
+                )
+                return f"{count} {label} matched the requested criteria.{scope}{_coverage_warning(aggregation)}"
+            if predicates == {"scheduled_working_day", "not_worked"}:
+                verb = "was" if singular else "were"
+                noun = "day" if singular else "days"
+                return (
+                    f"{count} scheduled working {noun} {verb} not attended."
+                    f"{scope}{_coverage_warning(aggregation)}"
+                )
+            if predicates == {"worked"}:
+                noun = "day" if singular else "days"
+                return f"{count} worked {noun}.{scope}{_coverage_warning(aggregation)}"
+            if predicates == {"scheduled_working_day"}:
+                noun = "day" if singular else "days"
+                return f"{count} scheduled working {noun}.{scope}{_coverage_warning(aggregation)}"
+            if predicates == {"absent"}:
+                noun = "day" if singular else "days"
+                return f"{count} recorded absent {noun}.{scope}{_coverage_warning(aggregation)}"
+            if predicates == {"not_worked"}:
+                noun = "day" if singular else "days"
+                return (
+                    f"{count} recorded {noun} had no positive worked hours."
+                    f"{scope}{_coverage_warning(aggregation)}"
+                )
+        if plan.measure is not None:
+            measure_names = MEASURE_DEFINITIONS[plan.measure].natural_names
+            label = measure_names[0 if singular else min(1, len(measure_names) - 1)]
+        else:
             label = (
-                definition.natural_names[0]
-                if singular
-                else definition.natural_names[-1]
+                contract.unit[:-1]
+                if singular and contract.unit.endswith("s")
+                else contract.unit
             )
-            return f"{count} {label} matched the requested criteria.{scope}{_coverage_warning(aggregation)}"
-        if predicates == {"scheduled_working_day", "not_worked"}:
-            verb = "was" if singular else "were"
-            noun = "day" if singular else "days"
-            return (
-                f"{count} scheduled working {noun} {verb} not attended."
-                f"{scope}{_coverage_warning(aggregation)}"
+        predicate_labels = [
+            next(
+                (
+                    natural_name
+                    for natural_name in BUSINESS_PREDICATE_DEFINITIONS[
+                        predicate
+                    ].natural_names
+                    if natural_name.casefold() == predicate.replace("_", " ").casefold()
+                ),
+                BUSINESS_PREDICATE_DEFINITIONS[predicate].natural_names[0],
             )
-        if predicates == {"worked"}:
-            noun = "day" if singular else "days"
-            return f"{count} worked {noun}.{scope}{_coverage_warning(aggregation)}"
-        if predicates == {"scheduled_working_day"}:
-            noun = "day" if singular else "days"
-            return f"{count} scheduled working {noun}.{scope}{_coverage_warning(aggregation)}"
-        if predicates == {"absent"}:
-            noun = "day" if singular else "days"
-            return f"{count} recorded absent {noun}.{scope}{_coverage_warning(aggregation)}"
-        if predicates == {"not_worked"}:
-            noun = "day" if singular else "days"
-            return (
-                f"{count} recorded {noun} had no positive worked hours."
-                f"{scope}{_coverage_warning(aggregation)}"
-            )
-        label = {
-            "Employee_ID": "employees",
-            "Date": "days",
-        }.get(field, field or "distinct values")
+            for predicate in plan.business_predicates
+        ]
+        qualifier = (
+            f" matched the {' and '.join(predicate_labels)} criteria"
+            if predicate_labels
+            else " matched the requested criteria"
+        )
         return (
-            f"{_format_number(value)} distinct {label} matched the requested criteria."
+            f"{count} {label}{qualifier}."
             f"{scope}"
             f"{_coverage_warning(aggregation)}"
         )

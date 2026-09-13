@@ -20,6 +20,22 @@ PRIVATE_FIXTURES_AVAILABLE = (
 
 
 class BaselineCapabilityParityTests(unittest.TestCase):
+    def test_behavior_compares_predicate_conjunctions_without_order(self):
+        test = TestQuestion(
+            question="How many days did not attend?",
+            keywords=[],
+            reference_answer="One scheduled date was not worked.",
+            category="non_attended_days",
+            expected_calculation={
+                "value": 1,
+                "business_predicates": ["scheduled_working_day", "not_worked"],
+            },
+        )
+        result = evaluation.evaluate_behavior(test)
+        self.assertTrue(result.calculation_ok)
+        test.expected_calculation["business_predicates"] = ["scheduled_working_day"]
+        self.assertFalse(evaluation.evaluate_behavior(test).calculation_ok)
+
     """Synthetic baseline behaviors through proposal, gate, retrieval and evaluator."""
 
     def setUp(self):
@@ -123,6 +139,10 @@ class BaselineCapabilityParityTests(unittest.TestCase):
         cases = (
             ("How many days were worked?", "distinct_count", "Date", 2, "dates"),
             ("How many days did not work?", "distinct_count", "Date", 2, "dates"),
+            ("How many days did not attend?", "distinct_count", "Date", 1, "dates"),
+            ("How many zero worked hours dates?", "distinct_count", "Date", 2, "dates"),
+            ("Count working day schedule dates", "distinct_count", "Date", 3, "dates"),
+            ("Count scheduled work dates", "distinct_count", "Date", 3, "dates"),
             (
                 "How many scheduled days did not attend?",
                 "distinct_count",

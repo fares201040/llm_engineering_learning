@@ -695,7 +695,14 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
     )
     generic_count = (
         raw_calculation.get("operation") == "count"
-        and raw_calculation.get("field") is None
+        and (
+            raw_calculation.get("field") is None
+            or (
+                len(measure_facts) == 1
+                and raw_calculation.get("field")
+                == MEASURE_DEFINITIONS[next(iter(measure_facts))].aggregation_field
+            )
+        )
         and raw_calculation.get("percentage_condition") is None
     )
     raw_definition = MEASURE_DEFINITIONS.get(raw_measure.get("name"))
@@ -709,8 +716,8 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
     if nonaggregate_count or (
         generic_count and (measure_facts or calculation_facts or nonaggregate_shape)
     ):
-        # A fieldless provider count is a redundant default when the request
-        # already grounds the complete operation or an explicit nonaggregate shape.
+        # A fieldless or same-subject provider count cannot replace the complete
+        # grounded operation. A different counted subject still requires rejection.
         prepared["calculation"] = None
         raw_calculation = {}
     if nonaggregate_count or (
@@ -781,7 +788,42 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
             "subject_field": field,
             "grain": [field] if field else [],
         }
-    filters = list(prepared.get("filters") or [])
+    population_constraints = [
+        (fact.field, fact.operator, fact.values)
+        for fact in strong_facts
+        if fact.kind == "filter" and fact.scope == "population"
+    ]
+    population_constraints.extend(
+        (
+            condition.field,
+            condition.operator,
+            condition.value
+            if isinstance(condition.value, tuple)
+            else (condition.value,),
+        )
+        for fact in strong_facts
+        if fact.kind == "predicate" and fact.scope == "population"
+        for condition in BUSINESS_PREDICATE_DEFINITIONS[
+            fact.concept_name
+        ].required_filters
+    )
+    # A finite, independently required population can prove an exclusion redundant.
+    # Contradictory exclusions and constraints on any other field remain untrusted.
+    filters = [
+        item
+        for item in prepared.get("filters") or []
+        if not (
+            item.get("operator") == "ne"
+            and any(
+                item.get("field") == field
+                and operator in {"eq", "in"}
+                and values
+                and all(type(item.get("value")) is type(value) for value in values)
+                and item.get("value") not in values
+                for field, operator, values in population_constraints
+            )
+        )
+    ]
     calculation = prepared.get("calculation") or {}
     nested_filters = [
         item

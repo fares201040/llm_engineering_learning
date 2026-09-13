@@ -121,12 +121,14 @@ def _expected_subset(actual: dict | None, expected: dict | None):
     if actual is None:
         return False
 
-    def matches(actual_value, expected_value):
+    def matches(key, actual_value, expected_value):
+        if key == "business_predicates" and isinstance(actual_value, list):
+            return set(actual_value) == set(expected_value)
         if isinstance(expected_value, float) and isinstance(actual_value, (int, float)):
             return math.isclose(actual_value, expected_value, abs_tol=0.005)
         return actual_value == expected_value
 
-    return all(matches(actual.get(key), value) for key, value in expected.items())
+    return all(matches(key, actual.get(key), value) for key, value in expected.items())
 
 
 def _expected_group_values_match(actual: dict | None, expected: list[dict]):

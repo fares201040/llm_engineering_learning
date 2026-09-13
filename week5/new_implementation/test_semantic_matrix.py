@@ -259,7 +259,7 @@ class SemanticMatrixTests(unittest.TestCase):
 
     def test_overlapping_phrases_keep_only_the_supported_meaning(self):
         cases = (
-            ("not attended", "predicate", {"not_worked"}),
+            ("not attended", "predicate", {"scheduled_working_day", "not_worked"}),
             ("exclude off days", "predicate", {"scheduled_working_day"}),
             (
                 "recurring attendance patterns",

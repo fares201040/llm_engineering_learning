@@ -288,6 +288,75 @@ class RetrievalBoundaryTests(unittest.TestCase):
 
 
 class ProposalOperationNormalizationTests(unittest.TestCase):
+    def test_only_logically_redundant_provider_exclusion_is_removed(self):
+        question = "Count scheduled working days"
+        resolution = answer.ResolutionContext({})
+        facts = answer.detect_semantic_facts(question, resolution)
+        for field, value, ready in (
+            ("Day_Type", "OFF Day", True),
+            ("Day_Type", "Working Day", False),
+            ("Status", "Authorized", False),
+        ):
+            with self.subTest(field=field, value=value):
+                raw = dict(
+                    status="ready",
+                    filters=[
+                        dict(
+                            field=field,
+                            operator="ne",
+                            value=value,
+                            evidence_text="scheduled",
+                        )
+                    ],
+                    answer_contract=dict(
+                        shape="scalar", unit="dates", subject_field="Date"
+                    ),
+                )
+                proposal = answer.PlannerProposal.model_validate(
+                    answer._overlay_authoritative_facts(raw, facts)
+                )
+                result = answer.compile_proposal(
+                    proposal, answer.CompilationContext(question, facts, resolution)
+                )
+                self.assertEqual(result.ready, ready, result.violations)
+                if ready:
+                    self.assertEqual(
+                        [
+                            (f.field, f.operator, f.value)
+                            for f in result.executable_plan.filters
+                        ],
+                        [("Day_Type", "eq", "Working Day")],
+                    )
+
+    def test_same_subject_provider_count_cannot_replace_grounded_distinct_count(self):
+        question = "How many scheduled working days were there?"
+        resolution = answer.ResolutionContext({})
+        facts = answer.detect_semantic_facts(question, resolution)
+        for field, ready in (("Date", True), ("Employee_ID", False)):
+            with self.subTest(field=field):
+                raw = dict(
+                    status="ready",
+                    measure=dict(name="distinct_dates", evidence_text="days"),
+                    calculation=dict(
+                        operation="count", field=field, evidence_text="days"
+                    ),
+                    answer_contract=dict(
+                        shape="scalar", unit="dates", subject_field="Date"
+                    ),
+                )
+                proposal = answer.PlannerProposal.model_validate(
+                    answer._overlay_authoritative_facts(raw, facts)
+                )
+                result = answer.compile_proposal(
+                    proposal, answer.CompilationContext(question, facts, resolution)
+                )
+                self.assertEqual(result.ready, ready, result.violations)
+                if ready:
+                    self.assertEqual(
+                        result.executable_plan.aggregation, "distinct_count"
+                    )
+                    self.assertEqual(result.executable_plan.aggregation_field, "Date")
+
     def test_global_complete_facts_remove_only_default_interpretation_ambiguity(self):
         for question in (
             "Find unusual attendance records",

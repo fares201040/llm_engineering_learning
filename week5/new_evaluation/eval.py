@@ -14,6 +14,7 @@ if __package__ and __package__.startswith("week5."):
         POSTGRES_DSN,
         ConversationState,
         QueryPlan,
+        SemanticPlanValidationError,
         _import_psycopg,
         answer_question,
         answer_question_with_state,
@@ -28,6 +29,7 @@ elif __package__ == "new_evaluation":
         POSTGRES_DSN,
         ConversationState,
         QueryPlan,
+        SemanticPlanValidationError,
         _import_psycopg,
         answer_question,
         answer_question_with_state,
@@ -46,6 +48,7 @@ else:
         POSTGRES_DSN,
         ConversationState,
         QueryPlan,
+        SemanticPlanValidationError,
         _import_psycopg,
         answer_question,
         answer_question_with_state,
@@ -185,7 +188,7 @@ def evaluate_behavior(test: TestQuestion) -> BehaviorEval:
                     and selected_ids == turn["expected_employee_ids"]
                     and not pending_ids
                     and state.pending_question is None
-                    and state.pending_plan is None
+                    and state.pending_proposal is None
                     and state.pending_constraint is None
                 )
             if "expected_pending_ids" in turn:
@@ -208,6 +211,33 @@ def evaluate_behavior(test: TestQuestion) -> BehaviorEval:
 
     try:
         _chunks, plan, calculation, matched_count = fetch_context(test.question)
+    except SemanticPlanValidationError as exc:
+        actual_codes = sorted({item.code for item in exc.violations})
+        actual_capabilities = sorted(
+            item.target
+            for item in exc.violations
+            if item.code == "unsupported_capability"
+        )
+        codes_ok = actual_codes == sorted(test.expected_violation_codes)
+        capabilities_ok = actual_capabilities == sorted(
+            test.expected_unsupported_capabilities
+        )
+        expected_rejection = bool(
+            test.expected_violation_codes or test.expected_unsupported_capabilities
+        )
+        return BehaviorEval(
+            plan_ok=expected_rejection and codes_ok and capabilities_ok,
+            employee_ids_ok=expected_rejection,
+            matched_count_ok=expected_rejection,
+            calculation_ok=expected_rejection,
+            clarification_ok=expected_rejection,
+            answer_facts_ok=expected_rejection,
+            normalized_result_ok=expected_rejection,
+            expected_error_ok=test.expected_error is None,
+            violation_codes_ok=codes_ok,
+            answer_contract_ok=test.expected_answer_contract is None,
+            unsupported_capabilities_ok=capabilities_ok,
+        )
     except Exception as exc:
         expected_error_ok = bool(
             test.expected_error
@@ -295,6 +325,17 @@ def evaluate_behavior(test: TestQuestion) -> BehaviorEval:
         group_values_ok=_expected_group_values_match(
             calculation, test.expected_group_values
         ),
+        violation_codes_ok=not test.expected_violation_codes,
+        answer_contract_ok=(
+            test.expected_answer_contract is None
+            or _expected_subset(
+                getattr(plan, "answer_contract", None).model_dump()
+                if getattr(plan, "answer_contract", None) is not None
+                else None,
+                test.expected_answer_contract,
+            )
+        ),
+        unsupported_capabilities_ok=not test.expected_unsupported_capabilities,
     )
 
 

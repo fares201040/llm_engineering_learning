@@ -259,7 +259,11 @@ def _catalog_outcome(
     partial = tuple(
         value
         for value in values
-        if key and any(key in form.split() or form.startswith(f"{key} ") for form in _token_forms(value))
+        if key
+        and any(
+            any(token.startswith(key) for token in form.split())
+            for form in _token_forms(value)
+        )
     )
     if len(partial) == 1:
         return ResolutionOutcome("ambiguous", candidates=partial)
@@ -350,10 +354,40 @@ def _facts_for_named_phrases(question, kind, registry):
     return facts
 
 
+def _earliest_measure_facts(question: str) -> list[SemanticFact]:
+    candidates = _facts_for_named_phrases(question, "measure", MEASURE_DEFINITIONS)
+    if not candidates:
+        return []
+    normalized_question = normalize_semantic_text(question)
+    positions = []
+    for fact in candidates:
+        position = len(normalized_question)
+        for form in _token_forms(fact.evidence_text):
+            found = normalized_question.find(form)
+            if found >= 0:
+                position = min(position, found)
+        positions.append((position, fact))
+    earliest = min(position for position, _ in positions)
+    return [fact for position, fact in positions if position == earliest]
+
+
 def detect_semantic_facts(
     question: str, context: ResolutionContext
 ) -> tuple[SemanticFact, ...]:
     facts: list[SemanticFact] = []
+    for match in re.finditer(r"\b[A-Za-z]\d{4,}\b", question):
+        value = match.group(0)
+        facts.append(
+            SemanticFact(
+                kind="filter",
+                field="Employee_ID",
+                operator="eq",
+                values=(value,),
+                evidence_text=value,
+                origin="question",
+                strength="strong",
+            )
+        )
     registry = ResolverRegistry.default()
     field_matches = [
         (field, phrase)
@@ -403,7 +437,7 @@ def detect_semantic_facts(
             )
             break
     if re.search(r"\b(?:how many|count|number of|total number)\b", question, re.I):
-        facts.extend(_facts_for_named_phrases(question, "measure", MEASURE_DEFINITIONS))
+        facts.extend(_earliest_measure_facts(question))
     predicate_facts = _facts_for_named_phrases(
         question, "predicate", BUSINESS_PREDICATE_DEFINITIONS
     )

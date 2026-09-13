@@ -26,3 +26,23 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(payload["stage"], "planning")
         self.assertEqual(payload["state"], "success")
         self.assertGreaterEqual(payload["duration_seconds"], 0)
+
+    def test_semantic_and_sql_sensitive_payloads_are_redacted(self):
+        payload = redact(
+            {
+                "event": "proposal_rejected",
+                "violation_codes": ["ungrounded_constraint"],
+                "evidence_text": "off days for A11017",
+                "catalog_value": "Secret Department",
+                "sql": "SELECT * FROM attendance_records",
+                "params": ["A11017"],
+                "fingerprint": "safe-fingerprint",
+            }
+        )
+        rendered = str(payload)
+        self.assertIn("ungrounded_constraint", rendered)
+        self.assertIn("safe-fingerprint", rendered)
+        self.assertNotIn("off days", rendered)
+        self.assertNotIn("Secret Department", rendered)
+        self.assertNotIn("SELECT", rendered)
+        self.assertNotIn("A11017", rendered)

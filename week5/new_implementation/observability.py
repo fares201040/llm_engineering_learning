@@ -7,7 +7,18 @@ import logging
 import re
 
 
-_SENSITIVE_KEYS = {"query", "question", "name", "employee_id", "dsn", "search_query"}
+_SENSITIVE_KEYS = {
+    "query",
+    "question",
+    "name",
+    "employee_id",
+    "dsn",
+    "search_query",
+    "evidence_text",
+    "catalog_value",
+    "params",
+    "sql",
+}
 
 
 def redact(value):

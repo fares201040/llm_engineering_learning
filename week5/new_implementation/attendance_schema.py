@@ -300,7 +300,6 @@ class FieldDefinition:
     searchable: bool = True
     metadata: bool = True
     context: bool = True
-    catalog_resolution: bool = False
     natural_names: tuple[str, ...] = ()
     resolution_kind: ResolutionKind = "free_text"
     value_aliases: tuple["ValueAliasDefinition", ...] = ()
@@ -539,15 +538,6 @@ _TYPED_POSTGRES_COLUMNS = {
     "Period": "TO_CHAR(attendance_date, 'YYYY-MM')",
 }
 
-_CATALOG_FIELDS = {
-    "Department",
-    "Work_Location",
-    "Shift",
-    "Status",
-    "Exception",
-    "Leave_Type",
-}
-
 _FIELD_NATURAL_NAMES = {
     "Employee_ID": ("employee id", "employee ids", "id", "ids"),
     "Name": ("employee name", "employee names", "name", "names"),
@@ -628,7 +618,6 @@ for _field, _definition in tuple(_FIELD_DEFINITIONS.items()):
             else _ORDERED_OPERATORS
         ),
         sql_expression=_sql_expression,
-        catalog_resolution=_field in _CATALOG_FIELDS,
         natural_names=tuple(
             dict.fromkeys(
                 (
@@ -661,14 +650,6 @@ POSTGRES_FIELD_MAP = MappingProxyType(
     {
         field: definition.sql_expression
         for field, definition in FIELD_DEFINITIONS.items()
-    }
-)
-
-QUESTION_CONTEXT_FIELDS = MappingProxyType(
-    {
-        field: definition.aliases
-        for field, definition in FIELD_DEFINITIONS.items()
-        if definition.aliases
     }
 )
 
@@ -930,13 +911,6 @@ def render_planner_schema() -> str:
     }
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
-SEMANTIC_INTENT_PATTERNS = (
-    r"\b(?:abnormal|anomal(?:y|ies)|concerning|concerns?|odd|problematic|resembling|similar|suspicious|unusual|irregular)\b",
-    r"\b(?:attendance|clocking) (?:behavior|behaviour|issues?|patterns?|summary|summaries)\b",
-    r"\b(?:incomplete clocking|hr review|chronic lateness)\b",
-    r"\b(?:recurring|repeated)\s+(?:lateness|absence|attendance)\s+patterns?\b",
-)
-
 INCOMPATIBLE_BUSINESS_PREDICATE_SETS = tuple(
     sorted(
         {
@@ -949,17 +923,12 @@ INCOMPATIBLE_BUSINESS_PREDICATE_SETS = tuple(
 )
 
 
-def _filter_explicitly_selects_absence(condition: FilterCondition) -> bool:
-    if condition.field != "Exception":
-        return False
-    values = (
-        condition.value
-        if condition.operator == "in" and isinstance(condition.value, list)
-        else [condition.value]
-    )
-    return condition.operator in {"eq", "in"} and any(
-        str(value).casefold() == "absent" for value in values
-    )
+def _matches_registry_filter(condition: FilterCondition, required: RequiredFilter) -> bool:
+    values = condition.value if isinstance(condition.value, list) else [condition.value]
+    required_values = required.value if isinstance(required.value, tuple) else (required.value,)
+    return condition.field == required.field and condition.operator == required.operator and {
+        str(value).casefold() for value in values
+    } == {str(value).casefold() for value in required_values}
 
 
 def compile_business_intent(plan: QueryPlan) -> QueryPlan:
@@ -973,12 +942,16 @@ def compile_business_intent(plan: QueryPlan) -> QueryPlan:
             raise ValueError(
                 f"Business predicates {first} and {second} are incompatible."
             )
-    if "worked" in predicate_set and any(
-        _filter_explicitly_selects_absence(condition) for condition in compiled.filters
-    ):
-        raise ValueError(
-            "Business predicate worked conflicts with an explicit Exception=Absent filter."
-        )
+    for name in predicate_names:
+        for incompatible in BUSINESS_PREDICATE_DEFINITIONS[name].incompatible_filters:
+            if any(
+                _matches_registry_filter(condition, incompatible)
+                for condition in compiled.filters
+            ):
+                raise ValueError(
+                    f"Business predicate {name} conflicts with an explicit "
+                    f"{incompatible.field}={incompatible.value} filter."
+                )
 
     if compiled.measure is not None:
         definition = MEASURE_DEFINITIONS[compiled.measure]
@@ -1035,11 +1008,13 @@ def compile_business_intent(plan: QueryPlan) -> QueryPlan:
 
 
 def relevant_field_definitions(question: str):
+    normalized = re.sub(r"[^\w\s]", " ", question.casefold())
+    normalized = " ".join(re.sub(r"[_-]+", " ", normalized).split())
     return {
         field: definition
         for field, definition in FIELD_DEFINITIONS.items()
         if any(
-            re.search(pattern, question, flags=re.IGNORECASE)
-            for pattern in definition.aliases
+            re.search(rf"(?:^|\s){re.escape(phrase)}(?:$|\s)", normalized)
+            for phrase in definition.natural_names
         )
     }

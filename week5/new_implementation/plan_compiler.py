@@ -6,25 +6,46 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from week5.new_implementation.attendance_schema import (
-    BUSINESS_PREDICATE_DEFINITIONS,
-    FIELD_DEFINITIONS,
-    MEASURE_DEFINITIONS,
-    AnswerContract,
-    EvidenceOrigin,
-    ExecutableQueryPlan,
-    FilterCondition,
-    FilterOperator,
-    PlannerProposal,
-    QueryPlan,
-)
-from week5.new_implementation.semantic_resolution import (
-    ResolutionContext,
-    ResolverRegistry,
-    SemanticFact,
-    evidence_occurs,
-    normalize_semantic_text,
-)
+try:
+    from .attendance_schema import (
+        BUSINESS_PREDICATE_DEFINITIONS,
+        FIELD_DEFINITIONS,
+        MEASURE_DEFINITIONS,
+        AnswerContract,
+        EvidenceOrigin,
+        ExecutableQueryPlan,
+        FilterCondition,
+        FilterOperator,
+        PlannerProposal,
+        QueryPlan,
+    )
+    from .semantic_resolution import (
+        ResolutionContext,
+        ResolverRegistry,
+        SemanticFact,
+        evidence_occurs,
+        normalize_semantic_text,
+    )
+except ImportError:  # Direct execution from week5/new_implementation.
+    from attendance_schema import (
+        BUSINESS_PREDICATE_DEFINITIONS,
+        FIELD_DEFINITIONS,
+        MEASURE_DEFINITIONS,
+        AnswerContract,
+        EvidenceOrigin,
+        ExecutableQueryPlan,
+        FilterCondition,
+        FilterOperator,
+        PlannerProposal,
+        QueryPlan,
+    )
+    from semantic_resolution import (
+        ResolutionContext,
+        ResolverRegistry,
+        SemanticFact,
+        evidence_occurs,
+        normalize_semantic_text,
+    )
 
 
 ViolationCode = Literal[
@@ -154,6 +175,8 @@ def _fact_matches_provenance(fact: SemanticFact, item: ConstraintProvenance) -> 
     ):
         return False
     if item.target_kind == "filter":
+        if item.name is not None and fact.kind == "predicate":
+            return fact.concept_name == item.name
         return (
             fact.kind == "filter"
             and fact.field == item.field
@@ -184,6 +207,10 @@ class GroundingInvariant(PlanInvariant):
                 fact.strength == "strong" and _fact_matches_provenance(fact, item)
                 for fact in context.compilation.facts
             )
+            if item.target_kind == "entity" and evidence_present:
+                grounded = True
+            if item.origin == "trusted_state":
+                grounded = True
             if not evidence_present or not grounded:
                 violations.append(
                     PlanViolation(
@@ -352,6 +379,21 @@ def _canonicalize_filter(proposed, context, resolver_registry):
     return FilterCondition(field=proposed.field, operator=proposed.operator, value=value), (), "resolved"
 
 
+def _choice_origin(context, *, kind, evidence_text, field=None, operator=None, values=(), name=None):
+    for fact in context.facts:
+        if fact.strength != "strong" or fact.kind != kind:
+            continue
+        if field is not None and (fact.field != field or fact.operator != operator or set(fact.values) != set(values)):
+            continue
+        if name is not None and fact.concept_name != name:
+            continue
+        if evidence_occurs(fact.evidence_text, evidence_text) or evidence_occurs(
+            evidence_text, fact.evidence_text
+        ):
+            return fact.origin
+    return "question"
+
+
 def _candidate_plan(proposal, context):
     structured = bool(
         proposal.filters
@@ -430,6 +472,14 @@ def compile_proposal(
                 field=condition.field,
                 operator=condition.operator,
                 values=tuple(values),
+                origin=_choice_origin(
+                    context,
+                    kind="filter",
+                    evidence_text=proposed.evidence_text,
+                    field=condition.field,
+                    operator=condition.operator,
+                    values=tuple(values),
+                ),
                 evidence_text=proposed.evidence_text,
             )
         )
@@ -455,6 +505,12 @@ def compile_proposal(
                 target_kind="measure",
                 field=definition.aggregation_field,
                 name=proposal.measure.name,
+                origin=_choice_origin(
+                    context,
+                    kind="measure",
+                    evidence_text=proposal.measure.evidence_text,
+                    name=proposal.measure.name,
+                ),
                 evidence_text=proposal.measure.evidence_text,
             )
         )
@@ -482,6 +538,12 @@ def compile_proposal(
             ConstraintProvenance(
                 target_kind="predicate",
                 name=proposed.name,
+                origin=_choice_origin(
+                    context,
+                    kind="predicate",
+                    evidence_text=proposed.evidence_text,
+                    name=proposed.name,
+                ),
                 evidence_text=proposed.evidence_text,
             )
         )
@@ -489,6 +551,17 @@ def compile_proposal(
             value = list(required.value) if isinstance(required.value, tuple) else required.value
             candidate.filters.append(
                 FilterCondition(field=required.field, operator=required.operator, value=value)
+            )
+            values = value if isinstance(value, list) else [value]
+            provenance.append(
+                ConstraintProvenance(
+                    target_kind="filter",
+                    field=required.field,
+                    operator=required.operator,
+                    values=tuple(values),
+                    name=proposed.name,
+                    evidence_text=proposed.evidence_text,
+                )
             )
 
     for proposed in proposal.group_by:

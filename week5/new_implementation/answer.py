@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from collections.abc import Mapping
 from difflib import SequenceMatcher
 from time import perf_counter
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, Sequence
 from zoneinfo import ZoneInfo
 import math
 import json
@@ -19,6 +19,7 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 try:
     from .attendance_schema import (
         AccessContext,
+        AnswerContract,
         BUSINESS_PREDICATE_DEFINITIONS,
         CoverageWindow,
         FIELD_DEFINITIONS,
@@ -29,22 +30,54 @@ try:
         NUMERIC_FILTER_FIELDS,
         POSTGRES_FIELD_MAP,
         PlannerProposal,
-        QUESTION_CONTEXT_FIELDS,
-        SEMANTIC_INTENT_PATTERNS,
+        ProposedFilter,
+        ProposedCalculation,
+        ProposedFieldChoice,
+        ProposedLimit,
+        ProposedMeasureChoice,
+        ProposedNameHint,
+        ProposedOrderChoice,
+        ProposedPredicateChoice,
         FilterCondition,
         LOCAL_DEMO_ACCESS,
         QueryPlan,
+        RETRIEVAL_INTENT_DEFINITIONS,
+        VALUE_CONCEPT_DEFINITIONS,
+        ExecutableQueryPlan,
         compile_business_intent,
         relevant_field_definitions,
         render_planner_schema,
     )
     from .semantic_resolution import SemanticFact
+    from .semantic_resolution import (
+        EmployeeReference,
+        ResolutionContext,
+        detect_semantic_facts,
+        evidence_occurs,
+        merge_semantic_facts,
+    )
+    from .plan_compiler import (
+        CompilationContext,
+        ConstraintProvenance,
+        PendingConstraintData,
+        PlanViolation,
+        compile_proposal,
+        revalidate_executable_plan,
+    )
+    from .postgres_compiler import (
+        CompiledPostgresQuery,
+        compile_aggregation_queries,
+        compile_count_query,
+        compile_coverage_query,
+        compile_sample_query,
+    )
     from .chroma_client import create_chroma_client
     from .config import settings
     from .observability import EventLogger
 except ImportError:  # Running answer.py directly from its directory.
     from attendance_schema import (
         AccessContext,
+        AnswerContract,
         BUSINESS_PREDICATE_DEFINITIONS,
         CoverageWindow,
         FIELD_DEFINITIONS,
@@ -55,16 +88,47 @@ except ImportError:  # Running answer.py directly from its directory.
         NUMERIC_FILTER_FIELDS,
         POSTGRES_FIELD_MAP,
         PlannerProposal,
-        QUESTION_CONTEXT_FIELDS,
-        SEMANTIC_INTENT_PATTERNS,
+        ProposedFilter,
+        ProposedCalculation,
+        ProposedFieldChoice,
+        ProposedLimit,
+        ProposedMeasureChoice,
+        ProposedNameHint,
+        ProposedOrderChoice,
+        ProposedPredicateChoice,
         FilterCondition,
         LOCAL_DEMO_ACCESS,
         QueryPlan,
+        RETRIEVAL_INTENT_DEFINITIONS,
+        VALUE_CONCEPT_DEFINITIONS,
+        ExecutableQueryPlan,
         compile_business_intent,
         relevant_field_definitions,
         render_planner_schema,
     )
     from semantic_resolution import SemanticFact
+    from semantic_resolution import (
+        EmployeeReference,
+        ResolutionContext,
+        detect_semantic_facts,
+        evidence_occurs,
+        merge_semantic_facts,
+    )
+    from plan_compiler import (
+        CompilationContext,
+        ConstraintProvenance,
+        PendingConstraintData,
+        PlanViolation,
+        compile_proposal,
+        revalidate_executable_plan,
+    )
+    from postgres_compiler import (
+        CompiledPostgresQuery,
+        compile_aggregation_queries,
+        compile_count_query,
+        compile_coverage_query,
+        compile_sample_query,
+    )
     from chroma_client import create_chroma_client
     from config import settings
     from observability import EventLogger
@@ -205,7 +269,7 @@ class EmployeeCandidate(BaseModel):
 
 class ContextFetchResult(NamedTuple):
     chunks: list[Result]
-    plan: QueryPlan
+    plan: ExecutableQueryPlan
     aggregation: dict | None
     matched_count: int | None
     resolved_employees: list[EmployeeCandidate]
@@ -232,36 +296,41 @@ class EmployeeResolution(BaseModel):
 class ConversationState(BaseModel):
     selected_employees: list[EmployeeCandidate] = Field(default_factory=list)
     pending_question: str | None = None
-    pending_plan: QueryPlan | None = None
+    pending_proposal: PlannerProposal | None = None
+    pending_facts: list[SemanticFact] = Field(default_factory=list)
     pending_candidates: list[EmployeeCandidate] = Field(default_factory=list)
-    pending_constraint: PendingConstraint | None = None
+    pending_constraint: PendingConstraintData | None = None
     pending_interpretations: list[InterpretationName] = Field(default_factory=list)
 
 
-class EmployeeClarificationRequired(ValueError):
+class PlanningClarificationRequired(ValueError):
+    def __init__(self, proposal: PlannerProposal, facts: tuple[SemanticFact, ...]):
+        super().__init__("planning clarification required")
+        self.proposal = proposal
+        self.facts = facts
+
+
+class EmployeeClarificationRequired(PlanningClarificationRequired):
     """Retrieval must pause until the employee reference is clarified."""
 
-    def __init__(self, plan: QueryPlan, resolution: EmployeeResolution):
-        super().__init__(resolution.reference)
-        self.plan = plan
+    def __init__(self, proposal, facts, resolution: EmployeeResolution):
+        super().__init__(proposal, facts)
         self.resolution = resolution
 
 
-class ConstraintClarificationRequired(ValueError):
+class ConstraintClarificationRequired(PlanningClarificationRequired):
     """A catalog value has multiple displayed database-backed candidates."""
 
-    def __init__(self, plan: QueryPlan, pending: PendingConstraint):
-        super().__init__(pending.reference)
-        self.plan = plan
+    def __init__(self, proposal, facts, pending: PendingConstraintData):
+        super().__init__(proposal, facts)
         self.pending = pending
 
 
-class InterpretationClarificationRequired(ValueError):
+class InterpretationClarificationRequired(PlanningClarificationRequired):
     """A composable attendance interpretation must be selected."""
 
-    def __init__(self, plan: QueryPlan, candidates: list[InterpretationName]):
-        super().__init__(", ".join(candidates))
-        self.plan = plan
+    def __init__(self, proposal, facts, candidates: list[InterpretationName]):
+        super().__init__(proposal, facts)
         self.candidates = candidates
 
 
@@ -449,9 +518,7 @@ def resolve_relative_date_filters(
     """
     Resolve common relative English date phrases deterministically.
 
-    Explicit calendar dates such as "Sep 5, 2026" are still handled by the
-    query planner. This function removes ambiguity from phrases such as
-    yesterday / last week / this month / last 7 days.
+    Calendar ranges and common relative phrases are resolved before planning.
     """
     today = reference_date or _current_local_date()
     if isinstance(today, datetime):
@@ -484,6 +551,26 @@ def resolve_relative_date_filters(
     explicit_range = _resolve_explicit_date_range(text, today)
     if explicit_range:
         return explicit_range
+
+    month_match = re.search(
+        r"\b(?P<month>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+        r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
+        r"nov(?:ember)?|dec(?:ember)?)\s+(?P<year>\d{4})\b",
+        text,
+    )
+    if month_match:
+        month = {
+            "jan": 1, "january": 1, "feb": 2, "february": 2,
+            "mar": 3, "march": 3, "apr": 4, "april": 4, "may": 5,
+            "jun": 6, "june": 6, "jul": 7, "july": 7, "aug": 8,
+            "august": 8, "sep": 9, "sept": 9, "september": 9,
+            "oct": 10, "october": 10, "nov": 11, "november": 11,
+            "dec": 12, "december": 12,
+        }[month_match.group("month")]
+        year = int(month_match.group("year"))
+        start = date(year, month, 1)
+        next_month = date(year + (month == 12), month % 12 + 1, 1)
+        return between(start, next_month - timedelta(days=1))
 
     if re.search(r"\byesterday\b", text):
         return eq(today - timedelta(days=1))
@@ -618,6 +705,12 @@ def propose_query(
 Use only definitions and values supplied by the semantic registry or candidate context.
 Attach exact question evidence to every semantic choice.
 Do not invent a field, value, predicate, measure, grouping, order, or limit.
+Treat every strong deterministic fact as authoritative and copy it into the matching proposal choice.
+For a filter fact, copy its field, operator, canonical values, and evidence; use a scalar for one value unless the operator is in.
+For a measure or predicate fact, copy concept_name into the corresponding named choice instead of creating a calculation.
+Build AnswerContract from the selected measure definition, including its answer unit and aggregation field.
+When strong facts fully describe the request, return status ready and an empty interpretation_candidates list.
+Only ambiguous status may contain interpretation candidates, and only unsupported status may contain capability identifiers.
 Return ambiguous when evidence supports multiple meanings.
 Return unsupported with controlled capability identifiers when the typed proposal cannot express the request."""
     fact_context = {
@@ -656,7 +749,97 @@ Return unsupported with controlled capability identifiers when the typed proposa
         temperature=0,
         timeout=settings.planner_timeout_seconds,
     )
-    return PlannerProposal.model_validate_json(response.choices[0].message.content)
+    raw_proposal = json.loads(response.choices[0].message.content)
+    prepared = _overlay_authoritative_facts(raw_proposal, semantic_facts)
+    return PlannerProposal.model_validate_json(
+        json.dumps(prepared, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, ...]):
+    """Ensure independently detected strong facts survive an untrusted proposal."""
+    prepared = dict(raw_proposal)
+    if prepared.get("status") != "ready":
+        return prepared
+
+    strong_facts = tuple(fact for fact in facts if fact.strength == "strong")
+    measure_facts = {
+        fact.concept_name: fact
+        for fact in strong_facts
+        if fact.kind == "measure" and fact.concept_name in MEASURE_DEFINITIONS
+    }
+    deterministic_complete = bool(
+        len(measure_facts) == 1
+        and any(fact.kind == "filter" for fact in strong_facts)
+        and not any(fact.kind == "semantic_intent" for fact in strong_facts)
+        and all(
+            fact.kind in {"field", "filter", "measure", "predicate"}
+            for fact in strong_facts
+        )
+    )
+    if deterministic_complete:
+        prepared.update(
+            name_hint=None,
+            group_by=[],
+            order_by=None,
+            limit=None,
+        )
+    filters = [] if deterministic_complete else list(prepared.get("filters") or [])
+    for fact in facts:
+        if fact.strength != "strong" or fact.kind != "filter" or not fact.field:
+            continue
+        authoritative = {
+            "field": fact.field,
+            "operator": fact.operator,
+            "value": (
+                list(fact.values)
+                if fact.operator == "in"
+                else fact.values[0]
+            ),
+            "evidence_text": fact.evidence_text,
+        }
+        if not any(
+            item.get("field") == fact.field
+            and item.get("operator") == fact.operator
+            and item.get("value") == authoritative["value"]
+            for item in filters
+        ):
+            filters.append(authoritative)
+    prepared["filters"] = filters
+
+    if len(measure_facts) == 1:
+        measure_name, fact = next(iter(measure_facts.items()))
+        definition = MEASURE_DEFINITIONS[measure_name]
+        prepared["measure"] = {
+            "name": measure_name,
+            "evidence_text": fact.evidence_text,
+        }
+        prepared["calculation"] = None
+        prepared["interpretation_candidates"] = []
+        prepared["answer_contract"] = {
+            "shape": "grouped" if prepared.get("group_by") else definition.default_answer_shape,
+            "unit": definition.answer_unit,
+            "subject_field": definition.aggregation_field,
+            "grain": [definition.aggregation_field] if definition.aggregation_field else [],
+        }
+
+    predicates = [] if deterministic_complete else list(
+        prepared.get("business_predicates") or []
+    )
+    existing_predicates = {item.get("name") for item in predicates}
+    for fact in facts:
+        if (
+            fact.strength == "strong"
+            and fact.kind == "predicate"
+            and fact.concept_name in BUSINESS_PREDICATE_DEFINITIONS
+            and fact.concept_name not in existing_predicates
+        ):
+            predicates.append(
+                {"name": fact.concept_name, "evidence_text": fact.evidence_text}
+            )
+            existing_predicates.add(fact.concept_name)
+    prepared["business_predicates"] = predicates
+    return prepared
 
 
 @_retry()
@@ -707,22 +890,13 @@ Rules:
 5. Normalize explicit dates to YYYY-MM-DD.
 6. For date ranges use two Date filters: gte start and lte end.
 7. Relative date hints below are authoritative; use those exact Date filters.
-8. Select measure and business_predicates independently. For worked or attended
-   days use measure=distinct_dates and predicates=[worked]. For did-not-attend
-   or not-present days use measure=distinct_dates and
-   predicates=[scheduled_working_day, not_worked]. For explicit absent days use
-   measure=distinct_dates and predicates=[absent].
-9. Use measure=attendance_records only for attendance rows, records, or entries.
-   Use measure=distinct_dates with [scheduled_working_day] for scheduled dates.
-   Leave business_predicates empty when no business condition applies.
-10. Use employees for distinct employee counts. Use sum/average/min/max with
-    the correct numeric aggregation field when no named calculation applies.
-11. If the requested meaning is genuinely ambiguous, leave measure null,
+8. Select fields, measures, and predicates only from their supplied definitions.
+9. If the requested meaning is genuinely ambiguous, leave measure null,
     aggregation none, and set interpretation_candidates to two or more
     plausible interpretation preset identifiers. Do not guess a row count.
-12. For monthly employee pattern/summary questions, semantic/hybrid retrieval
+10. For monthly employee pattern/summary questions, semantic/hybrid retrieval
     may use employee_period chunks.
-13. search_query must be short and retain important employee/attendance terms.
+11. search_query must be short and retain important employee/attendance terms.
 
 Date context:
 {date_context}
@@ -915,12 +1089,14 @@ def load_employee_directory():
     return load_employee_directory_chroma()
 
 
-def load_attendance_catalog():
-    fields = [
+def load_attendance_catalog(fields: Sequence[str] | None = None):
+    allowed_fields = [
         field
         for field, definition in FIELD_DEFINITIONS.items()
-        if definition.catalog_resolution
+        if definition.resolution_kind == "catalog" and definition.planner_visible
     ]
+    fields = list(fields) if fields is not None else allowed_fields
+    fields = [field for field in fields if field in allowed_fields]
     catalog = {field: set() for field in fields}
     if _postgres_enabled():
         psycopg, dict_row = _import_psycopg()
@@ -953,11 +1129,69 @@ def load_attendance_catalog():
     }
 
 
+def load_attendance_catalog_candidates(
+    question: str,
+    proposed_filters: tuple[ProposedFilter, ...] = (),
+) -> dict[str, tuple[str, ...]]:
+    """Load only bounded candidates for catalog fields grounded in this request."""
+    fields = {
+        field
+        for field, definition in FIELD_DEFINITIONS.items()
+        if definition.planner_visible
+        and definition.resolution_kind == "catalog"
+        and any(evidence_occurs(question, phrase) for phrase in definition.natural_names)
+    }
+    filters_by_field: dict[str, list[str]] = {}
+    for proposed in proposed_filters:
+        definition = FIELD_DEFINITIONS.get(proposed.field)
+        if (
+            definition is None
+            or not definition.planner_visible
+            or definition.resolution_kind != "catalog"
+            or proposed.operator not in {"eq", "in"}
+            or not evidence_occurs(question, proposed.evidence_text)
+        ):
+            continue
+        fields.add(proposed.field)
+        raw_values = proposed.value if isinstance(proposed.value, list) else [proposed.value]
+        filters_by_field.setdefault(proposed.field, []).extend(map(str, raw_values))
+    if not fields:
+        return {}
+    catalog = load_attendance_catalog(sorted(fields))
+    bounded = {}
+    for field in sorted(fields):
+        values = catalog.get(field, [])
+        references = filters_by_field.get(field, [])
+        if references:
+            matching = [
+                value
+                for value in values
+                if any(
+                    reference.casefold() in value.casefold()
+                    or value.casefold() in reference.casefold()
+                    for reference in references
+                )
+            ]
+        else:
+            matching = values
+        bounded[field] = tuple(matching[: settings.constraint_candidate_limit])
+    return bounded
+
+
+def _employee_references(
+    candidates: Sequence[EmployeeCandidate] | None,
+) -> tuple[EmployeeReference, ...]:
+    return tuple(
+        EmployeeReference(employee_id=item.employee_id, name=item.name)
+        for item in candidates or ()
+    )
+
+
 def resolve_catalog_constraints(plan: QueryPlan, catalog=None, question: str = ""):
     relevant = [
         condition
         for condition in plan.filters
-        if FIELD_DEFINITIONS[condition.field].catalog_resolution
+        if FIELD_DEFINITIONS[condition.field].resolution_kind == "catalog"
         and condition.operator in {"eq", "in"}
     ]
     if not relevant:
@@ -1565,6 +1799,28 @@ def _normalize_typed_filter_value(field: str, value):
 
 class PlanValidationError(ValueError):
     """The interpreted query cannot be executed safely."""
+
+
+def format_plan_violations(violations: tuple[PlanViolation, ...]) -> str:
+    labels = {
+        "invalid_schema": "an unsupported field, value, or operator was selected",
+        "ungrounded_constraint": "a selected constraint was not stated in the request",
+        "uncovered_fact": "an important part of the request was not represented",
+        "contradiction": "the selected conditions conflict",
+        "answer_contract_mismatch": "the requested answer and calculation do not match",
+        "unsupported_capability": "the request needs a calculation that is not supported yet",
+        "ambiguous_value": "a value needs clarification",
+    }
+    messages = list(
+        dict.fromkeys(labels.get(item.code, "the request could not be verified") for item in violations)
+    )
+    return "; ".join(messages) + "."
+
+
+class SemanticPlanValidationError(PlanValidationError):
+    def __init__(self, violations: tuple[PlanViolation, ...]):
+        self.violations = violations
+        super().__init__(format_plan_violations(violations))
 
 
 def _normalize_filter_condition(condition: FilterCondition):
@@ -2218,7 +2474,11 @@ def _explicit_record_projection_contract(question: str):
 
 def _is_semantic_narrative_request(question: str) -> bool:
     return bool(
-        any(re.search(pattern, question, re.I) for pattern in SEMANTIC_INTENT_PATTERNS)
+        any(
+            evidence_occurs(question, phrase)
+            for definition in RETRIEVAL_INTENT_DEFINITIONS.values()
+            for phrase in definition.natural_names
+        )
         and not re.search(
             r"\b(?:how many|number of|count|percentage|percent|rate|total|sum|average|avg|mean|maximum|max|minimum|min)\b",
             question,
@@ -2398,8 +2658,9 @@ def normalize_query_plan(question: str, plan: QueryPlan):
             ]
 
     semantic_intent = any(
-        re.search(pattern, question, flags=re.IGNORECASE)
-        for pattern in SEMANTIC_INTENT_PATTERNS
+        evidence_occurs(question, phrase)
+        for definition in RETRIEVAL_INTENT_DEFINITIONS.values()
+        for phrase in definition.natural_names
     )
     normalized.mode = (
         "hybrid"
@@ -2852,39 +3113,123 @@ def fetch_postgres_coverage(connection=None) -> CoverageWindow | None:
     return CoverageWindow(date_min=row["date_min"], date_max=row["date_max"])
 
 
-def execute_exact_postgres(plan: QueryPlan):
-    """Calculate, count, and sample within one repeatable-read snapshot."""
+def _execute_rows_query(query: CompiledPostgresQuery, connection) -> list[dict]:
+    if not isinstance(query, CompiledPostgresQuery):
+        raise TypeError("Database execution requires CompiledPostgresQuery.")
+    event_logger.emit(
+        "postgres_query_compiled",
+        stage="postgres_compilation",
+        state="success",
+        purpose=query.purpose,
+        fingerprint=query.fingerprint,
+        parameter_count=len(query.params),
+    )
+    with connection.cursor() as cursor:
+        cursor.execute(query.sql, query.params)
+        return list(cursor.fetchall())
+
+
+def _execute_scalar_query(query: CompiledPostgresQuery, connection):
+    if not isinstance(query, CompiledPostgresQuery):
+        raise TypeError("Database execution requires CompiledPostgresQuery.")
+    event_logger.emit(
+        "postgres_query_compiled",
+        stage="postgres_compilation",
+        state="success",
+        purpose=query.purpose,
+        fingerprint=query.fingerprint,
+        parameter_count=len(query.params),
+    )
+    with connection.cursor() as cursor:
+        cursor.execute(query.sql, query.params)
+        return cursor.fetchone()
+
+
+def _map_compiled_aggregation(plan: ExecutableQueryPlan, queries, connection):
+    if not queries:
+        return None
+    if plan.aggregation == "percentage":
+        denominator_row = _execute_scalar_query(queries[0], connection)
+        numerator_row = _execute_scalar_query(queries[1], connection)
+        denominator = int(denominator_row["value"])
+        numerator = int(numerator_row["value"])
+        return {
+            "operation": "percentage",
+            "field": plan.aggregation_field or "attendance_records",
+            "numerator": numerator,
+            "denominator": denominator,
+            "value": (numerator / denominator * 100.0) if denominator else None,
+        }
+    field_name = plan.aggregation_field
+    group_by = list(plan.group_by)
+    if "Name" in group_by and "Employee_ID" not in group_by:
+        group_by.insert(0, "Employee_ID")
+    if group_by:
+        rows = _execute_rows_query(queries[0], connection)
+        values = [
+            {
+                "group": [row[f"group_{index}"] for index in range(len(group_by))],
+                "value": float(row["value"]) if row["value"] is not None else None,
+            }
+            for row in rows
+        ]
+        return _order_grouped_result(plan, field_name, group_by, values)
+    row = _execute_scalar_query(queries[0], connection)
+    value = row["value"]
+    if value is not None and plan.aggregation not in {"count", "distinct_count"}:
+        value = float(value)
+    result = {"operation": plan.aggregation, "value": value}
+    if field_name:
+        result["field"] = field_name
+    return result
+
+
+def execute_exact_postgres(plan: ExecutableQueryPlan):
+    """Execute only compiler-produced SQL within one read-only snapshot."""
+    if type(plan) is not ExecutableQueryPlan:
+        raise TypeError("Exact PostgreSQL execution requires ExecutableQueryPlan.")
     psycopg, dict_row = _import_psycopg()
     with psycopg.connect(POSTGRES_DSN, row_factory=dict_row) as connection:
         with connection.cursor() as cursor:
             cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        aggregation = calculate_aggregation_postgres(
-            plan, plan.filters, connection=connection
+        aggregation = _map_compiled_aggregation(
+            plan,
+            compile_aggregation_queries(plan, POSTGRES_ATTENDANCE_TABLE),
+            connection,
         )
         if aggregation is not None:
-            available = (
-                fetch_postgres_coverage(connection=connection)
-                if requested_date_window(plan) is not None
-                else None
-            )
+            available = None
+            if requested_date_window(plan) is not None:
+                coverage_row = _execute_scalar_query(
+                    compile_coverage_query(POSTGRES_ATTENDANCE_TABLE), connection
+                )
+                if coverage_row and coverage_row.get("date_min") is not None and coverage_row.get("date_max") is not None:
+                    available = CoverageWindow(
+                        date_min=coverage_row["date_min"],
+                        date_max=coverage_row["date_max"],
+                    )
             aggregation = attach_coverage_metadata(plan, aggregation, available)
-        matched_count = count_exact_postgres(plan.filters, connection=connection)
+        matched_count = int(
+            _execute_scalar_query(
+                compile_count_query(plan, POSTGRES_ATTENDANCE_TABLE), connection
+            )["value"]
+        )
         sample_limit = (
             settings.evidence_sample_size
             if aggregation is not None
             else min(plan.limit or MAX_EXACT_RESULTS, MAX_EXACT_RESULTS)
         )
-        chunks = fetch_exact_postgres(
-            plan.filters,
-            limit=sample_limit,
-            order_by=plan.order_by if aggregation is None else None,
-            order_direction=(
-                plan.order_direction
-                if aggregation is None and plan.order_by is not None
-                else "asc"
+        sample_plan = plan.model_copy(deep=True)
+        if aggregation is not None:
+            sample_plan.order_by = None
+            sample_plan.order_direction = "asc"
+        rows = _execute_rows_query(
+            compile_sample_query(
+                sample_plan, POSTGRES_ATTENDANCE_TABLE, limit=sample_limit
             ),
-            connection=connection,
+            connection,
         )
+        chunks = [_postgres_row_to_result(row) for row in rows]
     return chunks, aggregation, matched_count
 
 
@@ -3351,8 +3696,20 @@ def attach_coverage_metadata(
     enriched = dict(aggregation)
     if plan.measure is not None:
         enriched["measure"] = plan.measure
-    if plan.business_predicates:
-        enriched["business_predicates"] = list(plan.business_predicates)
+    enriched["business_predicates"] = list(plan.business_predicates)
+    matched_concepts = []
+    for name, concept in VALUE_CONCEPT_DEFINITIONS.items():
+        for condition in plan.filters:
+            values = condition.value if isinstance(condition.value, list) else [condition.value]
+            if (
+                condition.field == concept.field
+                and condition.operator in {"eq", "in"}
+                and set(map(str, values)) == set(concept.members)
+            ):
+                matched_concepts.append(name)
+                break
+    if matched_concepts:
+        enriched["value_concepts"] = matched_concepts
 
     requested = requested_date_window(plan)
     if available is not None and requested is not None:
@@ -3449,6 +3806,11 @@ def _format_aggregation_answer(question: str, aggregation: dict):
         predicates = set(aggregation.get("business_predicates", []))
         count = _format_number(value)
         singular = value == 1
+        value_concepts = aggregation.get("value_concepts", [])
+        if len(value_concepts) == 1:
+            definition = VALUE_CONCEPT_DEFINITIONS[value_concepts[0]]
+            label = definition.natural_names[0] if singular else definition.natural_names[-1]
+            return f"{count} {label} matched the requested criteria.{_coverage_warning(aggregation)}"
         if predicates == {"scheduled_working_day", "not_worked"}:
             verb = "was" if singular else "were"
             noun = "day" if singular else "days"
@@ -3514,9 +3876,9 @@ def _question_specific_context_fields(question: str, plan: QueryPlan):
     if plan.aggregation_field:
         evidence_fields.add(plan.aggregation_field)
 
-    for field, patterns in QUESTION_CONTEXT_FIELDS.items():
-        if any(
-            re.search(pattern, question, flags=re.IGNORECASE) for pattern in patterns
+    for field, definition in FIELD_DEFINITIONS.items():
+        if definition.planner_visible and any(
+            evidence_occurs(question, phrase) for phrase in definition.natural_names
         ):
             evidence_fields.add(field)
 
@@ -3558,7 +3920,8 @@ def _select_context_content(content: str, fields: set[str] | None):
 def _fetch_context_result(
     question: str,
     history=None,
-    prepared_plan: QueryPlan | None = None,
+    prepared_proposal: PlannerProposal | None = None,
+    prepared_facts: tuple[SemanticFact, ...] = (),
     default_employees: list[EmployeeCandidate] | None = None,
     request_id: str | None = None,
     *,
@@ -3570,25 +3933,135 @@ def _fetch_context_result(
     request_id = request_id or uuid.uuid4().hex
     started = perf_counter()
     planning_started = perf_counter()
-    plan = (
-        prepared_plan.model_copy(deep=True)
-        if prepared_plan is not None
-        else plan_query(question, history, trusted_employees=default_employees)
+    pre_catalog = load_attendance_catalog_candidates(question)
+    pre_context = ResolutionContext(
+        catalog=pre_catalog,
+        employees=_employee_references(default_employees),
     )
-    planning_seconds = perf_counter() - planning_started
-    plan = normalize_query_plan(question, plan)
-    if plan.interpretation_candidates:
-        raise InterpretationClarificationRequired(
-            plan, list(dict.fromkeys(plan.interpretation_candidates))
+    detected_facts = detect_semantic_facts(question, pre_context)
+    relative_dates = resolve_relative_date_filters(question)
+    date_facts = tuple(
+        SemanticFact(
+            kind="filter",
+            field=condition.field,
+            operator=condition.operator,
+            values=(condition.value,),
+            evidence_text=question,
+            origin="question",
+            strength="strong",
         )
-    plan = resolve_catalog_constraints(plan, question=question)
+        for condition in relative_dates
+    )
+    initial_facts = merge_semantic_facts(prepared_facts, detected_facts, date_facts)
+    event_logger.emit(
+        "semantic_facts_detected",
+        request_id=request_id,
+        stage="semantic_detection",
+        state="success",
+        fact_count=len(initial_facts),
+        fact_kinds=sorted({fact.kind for fact in initial_facts}),
+    )
+    proposal = prepared_proposal or propose_query(
+        question,
+        history,
+        trusted_employees=default_employees,
+        semantic_facts=initial_facts,
+        candidate_catalog=pre_catalog,
+    )
+    event_logger.emit(
+        "planner_proposal_received",
+        request_id=request_id,
+        stage="planning",
+        state="success",
+        status=proposal.status,
+        filter_count=len(proposal.filters),
+        predicate_count=len(proposal.business_predicates),
+        unsupported_capabilities=sorted(proposal.unsupported_capabilities),
+    )
+    if proposal.status == "unsupported":
+        rejected = compile_proposal(
+            proposal, CompilationContext(question, initial_facts, pre_context)
+        )
+        event_logger.emit(
+            "proposal_rejected",
+            request_id=request_id,
+            stage="semantic_validation",
+            state="rejected",
+            violation_codes=sorted({item.code for item in rejected.violations}),
+            violation_count=len(rejected.violations),
+            unsupported_capabilities=sorted(proposal.unsupported_capabilities),
+        )
+        raise SemanticPlanValidationError(rejected.violations)
+    if proposal.status == "ambiguous" and proposal.interpretation_candidates:
+        raise InterpretationClarificationRequired(
+            proposal,
+            initial_facts,
+            list(dict.fromkeys(proposal.interpretation_candidates)),
+        )
+    catalog = load_attendance_catalog_candidates(
+        question, proposed_filters=tuple(proposal.filters)
+    )
+    resolution_context = ResolutionContext(
+        catalog=catalog,
+        employees=_employee_references(default_employees),
+    )
+    facts = merge_semantic_facts(
+        initial_facts, detect_semantic_facts(question, resolution_context)
+    )
+    compilation_context = CompilationContext(question, facts, resolution_context)
+    compilation = compile_proposal(proposal, compilation_context)
+    if compilation.clarification is not None:
+        raise ConstraintClarificationRequired(
+            proposal, facts, compilation.clarification
+        )
+    if not compilation.ready:
+        event_logger.emit(
+            "proposal_rejected",
+            request_id=request_id,
+            stage="semantic_validation",
+            state="rejected",
+            violation_codes=sorted({item.code for item in compilation.violations}),
+            violation_count=len(compilation.violations),
+        )
+        raise SemanticPlanValidationError(compilation.violations)
+    assert compilation.executable_plan is not None
+    plan = compilation.executable_plan
+    event_logger.emit(
+        "executable_plan_compiled",
+        request_id=request_id,
+        stage="semantic_validation",
+        state="success",
+        mode=plan.mode,
+        operation=plan.aggregation,
+        filter_count=len(plan.filters),
+    )
+    provenance = list(compilation.provenance)
+    planning_seconds = perf_counter() - planning_started
+    employee_fields_before = {
+        condition.field for condition in plan.filters if condition.field in {"Employee_ID", "Name"}
+    }
     plan, employee_resolution = resolve_employee_plan(
         question,
         plan,
         default_candidates=default_employees,
     )
     if employee_resolution is not None and employee_resolution.outcome != "unique":
-        raise EmployeeClarificationRequired(plan, employee_resolution)
+        raise EmployeeClarificationRequired(proposal, facts, employee_resolution)
+
+    for condition in plan.filters:
+        if condition.field not in {"Employee_ID", "Name"} or condition.field in employee_fields_before:
+            continue
+        values = condition.value if isinstance(condition.value, list) else [condition.value]
+        provenance.append(
+            ConstraintProvenance(
+                target_kind="filter",
+                field=condition.field,
+                operator=condition.operator,
+                values=tuple(values),
+                origin="trusted_state",
+                evidence_text=str(values[0]),
+            )
+        )
 
     # Employee resolution can add a trusted structured constraint after the
     # initial plan normalization. Semantic retrieval must retain that scope.
@@ -3606,6 +4079,24 @@ def _fetch_context_result(
                 value="attendance_record",
             )
         )
+        provenance.append(
+            ConstraintProvenance(
+                target_kind="filter",
+                field="chunk_type",
+                operator="eq",
+                values=("attendance_record",),
+                origin="deterministic_default",
+                evidence_text="daily attendance scope",
+            )
+        )
+
+    revalidated = revalidate_executable_plan(
+        plan, compilation_context, tuple(provenance)
+    )
+    if not revalidated.ready:
+        raise SemanticPlanValidationError(revalidated.violations)
+    assert revalidated.executable_plan is not None
+    plan = revalidated.executable_plan
 
     backend = _retrieval_backend(plan.mode)
 
@@ -3726,7 +4217,6 @@ def _fetch_context_result(
 def fetch_context(
     question: str,
     history=None,
-    prepared_plan: QueryPlan | None = None,
     default_employees: list[EmployeeCandidate] | None = None,
     request_id: str | None = None,
     *,
@@ -3736,7 +4226,6 @@ def fetch_context(
     result = _fetch_context_result(
         question,
         history,
-        prepared_plan=prepared_plan,
         default_employees=default_employees,
         request_id=request_id,
         access_context=access_context,
@@ -3953,7 +4442,7 @@ def _select_pending_interpretation(
     return None
 
 
-def _format_constraint_clarification(pending: PendingConstraint):
+def _format_constraint_clarification(pending: PendingConstraintData):
     choices = "\n".join(
         f"{index}. {candidate.label or candidate.value}"
         for index, candidate in enumerate(pending.candidates, start=1)
@@ -3964,7 +4453,7 @@ def _format_constraint_clarification(pending: PendingConstraint):
     )
 
 
-def _select_pending_constraint_values(response: str, pending: PendingConstraint):
+def _select_pending_constraint_values(response: str, pending: PendingConstraintData):
     normalized = response.strip().casefold()
     if normalized in {"both", "all"}:
         return [candidate.value for candidate in pending.candidates]
@@ -4027,11 +4516,12 @@ def answer_question_with_state(
         return f"I could not safely interpret that request: {exc}", [], state
 
     effective_question = question
-    prepared_plan = None
+    prepared_proposal = None
+    prepared_facts: tuple[SemanticFact, ...] = ()
     employees_for_request = state.selected_employees
     if (
         state.pending_interpretations
-        and state.pending_plan is not None
+        and state.pending_proposal is not None
         and state.pending_question
     ):
         selected_interpretation = _select_pending_interpretation(
@@ -4045,42 +4535,90 @@ def answer_question_with_state(
             )
         definition = INTERPRETATION_PRESETS[selected_interpretation]
         effective_question = state.pending_question
-        prepared_plan = state.pending_plan.model_copy(
+        measure_definition = MEASURE_DEFINITIONS[definition.measure]
+        prepared_proposal = state.pending_proposal.model_copy(
             deep=True,
             update={
-                "measure": definition.measure,
-                "business_predicates": list(definition.business_predicates),
+                "status": "ready",
+                "measure": ProposedMeasureChoice(
+                    name=definition.measure, evidence_text=effective_question
+                ),
+                "business_predicates": [
+                    ProposedPredicateChoice(name=name, evidence_text=effective_question)
+                    for name in definition.business_predicates
+                ],
+                "answer_contract": AnswerContract(
+                    shape="scalar",
+                    unit=measure_definition.answer_unit,
+                    subject_field=measure_definition.aggregation_field,
+                    grain=(
+                        [measure_definition.aggregation_field]
+                        if measure_definition.aggregation_field
+                        else []
+                    ),
+                ),
                 "interpretation_candidates": [],
             },
         )
+        prepared_facts = tuple(state.pending_facts) + (
+            SemanticFact(
+                kind="measure",
+                concept_name=definition.measure,
+                evidence_text=effective_question,
+                origin="question",
+                strength="strong",
+            ),
+            *(
+                SemanticFact(
+                    kind="predicate",
+                    concept_name=name,
+                    evidence_text=effective_question,
+                    origin="question",
+                    strength="strong",
+                )
+                for name in definition.business_predicates
+            ),
+        )
         state.pending_interpretations = []
 
-    if state.pending_constraint is not None and state.pending_plan is not None:
+    if state.pending_constraint is not None and state.pending_proposal is not None:
         pending = state.pending_constraint
         selected_values = _select_pending_constraint_values(question, pending)
         if not selected_values:
             return _format_constraint_clarification(pending), [], state
         effective_question = state.pending_question or question
-        prepared_plan = state.pending_plan.model_copy(deep=True)
-        prepared_plan.filters = [
+        prepared_proposal = state.pending_proposal.model_copy(deep=True)
+        prepared_proposal.filters = [
             condition
-            for condition in prepared_plan.filters
+            for condition in prepared_proposal.filters
             if condition.field != pending.field
         ]
-        prepared_plan.filters.append(
-            FilterCondition(
+        prepared_proposal.filters.append(
+            ProposedFilter(
                 field=pending.field,
                 operator="eq" if len(selected_values) == 1 else "in",
                 value=selected_values[0]
                 if len(selected_values) == 1
                 else selected_values,
+                evidence_text=pending.reference,
             )
+        )
+        prepared_facts = tuple(state.pending_facts) + (
+            SemanticFact(
+                kind="filter",
+                field=pending.field,
+                operator="eq" if len(selected_values) == 1 else "in",
+                values=tuple(selected_values),
+                evidence_text=pending.reference,
+                origin="question",
+                strength="strong",
+            ),
         )
         state.pending_constraint = None
 
     if (
-        prepared_plan is None
-        and state.pending_plan is not None
+        prepared_proposal is None
+        and state.pending_proposal is not None
         and state.pending_question
         and state.pending_candidates
     ):
@@ -4132,14 +4670,44 @@ def answer_question_with_state(
 
         selected = [candidate for candidate in validated if candidate is not None]
         effective_question = state.pending_question
-        prepared_plan = _plan_for_selected_employees(state.pending_plan, selected)
+        prepared_proposal = state.pending_proposal.model_copy(deep=True)
+        prepared_proposal.name_hint = None
+        prepared_proposal.filters = [
+            condition
+            for condition in prepared_proposal.filters
+            if condition.field not in {"Employee_ID", "Name"}
+        ]
+        selected_ids = [candidate.employee_id for candidate in selected]
+        selected_operator = "eq" if len(selected_ids) == 1 else "in"
+        selected_value = selected_ids[0] if len(selected_ids) == 1 else selected_ids
+        selected_evidence = " ".join(selected_ids)
+        prepared_proposal.filters.append(
+            ProposedFilter(
+                field="Employee_ID",
+                operator=selected_operator,
+                value=selected_value,
+                evidence_text=selected_evidence,
+            )
+        )
+        prepared_facts = tuple(state.pending_facts) + (
+            SemanticFact(
+                kind="filter",
+                field="Employee_ID",
+                operator=selected_operator,
+                values=tuple(selected_ids),
+                evidence_text=selected_evidence,
+                origin="trusted_state",
+                strength="strong",
+            ),
+        )
         employees_for_request = selected
 
     try:
         result = _fetch_context_result(
             effective_question,
             history,
-            prepared_plan=prepared_plan,
+            prepared_proposal=prepared_proposal,
+            prepared_facts=prepared_facts,
             default_employees=employees_for_request,
             access_context=access_context,
         )
@@ -4150,37 +4718,43 @@ def answer_question_with_state(
         resolved_employees = result.resolved_employees
     except ConstraintClarificationRequired as exc:
         state.pending_question = effective_question
-        state.pending_plan = exc.plan
+        state.pending_proposal = exc.proposal
+        state.pending_facts = list(exc.facts)
         state.pending_constraint = exc.pending
         return _format_constraint_clarification(exc.pending), [], state
     except InterpretationClarificationRequired as exc:
         state.pending_question = effective_question
-        state.pending_plan = exc.plan
+        state.pending_proposal = exc.proposal
+        state.pending_facts = list(exc.facts)
         state.pending_interpretations = exc.candidates
         return _format_interpretation_clarification(exc.candidates), [], state
     except EmployeeClarificationRequired as exc:
         if exc.resolution.outcome == "none":
             state.pending_question = None
-            state.pending_plan = None
+            state.pending_proposal = None
+            state.pending_facts = []
             state.pending_candidates = []
             state.pending_constraint = None
             state.pending_interpretations = []
             return _format_employee_clarification(exc.resolution), [], state
         state.pending_question = effective_question
-        state.pending_plan = exc.plan
+        state.pending_proposal = exc.proposal
+        state.pending_facts = list(exc.facts)
         state.pending_candidates = exc.resolution.candidates
         state.pending_interpretations = []
         return _format_employee_clarification(exc.resolution), [], state
     except PlanValidationError as exc:
         state.pending_question = None
-        state.pending_plan = None
+        state.pending_proposal = None
+        state.pending_facts = []
         state.pending_candidates = []
         state.pending_constraint = None
         state.pending_interpretations = []
         return f"I could not safely interpret that request: {exc}", [], state
 
     state.pending_question = None
-    state.pending_plan = None
+    state.pending_proposal = None
+    state.pending_facts = []
     state.pending_candidates = []
     state.pending_constraint = None
     state.pending_interpretations = []

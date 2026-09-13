@@ -110,7 +110,15 @@ class PlanCompilerTests(unittest.TestCase):
     def _proposal(self, proposed_filter):
         return PlannerProposal(
             status="ready",
-            filters=[proposed_filter],
+            filters=[
+                proposed_filter,
+                ProposedFilter(
+                    field="Employee_ID",
+                    operator="eq",
+                    value="A11017",
+                    evidence_text="A11017",
+                ),
+            ],
             measure=ProposedMeasureChoice(
                 name="distinct_dates", evidence_text="days"
             ),

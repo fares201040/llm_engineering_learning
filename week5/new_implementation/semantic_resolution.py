@@ -14,8 +14,8 @@ try:
     from .attendance_schema import (
         BUSINESS_PREDICATE_DEFINITIONS,
         CALCULATION_DEFINITIONS,
-        CATEGORICAL_CONSTRAINT_INTRODUCER,
         COLLECTIVE_MODIFIER_PATTERN,
+        CONSTRAINT_CLAUSE_GRAMMAR,
         canonicalize_storage_value,
         FIELD_DEFINITIONS,
         FILTER_OPERATOR_DEFINITIONS,
@@ -33,8 +33,8 @@ except ImportError:  # Direct execution from week5/new_implementation.
     from attendance_schema import (
         BUSINESS_PREDICATE_DEFINITIONS,
         CALCULATION_DEFINITIONS,
-        CATEGORICAL_CONSTRAINT_INTRODUCER,
         COLLECTIVE_MODIFIER_PATTERN,
+        CONSTRAINT_CLAUSE_GRAMMAR,
         canonicalize_storage_value,
         FIELD_DEFINITIONS,
         FILTER_OPERATOR_DEFINITIONS,
@@ -208,7 +208,12 @@ class FieldResolver(ABC):
         raise NotImplementedError
 
     def detect(
-        self, question: str, field: str, context: ResolutionContext
+        self,
+        question: str,
+        field: str,
+        context: ResolutionContext,
+        *,
+        categorical_clauses=None,
     ) -> tuple[SemanticFact, ...]:
         definition = FIELD_DEFINITIONS[field]
         field_facts = tuple(
@@ -228,29 +233,16 @@ class FieldResolver(ABC):
         }:
             return ()
         field_evidence = field_facts[0].evidence_text if field_facts else ""
+        if definition.resolution_kind in {"catalog", "closed_value"}:
+            return field_facts + _categorical_field_facts(
+                question, field, field_evidence, context, categorical_clauses
+            )
         value_search_text = normalize_semantic_text(question).replace(
             normalize_semantic_text(field_evidence), " ", 1
         )
         values: list[tuple[object, str]] = []
         rejected_facts: list[SemanticFact] = []
-        if definition.resolution_kind == "closed_value":
-            values.extend(
-                (value, value)
-                for value in definition.closed_values
-                if evidence_occurs(question, value)
-            )
-            values.extend(
-                (alias.canonical_value, alias.natural_name)
-                for alias in definition.value_aliases
-                if evidence_occurs(question, alias.natural_name)
-            )
-        elif definition.resolution_kind == "catalog":
-            values.extend(
-                (value, value)
-                for value in context.catalog.get(field, ())
-                if evidence_occurs(question, value)
-            )
-        elif definition.resolution_kind == "identifier":
+        if definition.resolution_kind == "identifier":
             match = re.search(r"\b[A-Za-z][A-Za-z0-9_-]*\d[A-Za-z0-9_-]*\b", question)
             if match:
                 values.append((match.group(0), match.group(0)))
@@ -322,22 +314,9 @@ class FieldResolver(ABC):
             match = re.search(pattern, question)
             if match:
                 values.append((match.group(0), match.group(0)))
-        if definition.resolution_kind in {"catalog", "closed_value"}:
-            for literal in _categorical_literal_fragments(field, context):
-                bindings = _field_value_bindings(question, field_evidence, literal)
-                if any(
-                    binding.operator
-                    and FILTER_OPERATOR_DEFINITIONS[binding.operator].uses_text_pattern
-                    for binding in bindings
-                ):
-                    values.append((literal, literal))
         value_facts = []
-        bound_constraints = []
         for value, evidence in dict.fromkeys(values):
-            if definition.resolution_kind not in {
-                "catalog",
-                "closed_value",
-            } and _unsupported_operator_between(question, field_evidence, evidence):
+            if _unsupported_operator_between(question, field_evidence, evidence):
                 rejected_facts.append(
                     _unsupported_fact("unsupported_operator", evidence)
                 )
@@ -348,44 +327,6 @@ class FieldResolver(ABC):
             ):
                 rejected_facts.append(_unsupported_fact("malformed_value", evidence))
                 continue
-            evidence_span = None
-            operator = "eq"
-            if definition.resolution_kind in {"catalog", "closed_value"}:
-                bindings = _field_value_bindings(question, field_evidence, evidence)
-                bound_constraints.extend(
-                    binding.constraint_span for binding in bindings
-                )
-                if bindings and any(
-                    binding.operator not in definition.operators for binding in bindings
-                ):
-                    rejected_facts.append(
-                        _unsupported_fact(
-                            "unsupported_operator",
-                            question[slice(*bindings[0].constraint_span)],
-                        )
-                    )
-                    continue
-                if not bindings:
-                    bound_spans = _implicit_categorical_value_spans(question, evidence)
-                    if bound_spans and _categorical_value_owners(value, context) != {
-                        field
-                    }:
-                        rejected_facts.append(
-                            _unsupported_fact("ambiguous_value_binding", evidence)
-                        )
-                        continue
-                    bindings = tuple(
-                        CategoricalBinding(span, "eq", span) for span in bound_spans
-                    )
-                if len(bindings) > 1:
-                    rejected_facts.append(
-                        _unsupported_fact("ambiguous_value_binding", evidence)
-                    )
-                    continue
-                if not bindings:
-                    continue
-                evidence_span = bindings[0].value_span
-                operator = bindings[0].operator
             value_facts.append(
                 SemanticFact(
                     kind="filter",
@@ -393,25 +334,14 @@ class FieldResolver(ABC):
                     operator=(
                         _numeric_operator(match.group("comparator"))
                         if definition.resolution_kind == "numeric" and match
-                        else operator
+                        else "eq"
                     ),
                     values=(value,),
                     evidence_text=evidence,
-                    evidence_span=evidence_span,
                     origin="question",
                     strength="strong",
                 )
             )
-        if definition.resolution_kind in {"catalog", "closed_value"}:
-            for start, end, operator_end in _field_operator_spans(
-                question, field_evidence
-            ):
-                if not any(lo <= start and end <= hi for lo, hi in bound_constraints):
-                    rejected_facts.append(
-                        _unsupported_fact(
-                            "unsupported_constraint", question[start:operator_end]
-                        )
-                    )
         return field_facts + tuple(value_facts) + tuple(rejected_facts)
 
     @abstractmethod
@@ -464,27 +394,8 @@ def _field_has_collective_modifier(question, start, end):
     )
 
 
-def _field_operator_spans(question, field_evidence):
-    """Find explicit field/operator roles independently of operand resolution."""
-    spans = set()
-    for form in _token_forms(field_evidence):
-        for start, end in _raw_phrase_spans(question, form):
-            if _field_has_collective_modifier(question, start, end):
-                continue
-            operator_ends = [
-                end + token.end()
-                for token in re.finditer(r"\w+|[^\w\s]+", question[end:])
-                if _registered_filter_operator(question[end : end + token.end()])[0]
-            ]
-            if operator_ends or re.search(
-                CATEGORICAL_CONSTRAINT_INTRODUCER, question[:start], re.I
-            ):
-                spans.add((start, end, max(operator_ends, default=end)))
-    return tuple(sorted(spans))
-
-
-def _field_value_bindings(question, field_evidence, value_evidence):
-    """Retain nearest occurrences only after proving a field/value relation."""
+def _adjacent_categorical_bindings(question, field_evidence, value_evidence):
+    """Bind value-as-field-modifier phrases outside explicit consumed clauses."""
     value_spans = _raw_phrase_spans(question, value_evidence)
     field_spans = {
         span
@@ -498,9 +409,6 @@ def _field_value_bindings(question, field_evidence, value_evidence):
         field_is_subject = re.search(
             r"\b(?:which|by|per|each|every|all|any)\s*$", question[:field_start], re.I
         )
-        explicit_constraint = re.search(
-            CATEGORICAL_CONSTRAINT_INTRODUCER, question[:field_start], re.I
-        )
         for value_start, value_end in value_spans:
             if not (field_end <= value_start or value_end <= field_start):
                 continue
@@ -508,21 +416,13 @@ def _field_value_bindings(question, field_evidence, value_evidence):
             adjacent = not gap.strip() and not (
                 field_end <= value_start and field_is_subject
             )
-            operator_role, operator = (
-                _registered_filter_operator(gap)
-                if field_end <= value_start
-                else (False, None)
-            )
-            unrepresented = (
-                field_end <= value_start and explicit_constraint and bool(gap.strip())
-            )
-            if adjacent or operator_role or unrepresented:
+            if adjacent:
                 candidates.append(
                     (
                         len(normalize_semantic_text(gap)),
                         CategoricalBinding(
                             (value_start, value_end),
-                            "eq" if adjacent else operator,
+                            "eq",
                             (min(field_start, value_start), max(field_end, value_end)),
                         ),
                     )
@@ -532,6 +432,366 @@ def _field_value_bindings(question, field_evidence, value_evidence):
     distance = min(item[0] for item in candidates)
     nearest = {binding for gap, binding in candidates if gap == distance}
     return tuple(sorted(nearest, key=lambda item: item.value_span))
+
+
+@dataclass(frozen=True)
+class CategoricalClause:
+    field: str
+    operator: FilterOperator | None
+    field_span: tuple[int, int]
+    operator_span: tuple[int, int]
+    operand_span: tuple[int, int]
+    consumed_span: tuple[int, int]
+    values: tuple[str | float, ...] = ()
+    member_spans: tuple[tuple[int, int], ...] = ()
+    violation: str | None = None
+
+
+def _registry_field_occurrences(question):
+    candidates = {
+        (field, start, end)
+        for field, definition in FIELD_DEFINITIONS.items()
+        if definition.planner_visible
+        for phrase in definition.natural_names
+        for form in _token_forms(phrase)
+        for start, end in _raw_phrase_spans(question, form)
+    }
+    return tuple(
+        sorted(
+            (
+                item
+                for item in candidates
+                if not any(
+                    other[1] <= item[1]
+                    and item[2] <= other[2]
+                    and other[2] - other[1] > item[2] - item[1]
+                    for other in candidates
+                )
+            ),
+            key=lambda item: (item[1], -item[2], item[0]),
+        )
+    )
+
+
+def _operator_prefix(question, start, end):
+    matches = []
+    for token in re.finditer(r"\w+|[^\w\s]+", question[start:end]):
+        stop = start + token.end()
+        recognized, operator = _registered_filter_operator(question[start:stop])
+        if recognized:
+            matches.append((stop, operator))
+    if not matches:
+        return False, None, start
+    stop, operator = max(matches, key=lambda item: item[0])
+    return True, operator, stop
+
+
+def _trim_operand_span(question, start, end):
+    while start < end and question[start].isspace():
+        start += 1
+    while end > start and (question[end - 1].isspace() or question[end - 1] in "?.!"):
+        end -= 1
+    return start, end
+
+
+def _resolve_complete_operand(question, field, operator, span, context):
+    """Resolve all source characters and every list member, or return no values."""
+    registry = ResolverRegistry.default()
+    start, end = _trim_operand_span(question, *span)
+    if start == end or operator not in FIELD_DEFINITIONS[field].operators:
+        return (), (), "unsupported_constraint"
+
+    def atom(lo, hi):
+        lo, hi = _trim_operand_span(question, lo, hi)
+        if lo == hi:
+            return None
+        raw = question[lo:hi]
+        result = registry.canonicalize(field, raw, raw, context, operator=operator)
+        if result.status == "resolved" and len(result.values) == 1:
+            return result.values[0], (lo, hi)
+        return None
+
+    if operator != "in":
+        resolved = atom(start, end)
+        return (
+            ((resolved[0],), (resolved[1],), None)
+            if resolved
+            else ((), (), "unsupported_constraint")
+        )
+    separators = tuple(
+        re.finditer(
+            CONSTRAINT_CLAUSE_GRAMMAR["list_separator"], question[start:end], re.I
+        )
+    )
+    memo = {}
+
+    def members(cursor):
+        if cursor in memo:
+            return memo[cursor]
+        solutions = []
+        endpoints = [
+            (start + match.start(), start + match.end())
+            for match in separators
+            if start + match.start() >= cursor
+        ]
+        for stop, following in [*endpoints, (end, None)]:
+            resolved = atom(cursor, stop)
+            if resolved is None:
+                continue
+            tails = ((),) if following is None else members(following)
+            for tail in tails:
+                solution = (resolved, *tail)
+                if solution not in solutions:
+                    solutions.append(solution)
+                if len(solutions) > 1:
+                    memo[cursor] = tuple(solutions)
+                    return memo[cursor]
+        memo[cursor] = tuple(solutions)
+        return memo[cursor]
+
+    solutions = members(start)
+    if len(solutions) != 1:
+        return (
+            (),
+            (),
+            "ambiguous_value_binding" if solutions else "unsupported_constraint",
+        )
+    return (
+        tuple(item[0] for item in solutions[0]),
+        tuple(item[1] for item in solutions[0]),
+        None,
+    )
+
+
+def _clause_operand_ends(question, start, fields):
+    """Separate clauses only at independently registered field or scope roles."""
+    hard_end = len(question)
+    for _, field_start, field_end in fields:
+        if field_start <= start or not question[field_end:].strip(" \t\r\n?.!"):
+            continue
+        separator = re.search(
+            CONSTRAINT_CLAUSE_GRAMMAR["coordinator"], question[start:field_start], re.I
+        )
+        if separator:
+            hard_end = min(hard_end, start + separator.start())
+    ends = {hard_end}
+    ends.update(
+        start + match.start()
+        for match in re.finditer(
+            CONSTRAINT_CLAUSE_GRAMMAR["identity_scope"], question[start:hard_end], re.I
+        )
+    )
+    field_matches = [(field, question[lo:hi]) for field, lo, hi in fields]
+    for fact in _grouping_facts(question, field_matches):
+        ends.update(
+            lo
+            for lo, _ in _raw_phrase_spans(question, fact.evidence_text)
+            if start <= lo < hard_end
+        )
+    for reference_start, _ in TemporalResolver.reference_spans(question):
+        if start <= reference_start < hard_end:
+            _, _, operator_start = TemporalResolver._operator(
+                question[start:reference_start]
+            )
+            if operator_start is not None:
+                ends.add(start + operator_start)
+    return tuple(sorted(ends, reverse=True))
+
+
+def _parse_categorical_clauses(question, context, *, excluded_spans=()):
+    fields = tuple(
+        item
+        for item in _registry_field_occurrences(question)
+        if not any(lo <= item[1] and item[2] <= hi for lo, hi in excluded_spans)
+    )
+    value_spans = {
+        span
+        for target, definition in FIELD_DEFINITIONS.items()
+        if definition.resolution_kind in {"catalog", "closed_value"}
+        for value in (
+            *definition.closed_values,
+            *context.catalog.get(target, ()),
+            *(alias.natural_name for alias in definition.value_aliases),
+        )
+        for span in _raw_phrase_spans(question, value)
+    }
+    projection = re.search(CONSTRAINT_CLAUSE_GRAMMAR["projection"], question, re.I)
+    projection_fields = []
+    if projection:
+        remainder = question[projection.start(1) : projection.end(1)]
+        projection_fields = [
+            item
+            for item in fields
+            if projection.start(1) <= item[1] and item[2] <= projection.end(1)
+        ]
+        for _, lo, hi in reversed(projection_fields):
+            lo, hi = lo - projection.start(1), hi - projection.start(1)
+            remainder = remainder[:lo] + " " * (hi - lo) + remainder[hi:]
+        if re.sub(r"\b(?:and|the|only)\b|[\s,?.!]", "", remainder, flags=re.I):
+            projection_fields = []
+    clauses = []
+    for field, start, end in fields:
+        definition = FIELD_DEFINITIONS[field]
+        if definition.resolution_kind not in {"catalog", "closed_value"}:
+            continue
+        if any(
+            lo <= start < hi for clause in clauses for lo, hi in (clause.consumed_span,)
+        ) or _field_has_collective_modifier(question, start, end):
+            continue
+        recognized, operator, operator_end = _operator_prefix(
+            question, end, len(question)
+        )
+        if not recognized and (
+            any(
+                lo <= start and end <= hi and (lo, hi) != (start, end)
+                for lo, hi in value_spans
+            )
+            or (field, start, end) in projection_fields
+            or any(
+                not question[rank.end() : start].strip()
+                for rank in re.finditer(
+                    ORDERING_ROLE_PATTERNS["limit"], question[:start], re.I
+                )
+            )
+        ):
+            continue
+        if not recognized and re.match(r"\s*[,;?!]", question[end:]):
+            continue
+        operator = operator if recognized else "eq"
+        operand_start = operator_end if recognized else end
+        candidates = _clause_operand_ends(question, operand_start, fields)
+        resolved = []
+        for candidate_end in candidates:
+            span = _trim_operand_span(question, operand_start, candidate_end)
+            values, member_spans, violation = _resolve_complete_operand(
+                question, field, operator, span, context
+            )
+            if violation is None:
+                resolved.append((span, values, member_spans))
+        non_constraint_role = re.search(
+            CONSTRAINT_CLAUSE_GRAMMAR["non_constraint_prefix"], question[:start], re.I
+        )
+        if (
+            not recognized
+            and not resolved
+            and (non_constraint_role or not question[end:].strip(" \t\r\n?.!"))
+        ):
+            continue
+        span, values, member_spans = (
+            resolved[0]
+            if resolved
+            else (_trim_operand_span(question, operand_start, candidates[0]), (), ())
+        )
+        violation = (
+            None
+            if resolved
+            else "unsupported_constraint"
+            if operator in definition.operators
+            else "unsupported_operator"
+        )
+        if len(resolved) > 1:
+            violation = "ambiguous_value_binding"
+        if not recognized and resolved:
+            preposed = any(
+                value_end <= start and not question[value_end:start].strip()
+                for value in (
+                    *definition.closed_values,
+                    *context.catalog.get(field, ()),
+                )
+                for _, value_end in _raw_phrase_spans(question, value)
+            )
+            if preposed:
+                violation = "ambiguous_value_binding"
+        clauses.append(
+            CategoricalClause(
+                field,
+                operator,
+                (start, end),
+                (end, operator_end),
+                span,
+                (start, max(end, span[1])),
+                values if violation is None else (),
+                member_spans if violation is None else (),
+                violation,
+            )
+        )
+    return tuple(clauses)
+
+
+def _categorical_field_facts(question, field, field_evidence, context, clauses=None):
+    clauses = (
+        _parse_categorical_clauses(question, context) if clauses is None else clauses
+    )
+    facts = []
+    for clause in clauses:
+        if clause.field != field:
+            continue
+        if clause.violation:
+            facts.append(
+                _unsupported_fact(
+                    clause.violation, question[slice(*clause.consumed_span)].strip()
+                )
+            )
+        else:
+            facts.append(
+                SemanticFact(
+                    kind="filter",
+                    field=field,
+                    operator=clause.operator,
+                    values=clause.values,
+                    evidence_text=question[slice(*clause.operand_span)],
+                    evidence_span=clause.operand_span,
+                    origin="question",
+                    strength="strong",
+                )
+            )
+    if any(
+        clause.field == field and clause.violation == "ambiguous_value_binding"
+        for clause in clauses
+    ):
+        return tuple(facts)
+    definition = FIELD_DEFINITIONS[field]
+    values = [
+        (value, value)
+        for value in (*definition.closed_values, *context.catalog.get(field, ()))
+    ]
+    values.extend(
+        (alias.canonical_value, alias.natural_name)
+        for alias in definition.value_aliases
+    )
+    for value, evidence in dict.fromkeys(values):
+        bindings = _adjacent_categorical_bindings(question, field_evidence, evidence)
+        if not bindings:
+            spans = _implicit_categorical_value_spans(question, evidence)
+            if spans and _categorical_value_owners(value, context) != {field}:
+                facts.append(_unsupported_fact("ambiguous_value_binding", evidence))
+                continue
+            bindings = tuple(CategoricalBinding(span, "eq", span) for span in spans)
+        bindings = tuple(
+            binding
+            for binding in bindings
+            if not any(
+                binding.value_span[0] < clause.consumed_span[1]
+                and clause.consumed_span[0] < binding.value_span[1]
+                for clause in clauses
+            )
+        )
+        if len(bindings) > 1:
+            facts.append(_unsupported_fact("ambiguous_value_binding", evidence))
+        elif bindings:
+            facts.append(
+                SemanticFact(
+                    kind="filter",
+                    field=field,
+                    operator="eq",
+                    values=(value,),
+                    evidence_text=evidence,
+                    evidence_span=bindings[0].value_span,
+                    origin="question",
+                    strength="strong",
+                )
+            )
+    return tuple(facts)
 
 
 def _categorical_literal_fragments(field, context):
@@ -676,7 +936,11 @@ class EntityResolver(FieldResolver):
             for span in _raw_phrase_spans(question, phrase)
         ]
         non_entity_field_spans = []
-        categorical_operator_spans = []
+        categorical_clauses = _parse_categorical_clauses(question, context)
+        categorical_operator_spans = [
+            clause.operator_span for clause in categorical_clauses
+        ]
+        protected_spans.extend(clause.consumed_span for clause in categorical_clauses)
         for target, definition in FIELD_DEFINITIONS.items():
             if definition.resolution_kind in {"entity", "identifier"}:
                 continue
@@ -686,14 +950,6 @@ class EntityResolver(FieldResolver):
                 for span in _raw_phrase_spans(question, phrase)
             ]
             non_entity_field_spans.extend(field_spans)
-            if definition.resolution_kind in {"catalog", "closed_value"}:
-                categorical_operator_spans.extend(
-                    (field_end, operator_end)
-                    for phrase in definition.natural_names
-                    for _, field_end, operator_end in _field_operator_spans(
-                        question, phrase
-                    )
-                )
             if field_spans:
                 values = (*context.catalog.get(target, ()), *definition.closed_values)
                 protected_spans.extend(
@@ -701,13 +957,6 @@ class EntityResolver(FieldResolver):
                     for value in values
                     for span in _raw_phrase_spans(question, value)
                 )
-                if definition.resolution_kind in {"catalog", "closed_value"}:
-                    protected_spans.extend(
-                        binding.constraint_span
-                        for phrase in definition.natural_names
-                        for value in _categorical_literal_fragments(target, context)
-                        for binding in _field_value_bindings(question, phrase, value)
-                    )
         syntax_spans = []
         for match in re.finditer(
             r"\b(?P<name>[^\W\d_][\w'-]*(?:\s+[^\W\d_][\w'-]*)*)['’]s\b", question
@@ -1283,17 +1532,26 @@ class ResolverRegistry:
         if definition is None or not definition.filterable:
             return ResolutionOutcome("unknown")
         operator_definition = FILTER_OPERATOR_DEFINITIONS.get(operator)
+        pattern_literals = (
+            tuple(
+                value
+                for value in _categorical_literal_fragments(field, context)
+                if normalize_semantic_text(value) == normalize_semantic_text(raw_value)
+            )
+            if definition.resolution_kind in {"catalog", "closed_value"}
+            else ()
+        )
         if (
             operator in definition.operators
             and operator_definition is not None
             and operator_definition.uses_text_pattern
             and definition.resolution_kind in {"catalog", "closed_value"}
             and isinstance(raw_value, str)
-            and raw_value in _categorical_literal_fragments(field, context)
+            and len(pattern_literals) == 1
         ):
             # Pattern operands are literals, not incomplete names to expand to a
             # guessed member. Independent filter facts still ground the compiler.
-            return ResolutionOutcome("resolved", (raw_value,))
+            return ResolutionOutcome("resolved", pattern_literals)
         return self.for_kind(definition.resolution_kind).canonicalize(
             field, raw_value, evidence_text, context
         )
@@ -1727,6 +1985,15 @@ def detect_semantic_facts(
                 + " " * (end - start)
                 + semantic_question[end:]
             )
+    categorical_clauses = _parse_categorical_clauses(
+        question,
+        context,
+        excluded_spans=tuple(
+            fact.evidence_span
+            for fact in facts
+            if fact.kind == "entity" and fact.evidence_span is not None
+        ),
+    )
     field_matches = [
         (field, phrase)
         for field, definition in FIELD_DEFINITIONS.items()
@@ -1765,7 +2032,14 @@ def detect_semantic_facts(
             continue
         facts.extend(
             registry.for_kind(definition.resolution_kind).detect(
-                semantic_question, field, context
+                semantic_question,
+                field,
+                context,
+                **(
+                    {"categorical_clauses": categorical_clauses}
+                    if definition.resolution_kind in {"catalog", "closed_value"}
+                    else {}
+                ),
             )
         )
     for field, definition in FIELD_DEFINITIONS.items():
@@ -1776,7 +2050,10 @@ def detect_semantic_facts(
         ):
             facts.extend(
                 registry.for_kind(definition.resolution_kind).detect(
-                    semantic_question, field, context
+                    semantic_question,
+                    field,
+                    context,
+                    categorical_clauses=categorical_clauses,
                 )
             )
     facts.extend(
@@ -2017,7 +2294,7 @@ def _executable_choice_facts(question, field_matches, facts, *, original_questio
         add("unsupported", rank_clause.group(0), concept_name="unsupported_constraint")
 
     projection_text = normalize_semantic_text(original_question)
-    projection_pattern = r"\b(?:show|list|display|select)\s+(.+?)(?:\s+(?:from|for|where|with|ordered|sorted)\b|$)"
+    projection_pattern = CONSTRAINT_CLAUSE_GRAMMAR["projection"]
     projection = re.search(projection_pattern, projection_text)
     raw_projection = re.search(projection_pattern, original_question, re.I)
     if projection and not any(

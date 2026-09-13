@@ -1040,10 +1040,18 @@ FILTER_OPERATOR_DEFINITIONS = MappingProxyType(
     }
 )
 
-# A constraint introducer gives an unrecognized relation a fail-closed role.
-CATEGORICAL_CONSTRAINT_INTRODUCER = r"\b(?:where|with|whose)\s*$"
+# Clause grammar is independent of catalog membership and optional introducers.
 UNSUPPORTED_FILTER_OPERATOR_PATTERN = r"\b(?:match(?:es)?|regex|ends? with)\b"
 COLLECTIVE_MODIFIER_PATTERN = r"(?:combined|in total)"
+CONSTRAINT_CLAUSE_GRAMMAR = MappingProxyType(
+    {
+        "coordinator": r"(?:\band\b|[,;])\s*(?:(?:where|with)\s+)?$",
+        "list_separator": r",|\band\b",
+        "identity_scope": r"\bfor\b",
+        "non_constraint_prefix": r"\b(?:which|what|by|per|each|every|all|any|show|list|display)\s*$",
+        "projection": r"\b(?:show|list|display|select)\s+(.+?)(?:\s+(?:from|for|where|with|ordered|sorted)\b|$)",
+    }
+)
 
 
 # Shared grammatical roles used before categorical literals become constraints.

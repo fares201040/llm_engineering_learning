@@ -20,6 +20,93 @@ PRIVATE_FIXTURES_AVAILABLE = (
 
 
 class BaselineCapabilityParityTests(unittest.TestCase):
+    def test_incomplete_or_unsupported_catalog_clause_never_retrieves(self):
+        for introducer in ("", "where "):
+            for clause in (
+                "Department equals Sales North",
+                "Department in Sales and Unknown",
+                "Department contains Sales North",
+                "Department starts with Sales North",
+                "Department sounds like Sales",
+                "Department resembles Sales",
+                "Department is approximately Sales",
+            ):
+                with self.subTest(introducer=introducer, clause=clause):
+                    self.store.get.reset_mock()
+                    with patch.object(
+                        self.answer,
+                        "load_attendance_catalog_candidates",
+                        return_value={"Department": ("Sales", "Support")},
+                    ):
+                        with self.assertRaises(self.answer.SemanticPlanValidationError):
+                            self.answer.fetch_context(
+                                f"Count records {introducer}{clause}"
+                            )
+                    self.store.get.assert_not_called()
+
+    def test_complete_lists_and_multiple_clauses_execute_all_constraints(self):
+        for row, department in zip(
+            self.rows, ("Sales", "Support", "Sales", "Sales North", "Operations")
+        ):
+            row["Department"] = department
+        catalog = {"Department": ("Sales", "Support", "Sales North", "Operations")}
+        for clause, expected in (
+            ("Department in Sales and Support and Status is Authorized", 2),
+            ("Department in Sales, Support and Status is Authorized", 2),
+            ("Department in Sales and Support; Status is Authorized", 2),
+            ("Department equals Sales North", 1),
+            ("Department contains Sales North", 1),
+            ("Department equals Sales and Status is Authorized", 1),
+            ("Department in Sales and Support and Total_OT greater than 0", 2),
+        ):
+            with self.subTest(clause=clause):
+                with patch.object(
+                    self.answer,
+                    "load_attendance_catalog_candidates",
+                    return_value=catalog,
+                ):
+                    _, plan, result, _ = self.answer.fetch_context(
+                        f"Count records {clause}"
+                    )
+                self.assertEqual(result["value"], expected)
+                department = next(
+                    item for item in plan.filters if item.field == "Department"
+                )
+                if clause.startswith("Department in"):
+                    self.assertEqual(
+                        (department.operator, department.value),
+                        ("in", ["Sales", "Support"]),
+                    )
+
+    def test_list_members_can_contain_the_conjunction_word(self):
+        for row, department in zip(
+            self.rows,
+            (
+                "Research and Development",
+                "Research and Development",
+                "Sales",
+                "Sales",
+                "Support",
+            ),
+        ):
+            row["Department"] = department
+        with patch.object(
+            self.answer,
+            "load_attendance_catalog_candidates",
+            return_value={
+                "Department": ("Research and Development", "Sales", "Support")
+            },
+        ):
+            _, plan, result, _ = self.answer.fetch_context(
+                "Count records Department in Research and Development and Sales"
+            )
+        department = next(item for item in plan.filters if item.field == "Department")
+        self.assertEqual(
+            (department.operator, department.value),
+            ("in", ["Research and Development", "Sales"]),
+        )
+        self.assertEqual(result["value"], 4)
+
     def test_unbound_catalog_operator_rejects_instead_of_counting_every_record(self):
         for prefix in ("Count records where", "Count records"):
             for grammar in (

@@ -14,6 +14,95 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class BaselineOrderingGrammarTests(unittest.TestCase):
+    def test_explicit_categorical_operand_is_never_prefix_truncated(self):
+        context = ResolutionContext({"Department": ("Sales", "Support")})
+        for clause in (
+            "Department equals Sales North",
+            "Department in Sales and Unknown",
+            "Department contains Sales North",
+            "Department starts with Sales North",
+        ):
+            for introducer in ("", "where "):
+                with self.subTest(clause=clause, introducer=introducer):
+                    facts = detect_semantic_facts(
+                        f"Count records {introducer}{clause}", context
+                    )
+                    self.assertTrue(
+                        [
+                            fact
+                            for fact in facts
+                            if fact.kind == "unsupported" and fact.strength == "strong"
+                        ]
+                    )
+                    self.assertFalse(
+                        [
+                            fact
+                            for fact in facts
+                            if fact.kind == "filter" and fact.field == "Department"
+                        ]
+                    )
+
+    def test_unregistered_field_relation_is_a_clause_without_where(self):
+        context = ResolutionContext({"Department": ("Sales",)})
+        for relation in ("sounds like", "resembles", "is approximately"):
+            with self.subTest(relation=relation):
+                facts = detect_semantic_facts(
+                    f"Count records Department {relation} Sales", context
+                )
+                self.assertTrue(
+                    [
+                        fact
+                        for fact in facts
+                        if fact.kind == "unsupported" and fact.strength == "strong"
+                    ]
+                )
+                self.assertFalse(
+                    [
+                        fact
+                        for fact in facts
+                        if fact.kind == "filter" and fact.field == "Department"
+                    ]
+                )
+
+    def test_complete_categorical_lists_and_conjoined_clauses_are_grounded(self):
+        context = ResolutionContext(
+            {"Department": ("Sales", "Support", "Research and Development")}
+        )
+        for members, expected in (
+            ("Sales and Support", ("Sales", "Support")),
+            ("Sales, Support", ("Sales", "Support")),
+            (
+                "Research and Development and Sales",
+                ("Research and Development", "Sales"),
+            ),
+        ):
+            question = f"Count records Department in {members} and Status is Authorized"
+            with self.subTest(members=members):
+                facts = detect_semantic_facts(question, context)
+                self.assertFalse([fact for fact in facts if fact.kind == "unsupported"])
+                self.assertIn(
+                    ("Department", "in", expected),
+                    {
+                        (fact.field, fact.operator, fact.values)
+                        for fact in facts
+                        if fact.kind == "filter"
+                    },
+                )
+                self.assertIn(
+                    ("Status", "eq", ("Authorized",)),
+                    {
+                        (fact.field, fact.operator, fact.values)
+                        for fact in facts
+                        if fact.kind == "filter"
+                    },
+                )
+                department = next(
+                    fact
+                    for fact in facts
+                    if fact.kind == "filter" and fact.field == "Department"
+                )
+                self.assertEqual(question[slice(*department.evidence_span)], members)
+
     def test_unbound_categorical_operator_operand_cannot_disappear(self):
         context = ResolutionContext({"Department": ("Sales",)})
         for prefix in ("Count records where", "Count records"):

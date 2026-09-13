@@ -14,6 +14,46 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class BaselineOrderingGrammarTests(unittest.TestCase):
+    def test_bound_value_occurrence_does_not_hide_independent_ranking(self):
+        facts = detect_semantic_facts(
+            "Which department has the highest total overtime where Position equal to Highest?",
+            ResolutionContext({"Position": ("Highest",)}),
+        )
+        self.assertEqual(
+            [(fact.field, fact.direction) for fact in facts if fact.kind == "ranking"],
+            [("value", "desc")],
+        )
+
+    def test_quantified_relation_subjects_remain_grouping_fields(self):
+        for question, field in (
+            ("How many records does each department have?", "Department"),
+            ("How many records does each employee have?", "Employee_ID"),
+            ("Count records that belong to each employee", "Employee_ID"),
+        ):
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(question, ResolutionContext({}))
+                self.assertFalse(
+                    [fact for fact in facts if fact.kind == "entity"], facts
+                )
+                self.assertEqual(
+                    {fact.field for fact in facts if fact.kind == "group_by"}, {field}
+                )
+
+    def test_superlative_requires_a_ranking_clause_outside_bound_values(self):
+        facts = detect_semantic_facts(
+            "Count records by department highest", ResolutionContext({})
+        )
+        self.assertFalse([fact for fact in facts if fact.kind == "ranking"])
+        self.assertTrue([fact for fact in facts if fact.kind == "unsupported"])
+        facts = detect_semantic_facts(
+            "Which department has the highest total overtime where Position equal to Lowest Officer?",
+            ResolutionContext({"Position": ("Lowest Officer",)}),
+        )
+        self.assertEqual(
+            [(fact.field, fact.direction) for fact in facts if fact.kind == "ranking"],
+            [("value", "desc")],
+        )
+
     def test_question_verb_prefix_is_not_part_of_possessive_employee_name(self):
         facts = detect_semantic_facts(
             "What were Morgan River's total worked hours?", ResolutionContext({})

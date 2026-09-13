@@ -20,6 +20,28 @@ PRIVATE_FIXTURES_AVAILABLE = (
 
 
 class BaselineCapabilityParityTests(unittest.TestCase):
+    def test_bound_catalog_superlative_preserves_all_groups(self):
+        for title in ("Highest Officer", "Lowest Officer", "Latest Officer"):
+            with self.subTest(title=title):
+                for index, row in enumerate(self.rows):
+                    row.update(
+                        Position=title, Department="Alpha" if index < 3 else "Beta"
+                    )
+                with patch.object(
+                    self.answer,
+                    "load_attendance_catalog_candidates",
+                    return_value={"Position": (title,)},
+                ):
+                    _, plan, calculation, _ = self.answer.fetch_context(
+                        f"Count attendance records by Department where Position equal to {title}"
+                    )
+                self.assertIsNone(plan.order_by)
+                self.assertIsNone(plan.limit)
+                self.assertEqual(len(calculation["rows"]), 2)
+                self.assertEqual(
+                    sorted(row["value"] for row in calculation["rows"]), [2, 3]
+                )
+
     def test_behavior_compares_predicate_conjunctions_without_order(self):
         test = TestQuestion(
             question="How many days did not attend?",

@@ -288,6 +288,118 @@ class RetrievalBoundaryTests(unittest.TestCase):
 
 
 class ProposalOperationNormalizationTests(unittest.TestCase):
+    def test_count_defaults_are_rejected_for_a_different_grounded_operation(self):
+        for question in (
+            "What is total overtime?",
+            "Show attendance on 2026-09-01",
+            "Find unusual attendance records",
+        ):
+            for choices in (
+                dict(
+                    measure=dict(name="attendance_records", evidence_text="attendance")
+                ),
+                dict(calculation=dict(operation="count", evidence_text="attendance")),
+            ):
+                with self.subTest(question=question, choices=choices):
+                    resolution = answer.ResolutionContext({})
+                    facts = answer.detect_semantic_facts(question, resolution)
+                    raw = dict(
+                        status="ready",
+                        answer_contract=dict(shape="scalar", unit="records"),
+                        **choices,
+                    )
+                    proposal = answer.PlannerProposal.model_validate(
+                        answer._overlay_authoritative_facts(raw, facts)
+                    )
+                    result = answer.compile_proposal(
+                        proposal, answer.CompilationContext(question, facts, resolution)
+                    )
+                    self.assertFalse(result.ready)
+                    self.assertTrue(result.violations)
+
+    def test_incompatible_provider_calculation_cannot_be_overwritten(self):
+        question = "What is total overtime?"
+        resolution = answer.ResolutionContext({})
+        facts = answer.detect_semantic_facts(question, resolution)
+        for operation, ready in (("average", False), ("sum", True)):
+            with self.subTest(operation=operation):
+                raw = dict(
+                    status="ready",
+                    calculation=dict(
+                        operation=operation,
+                        field="Total_OT",
+                        evidence_text="total overtime",
+                    ),
+                    answer_contract=dict(
+                        shape="scalar", unit="hours", subject_field="Total_OT"
+                    ),
+                )
+                proposal = answer.PlannerProposal.model_validate(
+                    answer._overlay_authoritative_facts(raw, facts)
+                )
+                result = answer.compile_proposal(
+                    proposal, answer.CompilationContext(question, facts, resolution)
+                )
+                self.assertEqual(result.ready, ready, result.violations)
+                if not ready:
+                    self.assertTrue(result.violations)
+
+    def test_incompatible_provider_measure_cannot_be_overwritten(self):
+        question = "How many dates were worked?"
+        resolution = answer.ResolutionContext({})
+        facts = answer.detect_semantic_facts(question, resolution)
+        for measure, ready in (("employees", False), ("distinct_dates", True)):
+            with self.subTest(measure=measure):
+                raw = dict(
+                    status="ready",
+                    measure=dict(name=measure, evidence_text="dates"),
+                    answer_contract=dict(
+                        shape="scalar", unit="dates", subject_field="Date"
+                    ),
+                )
+                proposal = answer.PlannerProposal.model_validate(
+                    answer._overlay_authoritative_facts(raw, facts)
+                )
+                result = answer.compile_proposal(
+                    proposal, answer.CompilationContext(question, facts, resolution)
+                )
+                self.assertEqual(result.ready, ready, result.violations)
+                if not ready:
+                    self.assertTrue(result.violations)
+
+    def test_incompatible_provider_numerator_cannot_be_overwritten(self):
+        question = "What percentage of records are Authorized?"
+        resolution = answer.ResolutionContext({})
+        facts = answer.detect_semantic_facts(question, resolution)
+        for field, value, ready in (
+            ("Exception", "Absent", False),
+            ("Status", "Authorized", True),
+        ):
+            with self.subTest(field=field):
+                raw = dict(
+                    status="ready",
+                    calculation=dict(
+                        operation="percentage",
+                        evidence_text="percentage",
+                        percentage_condition=dict(
+                            field=field,
+                            operator="eq",
+                            value=value,
+                            evidence_text="Authorized",
+                        ),
+                    ),
+                    answer_contract=dict(shape="scalar", unit="percentage"),
+                )
+                proposal = answer.PlannerProposal.model_validate(
+                    answer._overlay_authoritative_facts(raw, facts)
+                )
+                result = answer.compile_proposal(
+                    proposal, answer.CompilationContext(question, facts, resolution)
+                )
+                self.assertEqual(result.ready, ready, result.violations)
+                if not ready:
+                    self.assertTrue(result.violations)
+
     def test_only_logically_redundant_provider_exclusion_is_removed(self):
         question = "Count scheduled working days"
         resolution = answer.ResolutionContext({})
@@ -328,11 +440,11 @@ class ProposalOperationNormalizationTests(unittest.TestCase):
                         [("Day_Type", "eq", "Working Day")],
                     )
 
-    def test_same_subject_provider_count_cannot_replace_grounded_distinct_count(self):
+    def test_same_subject_count_is_not_equivalent_to_distinct_count(self):
         question = "How many scheduled working days were there?"
         resolution = answer.ResolutionContext({})
         facts = answer.detect_semantic_facts(question, resolution)
-        for field, ready in (("Date", True), ("Employee_ID", False)):
+        for field in ("Date", "Employee_ID"):
             with self.subTest(field=field):
                 raw = dict(
                     status="ready",
@@ -350,12 +462,8 @@ class ProposalOperationNormalizationTests(unittest.TestCase):
                 result = answer.compile_proposal(
                     proposal, answer.CompilationContext(question, facts, resolution)
                 )
-                self.assertEqual(result.ready, ready, result.violations)
-                if ready:
-                    self.assertEqual(
-                        result.executable_plan.aggregation, "distinct_count"
-                    )
-                    self.assertEqual(result.executable_plan.aggregation_field, "Date")
+                self.assertFalse(result.ready)
+                self.assertTrue(result.violations)
 
     def test_global_complete_facts_remove_only_default_interpretation_ambiguity(self):
         for question in (
@@ -400,7 +508,7 @@ class ProposalOperationNormalizationTests(unittest.TestCase):
                     proposal.interpretation_candidates, raw["interpretation_candidates"]
                 )
 
-    def test_employee_measure_is_a_qualifier_for_a_grounded_scoped_sum(self):
+    def test_scoped_employee_count_is_not_equivalent_to_a_grounded_sum(self):
         question = "What is total worked hours for A10001?"
         resolution = answer.ResolutionContext({})
         facts = answer.detect_semantic_facts(question, resolution)
@@ -422,11 +530,10 @@ class ProposalOperationNormalizationTests(unittest.TestCase):
         result = answer.compile_proposal(
             proposal, answer.CompilationContext(question, facts, resolution)
         )
-        self.assertTrue(result.ready, result.violations)
-        self.assertEqual(result.executable_plan.aggregation, "sum")
-        self.assertIsNone(result.executable_plan.measure)
+        self.assertFalse(result.ready)
+        self.assertTrue(result.violations)
 
-    def test_distinct_count_default_cannot_replace_registered_narrative_intent(self):
+    def test_distinct_count_is_rejected_for_registered_narrative_intent(self):
         question = "Which employees show unusual attendance patterns?"
         resolution = answer.ResolutionContext({})
         facts = answer.detect_semantic_facts(question, resolution)
@@ -448,9 +555,8 @@ class ProposalOperationNormalizationTests(unittest.TestCase):
         result = answer.compile_proposal(
             proposal, answer.CompilationContext(question, facts, resolution)
         )
-        self.assertTrue(result.ready, result.violations)
-        self.assertEqual(result.executable_plan.mode, "semantic")
-        self.assertEqual(result.executable_plan.answer_contract.shape, "narrative")
+        self.assertFalse(result.ready)
+        self.assertTrue(result.violations)
 
     def test_registered_narrative_intent_corrects_only_narrative_capability_default(
         self,
@@ -500,7 +606,7 @@ class ProposalOperationNormalizationTests(unittest.TestCase):
         self.assertTrue(result.ready, result.violations)
         self.assertEqual(result.executable_plan.filters, [])
 
-    def test_generic_provider_count_cannot_replace_grounded_operation(self):
+    def test_missing_provider_operation_uses_complete_grounded_facts(self):
         for question, operation, field, shape in (
             ("How many dates were worked?", "distinct_count", "Date", "scalar"),
             ("What is total overtime?", "sum", "Total_OT", "scalar"),
@@ -512,10 +618,6 @@ class ProposalOperationNormalizationTests(unittest.TestCase):
                 facts = answer.detect_semantic_facts(question, resolution)
                 raw = dict(
                     status="ready",
-                    measure=dict(name="attendance_records", evidence_text=question),
-                    calculation=dict(
-                        operation="count", field=None, evidence_text=question
-                    ),
                     answer_contract=dict(shape="scalar", unit="records"),
                 )
                 proposal = answer.PlannerProposal.model_validate(
@@ -1761,14 +1863,14 @@ class ExecutablePlanSafetyTests(unittest.TestCase):
                 }
             ],
             "measure": {
-                "name": "employees",
-                "evidence_text": "employee",
+                "name": "distinct_dates",
+                "evidence_text": "days",
             },
             "answer_contract": {
                 "shape": "scalar",
-                "unit": "employees",
-                "subject_field": "Employee_ID",
-                "grain": ["Employee_ID"],
+                "unit": "dates",
+                "subject_field": "Date",
+                "grain": ["Date"],
             },
         }
         facts = (

@@ -693,39 +693,12 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
     nonaggregate_shape = requested_shape is not None and not (
         measure_facts or calculation_facts
     )
-    generic_count = (
-        raw_calculation.get("operation") == "count"
-        and (
-            raw_calculation.get("field") is None
-            or (
-                len(measure_facts) == 1
-                and raw_calculation.get("field")
-                == MEASURE_DEFINITIONS[next(iter(measure_facts))].aggregation_field
-            )
-        )
-        and raw_calculation.get("percentage_condition") is None
-    )
-    raw_definition = MEASURE_DEFINITIONS.get(raw_measure.get("name"))
-    nonaggregate_count = (
-        nonaggregate_shape
-        and raw_definition is not None
-        and raw_definition.aggregation in {"count", "distinct_count"}
-        and (raw_calculation.get("operation"), raw_calculation.get("field"))
-        == (raw_definition.aggregation, raw_definition.aggregation_field)
-    )
-    if nonaggregate_count or (
-        generic_count and (measure_facts or calculation_facts or nonaggregate_shape)
-    ):
-        # A fieldless or same-subject provider count cannot replace the complete
-        # grounded operation. A different counted subject still requires rejection.
-        prepared["calculation"] = None
-        raw_calculation = {}
-    if nonaggregate_count or (
-        raw_measure.get("name") == "attendance_records"
-        and (calculation_facts or nonaggregate_shape)
-    ):
-        prepared["measure"] = None
     if nonaggregate_shape:
+        if raw_measure or raw_calculation:
+            return {
+                "status": "unsupported",
+                "unsupported_capabilities": ["unsupported_constraint"],
+            }
         prepared["answer_contract"] = {
             "shape": requested_shape,
             "unit": "value",
@@ -734,9 +707,12 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
         }
     if len(measure_facts) == 1 and raw_calculation:
         definition = MEASURE_DEFINITIONS[next(iter(measure_facts))]
-        if (raw_calculation.get("operation"), raw_calculation.get("field")) != (
-            definition.aggregation,
-            definition.aggregation_field,
+        if raw_calculation.get("percentage_condition") is not None or any(
+            raw_calculation.get(key) is not None and raw_calculation[key] != expected
+            for key, expected in (
+                ("operation", definition.aggregation),
+                ("field", definition.aggregation_field),
+            )
         ):
             return {
                 "status": "unsupported",
@@ -744,6 +720,14 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
             }
     if len(calculation_facts) == 1:
         (operation, field), fact = next(iter(calculation_facts.items()))
+        if any(
+            raw_calculation.get(key) is not None and raw_calculation[key] != expected
+            for key, expected in (("operation", operation), ("field", field))
+        ):
+            return {
+                "status": "unsupported",
+                "unsupported_capabilities": ["multi_stage_aggregation"],
+            }
         raw_measure = prepared.get("measure")
         if raw_measure:
             definition = MEASURE_DEFINITIONS.get(raw_measure.get("name"))
@@ -752,20 +736,7 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
                 == (operation, field)
                 or (operation == "percentage" and definition.aggregation_field == field)
             )
-            scoped_subject = (
-                operation != "percentage"
-                and definition is not None
-                and definition.aggregation == "distinct_count"
-                and (raw_calculation.get("operation"), raw_calculation.get("field"))
-                == (operation, field)
-                and any(
-                    item.kind == "filter"
-                    and item.field == definition.aggregation_field
-                    and item.scope != "percentage_numerator"
-                    for item in strong_facts
-                )
-            )
-            if not (equivalent or scoped_subject):
+            if not equivalent:
                 return {
                     "status": "unsupported",
                     "unsupported_capabilities": ["multi_stage_aggregation"],
@@ -841,6 +812,15 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
         }
         if fact.scope == "percentage_numerator":
             if calculation.get("operation") == "percentage":
+                existing = calculation.get("percentage_condition") or {}
+                if any(
+                    key in existing and existing[key] != authoritative[key]
+                    for key in ("field", "operator", "value")
+                ):
+                    return {
+                        "status": "unsupported",
+                        "unsupported_capabilities": ["percentage_population"],
+                    }
                 calculation["percentage_condition"] = authoritative
                 prepared["calculation"] = calculation
                 filters = [
@@ -864,6 +844,12 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
     if len(measure_facts) == 1:
         measure_name, fact = next(iter(measure_facts.items()))
         definition = MEASURE_DEFINITIONS[measure_name]
+        proposed_measure = (prepared.get("measure") or {}).get("name")
+        if proposed_measure is not None and proposed_measure != measure_name:
+            return {
+                "status": "unsupported",
+                "unsupported_capabilities": ["multi_stage_aggregation"],
+            }
         prepared["measure"] = {
             "name": measure_name,
             "evidence_text": fact.evidence_text,

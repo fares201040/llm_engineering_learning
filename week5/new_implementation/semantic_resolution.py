@@ -506,6 +506,19 @@ class EntityResolver(FieldResolver):
             reference = question[start:end]
             if not reference or re.search(r"\d", reference):
                 continue
+            quantified = re.fullmatch(
+                r"(?:each|every|all|any)\s+(?:the\s+)?(.+)",
+                normalize_semantic_text(reference),
+            )
+            if quantified and any(
+                set(_token_forms(quantified.group(1))) & set(_token_forms(phrase))
+                for definition in (
+                    *FIELD_DEFINITIONS.values(),
+                    *MEASURE_DEFINITIONS.values(),
+                )
+                for phrase in definition.natural_names
+            ):
+                continue
             if any(start < stop and begin < end for begin, stop in temporal_spans):
                 continue
             if any(begin <= start and end <= stop for begin, stop in protected_spans):
@@ -1346,7 +1359,18 @@ def _grouping_facts(
 ) -> list[SemanticFact]:
     normalized_question = normalize_semantic_text(question)
     facts = []
-    for field, phrase in field_matches:
+    subject_matches = [
+        (definition.aggregation_field, phrase)
+        for definition in MEASURE_DEFINITIONS.values()
+        if definition.aggregation_field is not None
+        and FIELD_DEFINITIONS[definition.aggregation_field].groupable
+        for phrase in definition.natural_names
+        if not any(
+            set(_token_forms(phrase)) & set(_token_forms(field_phrase))
+            for _, field_phrase in field_matches
+        )
+    ]
+    for field, phrase in [*field_matches, *subject_matches]:
         normalized_phrase = normalize_semantic_text(phrase)
         match = re.search(
             rf"\b(?:by|per|for each|in each|each)\s+(?:the\s+)?{re.escape(normalized_phrase)}\b",
@@ -1465,7 +1489,7 @@ def detect_semantic_facts(
                     strength="strong",
                 )
             )
-    facts.extend(_grouping_facts(question, maximal_field_matches))
+    facts.extend(_grouping_facts(semantic_question, maximal_field_matches))
     facts.extend(_calculation_facts(semantic_question, selected_fields, facts))
     if re.search(r"\b(?:how many|count|number of|total number)\b", question, re.I):
         facts.extend(_earliest_measure_facts(semantic_question))
@@ -1488,6 +1512,27 @@ def detect_semantic_facts(
 def _executable_choice_facts(question, field_matches, facts, *, original_question):
     """Compose executable roles from recognized fields and operation clauses."""
     normalized = normalize_semantic_text(question)
+    for fact in facts:
+        if fact.strength == "strong" and fact.kind == "filter":
+            value_spans = _raw_phrase_spans(normalized, fact.evidence_text)
+            bound_spans = [
+                value_span
+                for value_span in value_spans
+                if fact.field in FIELD_DEFINITIONS
+                and any(
+                    field_end <= value_span[0]
+                    and re.fullmatch(
+                        r"\s*(?:(?:is|equals?|equal to|in|contains|starts with)\s*)?",
+                        normalized[field_end : value_span[0]],
+                    )
+                    for phrase in FIELD_DEFINITIONS[fact.field].natural_names
+                    for _, field_end in _raw_phrase_spans(normalized, phrase)
+                )
+            ]
+            # Preserve a separate grammatical ranking occurrence when the same
+            # token is also the independently bound value of a field.
+            for start, end in bound_spans or value_spans:
+                normalized = normalized[:start] + " " * (end - start) + normalized[end:]
 
     def add(kind, evidence, **values):
         facts.append(
@@ -1601,7 +1646,15 @@ def _executable_choice_facts(question, field_matches, facts, *, original_questio
                 add("group_by", evidence, field=field)
                 grouping = [f for f in facts if f.kind == "group_by"]
         operations = [f for f in facts if f.kind in {"calculation", "measure"}]
-        if grouping and len(operations) == 1:
+        modifies_operation = any(
+            re.match(
+                rf"\s+(?:(?:the|number of|count of)\s+)?{re.escape(form)}\b",
+                normalized[superlative.end() :],
+            )
+            for fact in operations
+            for form in _token_forms(fact.evidence_text)
+        )
+        if grouping and len(operations) == 1 and modifies_operation:
             direction = "desc" if superlative.group(1) == "highest" else "asc"
             add("order_by", superlative.group(0), field="value", direction=direction)
             add("ranking", superlative.group(0), field="value", direction=direction)

@@ -143,29 +143,6 @@ def _unsupported_fact(concept_name: str, evidence_text: str) -> "SemanticFact":
     )
 
 
-def _numeric_operator(comparator: str | None) -> FilterOperator:
-    normalized = normalize_semantic_text(comparator or "")
-    return {
-        "not more than": "lte",
-        "no more than": "lte",
-        "at most": "lte",
-        "not less than": "gte",
-        "no less than": "gte",
-        "at least": "gte",
-        "more than": "gt",
-        "greater than": "gt",
-        "above": "gt",
-        "over": "gt",
-        "less than": "lt",
-        "below": "lt",
-        "under": "lt",
-        "equal to": "eq",
-        "equals": "eq",
-        "is": "eq",
-        "exactly": "eq",
-    }.get(normalized, "eq")
-
-
 class EmployeeReference(BaseModel):
     model_config = ConfigDict(frozen=True)
     employee_id: str
@@ -237,9 +214,6 @@ class FieldResolver(ABC):
             return field_facts + _categorical_field_facts(
                 question, field, field_evidence, context, categorical_clauses
             )
-        value_search_text = normalize_semantic_text(question).replace(
-            normalize_semantic_text(field_evidence), " ", 1
-        )
         values: list[tuple[object, str]] = []
         rejected_facts: list[SemanticFact] = []
         if definition.resolution_kind == "identifier":
@@ -252,51 +226,6 @@ class FieldResolver(ABC):
                 for employee in context.employees
                 if evidence_occurs(question, employee.name)
             )
-        elif definition.resolution_kind == "numeric":
-            number = r"[-+]?\d+(?:\.\d+)?"
-            match = re.search(
-                r"(?<![A-Za-z0-9_])(?P<comparator>not\s+more\s+than|no\s+more\s+than|at\s+most|"
-                r"not\s+less\s+than|no\s+less\s+than|at\s+least|more\s+than|"
-                r"greater\s+than|less\s+than|equal\s+to|above|below|over|under|"
-                rf"equals?|is|exactly)\s+(?P<number>{number})(?![A-Za-z0-9_])",
-                value_search_text,
-                re.I,
-            )
-            if match is None:
-                field_phrase = re.escape(field_facts[0].evidence_text).replace(
-                    r"\ ", r"\s+"
-                )
-                match = re.search(
-                    rf"\b{field_phrase}\b\s+(?:(?P<comparator>equals?|is)\s+)?"
-                    rf"(?P<number>{number})(?![A-Za-z0-9_])",
-                    question,
-                    re.I,
-                )
-            if match:
-                values.append((float(match.group("number")), match.group(0)))
-            else:
-                field_span = _evidence_span(question, field_facts[0].evidence_text)
-                remaining = " ".join(
-                    normalize_semantic_text(question).split()[
-                        field_span[1] if field_span is not None else 0 :
-                    ]
-                )
-                malformed = re.match(
-                    r"(?:not\s+more\s+than|no\s+more\s+than|at\s+most|"
-                    r"not\s+less\s+than|no\s+less\s+than|at\s+least|more\s+than|"
-                    r"greater\s+than|less\s+than|equal\s+to|above|below|over|under|"
-                    r"equals?|is|exactly)\s+(?P<value>\S+)",
-                    remaining,
-                    re.I,
-                )
-                if malformed and not re.match(
-                    r"(?:over|under)\s+(?:the|last|next|this|current)\b",
-                    remaining,
-                    re.I,
-                ):
-                    rejected_facts.append(
-                        _unsupported_fact("malformed_value", malformed.group(0))
-                    )
         elif definition.resolution_kind == "temporal":
             pattern = (
                 r"\b\d{4}-(?:0[1-9]|1[0-2])\b"
@@ -331,11 +260,7 @@ class FieldResolver(ABC):
                 SemanticFact(
                     kind="filter",
                     field=field,
-                    operator=(
-                        _numeric_operator(match.group("comparator"))
-                        if definition.resolution_kind == "numeric" and match
-                        else "eq"
-                    ),
+                    operator="eq",
                     values=(value,),
                     evidence_text=evidence,
                     origin="question",
@@ -579,6 +504,44 @@ def _resolve_complete_operand(question, field, operator, span, context):
     )
 
 
+def _preposed_numeric_clause(question, field, start, end, fields, context):
+    """Prove an operator + complete operand immediately before its numeric field."""
+    if FIELD_DEFINITIONS[field].resolution_kind != "numeric":
+        return None
+    lower = max((hi for _, _, hi in fields if hi <= start), default=0)
+    scope_starts = tuple(
+        lower + match.end()
+        for match in re.finditer(
+            CONSTRAINT_CLAUSE_GRAMMAR["clause_separator"], question[lower:start], re.I
+        )
+    )
+    lower = max(scope_starts, default=lower)
+    for token in re.finditer(r"\w+|[^\w\s]+", question[lower:start]):
+        operator_start = lower + token.start()
+        recognized, operator, operator_end = _operator_prefix(
+            question, operator_start, start, field
+        )
+        if not recognized or operator_end == start:
+            continue
+        span = _trim_operand_span(question, operator_end, start)
+        values, members, violation = _resolve_complete_operand(
+            question, field, operator, span, context
+        )
+        if violation is None or operator != "eq" or scope_starts:
+            return ConstraintClause(
+                field,
+                operator,
+                (start, end),
+                (operator_start, operator_end),
+                span,
+                (operator_start, end),
+                values,
+                members,
+                violation,
+            )
+    return None
+
+
 def _clause_operand_ends(question, start, fields, context, field, operator, cache=None):
     """Keep grounded atoms whole and split only before complete native clauses."""
     cache = {} if cache is None else cache
@@ -604,15 +567,24 @@ def _clause_operand_ends(question, start, fields, context, field, operator, cach
     }
     hard_end = len(question)
     for next_field, field_start, field_end in fields:
-        if field_start <= start or not question[field_end:].strip(" \t\r\n?.!"):
+        if field_start <= start:
             continue
+        preposed = _preposed_numeric_clause(
+            question, next_field, field_start, field_end, fields, context
+        )
+        if not preposed and not question[field_end:].strip(" \t\r\n?.!"):
+            continue
+        clause_start = preposed.consumed_span[0] if preposed else field_start
         separator = re.search(
-            CONSTRAINT_CLAUSE_GRAMMAR["coordinator"], question[start:field_start], re.I
+            CONSTRAINT_CLAUSE_GRAMMAR["coordinator"], question[start:clause_start], re.I
         )
         if not separator:
             continue
         boundary = start + separator.start()
         if any(lo < boundary and field_end <= hi for lo, hi in atomic_spans):
+            continue
+        if preposed and preposed.violation is None:
+            hard_end = min(hard_end, boundary)
             continue
         recognized, next_operator, operand_start = _operator_prefix(
             question, field_end, len(question), next_field
@@ -676,6 +648,17 @@ def _parse_constraint_clauses(
         )
         for span in _raw_phrase_spans(question, value)
     }
+    value_spans.update(
+        span
+        for registry in (
+            BUSINESS_PREDICATE_DEFINITIONS,
+            MEASURE_DEFINITIONS,
+            VALUE_CONCEPT_DEFINITIONS,
+        )
+        for definition in registry.values()
+        for phrase in definition.natural_names
+        for span in _raw_phrase_spans(question, phrase)
+    )
     projection = re.search(CONSTRAINT_CLAUSE_GRAMMAR["projection"], question, re.I)
     projection_fields = []
     if projection:
@@ -706,6 +689,11 @@ def _parse_constraint_clauses(
         recognized, operator, operator_end = _operator_prefix(
             question, end, len(question), field
         )
+        preposed = (
+            _preposed_numeric_clause(question, field, start, end, fields, context)
+            if include_typed
+            else None
+        )
         if not recognized and (
             any(
                 lo <= start and end <= hi and (lo, hi) != (start, end)
@@ -720,13 +708,22 @@ def _parse_constraint_clauses(
             )
         ):
             continue
-        if not recognized and re.match(r"\s*[,;?!]", question[end:]):
+        if not recognized and not preposed and re.match(r"\s*[,;?!]", question[end:]):
             continue
         operator = operator if recognized else "eq"
         operand_start = operator_end if recognized else end
         candidates = _clause_operand_ends(
             question, operand_start, fields, context, field, operator
         )
+        if definition.resolution_kind == "numeric" and any(
+            end <= lo
+            and not question[end:lo].strip()
+            and any(
+                _trim_operand_span(question, end, stop)[1] == hi for stop in candidates
+            )
+            for lo, hi in TemporalResolver.scope_spans(question)
+        ):
+            continue
         resolved = []
         for candidate_end in candidates:
             span = _trim_operand_span(question, operand_start, candidate_end)
@@ -735,13 +732,44 @@ def _parse_constraint_clauses(
             )
             if violation is None:
                 resolved.append((span, values, member_spans))
+        if preposed:
+            tail_empty = not question[end:].strip(" \t\r\n?.!")
+            independent_tail = any(
+                not question[end:candidate].strip() for candidate in candidates
+            )
+            if not recognized and not resolved and (tail_empty or independent_tail):
+                clauses.append(preposed)
+            else:
+                clauses.append(
+                    ConstraintClause(
+                        field,
+                        None,
+                        (start, end),
+                        preposed.operator_span,
+                        (preposed.operand_span[0], candidates[0]),
+                        (preposed.consumed_span[0], candidates[0]),
+                        violation="ambiguous_value_binding",
+                    )
+                )
+            continue
         non_constraint_role = re.search(
             CONSTRAINT_CLAUSE_GRAMMAR["non_constraint_prefix"], question[:start], re.I
         )
         if (
             not recognized
             and not resolved
-            and (non_constraint_role or not question[end:].strip(" \t\r\n?.!"))
+            and (
+                non_constraint_role
+                or not question[end:].strip(" \t\r\n?.!")
+                or (
+                    any(not question[end:candidate].strip() for candidate in candidates)
+                    and re.match(
+                        CONSTRAINT_CLAUSE_GRAMMAR["scope_boundary"],
+                        question[end:],
+                        re.I,
+                    )
+                )
+            )
         ):
             continue
         span, values, member_spans = (
@@ -769,9 +797,12 @@ def _parse_constraint_clauses(
             )
             if preposed:
                 violation = "ambiguous_value_binding"
-        # Other field kinds retain their authoritative detector's rejection path;
-        # this parser contributes only fully proved source provenance for them.
-        if not categorical and violation is not None:
+        # Numeric and categorical facts are owned by this clause parser. Other
+        # typed fields retain their authoritative detector's rejection path.
+        if (
+            definition.resolution_kind not in {"catalog", "closed_value", "numeric"}
+            and violation is not None
+        ):
             continue
         clauses.append(
             ConstraintClause(
@@ -1230,6 +1261,21 @@ class TemporalResolver(FieldResolver):
             )
         )
 
+    @classmethod
+    def scope_spans(cls, question):
+        """Recognize a scope preposition bound to a complete calendar reference."""
+        return tuple(
+            (match.start(), end)
+            for start, end in cls.reference_spans(question)
+            if (
+                match := re.search(
+                    CONSTRAINT_CLAUSE_GRAMMAR["temporal_scope_prefix"],
+                    question[:start],
+                    re.I,
+                )
+            )
+        )
+
     def detect(self, question, field, context):
         # All temporal filters come from the per-literal path, including times.
         return tuple(
@@ -1466,6 +1512,35 @@ class TemporalResolver(FieldResolver):
 
 class NumericResolver(FieldResolver):
     kinds = frozenset({"numeric"})
+
+    def detect(self, question, field, context, *, constraint_clauses=None):
+        fields = super().detect(question, field, context)
+        clauses = (
+            _parse_constraint_clauses(question, context, include_typed=True)
+            if constraint_clauses is None
+            else constraint_clauses
+        )
+        facts = []
+        for clause in clauses:
+            if clause.field != field:
+                continue
+            evidence = question[slice(*clause.consumed_span)].strip()
+            if clause.violation:
+                facts.append(_unsupported_fact(clause.violation, evidence))
+            else:
+                facts.append(
+                    SemanticFact(
+                        kind="filter",
+                        field=field,
+                        operator=clause.operator,
+                        values=clause.values,
+                        evidence_text=evidence,
+                        evidence_span=clause.consumed_span,
+                        origin="question",
+                        strength="strong",
+                    )
+                )
+        return fields + tuple(facts)
 
     def canonicalize(self, field, raw_value, evidence_text, context):
         try:
@@ -2108,6 +2183,8 @@ def detect_semantic_facts(
                 **(
                     {"categorical_clauses": constraint_clauses}
                     if definition.resolution_kind in {"catalog", "closed_value"}
+                    else {"constraint_clauses": constraint_clauses}
+                    if definition.resolution_kind == "numeric"
                     else {}
                 ),
             )

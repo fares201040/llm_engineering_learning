@@ -65,6 +65,128 @@ def registered_test_alias(field, alias):
 
 
 class BaselineOrderingGrammarTests(unittest.TestCase):
+    def test_numeric_field_pair_constraints_do_not_filter_aggregate_targets(self):
+        numeric_fields = [
+            field
+            for field, definition in FIELD_DEFINITIONS.items()
+            if definition.planner_visible and definition.resolution_kind == "numeric"
+        ]
+        for target in numeric_fields:
+            for constrained in numeric_fields:
+                with self.subTest(target=target, constrained=constrained):
+                    question = f"Sum {target} where {constrained} equals 2"
+                    facts = detect_semantic_facts(question, ResolutionContext({}))
+                    filters = [fact for fact in facts if fact.kind == "filter"]
+                    self.assertEqual(
+                        [(fact.field, fact.operator, fact.values) for fact in filters],
+                        [(constrained, "eq", (2.0,))],
+                    )
+                    self.assertIsNotNone(filters[0].evidence_span)
+                    self.assertEqual(
+                        question[slice(*filters[0].evidence_span)],
+                        f"{constrained} equals 2",
+                    )
+                    self.assertEqual(
+                        [
+                            (fact.field, fact.concept_name)
+                            for fact in facts
+                            if fact.kind == "calculation"
+                        ],
+                        [(target, "sum")],
+                    )
+                    self.assertFalse(any(fact.kind == "unsupported" for fact in facts))
+
+    def test_numeric_clauses_preserve_independent_operators_and_preposed_values(self):
+        for question, expected in (
+            (
+                "Count records where Total_OT greater than 1 and Total_Worked_Hrs less than 8",
+                {("Total_OT", "gt", (1.0,)), ("Total_Worked_Hrs", "lt", (8.0,))},
+            ),
+            (
+                "Count records with above 1 Total_OT and below 8 Total_Worked_Hrs",
+                {("Total_OT", "gt", (1.0,)), ("Total_Worked_Hrs", "lt", (8.0,))},
+            ),
+            (
+                "Sum Total_OT where Date equals 2026-09-01 and Employee_ID equals A10001",
+                {("Date", "eq", ("2026-09-01",)), ("Employee_ID", "eq", ("A10001",))},
+            ),
+        ):
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(question, ResolutionContext({}))
+                self.assertEqual(
+                    {
+                        (fact.field, fact.operator, fact.values)
+                        for fact in facts
+                        if fact.kind == "filter"
+                    },
+                    expected,
+                )
+                self.assertFalse(any(fact.kind == "unsupported" for fact in facts))
+
+    def test_numeric_unbound_or_incomplete_operands_fail_closed(self):
+        for question in (
+            "Count records where Total_OT equals 2 extra",
+            "Count records where Total_OT sounds like 2",
+            "Count records where Total_OT equals 2026-09-01",
+            "Count records where Total_OT and Total_Worked_Hrs equals 2",
+            "Count records with above 2 Total_OT below 5",
+            "Count records with above bananas Total_OT",
+            "Count records with above 2 extra Total_OT",
+            "Count records with equals 2 extra Total_OT",
+        ):
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(question, ResolutionContext({}))
+                self.assertTrue(any(fact.kind == "unsupported" for fact in facts))
+
+    def test_numeric_operator_forms_remain_bound_in_both_directions(self):
+        for phrase, operator in (
+            ("equals", "eq"),
+            ("exactly", "eq"),
+            ("is not", "ne"),
+            ("above", "gt"),
+            ("over", "gt"),
+            ("below", "lt"),
+            ("under", "lt"),
+            ("at least", "gte"),
+            ("at most", "lte"),
+            ("not more than", "lte"),
+            ("no more than", "lte"),
+            ("not less than", "gte"),
+            ("no less than", "gte"),
+            ("greater than or equal to", "gte"),
+            ("less than or equal to", "lte"),
+        ):
+            for clause in (f"Total_OT {phrase} 2", f"{phrase} 2 Total_OT"):
+                with self.subTest(clause=clause):
+                    facts = detect_semantic_facts(
+                        f"Count records with {clause}", ResolutionContext({})
+                    )
+                    self.assertEqual(
+                        [
+                            (fact.field, fact.operator, fact.values)
+                            for fact in facts
+                            if fact.kind == "filter"
+                        ],
+                        [("Total_OT", operator, (2.0,))],
+                    )
+                    self.assertFalse(any(fact.kind == "unsupported" for fact in facts))
+
+    def test_temporal_scope_is_not_a_numeric_operand(self):
+        for question in (
+            "Show overtime over the last month",
+            "Show overtime over September 2026",
+            "Show overtime under the current week",
+        ):
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(question, ResolutionContext({}))
+                self.assertFalse(any(fact.kind == "unsupported" for fact in facts))
+                self.assertFalse(
+                    any(
+                        fact.kind == "filter" and fact.field == "Total_OT"
+                        for fact in facts
+                    )
+                )
+
     def test_identity_operand_mask_cannot_synthesize_projection(self):
         context = ResolutionContext(
             {},

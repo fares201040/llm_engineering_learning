@@ -20,6 +20,64 @@ PRIVATE_FIXTURES_AVAILABLE = (
 
 
 class BaselineCapabilityParityTests(unittest.TestCase):
+    def test_cross_field_numeric_aggregates_execute_only_requested_filter(self):
+        for target, constrained, value, expected in (
+            ("Total_OT", "Total_Worked_Hrs", 2, 1.0),
+            ("Total_Worked_Hrs", "Total_OT", 2, 8.0),
+            ("Total_OT", "Total_OT", 2, 2.0),
+            ("Total_Worked_Hrs", "Total_Worked_Hrs", 2, 2.0),
+        ):
+            with self.subTest(target=target, constrained=constrained):
+                _, plan, result, _ = self.answer.fetch_context(
+                    f"Sum {target} where {constrained} equals {value}"
+                )
+                self.assertEqual(
+                    (plan.aggregation, plan.aggregation_field, result["value"]),
+                    ("sum", target, expected),
+                )
+                self.assertEqual(
+                    [
+                        (item.field, item.operator, item.value)
+                        for item in plan.filters
+                        if item.field != "chunk_type"
+                    ],
+                    [(constrained, "eq", float(value))],
+                )
+
+    def test_multiple_numeric_clauses_execute_independently(self):
+        for question in (
+            "Count records where Total_OT greater than 1 and Total_Worked_Hrs less than 8",
+            "Count records with above 1 Total_OT and below 8 Total_Worked_Hrs",
+        ):
+            with self.subTest(question=question):
+                _, plan, result, _ = self.answer.fetch_context(question)
+                self.assertEqual((plan.aggregation, result["value"]), ("count", 1))
+                self.assertEqual(
+                    {
+                        (item.field, item.operator, item.value)
+                        for item in plan.filters
+                        if item.field != "chunk_type"
+                    },
+                    {("Total_OT", "gt", 1.0), ("Total_Worked_Hrs", "lt", 8.0)},
+                )
+
+    def test_numeric_operand_rejection_precedes_retrieval(self):
+        for question in (
+            "Count records where Total_OT equals 2 extra",
+            "Count records where Total_OT sounds like 2",
+            "Count records where Total_OT equals 2026-09-01",
+            "Count records where Total_OT and Total_Worked_Hrs equals 2",
+            "Count records with above 2 Total_OT below 5",
+            "Count records with above bananas Total_OT",
+            "Count records with above 2 extra Total_OT",
+            "Count records with equals 2 extra Total_OT",
+        ):
+            with self.subTest(question=question):
+                self.store.get.reset_mock()
+                with self.assertRaises(self.answer.PlanValidationError):
+                    self.answer.fetch_context(question)
+                self.store.get.assert_not_called()
+
     def test_bound_field_alias_matrix_executes_count_filters(self):
         from week5.new_implementation.test_semantic_resolution import (
             ROLE_ALIAS_CASES,

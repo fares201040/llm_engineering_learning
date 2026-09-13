@@ -1023,7 +1023,7 @@ class FilterOperatorDefinition:
 FILTER_OPERATOR_DEFINITIONS = MappingProxyType(
     {
         "eq": FilterOperatorDefinition(
-            r"(?:=|:|is(?: exactly)?|equals?(?: to)?|has(?: the)? value)", "ne"
+            r"(?:=|:|is(?: exactly)?|exactly|equals?(?: to)?|has(?: the)? value)", "ne"
         ),
         "ne": FilterOperatorDefinition(r"(?:!=|<>|is not)", "eq"),
         "in": FilterOperatorDefinition(r"(?:is )?in"),
@@ -1033,10 +1033,16 @@ FILTER_OPERATOR_DEFINITIONS = MappingProxyType(
         "starts_with": FilterOperatorDefinition(
             r"(?:starts?|starting) with", uses_text_pattern=True
         ),
-        "gt": FilterOperatorDefinition(r"(?:>|greater than|more than|above)"),
-        "gte": FilterOperatorDefinition(r"(?:>=|at least|greater than or equal to)"),
-        "lt": FilterOperatorDefinition(r"(?:<|less than|below)"),
-        "lte": FilterOperatorDefinition(r"(?:<=|at most|less than or equal to)"),
+        "gt": FilterOperatorDefinition(
+            r"(?:>|greater than|more than|above|over)", "lte"
+        ),
+        "gte": FilterOperatorDefinition(
+            r"(?:>=|at least|no less than|greater than or equal to)", "lt"
+        ),
+        "lt": FilterOperatorDefinition(r"(?:<|less than|below|under)", "gte"),
+        "lte": FilterOperatorDefinition(
+            r"(?:<=|at most|no more than|less than or equal to)", "gt"
+        ),
     }
 )
 
@@ -1045,7 +1051,10 @@ UNSUPPORTED_FILTER_OPERATOR_PATTERN = r"\b(?:match(?:es)?|regex|ends? with)\b"
 COLLECTIVE_MODIFIER_PATTERN = r"(?:combined|in total)"
 CONSTRAINT_CLAUSE_GRAMMAR = MappingProxyType(
     {
-        "coordinator": r"(?:\band\b|[,;])\s*(?:(?:where|with)\s+)?$",
+        "coordinator": r"(?:(?:\band\b|[,;])\s*(?:(?:where|with)\s+)?|\b(?:where|with)\s+)$",
+        "scope_boundary": r"\s*(?:where|with|for|by|per)\b",
+        "temporal_scope_prefix": r"\b(?:over|under)\s+(?:the\s+)?$",
+        "clause_separator": r"\b(?:and|where|with)\b|[,;]",
         "list_separator": r",|\band\b",
         "identity_scope": r"\bfor\b",
         "non_constraint_prefix": r"\b(?:which|what|by|per|each|every|all|any|show|list|display)\s*$",

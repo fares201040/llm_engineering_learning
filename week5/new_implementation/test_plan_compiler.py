@@ -23,6 +23,98 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class ExecutableChoiceCoverageTests(unittest.TestCase):
+    def test_revalidation_rejects_deleted_filter_and_aggregate(self):
+        question = "Count Authorized records"
+        result = self.compile(
+            question,
+            measure=dict(name="attendance_records", evidence_text="records"),
+            business_predicates=[dict(name="authorized", evidence_text="Authorized")],
+            answer_contract=dict(shape="scalar", unit="records"),
+        )
+        self.assertTrue(result.ready, result.violations)
+        resolution = ResolutionContext({})
+        context = CompilationContext(
+            question, detect_semantic_facts(question, resolution), resolution
+        )
+        for changes in ({"filters": []}, {"measure": None, "aggregation": "none"}):
+            with self.subTest(changes=changes):
+                altered = result.executable_plan.model_copy(update=changes)
+                checked = revalidate_executable_plan(
+                    altered, context, result.provenance
+                )
+                self.assertFalse(checked.ready)
+        without_filter_provenance = tuple(
+            p for p in result.provenance if p.target_kind != "filter"
+        )
+        checked = revalidate_executable_plan(
+            result.executable_plan.model_copy(update={"filters": []}),
+            context,
+            without_filter_provenance,
+        )
+        self.assertFalse(checked.ready)
+
+    def test_grouped_percentage_is_rejected_before_execution(self):
+        result = self.compile(
+            "Top 3 Departments by percentage of records with Status equal to Authorized",
+            calculation=dict(
+                operation="percentage",
+                evidence_text="percentage",
+                percentage_condition=dict(
+                    field="Status",
+                    operator="eq",
+                    value="Authorized",
+                    evidence_text="Status equal to Authorized",
+                ),
+            ),
+            group_by=[dict(field="Department", evidence_text="Departments")],
+            order_by=dict(field="value", direction="desc", evidence_text="Top 3"),
+            limit=dict(value=3, evidence_text="Top 3"),
+            answer_contract=dict(shape="grouped", unit="percentage"),
+        )
+        self.assertFalse(result.ready)
+        self.assertIn("unsupported_capability", {v.code for v in result.violations})
+
+    def test_independent_unbound_sum_is_not_hidden_by_named_count(self):
+        result = self.compile(
+            "Count records and calculate total score",
+            measure=dict(name="attendance_records", evidence_text="records"),
+            answer_contract=dict(shape="scalar", unit="records"),
+        )
+        self.assertFalse(result.ready)
+        self.assertIn("unsupported_capability", {v.code for v in result.violations})
+
+    def test_unknown_projection_remainder_without_from_is_rejected(self):
+        result = self.compile(
+            "Show Date and FavoriteColor",
+            answer_contract=dict(shape="rows", unit="value"),
+        )
+        self.assertFalse(result.ready)
+        self.assertIn("unsupported_capability", {v.code for v in result.violations})
+
+    def test_trailing_order_key_is_not_silently_dropped(self):
+        result = self.compile(
+            "Show records ordered by Date ascending and Name descending",
+            order_by=dict(
+                field="Date", direction="asc", evidence_text="Date ascending"
+            ),
+            answer_contract=dict(shape="rows", unit="value"),
+        )
+        self.assertFalse(result.ready)
+        self.assertIn("unsupported_capability", {v.code for v in result.violations})
+
+    def test_first_and_last_without_order_basis_are_rejected(self):
+        for position in ("first", "last"):
+            with self.subTest(position=position):
+                result = self.compile(
+                    f"Show {position} 3 records",
+                    limit=dict(value=3, evidence_text=f"{position} 3"),
+                    answer_contract=dict(shape="rows", unit="value"),
+                )
+                self.assertFalse(result.ready)
+                self.assertIn(
+                    "unsupported_capability", {v.code for v in result.violations}
+                )
+
     def test_unbound_calculation_cannot_disappear_from_request(self):
         for question in (
             "Calculate average attendance records",

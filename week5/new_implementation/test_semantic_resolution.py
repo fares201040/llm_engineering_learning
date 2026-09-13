@@ -14,6 +14,36 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class TemporalCompositionDetectorTests(unittest.TestCase):
+    def test_projection_delimiters_do_not_leak_from_correction_prefix(self):
+        facts = detect_semantic_facts(
+            "No, show department Op",
+            ResolutionContext({"Department": ("Operations East", "Operations West")}),
+        )
+        self.assertFalse(
+            [f for f in facts if f.kind in {"projection", "unsupported"}], facts
+        )
+
+    def test_entity_names_and_correction_verbs_are_not_calculations(self):
+        context = ResolutionContext(
+            {},
+            employees=(
+                EmployeeReference(employee_id="A10018", name="Max River"),
+                EmployeeReference(employee_id="A10019", name="Mean Lake"),
+            ),
+        )
+        for question in (
+            "Count records for Max River",
+            "Count records for Mean Lake",
+            "I mean count records",
+            "No, I mean Authorized records",
+        ):
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(question, context)
+                self.assertFalse(
+                    [f for f in facts if f.kind in {"calculation", "unsupported"}],
+                    facts,
+                )
+
     def test_non_temporal_on_preserves_employee_and_catalog_constraint(self):
         for question, field, value in (
             (

@@ -662,6 +662,19 @@ def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, 
             }
     if len(calculation_facts) == 1:
         (operation, field), fact = next(iter(calculation_facts.items()))
+        raw_measure = prepared.get("measure")
+        if raw_measure:
+            definition = MEASURE_DEFINITIONS.get(raw_measure.get("name"))
+            equivalent = definition is not None and (
+                (definition.aggregation, definition.aggregation_field)
+                == (operation, field)
+                or (operation == "percentage" and definition.aggregation_field == field)
+            )
+            if not equivalent:
+                return {
+                    "status": "unsupported",
+                    "unsupported_capabilities": ["multi_stage_aggregation"],
+                }
         calculation = dict(raw_calculation)
         calculation.update(
             operation=operation, field=field, evidence_text=fact.evidence_text

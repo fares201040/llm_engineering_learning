@@ -1240,6 +1240,44 @@ def _earliest_measure_facts(question: str) -> list[SemanticFact]:
     return [fact for position, fact in positions if position == earliest]
 
 
+def _calculation_matches(question, definition, facts):
+    matches = [
+        match
+        for pattern in definition.detection_patterns
+        for match in re.finditer(pattern, question, re.I)
+    ]
+    # A correction verb following a subject pronoun is not an aggregate noun.
+    grammatical = [
+        match
+        for match in matches
+        if not (
+            normalize_semantic_text(match.group(0)) == "mean"
+            and re.search(
+                r"\b(?:i|we|you|they)\s+(?:really\s+)?$",
+                question[: match.start()],
+                re.I,
+            )
+        )
+    ]
+    # Operation-looking tokens inside an independently bound filter phrase
+    # describe that field, not a separate aggregate request.
+    filter_spans = [
+        span
+        for fact in facts
+        if fact.kind == "filter"
+        for span in _evidence_spans(question, fact.evidence_text)
+    ]
+    return [
+        match
+        for match in grammatical
+        if not any(
+            start <= len(normalize_semantic_text(question[: match.start()]).split())
+            and len(normalize_semantic_text(question[: match.end()]).split()) <= end
+            for start, end in filter_spans
+        )
+    ]
+
+
 def _calculation_facts(
     question: str,
     selected_fields: tuple[str, ...],
@@ -1247,11 +1285,7 @@ def _calculation_facts(
 ) -> list[SemanticFact]:
     facts = []
     for name, definition in CALCULATION_DEFINITIONS.items():
-        matches = [
-            match
-            for pattern in definition.detection_patterns
-            if (match := re.search(pattern, question, re.I)) is not None
-        ]
+        matches = _calculation_matches(question, definition, existing_facts)
         if not matches:
             continue
         evidence = min(matches, key=lambda match: match.start()).group(0)
@@ -1419,7 +1453,7 @@ def detect_semantic_facts(
                 )
             )
     facts.extend(_grouping_facts(question, maximal_field_matches))
-    facts.extend(_calculation_facts(question, selected_fields, facts))
+    facts.extend(_calculation_facts(semantic_question, selected_fields, facts))
     if re.search(r"\b(?:how many|count|number of|total number)\b", question, re.I):
         facts.extend(_earliest_measure_facts(semantic_question))
     predicate_facts = _facts_for_named_phrases(
@@ -1432,11 +1466,13 @@ def detect_semantic_facts(
         )
     )
     selected = list(_select_longest_supported_facts(question, facts))
-    selected = _executable_choice_facts(question, maximal_field_matches, selected)
+    selected = _executable_choice_facts(
+        semantic_question, maximal_field_matches, selected, original_question=question
+    )
     return merge_semantic_facts(selected)
 
 
-def _executable_choice_facts(question, field_matches, facts):
+def _executable_choice_facts(question, field_matches, facts, *, original_question):
     """Compose executable roles from recognized fields and operation clauses."""
     normalized = normalize_semantic_text(question)
 
@@ -1458,15 +1494,23 @@ def _executable_choice_facts(question, field_matches, facts):
                 break
 
     for name, definition in CALCULATION_DEFINITIONS.items():
-        matches = [
-            match
-            for pattern in definition.detection_patterns
-            if (match := re.search(pattern, question, re.I)) is not None
-        ]
+        matches = _calculation_matches(question, definition, facts)
         represented = any(
             f.kind == "calculation" and f.concept_name == name for f in facts
         )
-        named_count = name == "sum" and any(f.kind == "measure" for f in facts)
+        named_count = name == "sum" and all(
+            any(
+                re.match(
+                    rf"^(?:of\s+)?(?:the\s+)?{re.escape(form)}\b",
+                    normalize_semantic_text(question[match.end() :]),
+                )
+                for fact in facts
+                if fact.kind == "measure"
+                for phrase in MEASURE_DEFINITIONS[fact.concept_name].natural_names
+                for form in _token_forms(phrase)
+            )
+            for match in matches
+        )
         if matches and not represented and not named_count:
             add(
                 "unsupported",
@@ -1477,6 +1521,8 @@ def _executable_choice_facts(question, field_matches, facts):
     limit = re.search(r"\b(top|bottom|first|last|limit(?: to)?)\s+(\d+)\b", normalized)
     if limit:
         add("limit", limit.group(0), values=(float(limit.group(2)),))
+        if limit.group(1) in {"first", "last"}:
+            add("unsupported", limit.group(0), concept_name="unsupported_constraint")
     rank = limit if limit and limit.group(1) in {"top", "bottom"} else None
     if rank:
         direction = "desc" if rank.group(1) == "top" else "asc"
@@ -1499,6 +1545,11 @@ def _executable_choice_facts(question, field_matches, facts):
         if order:
             direction = "asc" if order.group(2) in {"ascending", "asc"} else "desc"
             add("order_by", order.group(0), field=field, direction=direction)
+            remaining = normalized[order.end() :].strip()
+            if remaining and not re.match(
+                r"^(?:where|with|for|limit|before|after|between|on|in)\b", remaining
+            ):
+                add("unsupported", remaining, concept_name="unsupported_constraint")
 
     order_clause = re.search(r"\b(?:order(?:ed)?|sort(?:ed)?)\s+by\b", normalized)
     if order_clause and not any(f.kind == "order_by" for f in facts):
@@ -1507,10 +1558,10 @@ def _executable_choice_facts(question, field_matches, facts):
     if rank_clause and not any(f.kind == "ranking" for f in facts):
         add("unsupported", rank_clause.group(0), concept_name="unsupported_constraint")
 
-    projection = re.search(
-        r"\b(?:show|list|display|select)\s+(.+?)(?:\s+(?:from|for|where|with|ordered|sorted)\b|$)",
-        normalized,
-    )
+    projection_text = normalize_semantic_text(original_question)
+    projection_pattern = r"\b(?:show|list|display|select)\s+(.+?)(?:\s+(?:from|for|where|with|ordered|sorted)\b|$)"
+    projection = re.search(projection_pattern, projection_text)
+    raw_projection = re.search(projection_pattern, original_question, re.I)
     if projection and not any(
         f.kind in {"measure", "calculation", "group_by"} for f in facts
     ):
@@ -1529,8 +1580,10 @@ def _executable_choice_facts(question, field_matches, facts):
         if not re.sub(r"\b(?:and|the|only)\b|\s+", "", remainder):
             for field, phrase in projection_fields:
                 add("projection", phrase, field=field)
-        elif projection_fields and re.search(
-            r"\bfrom\b", normalized[projection.end() - 5 :]
+        elif projection_fields and (
+            re.search(r"\bfrom\b", projection_text[projection.end() - 5 :])
+            or re.search(r"\band\b", projection.group(1))
+            or (raw_projection and "," in raw_projection.group(1))
         ):
             add(
                 "unsupported",

@@ -162,6 +162,27 @@ def _executable_plan(**values):
 
 
 class ProposalOperationNormalizationTests(unittest.TestCase):
+    def test_percentage_rejects_different_provider_population_measure(self):
+        question = "What percentage of records have Status equal to Authorized?"
+        facts = answer.detect_semantic_facts(question, answer.ResolutionContext({}))
+        raw = dict(
+            status="ready",
+            measure=dict(name="employees", evidence_text="records"),
+            calculation=dict(
+                operation="percentage",
+                evidence_text="percentage",
+                percentage_condition=dict(
+                    field="Status",
+                    operator="eq",
+                    value="Authorized",
+                    evidence_text="Authorized",
+                ),
+            ),
+            answer_contract=dict(shape="scalar", unit="percentage"),
+        )
+        prepared = answer._overlay_authoritative_facts(raw, facts)
+        self.assertIn(prepared["status"], {"ambiguous", "unsupported"})
+
     def test_overlay_retains_nonredundant_provider_order_for_rejection(self):
         question = "Count records with Status equal to Authorized"
         resolution = answer.ResolutionContext({})

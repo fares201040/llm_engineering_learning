@@ -381,7 +381,10 @@ class AnswerContractInvariant(PlanInvariant):
         proposal = context.proposal
         if proposal is None or proposal.answer_contract is None:
             return ()
-        if proposal.answer_contract.shape == "narrative":
+        if proposal.answer_contract.shape == "narrative" and (
+            context.candidate_plan.mode == "exact"
+            or context.candidate_plan.aggregation != "none"
+        ):
             return (
                 PlanViolation(
                     "unsupported_capability",
@@ -434,6 +437,11 @@ class CapabilityInvariant(PlanInvariant):
             for fact in context.compilation.facts
             if fact.kind == "unsupported" and fact.strength == "strong"
         )
+        if (
+            context.candidate_plan.aggregation == "percentage"
+            and context.candidate_plan.group_by
+        ):
+            detected_capabilities += ("grouped_percentage",)
         return tuple(
             PlanViolation(
                 "unsupported_capability",
@@ -470,6 +478,10 @@ class ExecutableChoiceInvariant(PlanInvariant):
             ("projection", plan.projection),
         ):
             required.extend(dict(target_kind=kind, field=field) for field in fields)
+        required.extend(
+            dict(target_kind="predicate", name=name)
+            for name in plan.business_predicates
+        )
         if plan.order_by:
             required.append(
                 dict(
@@ -518,7 +530,23 @@ class ExecutableChoiceInvariant(PlanInvariant):
                     scope="percentage_numerator",
                 )
             )
-        return tuple(
+        if plan.aggregation == "percentage":
+            denominator_name = next(
+                (
+                    name
+                    for name, definition in MEASURE_DEFINITIONS.items()
+                    if definition.aggregation_field == plan.aggregation_field
+                ),
+                None,
+            )
+            required.append(
+                dict(
+                    target_kind="percentage_denominator",
+                    name=denominator_name,
+                    field=plan.aggregation_field,
+                )
+            )
+        violations = tuple(
             PlanViolation(
                 "ungrounded_constraint",
                 item["target_kind"],
@@ -528,6 +556,42 @@ class ExecutableChoiceInvariant(PlanInvariant):
             if not any(
                 all(getattr(provenance, key) == value for key, value in item.items())
                 for provenance in context.provenance
+            )
+        )
+        executable_kinds = {
+            "filter",
+            "predicate",
+            "measure",
+            "calculation",
+            "group_by",
+            "projection",
+            "order_by",
+            "limit",
+            "percentage_denominator",
+        }
+        violations += tuple(
+            PlanViolation(
+                "uncovered_fact",
+                name,
+                "A business predicate lost its required executable filter.",
+            )
+            for name in plan.business_predicates
+            for condition in BUSINESS_PREDICATE_DEFINITIONS[name].required_filters
+            if not any(
+                _filter_matches_required(actual, condition) for actual in plan.filters
+            )
+        )
+        return violations + tuple(
+            PlanViolation(
+                "uncovered_fact",
+                provenance.target_kind,
+                "A verified executable constraint was removed from the plan.",
+            )
+            for provenance in context.provenance
+            if provenance.target_kind in executable_kinds
+            and not any(
+                all(getattr(provenance, key) == value for key, value in item.items())
+                for item in required
             )
         )
 

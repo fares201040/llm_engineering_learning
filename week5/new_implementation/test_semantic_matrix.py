@@ -4,6 +4,8 @@ import unittest
 from week5.new_implementation.attendance_schema import (
     BUSINESS_PREDICATE_DEFINITIONS,
     FIELD_DEFINITIONS,
+    MEASURE_DEFINITIONS,
+    RETRIEVAL_INTENT_DEFINITIONS,
     VALUE_CONCEPT_DEFINITIONS,
     AnswerContract,
     FilterOperator,
@@ -105,6 +107,138 @@ def generate_registry_cases() -> tuple[SemanticMatrixCase, ...]:
 
 
 class SemanticMatrixTests(unittest.TestCase):
+    def test_every_registered_closed_value_is_detected_canonically(self):
+        for field, definition in FIELD_DEFINITIONS.items():
+            if not definition.planner_visible:
+                continue
+            for value in definition.closed_values:
+                question = f"show {definition.natural_names[0]} equal to {value}"
+                with self.subTest(field=field, value=value):
+                    facts = detect_semantic_facts(question, ResolutionContext({}))
+                    self.assertIn(
+                        (field, "eq", (value,)),
+                        {
+                            (fact.field, fact.operator, fact.values)
+                            for fact in facts
+                            if fact.kind == "filter"
+                        },
+                    )
+
+    def test_every_registered_catalog_alias_is_detected_canonically(self):
+        for field, definition in FIELD_DEFINITIONS.items():
+            if definition.resolution_kind != "catalog":
+                continue
+            for alias in definition.value_aliases:
+                catalog = {field: (alias.canonical_value,)}
+                question = f"show {definition.natural_names[0]} {alias.natural_name}"
+                with self.subTest(field=field, alias=alias.natural_name):
+                    facts = detect_semantic_facts(
+                        question, ResolutionContext(catalog=catalog)
+                    )
+                    self.assertIn(
+                        (field, "eq", (alias.canonical_value,)),
+                        {
+                            (fact.field, fact.operator, fact.values)
+                            for fact in facts
+                            if fact.kind == "filter"
+                        },
+                    )
+
+    def test_every_registered_value_concept_phrase_is_detected(self):
+        for name, definition in VALUE_CONCEPT_DEFINITIONS.items():
+            for phrase in definition.natural_names:
+                with self.subTest(concept=name, phrase=phrase):
+                    facts = detect_semantic_facts(phrase, ResolutionContext({}))
+                    self.assertIn(
+                        (
+                            name,
+                            definition.field,
+                            definition.operator,
+                            definition.members,
+                        ),
+                        {
+                            (
+                                fact.concept_name,
+                                fact.field,
+                                fact.operator,
+                                fact.values,
+                            )
+                            for fact in facts
+                            if fact.kind == "filter"
+                        },
+                    )
+
+    def test_every_registered_measure_phrase_is_detected(self):
+        for name, definition in MEASURE_DEFINITIONS.items():
+            for phrase in definition.natural_names:
+                question = f"count {phrase}"
+                with self.subTest(measure=name, phrase=phrase):
+                    facts = detect_semantic_facts(question, ResolutionContext({}))
+                    self.assertIn(
+                        name,
+                        {fact.concept_name for fact in facts if fact.kind == "measure"},
+                    )
+
+    def test_every_registered_predicate_phrase_is_detected(self):
+        for name, definition in BUSINESS_PREDICATE_DEFINITIONS.items():
+            for phrase in definition.natural_names:
+                with self.subTest(predicate=name, phrase=phrase):
+                    facts = detect_semantic_facts(phrase, ResolutionContext({}))
+                    self.assertIn(
+                        name,
+                        {
+                            fact.concept_name
+                            for fact in facts
+                            if fact.kind == "predicate"
+                        },
+                    )
+
+    def test_every_registered_retrieval_intent_phrase_is_detected(self):
+        for name, definition in RETRIEVAL_INTENT_DEFINITIONS.items():
+            for phrase in definition.natural_names:
+                with self.subTest(intent=name, phrase=phrase):
+                    facts = detect_semantic_facts(phrase, ResolutionContext({}))
+                    self.assertIn(
+                        name,
+                        {
+                            fact.concept_name
+                            for fact in facts
+                            if fact.kind == "semantic_intent"
+                        },
+                    )
+
+    def test_malformed_values_and_unsupported_operators_emit_no_filter(self):
+        cases = (
+            "show lateness hours above bananas",
+            "show date equal to 2026-02-30",
+            "show status matches Authorized",
+        )
+
+        for question in cases:
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(question, ResolutionContext({}))
+                self.assertFalse(
+                    any(fact.kind in {"filter", "predicate"} for fact in facts)
+                )
+
+    def test_overlapping_phrases_keep_only_the_supported_meaning(self):
+        cases = (
+            ("not attended", "predicate", {"not_worked"}),
+            ("exclude off days", "predicate", {"scheduled_working_day"}),
+            (
+                "recurring attendance patterns",
+                "semantic_intent",
+                {"attendance_review"},
+            ),
+        )
+
+        for question, kind, expected in cases:
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(question, ResolutionContext({}))
+                self.assertEqual(
+                    {fact.concept_name for fact in facts if fact.kind == kind}, expected
+                )
+
     def test_representative_filter_for_every_planner_visible_field(self):
         covered = set()
         for case in generate_registry_cases():

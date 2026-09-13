@@ -351,6 +351,7 @@ class FieldDefinition:
     orderable: bool = True
     aggregatable: bool = False
     planner_visible: bool = True
+    phrase_priority: int = 100
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -374,6 +375,7 @@ class MeasureDefinition:
     natural_names: tuple[str, ...] = ()
     answer_unit: Literal["dates", "records", "employees"] = "records"
     default_answer_shape: Literal["scalar", "grouped"] = "scalar"
+    phrase_priority: int = 40
 
 
 @dataclass(frozen=True)
@@ -391,6 +393,8 @@ class PredicateDefinition:
     natural_names: tuple[str, ...] = ()
     incompatible_with: tuple[BusinessPredicateName, ...] = ()
     incompatible_filters: tuple[RequiredFilter, ...] = ()
+    composes_with: tuple[BusinessPredicateName, ...] = ()
+    phrase_priority: int = 80
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -399,12 +403,15 @@ class ValueConceptDefinition:
     description: str
     natural_names: tuple[str, ...]
     members: tuple[str, ...]
+    operator: FilterOperator = "in"
+    phrase_priority: int = 60
 
 
 @dataclass(frozen=True, kw_only=True)
 class RetrievalIntentDefinition:
     description: str
     natural_names: tuple[str, ...]
+    phrase_priority: int = 20
 
 
 @dataclass(frozen=True)
@@ -452,7 +459,7 @@ _FIELD_DEFINITIONS = {
     "Day_Type": FieldDefinition(
         "text",
         "Calendar or schedule classification; it is not proof of attendance.",
-        (r"\bday types?\b", r"\bscheduled working days?\b"),
+        (r"\bday types?\b",),
         ("Working Day", "OFF Day", "OFF Day (ZAS)"),
     ),
     "Holiday_Type": FieldDefinition(
@@ -462,18 +469,18 @@ _FIELD_DEFINITIONS = {
     "Status": FieldDefinition(
         "text",
         "Workflow or approval state; it is not proof that work occurred.",
-        (r"\bstatus\b", r"\bauthorized records?\b", r"\bdraft records?\b"),
+        (r"\bstatus\b",),
         ("Authorized", "Draft", "Pending For Authorization"),
     ),
     "Exception": FieldDefinition(
         "text",
         "Attendance outcome such as absence, lateness, early out, or OK.",
-        (r"\bexceptions?\b", r"\babs(?:ent|ence)\b"),
+        (r"\bexceptions?\b",),
     ),
     "Total_Worked_Hrs": FieldDefinition(
         "number",
         "Actual hours worked; a worked day requires a value greater than zero.",
-        (r"\bworked hours?\b", r"\bhours? worked\b", r"\bwork hours?\b"),
+        (r"\btotal worked (?:hours?|hrs?)\b",),
     ),
     "Lateness_Hrs": FieldDefinition(
         "number",
@@ -607,20 +614,17 @@ _FIELD_NATURAL_NAMES = {
     "Day_Type": (
         "day type",
         "day types",
-        "scheduled working day",
-        "scheduled working days",
     ),
     "Holiday_Type": ("holiday", "holidays", "holiday type", "holiday types"),
     "Shift": ("shift", "shifts"),
-    "Status": (
-        "status",
-        "authorized record",
-        "authorized records",
-        "draft record",
-        "draft records",
+    "Status": ("status",),
+    "Exception": ("exception", "exceptions"),
+    "Total_Worked_Hrs": (
+        "total worked hr",
+        "total worked hrs",
+        "total worked hour",
+        "total worked hours",
     ),
-    "Exception": ("exception", "exceptions", "absent", "absence"),
-    "Total_Worked_Hrs": ("worked hour", "worked hours", "hours worked", "work hours"),
     "Lateness_Hrs": ("late", "lateness", "late in", "late-in"),
     "Early_Out_Hrs": ("early out", "early-out"),
     "Overbreak_Hrs": ("over break", "over-break", "overbreak"),
@@ -767,7 +771,14 @@ MEASURE_DEFINITIONS = MappingProxyType(
             description="Count matching daily attendance rows.",
             aggregation="count",
             aggregation_field=None,
-            natural_names=("attendance record", "attendance records", "row", "rows"),
+            natural_names=(
+                "attendance record",
+                "attendance records",
+                "record",
+                "records",
+                "row",
+                "rows",
+            ),
             answer_unit="records",
         ),
         "employees": MeasureDefinition(
@@ -785,19 +796,62 @@ BUSINESS_PREDICATE_DEFINITIONS = MappingProxyType(
         "scheduled_working_day": PredicateDefinition(
             description="Scheduled working dates; this is not proof that work occurred.",
             required_filters=(RequiredFilter("Day_Type", "eq", "Working Day"),),
-            natural_names=("scheduled working day", "scheduled working days"),
+            natural_names=(
+                "scheduled day",
+                "scheduled days",
+                "scheduled working day",
+                "scheduled working days",
+                "exclude off day",
+                "exclude off days",
+                "excluding off day",
+                "excluding off days",
+                "without off day",
+                "without off days",
+            ),
+            incompatible_filters=(
+                RequiredFilter("Day_Type", "in", ("OFF Day", "OFF Day (ZAS)")),
+            ),
+            composes_with=("not_worked",),
+            phrase_priority=90,
         ),
         "worked": PredicateDefinition(
             description="Dates with positive actual worked hours.",
             required_filters=(RequiredFilter("Total_Worked_Hrs", "gt", 0.0),),
-            natural_names=("worked", "attended", "present"),
+            natural_names=(
+                "work",
+                "worked",
+                "attend",
+                "attended",
+                "present",
+                "positive work hour",
+                "positive work hours",
+                "positive worked hour",
+                "positive worked hours",
+            ),
             incompatible_with=("not_worked", "absent"),
             incompatible_filters=(RequiredFilter("Exception", "eq", "Absent"),),
         ),
         "not_worked": PredicateDefinition(
             description="Dates without positive actual worked hours.",
             required_filters=(RequiredFilter("Total_Worked_Hrs", "lte", 0.0),),
-            natural_names=("not worked", "did not work", "not attended", "not present"),
+            natural_names=(
+                "not work",
+                "not worked",
+                "did not work",
+                "not attend",
+                "not attended",
+                "did not attend",
+                "not present",
+                "zero work hour",
+                "zero work hours",
+                "zero worked hour",
+                "zero worked hours",
+                "no positive worked hour",
+                "no positive worked hours",
+            ),
+            incompatible_with=("worked",),
+            composes_with=("scheduled_working_day",),
+            phrase_priority=100,
         ),
         "absent": PredicateDefinition(
             description="Dates carrying the explicit Absent exception.",
@@ -899,6 +953,13 @@ VALUE_CONCEPT_DEFINITIONS = MappingProxyType(
             ),
             natural_names=("off day", "off days"),
             members=("OFF Day", "OFF Day (ZAS)"),
+        ),
+        "draft_status": ValueConceptDefinition(
+            field="Status",
+            description="Rows with workflow Status Draft.",
+            natural_names=("draft", "draft record", "draft records"),
+            members=("Draft",),
+            operator="eq",
         ),
     }
 )
@@ -1057,6 +1118,7 @@ def render_planner_schema() -> str:
                 "description": definition.description,
                 "natural_names": list(definition.natural_names),
                 "members": list(definition.members),
+                "operator": definition.operator,
             }
             for name, definition in _named_registry_items(VALUE_CONCEPT_DEFINITIONS)
         ],

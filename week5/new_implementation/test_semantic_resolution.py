@@ -12,6 +12,63 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class SemanticResolutionTests(unittest.TestCase):
+    def test_work_language_emits_positive_work_predicate(self):
+        cases = (
+            "How many days did employee A10017 work?",
+            "How many days did employee A10017 worked?",
+            "How many days did employee A10017 attend?",
+            "How many days did employee A10017 attended?",
+            "How many days had positive worked hours?",
+        )
+
+        for question in cases:
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(question, ResolutionContext(catalog={}))
+                predicates = {
+                    fact.concept_name for fact in facts if fact.kind == "predicate"
+                }
+                self.assertIn("worked", predicates)
+                self.assertNotIn("not_worked", predicates)
+
+    def test_non_work_language_is_compositional_without_positive_collision(self):
+        cases = (
+            (
+                "How many days had zero worked hours?",
+                {"not_worked"},
+            ),
+            (
+                "How many scheduled days did A10017 not attend?",
+                {"scheduled_working_day", "not_worked"},
+            ),
+        )
+
+        for question, expected in cases:
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(question, ResolutionContext(catalog={}))
+                predicates = {
+                    fact.concept_name for fact in facts if fact.kind == "predicate"
+                }
+                self.assertEqual(predicates, expected)
+                self.assertNotIn("worked", predicates)
+
+    def test_scheduled_and_off_day_exclusion_language_emit_schedule_predicate(self):
+        cases = (
+            "How many scheduled working days were there?",
+            "How many days remain when we exclude off days?",
+        )
+
+        for question in cases:
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(question, ResolutionContext(catalog={}))
+                predicates = {
+                    fact.concept_name for fact in facts if fact.kind == "predicate"
+                }
+                self.assertEqual(predicates, {"scheduled_working_day"})
+                self.assertFalse(
+                    any(fact.concept_name == "off_day" for fact in facts),
+                    "an exclusion must not emit the positive off-day value concept",
+                )
+
     def test_numeric_comparison_operator_is_detected_generically(self):
         facts = detect_semantic_facts(
             "How many attendance records have Lateness_Hrs at least 2?",
@@ -99,6 +156,24 @@ class SemanticResolutionTests(unittest.TestCase):
         self.assertEqual(fact.field, "Day_Type")
         self.assertEqual(fact.values, ("OFF Day", "OFF Day (ZAS)"))
         self.assertEqual(fact.evidence_text.casefold(), "off days")
+
+    def test_business_value_language_is_not_a_field_alias(self):
+        facts = detect_semantic_facts(
+            "How many draft records were there?", ResolutionContext(catalog={})
+        )
+
+        canonical = {
+            (fact.concept_name, fact.field, fact.operator, fact.values)
+            for fact in facts
+        }
+        self.assertIn(("draft_status", "Status", "eq", ("Draft",)), canonical)
+        self.assertIn(
+            "attendance_records",
+            {fact.concept_name for fact in facts if fact.kind == "measure"},
+        )
+        self.assertFalse(
+            any(fact.kind == "field" and fact.field == "Status" for fact in facts)
+        )
 
     def test_partial_catalog_collision_requires_clarification(self):
         context = ResolutionContext(catalog={"Shift": ("Night A", "Night B")})

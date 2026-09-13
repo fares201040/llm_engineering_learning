@@ -65,6 +65,45 @@ def evidence_occurs(text: str, evidence: str) -> bool:
     )
 
 
+def _evidence_span(text: str, evidence: str) -> tuple[int, int] | None:
+    """Locate semantic evidence in normalized token space for overlap ranking."""
+    best = None
+    for haystack in _token_forms(text):
+        for needle in _token_forms(evidence):
+            match = re.search(rf"(?:^|\s)({re.escape(needle)})(?:$|\s)", haystack)
+            if match is None:
+                continue
+            span = match.span(1)
+            if best is None or span[1] - span[0] > best[1] - best[0]:
+                best = span
+    return best
+
+
+def _unsupported_operator_between(
+    question: str, field_evidence: str, value_evidence: str
+) -> bool:
+    normalized = normalize_semantic_text(question)
+    field_span = _evidence_span(question, field_evidence)
+    value_span = _evidence_span(question, value_evidence)
+    if field_span is None or value_span is None:
+        return False
+    between = normalized[
+        min(field_span[1], value_span[1]) : max(field_span[0], value_span[0])
+    ]
+    return re.search(r"\b(?:matches?|regex|ends? with)\b", between) is not None
+
+
+def _evidence_follows_unsupported_operator(question: str, evidence: str) -> bool:
+    normalized = normalize_semantic_text(question)
+    span = _evidence_span(question, evidence)
+    if span is None:
+        return False
+    return (
+        re.search(r"\b(?:matches?|regex|ends? with)\s+$", normalized[: span[0]])
+        is not None
+    )
+
+
 def _numeric_operator(comparator: str | None) -> FilterOperator:
     normalized = normalize_semantic_text(comparator or "")
     return {
@@ -223,6 +262,13 @@ class FieldResolver(ABC):
                 strength="strong",
             )
             for value, evidence in dict.fromkeys(values)
+            if not _unsupported_operator_between(
+                question, field_facts[0].evidence_text, evidence
+            )
+            and (
+                definition.resolution_kind != "temporal"
+                or _canonical_value_is_valid(field, value)
+            )
         )
         return field_facts + value_facts
 
@@ -286,6 +332,14 @@ class NumericResolver(FieldResolver):
         except ValueError:
             return ResolutionOutcome("unknown")
         return ResolutionOutcome("resolved", (number,))
+
+
+def _canonical_value_is_valid(field: str, raw_value: object) -> bool:
+    try:
+        canonicalize_storage_value(field, raw_value)
+    except ValueError:
+        return False
+    return True
 
 
 def _closed_value_outcome(field: str, raw_value: object) -> ResolutionOutcome:
@@ -415,7 +469,11 @@ class ResolverRegistry:
 def _facts_for_named_phrases(question, kind, registry):
     facts = []
     for name, definition in registry.items():
-        for phrase in definition.natural_names:
+        for phrase in sorted(
+            definition.natural_names,
+            key=lambda item: (len(normalize_semantic_text(item).split()), len(item)),
+            reverse=True,
+        ):
             if evidence_occurs(question, phrase):
                 facts.append(
                     SemanticFact(
@@ -428,6 +486,163 @@ def _facts_for_named_phrases(question, kind, registry):
                 )
                 break
     return facts
+
+
+def _fact_priority(fact: SemanticFact) -> int:
+    if fact.kind == "field" and fact.field is not None:
+        return FIELD_DEFINITIONS[fact.field].phrase_priority
+    if fact.kind == "filter":
+        if fact.concept_name in VALUE_CONCEPT_DEFINITIONS:
+            return VALUE_CONCEPT_DEFINITIONS[fact.concept_name].phrase_priority
+        return 110
+    if fact.kind == "measure" and fact.concept_name in MEASURE_DEFINITIONS:
+        return MEASURE_DEFINITIONS[fact.concept_name].phrase_priority
+    if fact.kind == "predicate" and fact.concept_name in BUSINESS_PREDICATE_DEFINITIONS:
+        return BUSINESS_PREDICATE_DEFINITIONS[fact.concept_name].phrase_priority
+    if (
+        fact.kind == "semantic_intent"
+        and fact.concept_name in RETRIEVAL_INTENT_DEFINITIONS
+    ):
+        return RETRIEVAL_INTENT_DEFINITIONS[fact.concept_name].phrase_priority
+    return 0
+
+
+def _facts_have_same_meaning(left: SemanticFact, right: SemanticFact) -> bool:
+    return (
+        left.kind,
+        left.field,
+        left.operator,
+        left.values,
+        left.concept_name,
+        left.origin,
+    ) == (
+        right.kind,
+        right.field,
+        right.operator,
+        right.values,
+        right.concept_name,
+        right.origin,
+    )
+
+
+def _predicate_conflict(left: SemanticFact, right: SemanticFact) -> bool:
+    if left.concept_name is None or right.concept_name is None:
+        return False
+    left_definition = BUSINESS_PREDICATE_DEFINITIONS[left.concept_name]
+    right_definition = BUSINESS_PREDICATE_DEFINITIONS[right.concept_name]
+    if (
+        right.concept_name in left_definition.incompatible_with
+        or left.concept_name in right_definition.incompatible_with
+    ):
+        return True
+    return not (
+        right.concept_name in left_definition.composes_with
+        or left.concept_name in right_definition.composes_with
+    )
+
+
+def _fact_constraints(fact: SemanticFact):
+    if fact.kind == "predicate" and fact.concept_name is not None:
+        return BUSINESS_PREDICATE_DEFINITIONS[fact.concept_name].required_filters
+    if fact.kind == "filter" and fact.field is not None and fact.operator is not None:
+        value = fact.values if fact.operator == "in" else fact.values[0]
+        return ((fact.field, fact.operator, value),)
+    return ()
+
+
+def _constraint_parts(constraint):
+    if hasattr(constraint, "field"):
+        return constraint.field, constraint.operator, constraint.value
+    return constraint
+
+
+def _finite_value_set(operator, value):
+    if operator == "eq":
+        return {value}
+    if operator == "in":
+        return set(value)
+    return None
+
+
+def _constraints_conflict(left: SemanticFact, right: SemanticFact) -> bool:
+    for left_constraint in _fact_constraints(left):
+        left_field, left_operator, left_value = _constraint_parts(left_constraint)
+        left_values = _finite_value_set(left_operator, left_value)
+        if left_values is None:
+            continue
+        for right_constraint in _fact_constraints(right):
+            right_field, right_operator, right_value = _constraint_parts(
+                right_constraint
+            )
+            if left_field != right_field:
+                continue
+            right_values = _finite_value_set(right_operator, right_value)
+            if right_values is not None and left_values.isdisjoint(right_values):
+                return True
+    return False
+
+
+def _overlapping_facts_conflict(left: SemanticFact, right: SemanticFact) -> bool:
+    if _facts_have_same_meaning(left, right):
+        return False
+    if left.kind == right.kind == "predicate":
+        return _predicate_conflict(left, right)
+    if left.kind == right.kind and left.kind in {
+        "field",
+        "filter",
+        "measure",
+        "semantic_intent",
+    }:
+        return True
+    if _constraints_conflict(left, right):
+        return True
+    if {left.kind, right.kind} == {"field", "predicate"}:
+        field_fact = left if left.kind == "field" else right
+        predicate_fact = right if right.kind == "predicate" else left
+        return any(
+            required.field == field_fact.field
+            for required in BUSINESS_PREDICATE_DEFINITIONS[
+                predicate_fact.concept_name
+            ].required_filters
+        )
+    return False
+
+
+def _select_longest_supported_facts(
+    question: str, facts: Iterable[SemanticFact]
+) -> tuple[SemanticFact, ...]:
+    """Keep the longest supported meaning while preserving compatible facts."""
+    ranked = []
+    for index, fact in enumerate(facts):
+        if fact.kind in {
+            "filter",
+            "predicate",
+        } and _evidence_follows_unsupported_operator(question, fact.evidence_text):
+            continue
+        span = _evidence_span(question, fact.evidence_text)
+        span = span if span is not None else (index, index + 1)
+        ranked.append((span[1] - span[0], _fact_priority(fact), -span[0], span, fact))
+    ranked.sort(key=lambda item: item[:3], reverse=True)
+
+    selected: list[tuple[tuple[int, int], SemanticFact]] = []
+    for length, priority, _, span, fact in ranked:
+        if any(_facts_have_same_meaning(fact, existing) for _, existing in selected):
+            continue
+        suppressed = False
+        for existing_span, existing in selected:
+            overlaps = span[0] < existing_span[1] and existing_span[0] < span[1]
+            if not overlaps or not _overlapping_facts_conflict(fact, existing):
+                continue
+            existing_rank = (
+                existing_span[1] - existing_span[0],
+                _fact_priority(existing),
+            )
+            if existing_rank > (length, priority):
+                suppressed = True
+                break
+        if not suppressed:
+            selected.append((span, fact))
+    return tuple(fact for _, fact in sorted(selected, key=lambda item: item[0]))
 
 
 def _earliest_measure_facts(question: str) -> list[SemanticFact]:
@@ -582,7 +797,7 @@ def detect_semantic_facts(
                 SemanticFact(
                     kind="filter",
                     field=concept.field,
-                    operator="in",
+                    operator=concept.operator,
                     values=members,
                     concept_name=name,
                     evidence_text=phrase,
@@ -616,7 +831,7 @@ def detect_semantic_facts(
             question, "semantic_intent", RETRIEVAL_INTENT_DEFINITIONS
         )
     )
-    return merge_semantic_facts(facts)
+    return merge_semantic_facts(_select_longest_supported_facts(question, facts))
 
 
 def _fact_target(fact: SemanticFact):

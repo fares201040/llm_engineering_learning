@@ -107,6 +107,38 @@ def generate_registry_cases() -> tuple[SemanticMatrixCase, ...]:
 
 
 class SemanticMatrixTests(unittest.TestCase):
+    def test_unsupported_operator_before_registered_predicate_emits_rejection_fact(
+        self,
+    ):
+        facts = detect_semantic_facts(
+            "How many attendance records match Authorized?",
+            ResolutionContext({}),
+        )
+
+        self.assertNotIn(
+            "authorized",
+            {fact.concept_name for fact in facts if fact.kind == "predicate"},
+        )
+        self.assertIn(
+            "unsupported_operator",
+            {fact.concept_name for fact in facts if fact.kind == "unsupported"},
+        )
+
+    def test_unsupported_operator_before_value_concept_emits_rejection_fact(self):
+        facts = detect_semantic_facts(
+            "How many attendance records match off days?",
+            ResolutionContext({}),
+        )
+
+        self.assertNotIn(
+            "off_day",
+            {fact.concept_name for fact in facts if fact.kind == "filter"},
+        )
+        self.assertIn(
+            "unsupported_operator",
+            {fact.concept_name for fact in facts if fact.kind == "unsupported"},
+        )
+
     def test_every_registered_closed_value_is_detected_canonically(self):
         for field, definition in FIELD_DEFINITIONS.items():
             if not definition.planner_visible:

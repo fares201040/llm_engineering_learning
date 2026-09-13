@@ -20,6 +20,31 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class PlanCompilerTests(unittest.TestCase):
+    def test_fieldless_unsupported_predicate_operator_rejects_measure_only_plan(self):
+        question = "How many attendance records match Authorized?"
+        resolution = ResolutionContext({})
+        proposal = PlannerProposal(
+            status="ready",
+            measure=ProposedMeasureChoice(
+                name="attendance_records", evidence_text="attendance records"
+            ),
+            answer_contract=AnswerContract(
+                shape="scalar", unit="records", subject_field=None, grain=[]
+            ),
+        )
+
+        result = compile_proposal(
+            proposal,
+            CompilationContext(
+                question, detect_semantic_facts(question, resolution), resolution
+            ),
+        )
+
+        self.assertFalse(result.ready)
+        self.assertIn(
+            "unsupported_capability", {item.code for item in result.violations}
+        )
+
     def test_unsupported_or_malformed_constraint_rejects_measure_only_plan(self):
         cases = (
             "How many days have status matches Authorized?",

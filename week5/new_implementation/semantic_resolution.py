@@ -105,15 +105,18 @@ def _unsupported_operator_between(
     return re.search(r"\b(?:match(?:es)?|regex|ends? with)\b", between) is not None
 
 
-def _span_follows_unsupported_operator(question: str, span: tuple[int, int]) -> bool:
+def _unsupported_operator_before_span(
+    question: str, span: tuple[int, int]
+) -> tuple[str, tuple[int, int]] | None:
     tokens = normalize_semantic_text(question).split()
-    return (
-        re.search(
-            r"\b(?:match(?:es)?|regex|ends? with)\s*$",
-            " ".join(tokens[: span[0]]),
-        )
-        is not None
-    )
+    for token_count in (2, 1):
+        start = span[0] - token_count
+        if start < 0:
+            continue
+        evidence = " ".join(tokens[start : span[0]])
+        if re.fullmatch(r"(?:match(?:es)?|regex|ends? with)", evidence):
+            return evidence, (start, span[0])
+    return None
 
 
 def _unsupported_fact(concept_name: str, evidence_text: str) -> "SemanticFact":
@@ -660,12 +663,28 @@ def _select_longest_supported_facts(
         spans = _evidence_spans(question, fact.evidence_text)
         if not spans:
             spans = ((index, index + 1),)
-        ranked.extend(
-            (span[1] - span[0], _fact_priority(fact), -span[0], span, fact)
-            for span in spans
-            if fact.kind not in {"filter", "predicate"}
-            or not _span_follows_unsupported_operator(question, span)
-        )
+        for span in spans:
+            operator = (
+                _unsupported_operator_before_span(question, span)
+                if fact.kind in {"filter", "predicate"}
+                else None
+            )
+            if operator is not None:
+                evidence, operator_span = operator
+                rejected = _unsupported_fact("unsupported_operator", evidence)
+                ranked.append(
+                    (
+                        operator_span[1] - operator_span[0],
+                        _fact_priority(rejected),
+                        -operator_span[0],
+                        operator_span,
+                        rejected,
+                    )
+                )
+                continue
+            ranked.append(
+                (span[1] - span[0], _fact_priority(fact), -span[0], span, fact)
+            )
     ranked.sort(key=lambda item: item[:3], reverse=True)
 
     selected: list[tuple[tuple[int, int], SemanticFact]] = []

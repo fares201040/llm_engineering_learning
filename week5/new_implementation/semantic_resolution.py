@@ -65,42 +65,64 @@ def evidence_occurs(text: str, evidence: str) -> bool:
     )
 
 
-def _evidence_span(text: str, evidence: str) -> tuple[int, int] | None:
-    """Locate semantic evidence in normalized token space for overlap ranking."""
-    best = None
-    for haystack in _token_forms(text):
-        for needle in _token_forms(evidence):
-            match = re.search(rf"(?:^|\s)({re.escape(needle)})(?:$|\s)", haystack)
-            if match is None:
+def _semantic_token_forms(value: object) -> tuple[tuple[str, ...], ...]:
+    return tuple(tuple(form.split()) for form in _token_forms(value))
+
+
+def _evidence_spans(text: str, evidence: str) -> tuple[tuple[int, int], ...]:
+    """Locate every occurrence in normalized token space."""
+    haystacks = _semantic_token_forms(text)
+    needles = _semantic_token_forms(evidence)
+    spans = []
+    for haystack in haystacks:
+        for needle in needles:
+            if not needle or len(needle) > len(haystack):
                 continue
-            span = match.span(1)
-            if best is None or span[1] - span[0] > best[1] - best[0]:
-                best = span
-    return best
+            spans.extend(
+                (start, start + len(needle))
+                for start in range(len(haystack) - len(needle) + 1)
+                if haystack[start : start + len(needle)] == needle
+            )
+    return tuple(dict.fromkeys(spans))
+
+
+def _evidence_span(text: str, evidence: str) -> tuple[int, int] | None:
+    spans = _evidence_spans(text, evidence)
+    return spans[0] if spans else None
 
 
 def _unsupported_operator_between(
     question: str, field_evidence: str, value_evidence: str
 ) -> bool:
-    normalized = normalize_semantic_text(question)
+    tokens = normalize_semantic_text(question).split()
     field_span = _evidence_span(question, field_evidence)
     value_span = _evidence_span(question, value_evidence)
     if field_span is None or value_span is None:
         return False
-    between = normalized[
-        min(field_span[1], value_span[1]) : max(field_span[0], value_span[0])
-    ]
-    return re.search(r"\b(?:matches?|regex|ends? with)\b", between) is not None
+    between = " ".join(
+        tokens[min(field_span[1], value_span[1]) : max(field_span[0], value_span[0])]
+    )
+    return re.search(r"\b(?:match(?:es)?|regex|ends? with)\b", between) is not None
 
 
-def _evidence_follows_unsupported_operator(question: str, evidence: str) -> bool:
-    normalized = normalize_semantic_text(question)
-    span = _evidence_span(question, evidence)
-    if span is None:
-        return False
+def _span_follows_unsupported_operator(question: str, span: tuple[int, int]) -> bool:
+    tokens = normalize_semantic_text(question).split()
     return (
-        re.search(r"\b(?:matches?|regex|ends? with)\s+$", normalized[: span[0]])
+        re.search(
+            r"\b(?:match(?:es)?|regex|ends? with)\s*$",
+            " ".join(tokens[: span[0]]),
+        )
         is not None
+    )
+
+
+def _unsupported_fact(concept_name: str, evidence_text: str) -> "SemanticFact":
+    return SemanticFact(
+        kind="unsupported",
+        concept_name=concept_name,
+        evidence_text=evidence_text,
+        origin="question",
+        strength="strong",
     )
 
 
@@ -185,6 +207,7 @@ class FieldResolver(ABC):
             normalize_semantic_text(field_facts[0].evidence_text), " ", 1
         )
         values: list[tuple[object, str]] = []
+        rejected_facts: list[SemanticFact] = []
         if definition.resolution_kind == "closed_value":
             values.extend(
                 (value, value)
@@ -234,6 +257,25 @@ class FieldResolver(ABC):
                 )
             if match:
                 values.append((float(match.group("number")), match.group(0)))
+            else:
+                field_span = _evidence_span(question, field_facts[0].evidence_text)
+                remaining = " ".join(
+                    normalize_semantic_text(question).split()[
+                        field_span[1] if field_span is not None else 0 :
+                    ]
+                )
+                malformed = re.match(
+                    r"(?:not\s+more\s+than|no\s+more\s+than|at\s+most|"
+                    r"not\s+less\s+than|no\s+less\s+than|at\s+least|more\s+than|"
+                    r"greater\s+than|less\s+than|equal\s+to|above|below|over|under|"
+                    r"equals?|is|exactly)\s+(?P<value>\S+)",
+                    remaining,
+                    re.I,
+                )
+                if malformed:
+                    rejected_facts.append(
+                        _unsupported_fact("malformed_value", malformed.group(0))
+                    )
         elif definition.resolution_kind == "temporal":
             pattern = (
                 r"\b\d{4}-(?:0[1-9]|1[0-2])\b"
@@ -247,30 +289,37 @@ class FieldResolver(ABC):
             match = re.search(pattern, question)
             if match:
                 values.append((match.group(0), match.group(0)))
-        value_facts = tuple(
-            SemanticFact(
-                kind="filter",
-                field=field,
-                operator=(
-                    _numeric_operator(match.group("comparator"))
-                    if definition.resolution_kind == "numeric" and match
-                    else "eq"
-                ),
-                values=(value,),
-                evidence_text=evidence,
-                origin="question",
-                strength="strong",
-            )
-            for value, evidence in dict.fromkeys(values)
-            if not _unsupported_operator_between(
+        value_facts = []
+        for value, evidence in dict.fromkeys(values):
+            if _unsupported_operator_between(
                 question, field_facts[0].evidence_text, evidence
+            ):
+                rejected_facts.append(
+                    _unsupported_fact("unsupported_operator", evidence)
+                )
+                continue
+            if (
+                definition.resolution_kind == "temporal"
+                and not _canonical_value_is_valid(field, value)
+            ):
+                rejected_facts.append(_unsupported_fact("malformed_value", evidence))
+                continue
+            value_facts.append(
+                SemanticFact(
+                    kind="filter",
+                    field=field,
+                    operator=(
+                        _numeric_operator(match.group("comparator"))
+                        if definition.resolution_kind == "numeric" and match
+                        else "eq"
+                    ),
+                    values=(value,),
+                    evidence_text=evidence,
+                    origin="question",
+                    strength="strong",
+                )
             )
-            and (
-                definition.resolution_kind != "temporal"
-                or _canonical_value_is_valid(field, value)
-            )
-        )
-        return field_facts + value_facts
+        return field_facts + tuple(value_facts) + tuple(rejected_facts)
 
     @abstractmethod
     def canonicalize(
@@ -484,7 +533,6 @@ def _facts_for_named_phrases(question, kind, registry):
                         strength="strong",
                     )
                 )
-                break
     return facts
 
 
@@ -597,14 +645,9 @@ def _overlapping_facts_conflict(left: SemanticFact, right: SemanticFact) -> bool
     if _constraints_conflict(left, right):
         return True
     if {left.kind, right.kind} == {"field", "predicate"}:
-        field_fact = left if left.kind == "field" else right
-        predicate_fact = right if right.kind == "predicate" else left
-        return any(
-            required.field == field_fact.field
-            for required in BUSINESS_PREDICATE_DEFINITIONS[
-                predicate_fact.concept_name
-            ].required_filters
-        )
+        return True
+    if {left.kind, right.kind} == {"filter", "predicate"}:
+        return True
     return False
 
 
@@ -614,19 +657,23 @@ def _select_longest_supported_facts(
     """Keep the longest supported meaning while preserving compatible facts."""
     ranked = []
     for index, fact in enumerate(facts):
-        if fact.kind in {
-            "filter",
-            "predicate",
-        } and _evidence_follows_unsupported_operator(question, fact.evidence_text):
-            continue
-        span = _evidence_span(question, fact.evidence_text)
-        span = span if span is not None else (index, index + 1)
-        ranked.append((span[1] - span[0], _fact_priority(fact), -span[0], span, fact))
+        spans = _evidence_spans(question, fact.evidence_text)
+        if not spans:
+            spans = ((index, index + 1),)
+        ranked.extend(
+            (span[1] - span[0], _fact_priority(fact), -span[0], span, fact)
+            for span in spans
+            if fact.kind not in {"filter", "predicate"}
+            or not _span_follows_unsupported_operator(question, span)
+        )
     ranked.sort(key=lambda item: item[:3], reverse=True)
 
     selected: list[tuple[tuple[int, int], SemanticFact]] = []
     for length, priority, _, span, fact in ranked:
-        if any(_facts_have_same_meaning(fact, existing) for _, existing in selected):
+        if any(
+            span == existing_span and _facts_have_same_meaning(fact, existing)
+            for existing_span, existing in selected
+        ):
             continue
         suppressed = False
         for existing_span, existing in selected:
@@ -642,7 +689,11 @@ def _select_longest_supported_facts(
                 break
         if not suppressed:
             selected.append((span, fact))
-    return tuple(fact for _, fact in sorted(selected, key=lambda item: item[0]))
+    deduplicated = []
+    for _, fact in sorted(selected, key=lambda item: item[0]):
+        if not any(_facts_have_same_meaning(fact, item) for item in deduplicated):
+            deduplicated.append(fact)
+    return tuple(deduplicated)
 
 
 def _earliest_measure_facts(question: str) -> list[SemanticFact]:
@@ -805,7 +856,6 @@ def detect_semantic_facts(
                     strength="strong",
                 )
             )
-            break
     facts.extend(_grouping_facts(question, maximal_field_matches))
     facts.extend(_calculation_facts(question, selected_fields, facts))
     if re.search(r"\b(?:how many|count|number of|total number)\b", question, re.I):
@@ -813,19 +863,7 @@ def detect_semantic_facts(
     predicate_facts = _facts_for_named_phrases(
         question, "predicate", BUSINESS_PREDICATE_DEFINITIONS
     )
-    selected_phrases = [
-        phrase for field, phrase in maximal_field_matches if field in selected_fields
-    ]
-    facts.extend(
-        fact
-        for fact in predicate_facts
-        if not any(
-            normalize_semantic_text(fact.evidence_text)
-            != normalize_semantic_text(field_phrase)
-            and evidence_occurs(field_phrase, fact.evidence_text)
-            for field_phrase in selected_phrases
-        )
-    )
+    facts.extend(predicate_facts)
     facts.extend(
         _facts_for_named_phrases(
             question, "semantic_intent", RETRIEVAL_INTENT_DEFINITIONS

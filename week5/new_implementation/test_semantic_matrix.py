@@ -220,6 +220,10 @@ class SemanticMatrixTests(unittest.TestCase):
                 self.assertFalse(
                     any(fact.kind in {"filter", "predicate"} for fact in facts)
                 )
+                self.assertTrue(
+                    any(fact.kind == "unsupported" for fact in facts),
+                    "the compiler needs a durable rejection fact",
+                )
 
     def test_overlapping_phrases_keep_only_the_supported_meaning(self):
         cases = (

@@ -6,6 +6,7 @@ from week5.new_implementation.attendance_schema import (
     ProposedCalculation,
     ProposedFilter,
     ProposedMeasureChoice,
+    ProposedPredicateChoice,
 )
 from week5.new_implementation.plan_compiler import (
     PLAN_INVARIANTS,
@@ -19,6 +20,101 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class PlanCompilerTests(unittest.TestCase):
+    def test_unsupported_or_malformed_constraint_rejects_measure_only_plan(self):
+        cases = (
+            "How many days have status matches Authorized?",
+            "How many days have Date equal to 2026-02-30?",
+            "How many days have worked hours above bananas?",
+        )
+
+        for question in cases:
+            with self.subTest(question=question):
+                resolution = ResolutionContext({})
+                proposal = PlannerProposal(
+                    status="ready",
+                    measure=ProposedMeasureChoice(
+                        name="distinct_dates", evidence_text="days"
+                    ),
+                    answer_contract=AnswerContract(
+                        shape="scalar",
+                        unit="dates",
+                        subject_field="Date",
+                        grain=["Date"],
+                    ),
+                )
+
+                result = compile_proposal(
+                    proposal,
+                    CompilationContext(
+                        question,
+                        detect_semantic_facts(question, resolution),
+                        resolution,
+                    ),
+                )
+
+                self.assertFalse(result.ready)
+                self.assertIn(
+                    "unsupported_capability",
+                    {violation.code for violation in result.violations},
+                )
+
+    def test_numeric_worked_hours_constraint_compiles_without_work_predicate(self):
+        question = "How many days had worked hours above 2?"
+        resolution = ResolutionContext({})
+        proposal = PlannerProposal(
+            status="ready",
+            filters=[
+                ProposedFilter(
+                    field="Total_Worked_Hrs",
+                    operator="gt",
+                    value=2,
+                    evidence_text="worked hours above 2",
+                )
+            ],
+            measure=ProposedMeasureChoice(name="distinct_dates", evidence_text="days"),
+            answer_contract=AnswerContract(
+                shape="scalar", unit="dates", subject_field="Date", grain=["Date"]
+            ),
+        )
+
+        result = compile_proposal(
+            proposal,
+            CompilationContext(
+                question, detect_semantic_facts(question, resolution), resolution
+            ),
+        )
+
+        self.assertTrue(result.ready, result.violations)
+        self.assertEqual(
+            result.executable_plan.filters[0].model_dump(),
+            {"field": "Total_Worked_Hrs", "operator": "gt", "value": 2.0},
+        )
+        self.assertEqual(result.executable_plan.business_predicates, [])
+
+    def test_omitting_independent_positive_work_occurrence_is_rejected(self):
+        question = "How many days did not work and work?"
+        resolution = ResolutionContext({})
+        proposal = PlannerProposal(
+            status="ready",
+            measure=ProposedMeasureChoice(name="distinct_dates", evidence_text="days"),
+            business_predicates=[
+                ProposedPredicateChoice(name="not_worked", evidence_text="not work")
+            ],
+            answer_contract=AnswerContract(
+                shape="scalar", unit="dates", subject_field="Date", grain=["Date"]
+            ),
+        )
+
+        result = compile_proposal(
+            proposal,
+            CompilationContext(
+                question, detect_semantic_facts(question, resolution), resolution
+            ),
+        )
+
+        self.assertFalse(result.ready)
+        self.assertIn("uncovered_fact", {item.code for item in result.violations})
+
     def test_percentage_condition_is_canonicalized_grounded_and_preserved(self):
         question = (
             "What percentage of all attendance records have Status equal to Authorized?"

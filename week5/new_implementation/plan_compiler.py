@@ -386,15 +386,21 @@ class AnswerContractInvariant(PlanInvariant):
 class CapabilityInvariant(PlanInvariant):
     def check(self, context):
         proposal = context.proposal
-        if proposal is None or not proposal.unsupported_capabilities:
-            return ()
+        proposed_capabilities = (
+            proposal.unsupported_capabilities if proposal is not None else ()
+        )
+        detected_capabilities = tuple(
+            fact.concept_name or "unsupported_constraint"
+            for fact in context.compilation.facts
+            if fact.kind == "unsupported" and fact.strength == "strong"
+        )
         return tuple(
             PlanViolation(
                 "unsupported_capability",
                 capability,
                 "The request cannot be represented safely by the current plan language.",
             )
-            for capability in proposal.unsupported_capabilities
+            for capability in (*proposed_capabilities, *detected_capabilities)
         )
 
 

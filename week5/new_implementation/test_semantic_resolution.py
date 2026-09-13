@@ -12,6 +12,36 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class SemanticResolutionTests(unittest.TestCase):
+    def test_worked_hours_numeric_constraint_outranks_embedded_work_predicate(self):
+        facts = detect_semantic_facts(
+            "How many days had worked hours above 2?",
+            ResolutionContext(catalog={}),
+        )
+
+        self.assertIn(
+            ("Total_Worked_Hrs", "gt", (2.0,)),
+            {
+                (fact.field, fact.operator, fact.values)
+                for fact in facts
+                if fact.kind == "filter"
+            },
+        )
+        self.assertNotIn(
+            "worked",
+            {fact.concept_name for fact in facts if fact.kind == "predicate"},
+        )
+
+    def test_independent_positive_work_occurrence_survives_negated_occurrence(self):
+        facts = detect_semantic_facts(
+            "How many days did not work and work?",
+            ResolutionContext(catalog={}),
+        )
+
+        self.assertEqual(
+            {fact.concept_name for fact in facts if fact.kind == "predicate"},
+            {"worked", "not_worked"},
+        )
+
     def test_work_language_emits_positive_work_predicate(self):
         cases = (
             "How many days did employee A10017 work?",

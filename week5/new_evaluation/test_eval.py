@@ -20,6 +20,163 @@ PRIVATE_FIXTURES_AVAILABLE = (
 
 
 class BaselineCapabilityParityTests(unittest.TestCase):
+    def test_unbound_catalog_operator_rejects_instead_of_counting_every_record(self):
+        for prefix in ("Count records where", "Count records"):
+            for grammar in (
+                "in",
+                "contains",
+                "starts with",
+                "is not",
+                "does not contain",
+            ):
+                with self.subTest(prefix=prefix, grammar=grammar):
+                    self.store.get.reset_mock()
+                    with patch.object(
+                        self.answer,
+                        "load_attendance_catalog_candidates",
+                        return_value={"Department": ("Sales",)},
+                    ):
+                        with self.assertRaises(self.answer.SemanticPlanValidationError):
+                            self.answer.fetch_context(
+                                f"{prefix} Department {grammar} Unknown"
+                            )
+                    self.store.get.assert_not_called()
+
+    def test_categorical_operator_matrix_executes_restricted_populations(self):
+        for field, value, population, counts in (
+            (
+                "Department",
+                "Sales",
+                ("Sales", "Sales", "Sales East", "Field Sales", "Support"),
+                (2, 3, 2, 4, 3),
+            ),
+            (
+                "Position",
+                "Engineer",
+                ("Engineer", "Engineer", "Engineer Lead", "Lead Engineer", "Officer"),
+                (2, 3, 2, 4, 3),
+            ),
+            (
+                "Status",
+                "Authorized",
+                ("Authorized", "Authorized", "Authorized", "Draft", "Draft"),
+                (3, 2, 3, 3, 3),
+            ),
+            (
+                "Day_Type",
+                "OFF Day",
+                ("OFF Day", "OFF Day", "OFF Day (ZAS)", "OFF Day (ZAS)", "Working Day"),
+                (2, 3, 2, 4, 4),
+            ),
+        ):
+            for row, entry in zip(self.rows, population):
+                row[field] = entry
+            for (grammar, operator), expected in zip(
+                (
+                    ("is", "eq"),
+                    ("is not", "ne"),
+                    ("in", "in"),
+                    ("contains", "contains"),
+                    ("starts with", "starts_with"),
+                ),
+                counts,
+            ):
+                with self.subTest(field=field, grammar=grammar):
+                    with patch.object(
+                        self.answer,
+                        "load_attendance_catalog_candidates",
+                        return_value={field: tuple(dict.fromkeys(population))},
+                    ):
+                        _, plan, result, _ = self.answer.fetch_context(
+                            f"Count records where {field} {grammar} {value}"
+                        )
+                    filters = [item for item in plan.filters if item.field == field]
+                    self.assertEqual(
+                        [(item.operator, item.value) for item in filters],
+                        [(operator, [value] if operator == "in" else value)],
+                    )
+                    self.assertEqual(result["value"], expected)
+
+    def test_categorical_text_pattern_uses_literal_not_guessed_catalog_member(self):
+        for row, value in zip(
+            self.rows, ("Sales East", "Sales West", "Field Sales", "Support", "Support")
+        ):
+            row["Department"] = value
+        for grammar, operator, expected in (
+            ("contains", "contains", 3),
+            ("starts with", "starts_with", 2),
+        ):
+            with self.subTest(grammar=grammar):
+                with patch.object(
+                    self.answer,
+                    "load_attendance_catalog_candidates",
+                    return_value={
+                        "Department": (
+                            "Sales East",
+                            "Sales West",
+                            "Field Sales",
+                            "Support",
+                        )
+                    },
+                ):
+                    _, plan, result, _ = self.answer.fetch_context(
+                        f"Count records where Department {grammar} Sales"
+                    )
+                self.assertIn(
+                    ("Department", operator, "Sales"),
+                    {(item.field, item.operator, item.value) for item in plan.filters},
+                )
+                self.assertEqual(result["value"], expected)
+
+    def test_unrepresentable_categorical_operator_rejects_before_retrieval(self):
+        for field, value in (("Department", "Sales"), ("Status", "Authorized")):
+            for grammar in (
+                "does not contain",
+                "does not start with",
+                "not in",
+                "ends with",
+                "sounds like",
+                "greater than",
+            ):
+                with self.subTest(field=field, grammar=grammar):
+                    self.store.get.reset_mock()
+                    with patch.object(
+                        self.answer,
+                        "load_attendance_catalog_candidates",
+                        return_value={"Department": ("Sales",)},
+                    ):
+                        rejection = (
+                            self.answer.PlanValidationError
+                            if grammar == "greater than"
+                            else self.answer.SemanticPlanValidationError
+                        )
+                        with self.assertRaises(rejection):
+                            self.answer.fetch_context(
+                                f"Count records where {field} {grammar} {value}"
+                            )
+                    self.store.get.assert_not_called()
+
+    def test_bare_unsupported_catalog_operator_rejects_before_retrieval(self):
+        for grammar in (
+            "does not contain",
+            "does not start with",
+            "not in",
+            "ends with",
+            "regex",
+        ):
+            with self.subTest(grammar=grammar):
+                self.store.get.reset_mock()
+                with patch.object(
+                    self.answer,
+                    "load_attendance_catalog_candidates",
+                    return_value={"Department": ("Sales",)},
+                ):
+                    with self.assertRaises(self.answer.SemanticPlanValidationError):
+                        self.answer.fetch_context(
+                            f"Count records Department {grammar} Sales"
+                        )
+                self.store.get.assert_not_called()
+
     def test_explicit_distributive_totals_remain_grouped(self):
         for index, row in enumerate(self.rows):
             row["Department"] = "Alpha" if index < 3 else "Beta"
@@ -41,6 +198,13 @@ class BaselineCapabilityParityTests(unittest.TestCase):
                         )
 
     def test_collective_totals_defer_only_to_explicit_grouping(self):
+        self.stack.enter_context(
+            patch.object(
+                self.answer,
+                "load_attendance_catalog_candidates",
+                return_value={"Department": ("Total", "Alpha", "Beta")},
+            )
+        )
         for index, row in enumerate(self.rows):
             row["Department"] = "Alpha" if index < 3 else "Beta"
         for quantifier, subject, verb in (

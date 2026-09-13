@@ -1011,10 +1011,42 @@ CALCULATION_DEFINITIONS = MappingProxyType(
     }
 )
 
-# Shared grammatical roles used before categorical literals become constraints.
-CATEGORICAL_EQUALITY_PATTERN = (
-    r"(?:is(?: exactly)?|equals?(?: to)?|equal to|has(?: the)? value)"
+
+@dataclass(frozen=True)
+class FilterOperatorDefinition:
+    detection_pattern: str
+    negated_operator: FilterOperator | None = None
+    uses_text_pattern: bool = False
+
+
+# Operator meaning and surface grammar share the field registry's native operators.
+FILTER_OPERATOR_DEFINITIONS = MappingProxyType(
+    {
+        "eq": FilterOperatorDefinition(
+            r"(?:=|:|is(?: exactly)?|equals?(?: to)?|has(?: the)? value)", "ne"
+        ),
+        "ne": FilterOperatorDefinition(r"(?:!=|<>|is not)", "eq"),
+        "in": FilterOperatorDefinition(r"(?:is )?in"),
+        "contains": FilterOperatorDefinition(
+            r"(?:contains?|containing)", uses_text_pattern=True
+        ),
+        "starts_with": FilterOperatorDefinition(
+            r"(?:starts?|starting) with", uses_text_pattern=True
+        ),
+        "gt": FilterOperatorDefinition(r"(?:>|greater than|more than|above)"),
+        "gte": FilterOperatorDefinition(r"(?:>=|at least|greater than or equal to)"),
+        "lt": FilterOperatorDefinition(r"(?:<|less than|below)"),
+        "lte": FilterOperatorDefinition(r"(?:<=|at most|less than or equal to)"),
+    }
 )
+
+# A constraint introducer gives an unrecognized relation a fail-closed role.
+CATEGORICAL_CONSTRAINT_INTRODUCER = r"\b(?:where|with|whose)\s*$"
+UNSUPPORTED_FILTER_OPERATOR_PATTERN = r"\b(?:match(?:es)?|regex|ends? with)\b"
+COLLECTIVE_MODIFIER_PATTERN = r"(?:combined|in total)"
+
+
+# Shared grammatical roles used before categorical literals become constraints.
 ORDERING_ROLE_PATTERNS = MappingProxyType(
     {
         "aggregate": r"\b(highest|lowest)\b",

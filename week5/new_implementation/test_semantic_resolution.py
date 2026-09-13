@@ -14,6 +14,113 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class BaselineOrderingGrammarTests(unittest.TestCase):
+    def test_unbound_categorical_operator_operand_cannot_disappear(self):
+        context = ResolutionContext({"Department": ("Sales",)})
+        for prefix in ("Count records where", "Count records"):
+            for grammar in (
+                "in",
+                "contains",
+                "starts with",
+                "is not",
+                "does not contain",
+            ):
+                with self.subTest(prefix=prefix, grammar=grammar):
+                    facts = detect_semantic_facts(
+                        f"{prefix} Department {grammar} Unknown", context
+                    )
+                    self.assertTrue(
+                        [
+                            fact
+                            for fact in facts
+                            if fact.kind == "unsupported" and fact.strength == "strong"
+                        ]
+                    )
+
+    def test_registered_categorical_operators_preserve_binding_meaning(self):
+        context = ResolutionContext(
+            {"Department": ("Sales",), "Position": ("Engineer",)}
+        )
+        for field, value in (
+            ("Department", "Sales"),
+            ("Position", "Engineer"),
+            ("Status", "Authorized"),
+            ("Day_Type", "Working Day"),
+        ):
+            for grammar, operator in (
+                ("is exactly", "eq"),
+                ("is not", "ne"),
+                ("does not equal", "ne"),
+                ("not equal to", "ne"),
+                ("!=", "ne"),
+                ("<>", "ne"),
+                ("in", "in"),
+                ("contains", "contains"),
+                ("starts with", "starts_with"),
+            ):
+                question = f"Count records where {field} {grammar} {value}"
+                with self.subTest(field=field, grammar=grammar):
+                    facts = detect_semantic_facts(question, context)
+                    bound = [
+                        fact
+                        for fact in facts
+                        if fact.kind == "filter" and fact.field == field
+                    ]
+                    self.assertEqual(
+                        [(fact.operator, fact.values) for fact in bound],
+                        [(operator, (value,))],
+                    )
+                    self.assertEqual(question[slice(*bound[0].evidence_span)], value)
+
+    def test_unrepresentable_categorical_constraints_are_strong_unsupported(self):
+        context = ResolutionContext({"Department": ("Sales",)})
+        for grammar in (
+            "does not contain",
+            "does not start with",
+            "not in",
+            "ends with",
+            "sounds like",
+            "greater than",
+        ):
+            with self.subTest(grammar=grammar):
+                facts = detect_semantic_facts(
+                    f"Count records where Department {grammar} Sales", context
+                )
+                self.assertTrue(
+                    [
+                        fact
+                        for fact in facts
+                        if fact.kind == "unsupported" and fact.strength == "strong"
+                    ]
+                )
+                self.assertFalse(
+                    [
+                        fact
+                        for fact in facts
+                        if fact.kind == "filter" and fact.field == "Department"
+                    ]
+                )
+
+    def test_explicit_unsupported_operator_needs_no_constraint_introducer(self):
+        context = ResolutionContext({"Department": ("Sales",)})
+        for grammar in (
+            "does not contain",
+            "does not start with",
+            "not in",
+            "ends with",
+            "regex",
+        ):
+            with self.subTest(grammar=grammar):
+                facts = detect_semantic_facts(
+                    f"Count records Department {grammar} Sales", context
+                )
+                self.assertTrue(
+                    [
+                        fact
+                        for fact in facts
+                        if fact.kind == "unsupported" and fact.strength == "strong"
+                    ]
+                )
+
     def test_categorical_cooccurrence_does_not_prove_a_filter_role(self):
         context = ResolutionContext(
             {"Position": ("Highest", "Average", "Total", "Engineer")}
@@ -23,6 +130,7 @@ class BaselineOrderingGrammarTests(unittest.TestCase):
             "Which Position has the average Total_OT?",
             "Show Position and total overtime for all employees",
             "Count records by Position and Engineer",
+            "Count records by all Position in total",
         ):
             with self.subTest(question=question):
                 facts = (

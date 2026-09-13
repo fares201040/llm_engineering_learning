@@ -14,13 +14,16 @@ try:
     from .attendance_schema import (
         BUSINESS_PREDICATE_DEFINITIONS,
         CALCULATION_DEFINITIONS,
-        CATEGORICAL_EQUALITY_PATTERN,
+        CATEGORICAL_CONSTRAINT_INTRODUCER,
+        COLLECTIVE_MODIFIER_PATTERN,
         canonicalize_storage_value,
         FIELD_DEFINITIONS,
+        FILTER_OPERATOR_DEFINITIONS,
         MEASURE_DEFINITIONS,
         ORDERING_ROLE_PATTERNS,
         RETRIEVAL_INTENT_DEFINITIONS,
         VALUE_CONCEPT_DEFINITIONS,
+        UNSUPPORTED_FILTER_OPERATOR_PATTERN,
         UNSUPPORTED_REQUEST_PATTERNS,
         EvidenceOrigin,
         FilterOperator,
@@ -30,13 +33,16 @@ except ImportError:  # Direct execution from week5/new_implementation.
     from attendance_schema import (
         BUSINESS_PREDICATE_DEFINITIONS,
         CALCULATION_DEFINITIONS,
-        CATEGORICAL_EQUALITY_PATTERN,
+        CATEGORICAL_CONSTRAINT_INTRODUCER,
+        COLLECTIVE_MODIFIER_PATTERN,
         canonicalize_storage_value,
         FIELD_DEFINITIONS,
+        FILTER_OPERATOR_DEFINITIONS,
         MEASURE_DEFINITIONS,
         ORDERING_ROLE_PATTERNS,
         RETRIEVAL_INTENT_DEFINITIONS,
         VALUE_CONCEPT_DEFINITIONS,
+        UNSUPPORTED_FILTER_OPERATOR_PATTERN,
         UNSUPPORTED_REQUEST_PATTERNS,
         EvidenceOrigin,
         FilterOperator,
@@ -110,7 +116,7 @@ def _unsupported_operator_between(
     between = " ".join(
         tokens[min(field_span[1], value_span[1]) : max(field_span[0], value_span[0])]
     )
-    return re.search(r"\b(?:match(?:es)?|regex|ends? with)\b", between) is not None
+    return re.search(UNSUPPORTED_FILTER_OPERATOR_PATTERN, between) is not None
 
 
 def _unsupported_operator_before_span(
@@ -122,7 +128,7 @@ def _unsupported_operator_before_span(
         if start < 0:
             continue
         evidence = " ".join(tokens[start : span[0]])
-        if re.fullmatch(r"(?:match(?:es)?|regex|ends? with)", evidence):
+        if re.fullmatch(UNSUPPORTED_FILTER_OPERATOR_PATTERN, evidence):
             return evidence, (start, span[0])
     return None
 
@@ -316,9 +322,22 @@ class FieldResolver(ABC):
             match = re.search(pattern, question)
             if match:
                 values.append((match.group(0), match.group(0)))
+        if definition.resolution_kind in {"catalog", "closed_value"}:
+            for literal in _categorical_literal_fragments(field, context):
+                bindings = _field_value_bindings(question, field_evidence, literal)
+                if any(
+                    binding.operator
+                    and FILTER_OPERATOR_DEFINITIONS[binding.operator].uses_text_pattern
+                    for binding in bindings
+                ):
+                    values.append((literal, literal))
         value_facts = []
+        bound_constraints = []
         for value, evidence in dict.fromkeys(values):
-            if _unsupported_operator_between(question, field_evidence, evidence):
+            if definition.resolution_kind not in {
+                "catalog",
+                "closed_value",
+            } and _unsupported_operator_between(question, field_evidence, evidence):
                 rejected_facts.append(
                     _unsupported_fact("unsupported_operator", evidence)
                 )
@@ -330,11 +349,23 @@ class FieldResolver(ABC):
                 rejected_facts.append(_unsupported_fact("malformed_value", evidence))
                 continue
             evidence_span = None
+            operator = "eq"
             if definition.resolution_kind in {"catalog", "closed_value"}:
-                bound_spans = _field_value_evidence_spans(
-                    question, field_evidence, evidence
+                bindings = _field_value_bindings(question, field_evidence, evidence)
+                bound_constraints.extend(
+                    binding.constraint_span for binding in bindings
                 )
-                if not bound_spans:
+                if bindings and any(
+                    binding.operator not in definition.operators for binding in bindings
+                ):
+                    rejected_facts.append(
+                        _unsupported_fact(
+                            "unsupported_operator",
+                            question[slice(*bindings[0].constraint_span)],
+                        )
+                    )
+                    continue
+                if not bindings:
                     bound_spans = _implicit_categorical_value_spans(question, evidence)
                     if bound_spans and _categorical_value_owners(value, context) != {
                         field
@@ -343,14 +374,18 @@ class FieldResolver(ABC):
                             _unsupported_fact("ambiguous_value_binding", evidence)
                         )
                         continue
-                if len(bound_spans) > 1:
+                    bindings = tuple(
+                        CategoricalBinding(span, "eq", span) for span in bound_spans
+                    )
+                if len(bindings) > 1:
                     rejected_facts.append(
                         _unsupported_fact("ambiguous_value_binding", evidence)
                     )
                     continue
-                if not bound_spans:
+                if not bindings:
                     continue
-                evidence_span = bound_spans[0]
+                evidence_span = bindings[0].value_span
+                operator = bindings[0].operator
             value_facts.append(
                 SemanticFact(
                     kind="filter",
@@ -358,7 +393,7 @@ class FieldResolver(ABC):
                     operator=(
                         _numeric_operator(match.group("comparator"))
                         if definition.resolution_kind == "numeric" and match
-                        else "eq"
+                        else operator
                     ),
                     values=(value,),
                     evidence_text=evidence,
@@ -367,6 +402,16 @@ class FieldResolver(ABC):
                     strength="strong",
                 )
             )
+        if definition.resolution_kind in {"catalog", "closed_value"}:
+            for start, end, operator_end in _field_operator_spans(
+                question, field_evidence
+            ):
+                if not any(lo <= start and end <= hi for lo, hi in bound_constraints):
+                    rejected_facts.append(
+                        _unsupported_fact(
+                            "unsupported_constraint", question[start:operator_end]
+                        )
+                    )
         return field_facts + tuple(value_facts) + tuple(rejected_facts)
 
     @abstractmethod
@@ -391,7 +436,54 @@ def _raw_phrase_spans(text: str, phrase: str) -> tuple[tuple[int, int], ...]:
     )
 
 
-def _field_value_evidence_spans(question, field_evidence, value_evidence):
+@dataclass(frozen=True)
+class CategoricalBinding:
+    value_span: tuple[int, int]
+    operator: FilterOperator | None
+    constraint_span: tuple[int, int]
+
+
+def _registered_filter_operator(text):
+    """Retain an operator role even when its semantics have no native operator."""
+    grammar = " ".join(text.casefold().split())
+    for operator, definition in FILTER_OPERATOR_DEFINITIONS.items():
+        if re.fullmatch(definition.detection_pattern, grammar):
+            return True, operator
+    negated = re.fullmatch(r"(?:(?:does|do|is) )?not (.+)", grammar)
+    if negated:
+        for definition in FILTER_OPERATOR_DEFINITIONS.values():
+            if re.fullmatch(definition.detection_pattern, negated.group(1)):
+                return True, definition.negated_operator
+    return bool(re.fullmatch(UNSUPPORTED_FILTER_OPERATOR_PATTERN, grammar)), None
+
+
+def _field_has_collective_modifier(question, start, end):
+    return bool(
+        re.search(r"\b(?:by|per|each|every|all|any)\s*$", question[:start], re.I)
+        and re.match(rf"\s+{COLLECTIVE_MODIFIER_PATTERN}\b", question[end:], re.I)
+    )
+
+
+def _field_operator_spans(question, field_evidence):
+    """Find explicit field/operator roles independently of operand resolution."""
+    spans = set()
+    for form in _token_forms(field_evidence):
+        for start, end in _raw_phrase_spans(question, form):
+            if _field_has_collective_modifier(question, start, end):
+                continue
+            operator_ends = [
+                end + token.end()
+                for token in re.finditer(r"\w+|[^\w\s]+", question[end:])
+                if _registered_filter_operator(question[end : end + token.end()])[0]
+            ]
+            if operator_ends or re.search(
+                CATEGORICAL_CONSTRAINT_INTRODUCER, question[:start], re.I
+            ):
+                spans.add((start, end, max(operator_ends, default=end)))
+    return tuple(sorted(spans))
+
+
+def _field_value_bindings(question, field_evidence, value_evidence):
     """Retain nearest occurrences only after proving a field/value relation."""
     value_spans = _raw_phrase_spans(question, value_evidence)
     field_spans = {
@@ -401,8 +493,13 @@ def _field_value_evidence_spans(question, field_evidence, value_evidence):
     }
     candidates = []
     for field_start, field_end in field_spans:
+        if _field_has_collective_modifier(question, field_start, field_end):
+            continue
         field_is_subject = re.search(
             r"\b(?:which|by|per|each|every|all|any)\s*$", question[:field_start], re.I
+        )
+        explicit_constraint = re.search(
+            CATEGORICAL_CONSTRAINT_INTRODUCER, question[:field_start], re.I
         )
         for value_start, value_end in value_spans:
             if not (field_end <= value_start or value_end <= field_start):
@@ -411,21 +508,48 @@ def _field_value_evidence_spans(question, field_evidence, value_evidence):
             adjacent = not gap.strip() and not (
                 field_end <= value_start and field_is_subject
             )
-            equality = field_end <= value_start and (
-                re.fullmatch(r"\s*[=:]\s*", gap)
-                or re.fullmatch(
-                    CATEGORICAL_EQUALITY_PATTERN, normalize_semantic_text(gap)
-                )
+            operator_role, operator = (
+                _registered_filter_operator(gap)
+                if field_end <= value_start
+                else (False, None)
             )
-            if adjacent or equality:
+            unrepresented = (
+                field_end <= value_start and explicit_constraint and bool(gap.strip())
+            )
+            if adjacent or operator_role or unrepresented:
                 candidates.append(
-                    (len(normalize_semantic_text(gap)), (value_start, value_end))
+                    (
+                        len(normalize_semantic_text(gap)),
+                        CategoricalBinding(
+                            (value_start, value_end),
+                            "eq" if adjacent else operator,
+                            (min(field_start, value_start), max(field_end, value_end)),
+                        ),
+                    )
                 )
     if not candidates:
         return ()
     distance = min(item[0] for item in candidates)
-    nearest = {span for gap, span in candidates if gap == distance}
-    return tuple(sorted(nearest))
+    nearest = {binding for gap, binding in candidates if gap == distance}
+    return tuple(sorted(nearest, key=lambda item: item.value_span))
+
+
+def _categorical_literal_fragments(field, context):
+    definition = FIELD_DEFINITIONS[field]
+    return tuple(
+        sorted(
+            {
+                " ".join(tokens[start:end])
+                for value in (
+                    *context.catalog.get(field, ()),
+                    *definition.closed_values,
+                )
+                for tokens in (str(value).split(),)
+                for start in range(len(tokens))
+                for end in range(start + 1, len(tokens) + 1)
+            }
+        )
+    )
 
 
 def _categorical_value_owners(value, context):
@@ -552,6 +676,7 @@ class EntityResolver(FieldResolver):
             for span in _raw_phrase_spans(question, phrase)
         ]
         non_entity_field_spans = []
+        categorical_operator_spans = []
         for target, definition in FIELD_DEFINITIONS.items():
             if definition.resolution_kind in {"entity", "identifier"}:
                 continue
@@ -561,6 +686,14 @@ class EntityResolver(FieldResolver):
                 for span in _raw_phrase_spans(question, phrase)
             ]
             non_entity_field_spans.extend(field_spans)
+            if definition.resolution_kind in {"catalog", "closed_value"}:
+                categorical_operator_spans.extend(
+                    (field_end, operator_end)
+                    for phrase in definition.natural_names
+                    for _, field_end, operator_end in _field_operator_spans(
+                        question, phrase
+                    )
+                )
             if field_spans:
                 values = (*context.catalog.get(target, ()), *definition.closed_values)
                 protected_spans.extend(
@@ -568,6 +701,13 @@ class EntityResolver(FieldResolver):
                     for value in values
                     for span in _raw_phrase_spans(question, value)
                 )
+                if definition.resolution_kind in {"catalog", "closed_value"}:
+                    protected_spans.extend(
+                        binding.constraint_span
+                        for phrase in definition.natural_names
+                        for value in _categorical_literal_fragments(target, context)
+                        for binding in _field_value_bindings(question, phrase, value)
+                    )
         syntax_spans = []
         for match in re.finditer(
             r"\b(?P<name>[^\W\d_][\w'-]*(?:\s+[^\W\d_][\w'-]*)*)['’]s\b", question
@@ -629,8 +769,10 @@ class EntityResolver(FieldResolver):
             reference = question[start:end]
             if not reference or re.search(r"\d", reference):
                 continue
+            if any(begin <= start < stop for begin, stop in categorical_operator_spans):
+                continue
             quantified = re.fullmatch(
-                r"(?:each|every|all|any)\s+(?:the\s+)?(.+?)(?:\s+(?:combined|in total))?",
+                rf"(?:each|every|all|any)\s+(?:the\s+)?(.+?)(?:\s+{COLLECTIVE_MODIFIER_PATTERN})?",
                 normalize_semantic_text(reference),
             )
             if quantified and any(
@@ -1136,10 +1278,22 @@ class ResolverRegistry:
             raise ValueError(f"Resolution kind {kind!r} must have exactly one resolver")
         return owners[0]
 
-    def canonicalize(self, field, raw_value, evidence_text, context):
+    def canonicalize(self, field, raw_value, evidence_text, context, *, operator=None):
         definition = FIELD_DEFINITIONS.get(field)
         if definition is None or not definition.filterable:
             return ResolutionOutcome("unknown")
+        operator_definition = FILTER_OPERATOR_DEFINITIONS.get(operator)
+        if (
+            operator in definition.operators
+            and operator_definition is not None
+            and operator_definition.uses_text_pattern
+            and definition.resolution_kind in {"catalog", "closed_value"}
+            and isinstance(raw_value, str)
+            and raw_value in _categorical_literal_fragments(field, context)
+        ):
+            # Pattern operands are literals, not incomplete names to expand to a
+            # guessed member. Independent filter facts still ground the compiler.
+            return ResolutionOutcome("resolved", (raw_value,))
         return self.for_kind(definition.resolution_kind).canonicalize(
             field, raw_value, evidence_text, context
         )
@@ -1527,7 +1681,7 @@ def _grouping_facts(
             and (
                 re.match(r"in total\b", normalized_question)
                 or re.match(
-                    r"\s+(?:have\s+)?(?:combined|in total)\b",
+                    rf"\s+(?:have\s+)?{COLLECTIVE_MODIFIER_PATTERN}\b",
                     normalized_question[match.end() :],
                 )
             )

@@ -650,6 +650,7 @@ def _canonicalize_filter(proposed, context, resolver_registry):
             raw_value,
             proposed.evidence_text,
             context.resolution_context,
+            operator=proposed.operator,
         )
         if outcome.status == "resolved":
             canonical.extend(outcome.values)

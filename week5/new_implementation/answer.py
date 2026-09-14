@@ -92,6 +92,7 @@ try:
         SurfaceCandidate,
         analyze_question_surface,
         automatically_accepted_candidates,
+        is_conversation_control_reference,
         normalize_for_matching,
     )
 except ImportError:  # Running answer.py directly from its directory.
@@ -170,6 +171,7 @@ except ImportError:  # Running answer.py directly from its directory.
         SurfaceCandidate,
         analyze_question_surface,
         automatically_accepted_candidates,
+        is_conversation_control_reference,
         normalize_for_matching,
     )
 
@@ -334,6 +336,7 @@ class EmployeeResolution(BaseModel):
         "reordered_tokens",
         "transliteration",
         "fuzzy",
+        "edit_distance",
         "none",
     ] = "none"
     has_more_candidates: bool = False
@@ -775,13 +778,25 @@ def _normalize_name(value: str):
     return normalize_for_matching(str(value))
 
 
-def _employee_fuzzy_score(reference: str, candidate: EmployeeCandidate):
-    normalized_name = _normalize_name(candidate.name)
-    return max(
-        SequenceMatcher(None, reference, normalized_name).ratio(),
-        *(
-            SequenceMatcher(None, reference, token).ratio()
-            for token in normalized_name.split()
+def _similarity(reference: str, candidate_text: str) -> float:
+    return SequenceMatcher(None, reference, candidate_text).ratio()
+
+
+def _best_scored_candidates(
+    scored: Sequence[tuple[float, EmployeeCandidate]],
+) -> list[EmployeeCandidate]:
+    qualified = [item for item in scored if item[0] >= FUZZY_NAME_THRESHOLD]
+    if not qualified:
+        return []
+    best_score = max(round(score, 3) for score, _candidate in qualified)
+    tied = [
+        candidate for score, candidate in qualified if round(score, 3) == best_score
+    ]
+    return sorted(
+        tied,
+        key=lambda candidate: (
+            _normalize_name(candidate.name),
+            candidate.employee_id,
         ),
     )
 
@@ -896,8 +911,6 @@ def resolve_employee_reference(
             ranked_partial.append((0, "prefix", candidate))
         elif sorted(reference_tokens) == sorted(normalized_name.split()):
             ranked_partial.append((1, "reordered_tokens", candidate))
-        elif normalized_reference in normalized_name:
-            ranked_partial.append((2, "substring", candidate))
     if ranked_partial:
         ranked_partial.sort(
             key=lambda item: (
@@ -915,23 +928,60 @@ def resolve_employee_reference(
             has_more_candidates=len(partial) > limit,
         )
 
-    transliterated_reference = _transliterate_arabic_name(normalized_reference)
-    transliterated = []
-    if transliterated_reference != normalized_reference:
-        transliterated = [
-            candidate
-            for candidate in ordered
-            if _employee_fuzzy_score(transliterated_reference, candidate)
-            >= FUZZY_NAME_THRESHOLD
-        ]
-    if transliterated:
-        transliterated.sort(
-            key=lambda candidate: (
-                -_employee_fuzzy_score(transliterated_reference, candidate),
-                _normalize_name(candidate.name),
-                candidate.employee_id,
-            )
+    substring = [
+        candidate
+        for candidate in ordered
+        if normalized_reference in _normalize_name(candidate.name)
+    ]
+    if substring:
+        return EmployeeResolution(
+            outcome="confirmation" if len(substring) == 1 else "ambiguous",
+            candidates=substring[:limit],
+            reference=reference,
+            match_method="substring",
+            has_more_candidates=len(substring) > limit,
         )
+
+    transliterated_reference = _transliterate_arabic_name(normalized_reference)
+    use_transliteration = any(
+        "\u0600" <= character <= "\u06ff" for character in reference
+    ) or any(
+        any("\u0600" <= character <= "\u06ff" for character in candidate.name)
+        for candidate in ordered
+    )
+    transliterated_names = [
+        (_transliterate_arabic_name(candidate.name), candidate) for candidate in ordered
+    ]
+    transliterated = []
+    if use_transliteration:
+        transliterated = _best_scored_candidates(
+            [
+                (
+                    max(
+                        _similarity(transliterated_reference, name),
+                        _similarity(transliterated_reference, name.split()[0]),
+                    ),
+                    candidate,
+                )
+                for name, candidate in transliterated_names
+                if name.split()
+            ]
+        )
+        if not transliterated:
+            transliterated = _best_scored_candidates(
+                [
+                    (
+                        max(
+                            _similarity(transliterated_reference, token)
+                            for token in name.split()[1:]
+                        ),
+                        candidate,
+                    )
+                    for name, candidate in transliterated_names
+                    if len(name.split()) > 1
+                ]
+            )
+    if transliterated:
         return EmployeeResolution(
             outcome="confirmation" if len(transliterated) == 1 else "ambiguous",
             candidates=transliterated[:limit],
@@ -940,26 +990,44 @@ def resolve_employee_reference(
             has_more_candidates=len(transliterated) > limit,
         )
 
-    scored = [
-        (_employee_fuzzy_score(normalized_reference, candidate), candidate)
-        for candidate in ordered
-    ]
-    scored = [item for item in scored if item[0] >= FUZZY_NAME_THRESHOLD]
-    scored.sort(
-        key=lambda item: (
-            -item[0],
-            _normalize_name(item[1].name),
-            item[1].employee_id,
-        )
+    first_token_candidates = _best_scored_candidates(
+        [
+            (
+                max(
+                    _similarity(normalized_reference, _normalize_name(candidate.name)),
+                    _similarity(
+                        normalized_reference,
+                        _normalize_name(candidate.name).split()[0],
+                    ),
+                ),
+                candidate,
+            )
+            for candidate in ordered
+            if _normalize_name(candidate.name).split()
+        ]
     )
-    candidates = [candidate for _score, candidate in scored[:limit]]
+    candidates = first_token_candidates
+    if not candidates:
+        candidates = _best_scored_candidates(
+            [
+                (
+                    max(
+                        _similarity(normalized_reference, token)
+                        for token in _normalize_name(candidate.name).split()[1:]
+                    ),
+                    candidate,
+                )
+                for candidate in ordered
+                if len(_normalize_name(candidate.name).split()) > 1
+            ]
+        )
     if candidates:
         return EmployeeResolution(
             outcome="ambiguous" if len(candidates) > 1 else "confirmation",
-            candidates=candidates,
+            candidates=candidates[:limit],
             reference=reference,
             match_method="fuzzy",
-            has_more_candidates=len(scored) > limit,
+            has_more_candidates=len(candidates) > limit,
         )
 
     return EmployeeResolution(
@@ -968,6 +1036,99 @@ def resolve_employee_reference(
         reference=reference,
         match_method="none",
     )
+
+
+def _resolve_employee_mentions(
+    references: Sequence[str],
+    directory: list[EmployeeCandidate],
+) -> tuple[list[EmployeeCandidate], EmployeeResolution | None]:
+    """Resolve mentions in source order and stop at the first unsafe result."""
+    selected: list[EmployeeCandidate] = []
+    selected_ids: set[str] = set()
+    for reference in references:
+        resolution = resolve_employee_reference(reference, directory)
+        if resolution.outcome != "unique":
+            return selected, resolution
+        for candidate in resolution.candidates:
+            key = candidate.employee_id.casefold()
+            if key not in selected_ids:
+                selected.append(candidate)
+                selected_ids.add(key)
+    return selected, None
+
+
+_EMPLOYEE_ID_PATTERN = re.compile(r"[A-Za-z]\d{5}")
+_EMPLOYEE_ID_LIKE_PATTERN = re.compile(r"\b[A-Za-z][A-Za-z0-9_-]*\d[A-Za-z0-9_-]*\b")
+
+
+def _is_edit_distance_one(left: str, right: str) -> bool:
+    left = left.casefold()
+    right = right.casefold()
+    if abs(len(left) - len(right)) > 1 or left == right:
+        return False
+    if len(left) == len(right):
+        return sum(a != b for a, b in zip(left, right)) == 1
+    if len(left) > len(right):
+        left, right = right, left
+    left_index = right_index = differences = 0
+    while left_index < len(left) and right_index < len(right):
+        if left[left_index] == right[right_index]:
+            left_index += 1
+            right_index += 1
+            continue
+        differences += 1
+        right_index += 1
+        if differences > 1:
+            return False
+    return True
+
+
+def _malformed_employee_id_resolution(
+    reference: str,
+    directory: list[EmployeeCandidate],
+    limit: int | None = None,
+) -> EmployeeResolution | None:
+    """Offer finite authorized suggestions for one-edit malformed IDs only."""
+    limit = settings.constraint_candidate_limit if limit is None else limit
+    if _EMPLOYEE_ID_PATTERN.fullmatch(reference):
+        return None
+    candidates = sorted(
+        (
+            candidate
+            for candidate in directory
+            if _EMPLOYEE_ID_PATTERN.fullmatch(candidate.employee_id)
+            and _is_edit_distance_one(reference, candidate.employee_id)
+        ),
+        key=lambda candidate: (
+            _normalize_name(candidate.name),
+            candidate.employee_id,
+        ),
+    )
+    if not candidates:
+        return None
+    return EmployeeResolution(
+        outcome="confirmation" if len(candidates) == 1 else "ambiguous",
+        candidates=candidates[:limit],
+        reference=reference,
+        match_method="edit_distance",
+        has_more_candidates=len(candidates) > limit,
+    )
+
+
+def _replace_confirmed_malformed_employee_id(
+    question: str,
+    selected: Sequence[EmployeeCandidate],
+) -> str:
+    if len(selected) != 1:
+        return question
+    employee_id = selected[0].employee_id
+    for match in _EMPLOYEE_ID_LIKE_PATTERN.finditer(question):
+        reference = match.group(0)
+        if not _EMPLOYEE_ID_PATTERN.fullmatch(reference) and _is_edit_distance_one(
+            reference, employee_id
+        ):
+            return question[: match.start()] + employee_id + question[match.end() :]
+    return question
 
 
 def _chroma_domain_where(domain, condition=None):
@@ -3189,6 +3350,8 @@ def _implicit_bare_employee_resolution(
 ) -> EmployeeResolution | None:
     if any(fact.kind == "entity" for fact in facts):
         return None
+    if is_conversation_control_reference(question):
+        return None
     words = re.findall(r"[^\W\d_]+", question, flags=re.UNICODE)
     if not 1 <= len(words) <= 5:
         return None
@@ -3342,36 +3505,16 @@ def _fetch_context_result(
             entity_facts = [fact for fact in detected_facts if fact.kind == "entity"]
     if entity_facts and not trusted_selection:
         directory = directory if directory is not None else load_employee_directory()
-        selected = []
-        for fact in entity_facts:
-            if fact.field == "Employee_ID":
-                matches = [
-                    item
-                    for item in directory
-                    if item.employee_id.casefold() == str(fact.values[0]).casefold()
-                ]
-                entity_resolution = EmployeeResolution(
-                    outcome=(
-                        "unique"
-                        if len(matches) == 1
-                        else "ambiguous"
-                        if matches
-                        else "none"
-                    ),
-                    candidates=matches,
-                    reference=fact.evidence_text,
-                )
-            else:
-                entity_resolution = resolve_employee_reference(
-                    fact.evidence_text, directory
-                )
-            if entity_resolution.outcome != "unique":
-                break
-            selected.extend(entity_resolution.candidates)
-        if entity_resolution.outcome == "unique":
-            default_employees = list(
-                {item.employee_id: item for item in selected}.values()
+        selected, entity_resolution = _resolve_employee_mentions(
+            tuple(fact.evidence_text for fact in entity_facts), directory
+        )
+        if entity_resolution is None:
+            entity_resolution = EmployeeResolution(
+                outcome="unique",
+                candidates=selected,
+                reference=", ".join(fact.evidence_text for fact in entity_facts),
             )
+            default_employees = selected
         else:
             event_logger.emit(
                 "input_clarification_required",
@@ -4449,6 +4592,48 @@ def answer_question_with_state(
     except PlanValidationError as exc:
         return f"I could not safely interpret that request: {exc}", [], state
 
+    if state.pending_clarification is None:
+        malformed_tokens = tuple(
+            match.group(0)
+            for match in _EMPLOYEE_ID_LIKE_PATTERN.finditer(question)
+            if not _EMPLOYEE_ID_PATTERN.fullmatch(match.group(0))
+        )
+        malformed_resolution = None
+        if malformed_tokens:
+            directory = load_employee_directory()
+            malformed_resolution = next(
+                (
+                    resolution
+                    for reference in malformed_tokens
+                    if (
+                        resolution := _malformed_employee_id_resolution(
+                            reference, directory
+                        )
+                    )
+                    is not None
+                ),
+                None,
+            )
+        if malformed_resolution is not None:
+            state.pending_question = question
+            state.pending_proposal = None
+            state.pending_facts = []
+            state.pending_candidates = malformed_resolution.candidates
+            _store_employee_clarification(
+                state,
+                question,
+                None,
+                (),
+                malformed_resolution,
+            )
+            return (
+                _format_employee_clarification(
+                    malformed_resolution, locale=reply_locale
+                ),
+                [],
+                state,
+            )
+
     effective_question = question
     prepared_proposal = None
     prepared_facts: tuple[SemanticFact, ...] = ()
@@ -4681,7 +4866,9 @@ def answer_question_with_state(
             )
 
         selected = [candidate for candidate in validated if candidate is not None]
-        effective_question = state.pending_question
+        effective_question = _replace_confirmed_malformed_employee_id(
+            state.pending_question, selected
+        )
         selected_ids = [candidate.employee_id for candidate in selected]
         selected_operator = "eq" if len(selected_ids) == 1 else "in"
         selected_value = selected_ids[0] if len(selected_ids) == 1 else selected_ids

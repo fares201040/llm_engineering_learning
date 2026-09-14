@@ -1082,6 +1082,195 @@ class EmployeeResolutionTests(unittest.TestCase):
             ),
         )
 
+    def test_employee_resolution_keeps_only_the_strongest_partial_tier(self):
+        prefix = answer.EmployeeCandidate(employee_id="A10001", name="Alex North River")
+        reordered = answer.EmployeeCandidate(employee_id="A10002", name="North Alex")
+        weaker_substring = answer.EmployeeCandidate(
+            employee_id="A10003", name="West Alex North"
+        )
+
+        resolution = answer.resolve_employee_reference(
+            "Alex North", [weaker_substring, reordered, prefix]
+        )
+
+        self.assertEqual(resolution.outcome, "ambiguous")
+        self.assertEqual(resolution.match_method, "prefix")
+        self.assertEqual(resolution.candidates, [prefix, reordered])
+
+    def test_fuzzy_first_token_tier_excludes_weak_any_token_noise(self):
+        first_token = answer.EmployeeCandidate(
+            employee_id="A10001", name="Morgan River"
+        )
+        weaker_first_token = answer.EmployeeCandidate(
+            employee_id="A10002", name="Logan Valley"
+        )
+        any_token_noise = answer.EmployeeCandidate(
+            employee_id="A10003", name="Faris Morgan"
+        )
+
+        resolution = answer.resolve_employee_reference(
+            "Mogan", [any_token_noise, weaker_first_token, first_token]
+        )
+
+        self.assertEqual(resolution.outcome, "confirmation")
+        self.assertEqual(resolution.match_method, "fuzzy")
+        self.assertEqual(resolution.candidates, [first_token])
+
+    def test_arabic_transliteration_prefers_full_or_first_name_over_any_token(self):
+        first_token = answer.EmployeeCandidate(employee_id="A10001", name="احمد نهر")
+        any_token_noise = answer.EmployeeCandidate(
+            employee_id="A10002", name="فارس احمد"
+        )
+
+        resolution = answer.resolve_employee_reference(
+            "احمدد", [any_token_noise, first_token]
+        )
+
+        self.assertEqual(resolution.outcome, "confirmation")
+        self.assertEqual(resolution.match_method, "transliteration")
+        self.assertEqual(resolution.candidates, [first_token])
+
+    def test_fuzzy_tier_keeps_only_best_scores_tied_to_three_decimals(self):
+        best = answer.EmployeeCandidate(employee_id="A10001", name="Morgan River")
+        lower = answer.EmployeeCandidate(employee_id="A10002", name="Logan Valley")
+
+        resolution = answer.resolve_employee_reference("Mogan", [lower, best])
+
+        self.assertEqual(resolution.outcome, "confirmation")
+        self.assertEqual(resolution.candidates, [best])
+
+    def test_employee_mentions_resolve_in_order_and_stop_at_first_ambiguity(self):
+        morgan = answer.EmployeeCandidate(employee_id="A10001", name="Morgan River")
+        sam_north = answer.EmployeeCandidate(employee_id="A10002", name="Sam North")
+        sam_south = answer.EmployeeCandidate(employee_id="A10003", name="Sam South")
+        later = answer.EmployeeCandidate(employee_id="A10004", name="Later Person")
+
+        selected, blocker = answer._resolve_employee_mentions(
+            ("Morgan River", "Sam", "Later Person"),
+            [later, sam_south, morgan, sam_north],
+        )
+
+        self.assertEqual(selected, [morgan])
+        self.assertIsNotNone(blocker)
+        self.assertEqual(blocker.reference, "Sam")
+        self.assertEqual(blocker.candidates, [sam_north, sam_south])
+
+    def test_bare_conversation_controls_are_not_treated_as_employee_names(self):
+        directory = [
+            answer.EmployeeCandidate(employee_id="A10001", name="Agin Person"),
+            answer.EmployeeCandidate(employee_id="A10002", name="نفسه علي"),
+        ]
+
+        for control in ("again", "same employee", "both", "نفسه", "كلاهما"):
+            with self.subTest(control=control):
+                self.assertIsNone(
+                    answer._implicit_bare_employee_resolution(control, (), directory)
+                )
+
+    def test_malformed_employee_ids_suggest_only_one_edit_directory_matches(self):
+        candidate = answer.EmployeeCandidate(
+            employee_id="A11017", name="Example Employee"
+        )
+        unrelated = answer.EmployeeCandidate(
+            employee_id="A10029", name="Unrelated Employee"
+        )
+
+        for malformed in ("A110177", "A11O17", "A1117"):
+            with self.subTest(malformed=malformed):
+                resolution = answer._malformed_employee_id_resolution(
+                    malformed, [unrelated, candidate]
+                )
+                self.assertIsNotNone(resolution)
+                self.assertEqual(resolution.outcome, "confirmation")
+                self.assertEqual(resolution.match_method, "edit_distance")
+                self.assertEqual(resolution.candidates, [candidate])
+
+        self.assertIsNone(
+            answer._malformed_employee_id_resolution("A11777", [unrelated, candidate])
+        )
+
+    def test_stateful_chat_offers_localized_confirmation_for_malformed_id(self):
+        candidate = answer.EmployeeCandidate(
+            employee_id="A11017", name="Example Employee"
+        )
+
+        for question, expected_text, expected_locale in (
+            ("How many worked days for A110177?", "Did you mean", "en"),
+            ("كم يوم عمل للموظف A110177؟", "هل تقصد", "ar"),
+        ):
+            with (
+                self.subTest(question=question),
+                patch.object(
+                    answer, "load_employee_directory", return_value=[candidate]
+                ),
+                patch.object(answer, "load_attendance_catalog_candidates") as catalog,
+                patch.object(answer, "execute_exact_postgres") as retrieval,
+            ):
+                text, chunks, state = answer.answer_question_with_state(
+                    question, [], answer.ConversationState()
+                )
+
+                self.assertIn(expected_text, text)
+                self.assertEqual(chunks, [])
+                self.assertIsInstance(
+                    state.pending_clarification, answer.EmployeeClarification
+                )
+                self.assertTrue(state.pending_clarification.confirmation_required)
+                self.assertEqual(
+                    state.pending_clarification.reply_locale, expected_locale
+                )
+                self.assertEqual(state.pending_candidates, [candidate])
+                catalog.assert_not_called()
+                retrieval.assert_not_called()
+
+    def test_direct_fetch_keeps_malformed_employee_ids_fail_closed(self):
+        with (
+            patch.object(answer, "load_employee_directory") as directory,
+            patch.object(answer, "fetch_exact_chroma") as chroma,
+            patch.object(answer, "execute_exact_postgres") as postgres,
+            self.assertRaises(answer.SemanticPlanValidationError),
+        ):
+            answer.fetch_context("How many worked days for A110177?")
+
+        directory.assert_not_called()
+        chroma.assert_not_called()
+        postgres.assert_not_called()
+
+    def test_confirmed_malformed_id_resumes_the_original_stateful_request(self):
+        candidate = answer.EmployeeCandidate(
+            employee_id="A11017", name="Example Employee"
+        )
+        with (
+            patch.object(answer, "load_employee_directory", return_value=[candidate]),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=(
+                    [],
+                    {
+                        "operation": "distinct_count",
+                        "value": 4,
+                        "measure": "distinct_dates",
+                    },
+                    4,
+                ),
+            ) as retrieval,
+        ):
+            _text, _chunks, state = answer.answer_question_with_state(
+                "How many worked days for A110177?",
+                [],
+                answer.ConversationState(),
+            )
+            text, chunks, state = answer.answer_question_with_state("yes", [], state)
+
+        self.assertIn("4", text)
+        self.assertEqual(chunks, [])
+        self.assertEqual(state.selected_employees, [candidate])
+        self.assertIsNone(state.pending_clarification)
+        retrieval.assert_called_once()
+
     def test_default_candidate_limit_uses_the_configured_display_bound(self):
         directory = [
             answer.EmployeeCandidate(employee_id="A10001", name="Faris Ahmed"),

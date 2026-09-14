@@ -437,6 +437,50 @@ def normalize_for_matching(text: str) -> str:
     return _normalized_phrase(text)
 
 
+_CONVERSATION_CONTROL_REFERENCES = frozenset(
+    normalize_for_matching(value)
+    for value in (
+        "again",
+        "same",
+        "same one",
+        "same employee",
+        "this",
+        "that",
+        "it",
+        "him",
+        "her",
+        "them",
+        "both",
+        "all",
+        "separately",
+        "together",
+        "مرة أخرى",
+        "مجددا",
+        "مجدداً",
+        "نفسه",
+        "نفسها",
+        "نفس الموظف",
+        "نفس الموظفة",
+        "هذا",
+        "هذه",
+        "هو",
+        "هي",
+        "هم",
+        "كلاهما",
+        "كليهما",
+        "الجميع",
+        "معا",
+        "معاً",
+        "بشكل منفصل",
+    )
+)
+
+
+def is_conversation_control_reference(text: str) -> bool:
+    """Return whether bare text is a control/reference, never a person's name."""
+    return normalize_for_matching(text) in _CONVERSATION_CONTROL_REFERENCES
+
+
 def _reply_locale(question: str) -> ReplyLocale:
     arabic_tokens = sum(
         1 for token in _TOKEN_PATTERN.findall(question) if _ARABIC_ALPHA.search(token)

@@ -17,6 +17,7 @@ try:
         INTERPRETATION_PRESETS,
         MEASURE_DEFINITIONS,
         RESULT_INTENT_DEFINITIONS,
+        AnswerContract,
         PlannerProposal,
     )
     from .semantic_resolution import SemanticFact
@@ -29,6 +30,7 @@ except ImportError:  # Imported through answer.py's supported direct-script mode
         INTERPRETATION_PRESETS,
         MEASURE_DEFINITIONS,
         RESULT_INTENT_DEFINITIONS,
+        AnswerContract,
         PlannerProposal,
     )
     from semantic_resolution import SemanticFact
@@ -164,6 +166,66 @@ class ContextChoiceOption(_StrictFrozenModel):
         return value
 
 
+class EmployeeReferent(_StrictFrozenModel):
+    """A confirmed employee identity that is safe to retain for this session."""
+
+    employee_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+
+    @field_validator("employee_id", "name")
+    @classmethod
+    def _referent_text_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("employee referent values must not be blank")
+        return value
+
+
+class CoverageSnapshot(_StrictFrozenModel):
+    available_start: str = Field(min_length=1)
+    available_end: str = Field(min_length=1)
+    requested_start: str = Field(min_length=1)
+    requested_end: str = Field(min_length=1)
+    complete: bool
+
+
+class ResultSnapshot(_StrictFrozenModel):
+    """Bounded result metadata retained for contextual follow-up only."""
+
+    answer_contract: AnswerContract | None = None
+    matched_count: int | None = Field(default=None, ge=0)
+    coverage: CoverageSnapshot | None = None
+    operation: str | None = Field(default=None, min_length=1)
+    scalar_value: str | int | float | None = None
+
+
+class AttendanceUnitFrame(_StrictFrozenModel):
+    unit_id: str = Field(min_length=1)
+    source_text: str = Field(min_length=1)
+    facts: tuple[SemanticFact, ...] = ()
+    employees: tuple[EmployeeReferent, ...] = ()
+    result: ResultSnapshot
+
+    @field_validator("unit_id", "source_text")
+    @classmethod
+    def _unit_text_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("attendance unit values must not be blank")
+        return value
+
+
+class ConversationTurnFrame(_StrictFrozenModel):
+    original_question: str = Field(min_length=1)
+    reply_locale: ReplyLocale
+    units: tuple[AttendanceUnitFrame, ...] = Field(min_length=1)
+
+    @field_validator("original_question")
+    @classmethod
+    def _turn_question_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("conversation turn question must not be blank")
+        return value
+
+
 class _ClarificationBase(_StrictFrozenModel):
     original_question: str = Field(min_length=1)
     reply_locale: ReplyLocale
@@ -254,6 +316,41 @@ PendingClarification = Annotated[
     | ContextChoiceClarification,
     Field(discriminator="kind"),
 ]
+
+
+class ResolvedPendingMention(_StrictFrozenModel):
+    """A confirmed identity bound to one saved pending-request mention."""
+
+    source_text: str = Field(min_length=1)
+    referent: EmployeeReferent
+    source_span: tuple[int, int] | None = None
+
+    @model_validator(mode="after")
+    def _source_span_is_complete_when_present(self):
+        if self.source_span is None:
+            return self
+        start, end = self.source_span
+        if start < 0 or end <= start:
+            raise ValueError("resolved pending mention source span must be forward")
+        return self
+
+
+class PendingRequestFrame(_StrictFrozenModel):
+    """The sole resumable request record; display state stays in PendingClarification."""
+
+    original_question: str = Field(min_length=1)
+    reply_locale: ReplyLocale
+    facts: tuple[SemanticFact, ...] = ()
+    prepared_proposal: PlannerProposal | None = None
+    clarification: PendingClarification | None = None
+    resolved_mentions: tuple[ResolvedPendingMention, ...] = ()
+
+    @field_validator("original_question")
+    @classmethod
+    def _pending_question_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("pending request question must not be blank")
+        return value
 
 
 class InputUnderstanding(_StrictFrozenModel):

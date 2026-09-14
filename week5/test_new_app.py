@@ -53,6 +53,28 @@ class SessionStateTests(unittest.TestCase):
         )
         original = answer.ConversationState(
             selected_employees=[selected],
+            referents=[
+                answer.EmployeeReferent(
+                    employee_id="A11017", name="Example Employee Alpha"
+                )
+            ],
+            active_referent_ids=["A11017"],
+            recent_frames=[
+                answer.ConversationTurnFrame(
+                    original_question="worked days",
+                    reply_locale="en",
+                    units=(
+                        answer.AttendanceUnitFrame(
+                            unit_id="unit-1",
+                            source_text="worked days",
+                            result=answer.ResultSnapshot(matched_count=1),
+                        ),
+                    ),
+                )
+            ],
+            pending_request=answer.PendingRequestFrame(
+                original_question="Which employee?", reply_locale="en"
+            ),
             pending_question="Which employee?",
             pending_proposal=answer.PlannerProposal(
                 status="unsupported",

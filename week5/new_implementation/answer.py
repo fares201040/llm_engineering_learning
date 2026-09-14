@@ -85,6 +85,13 @@ try:
         CatalogOption,
         EmployeeClarification,
         EmployeeOption,
+        EmployeeReferent,
+        CoverageSnapshot,
+        ResultSnapshot,
+        AttendanceUnitFrame,
+        ConversationTurnFrame,
+        PendingRequestFrame,
+        ResolvedPendingMention,
         MeaningClarification,
         MeaningOption,
         MissingIntentClarification,
@@ -164,6 +171,13 @@ except ImportError:  # Running answer.py directly from its directory.
         CatalogOption,
         EmployeeClarification,
         EmployeeOption,
+        EmployeeReferent,
+        CoverageSnapshot,
+        ResultSnapshot,
+        AttendanceUnitFrame,
+        ConversationTurnFrame,
+        PendingRequestFrame,
+        ResolvedPendingMention,
         MeaningClarification,
         MeaningOption,
         MissingIntentClarification,
@@ -344,7 +358,11 @@ class EmployeeResolution(BaseModel):
 
 class ConversationState(BaseModel):
     selected_employees: list[EmployeeCandidate] = Field(default_factory=list)
+    referents: list[EmployeeReferent] = Field(default_factory=list)
+    active_referent_ids: list[str] = Field(default_factory=list)
+    recent_frames: list[ConversationTurnFrame] = Field(default_factory=list)
     pending_clarification: PendingClarification | None = None
+    pending_request: PendingRequestFrame | None = None
     pending_question: str | None = None
     pending_proposal: PlannerProposal | None = None
     pending_facts: list[SemanticFact] = Field(default_factory=list)
@@ -4392,12 +4410,147 @@ def _is_complete_new_attendance_question(question: str) -> bool:
 
 def _clear_pending_state(state: ConversationState) -> None:
     state.pending_clarification = None
+    state.pending_request = None
     state.pending_question = None
     state.pending_proposal = None
     state.pending_facts = []
     state.pending_candidates = []
     state.pending_constraint = None
     state.pending_interpretations = []
+
+
+def _write_pending_request(
+    state: ConversationState,
+    request: PendingRequestFrame,
+) -> None:
+    """Write the typed resumable request and preserve the public legacy mirrors."""
+    state.pending_request = request
+    state.pending_clarification = request.clarification
+    state.pending_question = request.original_question
+    state.pending_proposal = request.prepared_proposal
+    state.pending_facts = list(request.facts)
+
+
+def _sync_pending_request(state: ConversationState) -> None:
+    """Mirror legacy pending fields into the one typed resumable request frame."""
+    if state.pending_question is None:
+        state.pending_request = None
+        return
+    resolved_mentions: tuple[ResolvedPendingMention, ...] = ()
+    if isinstance(state.pending_clarification, EmployeeClarification):
+        resolved_mentions = tuple(
+            ResolvedPendingMention(
+                source_text=state.pending_clarification.reference_text or option.name,
+                source_span=state.pending_clarification.reference_span,
+                referent=EmployeeReferent(
+                    employee_id=option.employee_id,
+                    name=option.name,
+                ),
+            )
+            for option in state.pending_clarification.resolved_options
+        )
+    _write_pending_request(
+        state,
+        PendingRequestFrame(
+            original_question=state.pending_question,
+            reply_locale=(
+                state.pending_clarification.reply_locale
+                if state.pending_clarification is not None
+                else analyze_question_surface(state.pending_question).reply_locale
+            ),
+            facts=tuple(state.pending_facts),
+            prepared_proposal=state.pending_proposal,
+            clarification=state.pending_clarification,
+            resolved_mentions=resolved_mentions,
+        ),
+    )
+
+
+def _upsert_referents(
+    state: ConversationState,
+    referents: Sequence[EmployeeReferent],
+    *,
+    limit: int | None = None,
+) -> None:
+    """Keep only confirmed identities, ordered by their most recent use."""
+    bounded_limit = limit if limit is not None else settings.conversation_referent_limit
+    retained = list(state.referents)
+    for referent in referents:
+        key = referent.employee_id.casefold()
+        retained = [item for item in retained if item.employee_id.casefold() != key]
+        retained.append(referent)
+    state.referents = retained[-bounded_limit:]
+    state.active_referent_ids = [item.employee_id for item in referents][
+        -settings.conversation_employee_binding_limit :
+    ]
+
+
+def _revalidate_referents(
+    state: ConversationState,
+    directory: Sequence[EmployeeCandidate],
+) -> None:
+    """Refresh retained identities against the authorized directory and evict stale ones."""
+    current = {candidate.employee_id.casefold(): candidate for candidate in directory}
+    state.referents = [
+        EmployeeReferent(employee_id=candidate.employee_id, name=candidate.name)
+        for referent in state.referents
+        if (candidate := current.get(referent.employee_id.casefold())) is not None
+    ]
+    valid_ids = {referent.employee_id.casefold() for referent in state.referents}
+    state.active_referent_ids = [
+        employee_id
+        for employee_id in state.active_referent_ids
+        if employee_id.casefold() in valid_ids
+    ]
+
+
+def _store_successful_turn(
+    state: ConversationState,
+    frame: ConversationTurnFrame,
+    *,
+    limit: int | None = None,
+) -> None:
+    bounded_limit = (
+        limit if limit is not None else settings.conversation_recent_frame_limit
+    )
+    state.recent_frames = (state.recent_frames + [frame])[-bounded_limit:]
+    _upsert_referents(
+        state,
+        tuple(referent for unit in frame.units for referent in unit.employees),
+    )
+
+
+def _snapshot_successful_result(result: ContextFetchResult) -> ResultSnapshot:
+    aggregation = result.aggregation or {}
+    coverage_data = aggregation.get("coverage")
+    coverage = (
+        CoverageSnapshot(**coverage_data)
+        if isinstance(coverage_data, dict)
+        and {
+            "available_start",
+            "available_end",
+            "requested_start",
+            "requested_end",
+            "complete",
+        }
+        <= set(coverage_data)
+        else None
+    )
+    scalar_value = aggregation.get("value")
+    if not isinstance(scalar_value, (str, int, float)) or isinstance(
+        scalar_value, bool
+    ):
+        scalar_value = None
+    operation = aggregation.get("operation")
+    return ResultSnapshot(
+        answer_contract=getattr(result.plan, "answer_contract", None),
+        matched_count=result.matched_count,
+        coverage=coverage,
+        operation=operation
+        if isinstance(operation, str) and operation.strip()
+        else None,
+        scalar_value=scalar_value,
+    )
 
 
 def _store_employee_clarification(
@@ -4430,6 +4583,7 @@ def _store_employee_clarification(
         allow_multiple=_question_allows_multiple_employee_selection(question),
         has_more_candidates=resolution.has_more_candidates,
     )
+    _sync_pending_request(state)
 
 
 def _store_interpretation_clarification(
@@ -4454,6 +4608,7 @@ def _store_interpretation_clarification(
             for name in candidates
         ),
     )
+    _sync_pending_request(state)
 
 
 def _store_catalog_clarification(
@@ -4478,6 +4633,7 @@ def _store_catalog_clarification(
             for index, candidate in enumerate(pending.candidates, start=1)
         ),
     )
+    _sync_pending_request(state)
 
 
 def _interpretation_label(name: InterpretationName):
@@ -5148,6 +5304,9 @@ def answer_question_with_state(
         )
         _clear_pending_state(state)
         state.pending_clarification = pending
+        state.pending_question = effective_question
+        state.pending_facts = list(exc.facts)
+        _sync_pending_request(state)
         return _format_surface_meaning_clarification(pending), [], state
     except MissingIntentRequired as exc:
         _clear_pending_state(state)
@@ -5165,6 +5324,17 @@ def answer_question_with_state(
                 )
                 if len(exc.employees) == 1
                 else None
+            ),
+        )
+        state.pending_question = effective_question
+        state.pending_facts = list(prepared_facts)
+        state.pending_proposal = prepared_proposal
+        _sync_pending_request(state)
+        _upsert_referents(
+            state,
+            tuple(
+                EmployeeReferent(employee_id=item.employee_id, name=item.name)
+                for item in exc.employees
             ),
         )
         return (
@@ -5194,6 +5364,26 @@ def answer_question_with_state(
         aggregation,
         matched_count,
         locale=reply_locale,
+    )
+    confirmed = resolved_employees or employees_for_request
+    _store_successful_turn(
+        state,
+        ConversationTurnFrame(
+            original_question=effective_question,
+            reply_locale=reply_locale,
+            units=(
+                AttendanceUnitFrame(
+                    unit_id=uuid.uuid4().hex,
+                    source_text=effective_question,
+                    facts=tuple(prepared_facts),
+                    employees=tuple(
+                        EmployeeReferent(employee_id=item.employee_id, name=item.name)
+                        for item in confirmed
+                    ),
+                    result=_snapshot_successful_result(result),
+                ),
+            ),
+        ),
     )
     return _material_correction_note(effective_question) + text, chunks, state
 

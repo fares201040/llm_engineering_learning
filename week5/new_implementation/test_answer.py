@@ -3924,5 +3924,114 @@ class PostgresResultTests(unittest.TestCase):
         )
 
 
+class ConversationMemoryStateTests(unittest.TestCase):
+    def _referent(self, employee_id="A10001", name="Morgan River"):
+        return answer.EmployeeReferent(employee_id=employee_id, name=name)
+
+    def _frame(self, unit_id="unit-1"):
+        snapshot = answer.ResultSnapshot(
+            answer_contract=answer.AnswerContract(
+                shape="scalar", unit="dates", subject_field="Date", grain=["Date"]
+            ),
+            matched_count=4,
+            coverage=answer.CoverageSnapshot(
+                available_start="2026-09-01",
+                available_end="2026-09-07",
+                requested_start="2026-09-01",
+                requested_end="2026-09-07",
+                complete=True,
+            ),
+        )
+        return answer.AttendanceUnitFrame(
+            unit_id=unit_id,
+            source_text="worked days for Morgan River",
+            facts=(),
+            employees=(self._referent(),),
+            result=snapshot,
+        )
+
+    def test_memory_contracts_are_frozen_and_pending_request_is_resumable(self):
+        referent = self._referent()
+        pending = answer.PendingRequestFrame(
+            original_question="worked days for Morgan River",
+            reply_locale="en",
+            facts=(),
+            resolved_mentions=(
+                answer.ResolvedPendingMention(
+                    source_text="Morgan River", referent=referent
+                ),
+            ),
+        )
+
+        self.assertEqual(pending.resolved_mentions[0].referent, referent)
+        with self.assertRaisesRegex(Exception, "frozen"):
+            referent.name = "Changed"
+
+    def test_memory_upsert_evicts_old_referents_and_turns_without_aliasing_state(self):
+        state = answer.ConversationState()
+        answer._upsert_referents(
+            state,
+            (self._referent("A10001"), self._referent("A10002", "Sam North")),
+            limit=2,
+        )
+        answer._upsert_referents(
+            state, (self._referent("A10003", "Taylor East"),), limit=2
+        )
+        self.assertEqual(
+            [item.employee_id for item in state.referents], ["A10002", "A10003"]
+        )
+        answer._store_successful_turn(
+            state,
+            answer.ConversationTurnFrame(
+                original_question="worked days for Morgan River",
+                reply_locale="en",
+                units=(self._frame("unit-1"),),
+            ),
+            limit=1,
+        )
+        answer._store_successful_turn(
+            state,
+            answer.ConversationTurnFrame(
+                original_question="worked days for Morgan River",
+                reply_locale="en",
+                units=(self._frame("unit-2"),),
+            ),
+            limit=1,
+        )
+
+        copied = state.model_copy(deep=True)
+        copied.referents.clear()
+        self.assertEqual(
+            [frame.units[0].unit_id for frame in state.recent_frames], ["unit-2"]
+        )
+        self.assertEqual(copied.referents, [])
+
+    def test_pending_candidates_never_become_referents_and_confirmed_referents_revalidate(
+        self,
+    ):
+        candidate = answer.EmployeeCandidate(employee_id="A10001", name="Morgan River")
+        state = answer.ConversationState(pending_candidates=[candidate])
+        answer._write_pending_request(
+            state,
+            answer.PendingRequestFrame(
+                original_question="worked days for Morgan",
+                reply_locale="en",
+                facts=(),
+            ),
+        )
+        self.assertEqual(state.referents, [])
+
+        answer._upsert_referents(state, (self._referent(),))
+        answer._revalidate_referents(
+            state,
+            [
+                answer.EmployeeCandidate(
+                    employee_id="A10001", name="Morgan River Updated"
+                )
+            ],
+        )
+        self.assertEqual(state.referents[0].name, "Morgan River Updated")
+
+
 if __name__ == "__main__":
     unittest.main()

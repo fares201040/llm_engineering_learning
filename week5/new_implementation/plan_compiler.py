@@ -14,6 +14,7 @@ try:
         DERIVED_RESULT_DEFINITIONS,
         FIELD_DEFINITIONS,
         MEASURE_DEFINITIONS,
+        RESULT_INTENT_DEFINITIONS,
         EvidenceOrigin,
         ExecutableQueryPlan,
         effective_grouping_fields,
@@ -37,6 +38,7 @@ except ImportError:  # Direct execution from week5/new_implementation.
         DERIVED_RESULT_DEFINITIONS,
         FIELD_DEFINITIONS,
         MEASURE_DEFINITIONS,
+        RESULT_INTENT_DEFINITIONS,
         EvidenceOrigin,
         ExecutableQueryPlan,
         effective_grouping_fields,
@@ -203,6 +205,29 @@ class SchemaInvariant(PlanInvariant):
                         f"{calculation.operation} requires a numeric field.",
                     )
                 )
+        if context.candidate_plan.result_intent == "employee_profile":
+            definition = RESULT_INTENT_DEFINITIONS["employee_profile"]
+            if tuple(context.candidate_plan.projection) != definition.projection:
+                violations.append(
+                    PlanViolation(
+                        "invalid_schema",
+                        "employee_profile",
+                        "Employee profiles require exactly the registered projection.",
+                    )
+                )
+            employee_filters = [
+                condition
+                for condition in context.candidate_plan.filters
+                if condition.field == "Employee_ID" and condition.operator in {"eq", "in"}
+            ]
+            if len(employee_filters) != 1:
+                violations.append(
+                    PlanViolation(
+                        "invalid_schema",
+                        "employee_profile",
+                        "Employee profiles require one verified employee identity filter.",
+                    )
+                )
         return tuple(violations)
 
 
@@ -263,6 +288,8 @@ def _fact_matches_provenance(fact: SemanticFact, item: ConstraintProvenance) -> 
             and fact.field == item.field
             and fact.concept_name == item.name
         )
+    if item.target_kind == "result_intent":
+        return fact.kind == "result_intent" and fact.concept_name == item.name
     if item.target_kind == "entity":
         return fact.kind == "entity" and set(fact.values) == set(item.values)
     if item.target_kind == "limit":
@@ -314,6 +341,7 @@ class CoverageInvariant(PlanInvariant):
             "projection",
             "ranking",
             "percentage_denominator",
+            "result_intent",
         }
         for index, fact in enumerate(context.compilation.facts):
             if fact.strength != "strong" or fact.kind not in relevant_kinds:
@@ -415,6 +443,9 @@ class AnswerContractInvariant(PlanInvariant):
 
 def derive_expected_answer_contract(plan: QueryPlan) -> AnswerContract:
     """Derive the only answer shape allowed for a compiled operation."""
+    if plan.result_intent is not None:
+        definition = RESULT_INTENT_DEFINITIONS[plan.result_intent]
+        return AnswerContract(shape=definition.answer_shape, unit="value", grain=[])
     if plan.aggregation != "none":
         effective_group_by = effective_grouping_fields(plan.group_by)
         shape = "grouped" if effective_group_by else "scalar"
@@ -523,6 +554,8 @@ class ExecutableChoiceInvariant(PlanInvariant):
             )
         if plan.limit is not None:
             required.append(dict(target_kind="limit", values=(float(plan.limit),)))
+        if plan.result_intent is not None:
+            required.append(dict(target_kind="result_intent", name=plan.result_intent))
         if plan.measure:
             definition = MEASURE_DEFINITIONS[plan.measure]
             if (plan.aggregation, plan.aggregation_field) != (
@@ -599,6 +632,7 @@ class ExecutableChoiceInvariant(PlanInvariant):
             "order_by",
             "limit",
             "percentage_denominator",
+            "result_intent",
         }
         violations += tuple(
             PlanViolation(
@@ -713,6 +747,7 @@ def _candidate_plan(proposal, context):
         or proposal.projection
         or proposal.order_by
         or proposal.limit
+        or proposal.result_intent
     )
     semantic = any(fact.kind == "semantic_intent" for fact in context.facts)
     mode = "hybrid" if semantic and structured else "semantic" if semantic else "exact"
@@ -804,6 +839,33 @@ def compile_proposal(
                 values=(proposal.name_hint.value,),
                 evidence_text=proposal.name_hint.evidence_text,
             )
+        )
+
+    if proposal.result_intent is not None:
+        definition = RESULT_INTENT_DEFINITIONS[proposal.result_intent.name]
+        candidate.result_intent = proposal.result_intent.name
+        candidate.projection = list(definition.projection)
+        provenance.append(
+            ConstraintProvenance(
+                target_kind="result_intent",
+                name=proposal.result_intent.name,
+                origin=_choice_origin(
+                    context,
+                    kind="result_intent",
+                    evidence_text=proposal.result_intent.evidence_text,
+                    name=proposal.result_intent.name,
+                ),
+                evidence_text=proposal.result_intent.evidence_text,
+            )
+        )
+        provenance.extend(
+            ConstraintProvenance(
+                target_kind="projection",
+                field=field,
+                origin="deterministic_default",
+                evidence_text="registered employee profile",
+            )
+            for field in definition.projection
         )
 
     if proposal.measure is not None:

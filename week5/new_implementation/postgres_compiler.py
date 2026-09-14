@@ -9,6 +9,7 @@ try:
     from .attendance_schema import (
         FIELD_DEFINITIONS,
         POSTGRES_FIELD_MAP,
+        RESULT_INTENT_DEFINITIONS,
         ExecutableQueryPlan,
         FilterCondition,
         canonicalize_storage_value,
@@ -18,6 +19,7 @@ except ImportError:  # Direct execution from week5/new_implementation.
     from attendance_schema import (
         FIELD_DEFINITIONS,
         POSTGRES_FIELD_MAP,
+        RESULT_INTENT_DEFINITIONS,
         ExecutableQueryPlan,
         FilterCondition,
         canonicalize_storage_value,
@@ -35,7 +37,7 @@ class SqlFragment:
 class CompiledPostgresQuery:
     sql: str
     params: tuple[object, ...]
-    purpose: Literal["sample", "count", "aggregation", "coverage"]
+    purpose: Literal["sample", "count", "aggregation", "coverage", "profile"]
     fingerprint: str
 
 
@@ -205,6 +207,30 @@ leave_hrs, source_file, search_text, record_json
 FROM {table} WHERE {where.sql}
 ORDER BY {order_expression} {direction}, employee_id ASC, record_id ASC LIMIT %s"""
     return _query(sql, (*where.params, limit), "sample")
+
+
+def compile_profile_query(
+    plan: ExecutableQueryPlan,
+    table_name: str = "attendance_records",
+) -> CompiledPostgresQuery:
+    plan = _require_executable(plan)
+    if plan.result_intent != "employee_profile":
+        raise ValueError("Profile compilation requires employee_profile intent.")
+    definition = RESULT_INTENT_DEFINITIONS["employee_profile"]
+    if tuple(plan.projection) != definition.projection:
+        raise ValueError("Profile projection does not match the registered fields.")
+    table = _require_table_name(table_name)
+    where = compile_where(plan.filters)
+    columns = ", ".join(
+        f'{POSTGRES_FIELD_MAP[field]} AS "{field}"' for field in definition.projection
+    )
+    order = ", ".join(POSTGRES_FIELD_MAP[field] for field in definition.projection)
+    return _query(
+        f"SELECT DISTINCT {columns} FROM {table} "
+        f"WHERE {where.sql} ORDER BY {order}",
+        where.params,
+        "profile",
+    )
 
 
 def _aggregation_expression(plan: ExecutableQueryPlan) -> tuple[str, str | None]:

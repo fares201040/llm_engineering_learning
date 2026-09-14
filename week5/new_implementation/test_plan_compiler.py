@@ -9,6 +9,7 @@ from week5.new_implementation.attendance_schema import (
     ProposedFilter,
     ProposedMeasureChoice,
     ProposedPredicateChoice,
+    ProposedResultIntentChoice,
     ProposedNameHint,
     QueryPlan,
 )
@@ -26,6 +27,52 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class ExecutableChoiceCoverageTests(unittest.TestCase):
+    def test_profile_projection_change_is_rejected_during_revalidation(self):
+        question = "who is Faris"
+        resolution = ResolutionContext({})
+        facts = (
+            SemanticFact(
+                kind="result_intent",
+                concept_name="employee_profile",
+                evidence_text="who is",
+                origin="question",
+                strength="strong",
+            ),
+            SemanticFact(
+                kind="filter",
+                field="Employee_ID",
+                operator="eq",
+                values=("A10018",),
+                evidence_text="A10018",
+                origin="user_clarification",
+                strength="strong",
+            ),
+        )
+        proposal = PlannerProposal(
+            status="ready",
+            filters=[
+                ProposedFilter(
+                    field="Employee_ID",
+                    operator="eq",
+                    value="A10018",
+                    evidence_text="A10018",
+                )
+            ],
+            result_intent=ProposedResultIntentChoice(
+                name="employee_profile", evidence_text="who is"
+            ),
+            answer_contract=AnswerContract(shape="profile", unit="value"),
+        )
+        context = CompilationContext(question, facts, resolution)
+        compiled = compile_proposal(proposal, context)
+        self.assertTrue(compiled.ready, compiled.violations)
+
+        altered = compiled.executable_plan.model_copy(
+            update={"projection": ["Employee_Remarks"]}
+        )
+        checked = revalidate_executable_plan(altered, context, compiled.provenance)
+        self.assertFalse(checked.ready)
+
     def test_revalidation_rejects_deleted_filter_and_aggregate(self):
         question = "Count Authorized records"
         result = self.compile(

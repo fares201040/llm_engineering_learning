@@ -67,6 +67,7 @@ try:
         compile_count_query,
         compile_chunk_where,
         compile_coverage_query,
+        compile_profile_query,
         compile_sample_query,
     )
     from .chroma_client import create_chroma_client
@@ -89,6 +90,7 @@ try:
         MissingIntentClarification,
         PendingClarification,
         analyze_question_surface,
+        automatically_accepted_candidates,
     )
 except ImportError:  # Running answer.py directly from its directory.
     from attendance_schema import (
@@ -141,6 +143,7 @@ except ImportError:  # Running answer.py directly from its directory.
         compile_count_query,
         compile_chunk_where,
         compile_coverage_query,
+        compile_profile_query,
         compile_sample_query,
     )
     from chroma_client import create_chroma_client
@@ -163,6 +166,7 @@ except ImportError:  # Running answer.py directly from its directory.
         MissingIntentClarification,
         PendingClarification,
         analyze_question_surface,
+        automatically_accepted_candidates,
     )
 
 
@@ -1988,6 +1992,22 @@ def execute_exact_postgres(plan: ExecutableQueryPlan):
     with psycopg.connect(POSTGRES_DSN, row_factory=dict_row) as connection:
         with connection.cursor() as cursor:
             cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        if plan.result_intent == "employee_profile":
+            rows = _execute_rows_query(
+                compile_profile_query(plan, POSTGRES_ATTENDANCE_TABLE), connection
+            )
+            chunks = [
+                Result(
+                    page_content="\n".join(
+                        f"{field}: {row.get(field)}"
+                        for field in plan.projection
+                        if row.get(field) not in (None, "")
+                    ),
+                    metadata={field: row.get(field) for field in plan.projection},
+                )
+                for row in rows
+            ]
+            return chunks, None, len(chunks)
         aggregation = _map_compiled_aggregation(
             plan,
             compile_aggregation_queries(plan, POSTGRES_ATTENDANCE_TABLE),
@@ -2452,13 +2472,15 @@ def _human_date_range(start_text: str, end_text: str):
     )
 
 
-def _coverage_warning(aggregation: dict):
+def _coverage_warning(aggregation: dict, *, locale: str = "en"):
     coverage = aggregation.get("coverage")
     if not coverage or coverage.get("complete"):
         return ""
     available = _human_date_range(
         coverage["available_start"], coverage["available_end"]
     )
+    if locale == "ar":
+        return f" تغطي بيانات الحضور المتاحة الفترة {available}، وليس كامل الفترة المطلوبة."
     return (
         f" The available attendance data covers {available}, "
         "not the full requested period."
@@ -2470,6 +2492,27 @@ def _field_natural_label(field: str) -> str:
     if definition is None:
         return " ".join(part for part in re.split(r"[_\-\s]+", field) if part)
     return definition.natural_names[0]
+
+
+_ARABIC_FIELD_LABELS = {
+    "Employee_ID": "معرّف الموظف",
+    "Name": "اسم الموظف",
+    "Date": "التاريخ",
+    "Department": "القسم",
+    "Position": "المنصب",
+    "Work_Location": "موقع العمل",
+    "Total_Worked_Hrs": "ساعات العمل الفعلية",
+    "Total_OT": "ساعات العمل الإضافي",
+    "Status": "الحالة",
+    "Exception": "الاستثناء",
+    "Day_Type": "نوع اليوم",
+}
+
+
+def _localized_field_label(field: str, locale: str) -> str:
+    if locale == "ar":
+        return _ARABIC_FIELD_LABELS.get(field, _field_natural_label(field))
+    return _field_natural_label(field)
 
 
 def _format_verified_condition(condition: FilterCondition) -> str:
@@ -2553,13 +2596,80 @@ def _verified_scope_suffix(plan: QueryPlan) -> str:
     return f" {rendered[0].upper()}{rendered[1:]}."
 
 
-def _format_aggregation_answer(plan: QueryPlan, aggregation: dict):
+def _format_aggregation_answer(
+    plan: QueryPlan, aggregation: dict, *, locale: str = "en"
+):
     """Render a calculation result without allowing an LLM to alter it."""
     operation = plan.aggregation
     value = aggregation.get("value")
     field = plan.aggregation_field
     scope = _verified_scope_suffix(plan)
     contract = derive_expected_answer_contract(plan)
+
+    if locale == "ar":
+        warning = _coverage_warning(aggregation, locale="ar")
+        if aggregation.get("rows") is not None:
+            headers = [
+                *(
+                    _localized_field_label(group_field, "ar")
+                    for group_field in aggregation.get("group_by", plan.group_by)
+                ),
+                "النتيجة",
+            ]
+            lines = [" | ".join(headers), " | ".join(["---"] * len(headers))]
+            for row in aggregation["rows"]:
+                group = [
+                    "(فارغ)" if item is None else str(item) for item in row["group"]
+                ]
+                lines.append(" | ".join([*group, _format_number(row["value"])]))
+            if aggregation.get("truncated"):
+                lines.append(
+                    f"يتم عرض {len(aggregation['rows'])} من أصل "
+                    f"{aggregation['total_groups']} مجموعات."
+                )
+            return "\n".join(lines) + warning
+        if operation == "percentage":
+            if aggregation.get("denominator") == 0:
+                return "لا يمكن حساب النسبة لأن المقام يساوي صفرًا." + warning
+            return (
+                f"النسبة {_format_number(value)}% "
+                f"({aggregation.get('numerator')} من {aggregation.get('denominator')})."
+                + warning
+            )
+        if operation == "distinct_count" and contract.unit == "dates":
+            label = {
+                frozenset({"worked"}): "أيام عمل فعلية",
+                frozenset({"absent"}): "أيام غياب مسجلة",
+                frozenset({"scheduled_working_day"}): "أيام عمل مجدولة",
+                frozenset(
+                    {"scheduled_working_day", "not_worked"}
+                ): "أيام عمل مجدولة لم يتم حضورها",
+            }.get(frozenset(plan.business_predicates), "أيام")
+            return f"النتيجة: {_format_number(value)} {label}." + warning
+        if operation in {"count", "distinct_count"}:
+            label = {
+                "dates": "تواريخ",
+                "records": "سجلات حضور",
+                "employees": "موظفين",
+            }.get(contract.unit, "نتائج")
+            return f"النتيجة: {_format_number(value)} {label}." + warning
+        if operation in {"sum", "average", "min", "max"}:
+            operation_label = {
+                "sum": "المجموع",
+                "average": "المتوسط",
+                "min": "الحد الأدنى",
+                "max": "الحد الأعلى",
+            }[operation]
+            field_label = (
+                _localized_field_label(field, "ar") if field else "القيمة"
+            )
+            if value is None:
+                return f"لا توجد قيمة مسجلة لـ {field_label}." + warning
+            return (
+                f"{operation_label} لـ {field_label}: {_format_number(value)}."
+                + warning
+            )
+        return None
 
     if operation == "percentage":
         denominator_field = contract.subject_field
@@ -2800,6 +2910,63 @@ _RESULT_FACT_KINDS = frozenset(
 )
 
 
+def _facts_from_question_surface(question: str) -> tuple[SemanticFact, ...]:
+    surface = analyze_question_surface(question)
+    facts: list[SemanticFact] = []
+    for candidate in automatically_accepted_candidates(surface):
+        if candidate.method == "exact" and candidate.target_kind != "result_intent":
+            continue
+        common = dict(
+            evidence_text=candidate.evidence_text,
+            evidence_span=candidate.evidence_span,
+            origin="question",
+            strength="strong",
+        )
+        if candidate.target_kind == "result_intent":
+            facts.append(
+                SemanticFact(
+                    kind="result_intent",
+                    concept_name=candidate.target_name,
+                    **common,
+                )
+            )
+        elif candidate.target_kind == "interpretation":
+            definition = INTERPRETATION_PRESETS[candidate.target_name]
+            facts.append(
+                SemanticFact(
+                    kind="measure",
+                    concept_name=definition.measure,
+                    **common,
+                )
+            )
+            facts.extend(
+                SemanticFact(kind="predicate", concept_name=name, **common)
+                for name in definition.business_predicates
+            )
+        elif candidate.target_kind == "predicate":
+            facts.append(
+                SemanticFact(
+                    kind="predicate", concept_name=candidate.target_name, **common
+                )
+            )
+    return merge_semantic_facts(tuple(facts))
+
+
+def _profile_employee_reference(question: str) -> str | None:
+    surface = analyze_question_surface(question)
+    profile_candidates = [
+        candidate
+        for candidate in automatically_accepted_candidates(surface)
+        if candidate.target_kind == "result_intent"
+        and candidate.target_name == "employee_profile"
+    ]
+    if len(profile_candidates) != 1:
+        return None
+    _start, end = profile_candidates[0].evidence_span
+    reference = question[end:].strip(" \t\r\n:،,.?!")
+    return reference or None
+
+
 def _complete_registered_short_form(
     question: str,
     facts: tuple[SemanticFact, ...],
@@ -2908,7 +3075,10 @@ def _fetch_context_result(
         employees=_employee_references(default_employees),
         reference_date=_current_local_date(),
     )
-    detected_facts = detect_semantic_facts(question, identity_context)
+    surface_facts = _facts_from_question_surface(question)
+    detected_facts = merge_semantic_facts(
+        detect_semantic_facts(question, identity_context), surface_facts
+    )
     entity_resolution = None
     directory = None
     entity_facts = [fact for fact in detected_facts if fact.kind == "entity"]
@@ -2917,6 +3087,25 @@ def _fetch_context_result(
         and fact.origin in {"trusted_state", "user_clarification"}
         for fact in prepared_facts
     )
+    profile_reference = _profile_employee_reference(question)
+    if not entity_facts and not trusted_selection and profile_reference:
+        directory = load_employee_directory()
+        profile_resolution = resolve_employee_reference(profile_reference, directory)
+        entity_resolution = profile_resolution
+        detected_facts = merge_semantic_facts(
+            tuple(detected_facts),
+            (
+                SemanticFact(
+                    kind="entity",
+                    field="Name",
+                    values=(profile_reference,),
+                    evidence_text=profile_reference,
+                    origin="question",
+                    strength="strong",
+                ),
+            ),
+        )
+        entity_facts = [fact for fact in detected_facts if fact.kind == "entity"]
     if (
         not entity_facts
         and not trusted_selection
@@ -2989,7 +3178,9 @@ def _fetch_context_result(
         employees=_employee_references(default_employees),
         reference_date=_current_local_date(),
     )
-    detected_facts = detect_semantic_facts(question, pre_context)
+    detected_facts = merge_semantic_facts(
+        detect_semantic_facts(question, pre_context), surface_facts
+    )
     if any(
         fact.kind == "unsupported" and fact.strength == "strong"
         for fact in detected_facts
@@ -3047,6 +3238,15 @@ def _fetch_context_result(
     )
     initial_facts = merge_semantic_facts(prepared_facts, detected_facts, date_facts)
     initial_facts = _complete_registered_short_form(question, initial_facts)
+    if any(
+        fact.kind == "result_intent"
+        and fact.concept_name == "employee_profile"
+        and fact.strength == "strong"
+        for fact in initial_facts
+    ) and not default_employees:
+        raise PlanValidationError(
+            "Please provide the employee's full name or employee ID for the profile."
+        )
     if not _request_has_supported_result(initial_facts):
         raise MissingIntentRequired(default_employees or [])
     event_logger.emit(
@@ -3469,7 +3669,13 @@ def _answer_from_context(
 ) -> tuple[str, list[Result]]:
     started = perf_counter()
 
+    if plan.result_intent == "employee_profile":
+        return _format_employee_profile(
+            chunks, locale=analyze_question_surface(question).reply_locale
+        ), chunks
+
     if plan.projection:
+        locale = analyze_question_surface(question).reply_locale
 
         def cell(value):
             return (
@@ -3481,7 +3687,8 @@ def _answer_from_context(
         rows = [
             "| "
             + " | ".join(
-                _field_natural_label(field).title() for field in plan.projection
+                _localized_field_label(field, locale).title()
+                for field in plan.projection
             )
             + " |",
             "| " + " | ".join("---" for _ in plan.projection) + " |",
@@ -3500,6 +3707,7 @@ def _answer_from_context(
         deterministic_answer = _format_aggregation_answer(
             plan,
             aggregation,
+            locale=analyze_question_surface(question).reply_locale,
         )
         if deterministic_answer is not None:
             logger.info(
@@ -3553,8 +3761,49 @@ def _answer_from_context(
     )
 
 
-def _format_employee_clarification(resolution: EmployeeResolution):
+def _format_employee_profile(chunks: list[Result], *, locale: str = "en") -> str:
+    labels = (
+        {
+            "Employee_ID": "معرّف الموظف",
+            "Name": "اسم الموظف",
+            "Department": "القسم",
+            "Position": "المنصب",
+            "Work_Location": "موقع العمل",
+        }
+        if locale == "ar"
+        else {
+            "Employee_ID": "Employee ID",
+            "Name": "Employee name",
+            "Department": "Department",
+            "Position": "Position",
+            "Work_Location": "Work location",
+        }
+    )
+    heading = "ملف الموظف" if locale == "ar" else "Employee profile"
+    lines = [heading]
+    for field, label in labels.items():
+        values = sorted(
+            {
+                str(chunk.metadata[field]).strip()
+                for chunk in chunks
+                if chunk.metadata.get(field) not in (None, "")
+            },
+            key=str.casefold,
+        )
+        rendered = "; ".join(values) if values else ("غير مسجل" if locale == "ar" else "Not recorded")
+        lines.append(f"- {label}: {rendered}")
+    return "\n".join(lines)
+
+
+def _format_employee_clarification(
+    resolution: EmployeeResolution, *, locale: str = "en"
+):
     if resolution.outcome == "none":
+        if locale == "ar":
+            return (
+                "لم أجد موظفًا مطابقًا. "
+                "يرجى إدخال الاسم الكامل الصحيح أو معرّف الموظف."
+            )
         return (
             f"I could not find an employee matching {resolution.reference!r}. "
             "Please enter a valid employee name or employee ID."
@@ -3564,29 +3813,52 @@ def _format_employee_clarification(resolution: EmployeeResolution):
         f"{index}. {candidate.name} — {candidate.employee_id}"
         for index, candidate in enumerate(resolution.candidates, start=1)
     )
-    if resolution.outcome == "confirmation":
+    if locale == "ar":
+        heading = (
+            "هل تقصد هذا الموظف؟"
+            if resolution.outcome == "confirmation"
+            else "أي موظف تقصد؟"
+        )
+        instruction = "أرسل الرقم أو الاسم الكامل أو معرّف الموظف."
+        overflow_text = "يوجد موظفون آخرون مطابقون. أدخل أحرفًا إضافية لتضييق القائمة."
+    elif resolution.outcome == "confirmation":
         heading = "Did you mean this employee?"
+        instruction = "Reply with a number, full name, or employee ID."
+        overflow_text = "More employees matched. Enter more characters to narrow the list."
     else:
         heading = "Which employee did you mean?"
+        instruction = "Reply with a number, full name, or employee ID."
+        overflow_text = "More employees matched. Enter more characters to narrow the list."
     overflow = (
-        "\nMore employees matched. Enter more characters to narrow the list."
+        f"\n{overflow_text}"
         if resolution.has_more_candidates
         else ""
     )
     return (
         f"{heading}\n{choices}\n"
-        f"Reply with a number, full name, or employee ID.{overflow}"
+        f"{instruction}{overflow}"
     )
 
 
-def _format_missing_intent(employees: list[EmployeeCandidate]) -> str:
+def _format_missing_intent(
+    employees: list[EmployeeCandidate], *, locale: str = "en"
+) -> str:
     if len(employees) == 1:
         employee = employees[0]
+        if locale == "ar":
+            return (
+                f"اخترت {employee.name} ({employee.employee_id}). "
+                "ما معلومات الحضور التي تريدها؟"
+            )
         return (
             f"You selected {employee.name} ({employee.employee_id}). "
             "What attendance information would you like?"
         )
-    return "What attendance information would you like?"
+    return (
+        "ما معلومات الحضور التي تريدها؟"
+        if locale == "ar"
+        else "What attendance information would you like?"
+    )
 
 
 def _select_pending_employees(
@@ -3720,12 +3992,20 @@ def _interpretation_label(name: InterpretationName):
     return name.replace("_", " ")
 
 
-def _format_interpretation_clarification(candidates: list[InterpretationName]):
+def _format_interpretation_clarification(
+    candidates: list[InterpretationName], *, locale: str = "en"
+):
     choices = "\n".join(
         f"{index}. {_interpretation_label(name)} — "
         f"{INTERPRETATION_PRESETS[name].description}"
         for index, name in enumerate(candidates, start=1)
     )
+    if locale == "ar":
+        return (
+            "ما معنى الحضور الذي تقصده؟\n"
+            f"{choices}\n"
+            "أرسل الرقم أو اسم التفسير."
+        )
     return (
         "Which attendance meaning did you intend?\n"
         f"{choices}\n"
@@ -3748,11 +4028,18 @@ def _select_pending_interpretation(
     return None
 
 
-def _format_constraint_clarification(pending: PendingConstraintData):
+def _format_constraint_clarification(
+    pending: PendingConstraintData, *, locale: str = "en"
+):
     choices = "\n".join(
         f"{index}. {candidate.label or candidate.value}"
         for index, candidate in enumerate(pending.candidates, start=1)
     )
+    if locale == "ar":
+        return (
+            f"أي قيمة لحقل {_localized_field_label(pending.field, 'ar')} تقصد؟\n"
+            f"{choices}\nأرسل الرقم أو القيمة المطابقة."
+        )
     return (
         f"Which {pending.field} did you mean by {pending.reference!r}?\n"
         f"{choices}\nReply with a number, exact value, or 'all'."
@@ -3835,7 +4122,14 @@ def answer_question_with_state(
         )
         if selected_interpretation is None:
             return (
-                _format_interpretation_clarification(state.pending_interpretations),
+                _format_interpretation_clarification(
+                    state.pending_interpretations,
+                    locale=(
+                        state.pending_clarification.reply_locale
+                        if state.pending_clarification is not None
+                        else "en"
+                    ),
+                ),
                 [],
                 state,
             )
@@ -3891,7 +4185,14 @@ def answer_question_with_state(
         pending = state.pending_constraint
         selected_values = _select_pending_constraint_values(question, pending)
         if not selected_values:
-            return _format_constraint_clarification(pending), [], state
+            return _format_constraint_clarification(
+                pending,
+                locale=(
+                    state.pending_clarification.reply_locale
+                    if state.pending_clarification is not None
+                    else "en"
+                ),
+            ), [], state
         effective_question = state.pending_question or question
         prepared_proposal = state.pending_proposal.model_copy(deep=True)
         prepared_proposal.filters = [
@@ -3948,7 +4249,12 @@ def answer_question_with_state(
                 candidates=state.pending_candidates,
                 reference=question,
             )
-            return _format_employee_clarification(resolution), [], state
+            locale = (
+                state.pending_clarification.reply_locale
+                if state.pending_clarification is not None
+                else "en"
+            )
+            return _format_employee_clarification(resolution, locale=locale), [], state
 
         current_directory = load_employee_directory()
         current_by_identity = {
@@ -3981,7 +4287,12 @@ def answer_question_with_state(
                         outcome="ambiguous",
                         candidates=state.pending_candidates,
                         reference=question,
-                    )
+                    ),
+                    locale=(
+                        state.pending_clarification.reply_locale
+                        if state.pending_clarification is not None
+                        else "en"
+                    ),
                 ),
                 [],
                 state,
@@ -4051,7 +4362,10 @@ def answer_question_with_state(
         _store_catalog_clarification(
             state, effective_question, exc.proposal, exc.facts, exc.pending
         )
-        return _format_constraint_clarification(exc.pending), [], state
+        return _format_constraint_clarification(
+            exc.pending,
+            locale=analyze_question_surface(effective_question).reply_locale,
+        ), [], state
     except InterpretationClarificationRequired as exc:
         state.pending_question = effective_question
         state.pending_proposal = exc.proposal
@@ -4060,11 +4374,17 @@ def answer_question_with_state(
         _store_interpretation_clarification(
             state, effective_question, exc.proposal, exc.facts, exc.candidates
         )
-        return _format_interpretation_clarification(exc.candidates), [], state
+        return _format_interpretation_clarification(
+            exc.candidates,
+            locale=analyze_question_surface(effective_question).reply_locale,
+        ), [], state
     except EmployeeClarificationRequired as exc:
         if exc.resolution.outcome == "none":
             _clear_pending_state(state)
-            return _format_employee_clarification(exc.resolution), [], state
+            return _format_employee_clarification(
+                exc.resolution,
+                locale=analyze_question_surface(effective_question).reply_locale,
+            ), [], state
         state.pending_question = effective_question
         state.pending_proposal = exc.proposal
         state.pending_facts = list(exc.facts)
@@ -4077,7 +4397,10 @@ def answer_question_with_state(
             exc.facts,
             exc.resolution,
         )
-        return _format_employee_clarification(exc.resolution), [], state
+        return _format_employee_clarification(
+            exc.resolution,
+            locale=analyze_question_surface(effective_question).reply_locale,
+        ), [], state
     except MissingIntentRequired as exc:
         _clear_pending_state(state)
         if exc.employees:
@@ -4096,9 +4419,15 @@ def answer_question_with_state(
                 else None
             ),
         )
-        return _format_missing_intent(exc.employees), [], state
+        return _format_missing_intent(
+            exc.employees,
+            locale=analyze_question_surface(effective_question).reply_locale,
+        ), [], state
     except PlanValidationError as exc:
         _clear_pending_state(state)
+        locale = analyze_question_surface(effective_question).reply_locale
+        if locale == "ar":
+            return f"تعذر تفسير الطلب بأمان: {exc}", [], state
         return f"I could not safely interpret that request: {exc}", [], state
 
     _clear_pending_state(state)

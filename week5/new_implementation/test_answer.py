@@ -2085,6 +2085,85 @@ class RequestCompletenessTests(unittest.TestCase):
         self.assertEqual(state.pending_candidates, [])
 
 
+class EmployeeProfileTests(unittest.TestCase):
+    def test_partial_profile_request_resumes_after_selection_and_is_deterministic(self):
+        employees = [
+            answer.EmployeeCandidate(employee_id="A10018", name="Faris Ahmed"),
+            answer.EmployeeCandidate(employee_id="A10019", name="Faris North"),
+        ]
+        profile_rows = [
+            answer.Result(
+                page_content="ignored",
+                metadata={
+                    "Employee_ID": "A10019",
+                    "Name": "Faris North",
+                    "Department": "Operations",
+                    "Position": "Analyst",
+                    "Work_Location": "Aden",
+                },
+            ),
+            answer.Result(
+                page_content="ignored",
+                metadata={
+                    "Employee_ID": "A10019",
+                    "Name": "Faris North",
+                    "Department": "People",
+                    "Position": "Analyst",
+                    "Work_Location": "Aden",
+                },
+            ),
+        ]
+        with (
+            patch.object(answer, "load_employee_directory", return_value=employees),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=False),
+            patch.object(answer, "fetch_exact_chroma", return_value=profile_rows) as retrieve,
+            patch.object(answer, "completion") as final_llm,
+        ):
+            first, chunks, state = answer.answer_question_with_state(
+                "who is Faris", [], answer.ConversationState()
+            )
+            second, chunks, state = answer.answer_question_with_state("2", [], state)
+
+        self.assertIn("Which employee", first)
+        self.assertEqual(chunks, profile_rows)
+        self.assertIn("Faris North", second)
+        self.assertIn("A10019", second)
+        self.assertIn("Operations; People", second)
+        self.assertEqual(retrieve.call_args.args[0][0].field, "Employee_ID")
+        final_llm.assert_not_called()
+
+    def test_arabic_profile_clarification_and_answer_keep_arabic_locale(self):
+        employees = [
+            answer.EmployeeCandidate(employee_id="A10018", name="Faris Ahmed"),
+            answer.EmployeeCandidate(employee_id="A10019", name="Faris North"),
+        ]
+        profile = answer.Result(
+            page_content="ignored",
+            metadata={
+                "Employee_ID": "A10018",
+                "Name": "Faris Ahmed",
+                "Department": "Operations",
+                "Position": "Analyst",
+                "Work_Location": "Aden",
+            },
+        )
+        with (
+            patch.object(answer, "load_employee_directory", return_value=employees),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=False),
+            patch.object(answer, "fetch_exact_chroma", return_value=[profile]),
+        ):
+            first, _chunks, state = answer.answer_question_with_state(
+                "من هو فارس", [], answer.ConversationState()
+            )
+            second, _chunks, _state = answer.answer_question_with_state("١", [], state)
+
+        self.assertIn("أي موظف", first)
+        self.assertIn("اسم الموظف", second)
+        self.assertIn("A10018", second)
+
+
 class CoverageMetadataTests(unittest.TestCase):
     def test_chroma_coverage_uses_only_daily_attendance_dates(self):
         stored = {

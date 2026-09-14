@@ -10,12 +10,43 @@ from week5.new_implementation.attendance_schema import (
 from week5.new_implementation.postgres_compiler import (
     compile_aggregation_queries,
     compile_count_query,
+    compile_profile_query,
     compile_sample_query,
     compile_where,
 )
 
 
 class PostgresCompilerTests(unittest.TestCase):
+    def test_profile_query_is_distinct_and_parameterized(self):
+        plan = ExecutableQueryPlan(
+            mode="exact",
+            search_query="who is Faris",
+            filters=[
+                FilterCondition(field="Employee_ID", operator="eq", value="A10018")
+            ],
+            result_intent="employee_profile",
+            projection=[
+                "Employee_ID",
+                "Name",
+                "Department",
+                "Position",
+                "Work_Location",
+            ],
+            answer_contract=AnswerContract(shape="profile", unit="value"),
+        )
+
+        query = compile_profile_query(plan)
+
+        self.assertIn("SELECT DISTINCT", query.sql)
+        self.assertNotIn("A10018", query.sql)
+        self.assertEqual(query.params, ("A10018",))
+        for field in ("employee_id", "name", "department", "position", "work_location"):
+            self.assertIn(field, query.sql)
+
+        altered = plan.model_copy(update={"projection": ["Employee_Remarks"]})
+        with self.assertRaises(ValueError):
+            compile_profile_query(altered)
+
     def test_semantic_metadata_scope_always_binds_trusted_domain(self):
         from week5.new_implementation import postgres_compiler
 

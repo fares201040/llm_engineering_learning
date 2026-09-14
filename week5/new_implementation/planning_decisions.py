@@ -8,6 +8,7 @@ try:
         AnswerContract,
         FIELD_DEFINITIONS,
         MEASURE_DEFINITIONS,
+        RESULT_INTENT_DEFINITIONS,
         PlannerDecision,
         PlannerProposal,
         ProposedCalculation,
@@ -18,6 +19,7 @@ try:
         ProposedNameHint,
         ProposedOrderChoice,
         ProposedPredicateChoice,
+        ProposedResultIntentChoice,
         UnsupportedCapability,
     )
     from .semantic_resolution import SemanticFact
@@ -26,6 +28,7 @@ except ImportError:
         AnswerContract,
         FIELD_DEFINITIONS,
         MEASURE_DEFINITIONS,
+        RESULT_INTENT_DEFINITIONS,
         PlannerDecision,
         PlannerProposal,
         ProposedCalculation,
@@ -36,6 +39,7 @@ except ImportError:
         ProposedNameHint,
         ProposedOrderChoice,
         ProposedPredicateChoice,
+        ProposedResultIntentChoice,
         UnsupportedCapability,
     )
     from semantic_resolution import SemanticFact
@@ -136,8 +140,11 @@ def _unsupported_proposal(capabilities) -> PlannerProposal:
 
 
 def _answer_contract(
-    *, measure, calculation, groups, projection, semantic
+    *, measure, calculation, groups, projection, semantic, result_intent
 ) -> AnswerContract:
+    if result_intent is not None:
+        definition = RESULT_INTENT_DEFINITIONS[result_intent.name]
+        return AnswerContract(shape=definition.answer_shape, unit="value", grain=[])
     if projection:
         return AnswerContract(
             shape="rows",
@@ -221,7 +228,13 @@ def assemble_grounded_proposal(
 
     measures = _unique_facts(facts, "measure")
     calculations = _unique_facts(facts, "calculation")
-    if len(measures) > 1 or len(calculations) > 1 or (measures and calculations):
+    result_intents = _unique_facts(facts, "result_intent")
+    if (
+        len(measures) > 1
+        or len(calculations) > 1
+        or len(result_intents) > 1
+        or sum(bool(items) for items in (measures, calculations, result_intents)) > 1
+    ):
         return _unsupported_proposal(("multi_stage_aggregation",))
 
     filters = []
@@ -339,12 +352,21 @@ def assemble_grounded_proposal(
         else None
     )
     semantic = bool(_unique_facts(facts, "semantic_intent"))
+    result_intent = (
+        ProposedResultIntentChoice(
+            name=result_intents[0].concept_name,
+            evidence_text=result_intents[0].evidence_text,
+        )
+        if result_intents
+        else None
+    )
     contract = _answer_contract(
         measure=measure,
         calculation=calculation,
         groups=groups,
         projection=projection,
         semantic=semantic,
+        result_intent=result_intent,
     )
     return PlannerProposal(
         status="ready",
@@ -358,4 +380,5 @@ def assemble_grounded_proposal(
         order_by=order,
         limit=limit,
         answer_contract=contract,
+        result_intent=result_intent,
     )

@@ -1,7 +1,10 @@
 """Typed, source-preserving input-understanding contracts for attendance questions."""
 
 from dataclasses import dataclass
+from difflib import SequenceMatcher
+import re
 from typing import Annotated, Literal
+import unicodedata
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -74,6 +77,8 @@ class SurfaceCandidate(_StrictFrozenModel):
 
 
 class QuestionSurface(_StrictFrozenModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=False)
+
     original_text: str = Field(min_length=1)
     reply_locale: ReplyLocale
     candidates: tuple[SurfaceCandidate, ...] = ()
@@ -284,3 +289,239 @@ def validate_localized_alias_registry(
             if key in seen:
                 raise ValueError(f"duplicate localized alias {phrase!r}")
             seen.add(key)
+
+
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+_ARABIC_LETTERS = str.maketrans(
+    {
+        "أ": "ا",
+        "إ": "ا",
+        "آ": "ا",
+        "ٱ": "ا",
+        "ى": "ي",
+        "ؤ": "و",
+        "ئ": "ي",
+    }
+)
+_ARABIC_MARKS = re.compile(r"[\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06edـ]")
+_ARABIC_ALPHA = re.compile(r"[\u0600-\u06ff]")
+_LATIN_ALPHA = re.compile(r"[A-Za-z]")
+_TOKEN_PATTERN = re.compile(r"\b\w+\b", re.UNICODE)
+_NEGATION_TOKENS = frozenset(
+    {"not", "no", "without", "never", "لم", "لن", "لا", "ليس", "ما"}
+)
+
+
+@dataclass(frozen=True)
+class _NormalizedText:
+    text: str
+    source_indexes: tuple[int, ...]
+
+    def source_span(self, start: int, end: int) -> tuple[int, int]:
+        return self.source_indexes[start], self.source_indexes[end - 1] + 1
+
+
+def _normalize_character(character: str) -> str:
+    normalized = unicodedata.normalize("NFKC", character).casefold()
+    normalized = normalized.translate(_ARABIC_DIGITS).translate(_ARABIC_LETTERS)
+    normalized = _ARABIC_MARKS.sub("", normalized)
+    return "".join(
+        item if item.isalnum() or item in {"_", "<", ">", "=", "!"} else " "
+        for item in normalized
+    )
+
+
+def _normalize_with_source_map(text: str) -> _NormalizedText:
+    characters: list[str] = []
+    source_indexes: list[int] = []
+    for source_index, character in enumerate(text):
+        for normalized in _normalize_character(character):
+            if normalized.isspace():
+                if not characters or characters[-1] == " ":
+                    continue
+                characters.append(" ")
+                source_indexes.append(source_index)
+            else:
+                characters.append(normalized)
+                source_indexes.append(source_index)
+    if characters and characters[-1] == " ":
+        characters.pop()
+        source_indexes.pop()
+    return _NormalizedText("".join(characters), tuple(source_indexes))
+
+
+def _normalized_phrase(text: str) -> str:
+    return _normalize_with_source_map(text).text
+
+
+def _reply_locale(question: str) -> ReplyLocale:
+    arabic_tokens = sum(
+        1 for token in _TOKEN_PATTERN.findall(question) if _ARABIC_ALPHA.search(token)
+    )
+    latin_tokens = sum(
+        1 for token in _TOKEN_PATTERN.findall(question) if _LATIN_ALPHA.search(token)
+    )
+    return "ar" if arabic_tokens >= latin_tokens and arabic_tokens else "en"
+
+
+def _registry_aliases():
+    for name, definition in FIELD_DEFINITIONS.items():
+        for phrase in definition.natural_names:
+            yield "en", "field", name, phrase
+    for name, definition in MEASURE_DEFINITIONS.items():
+        for phrase in definition.natural_names:
+            yield "en", "measure", name, phrase
+    for name, definition in BUSINESS_PREDICATE_DEFINITIONS.items():
+        for phrase in definition.natural_names:
+            yield "en", "predicate", name, phrase
+    for name, definition in CALCULATION_DEFINITIONS.items():
+        for phrase in definition.natural_names:
+            yield "en", "calculation", name, phrase
+    for name in INTERPRETATION_PRESETS:
+        yield "en", "interpretation", name, name.replace("_", " ")
+    for name, definition in RESULT_INTENT_DEFINITIONS.items():
+        for phrase in definition.natural_names:
+            yield "en", "result_intent", name, phrase
+    for definition in LOCALIZED_ALIAS_DEFINITIONS:
+        for phrase in definition.phrases:
+            yield (
+                definition.locale,
+                definition.target_kind,
+                definition.target_name,
+                phrase,
+            )
+
+
+def _surface_candidate(
+    *,
+    original: str,
+    normalized: _NormalizedText,
+    normalized_span: tuple[int, int],
+    target_kind: TargetKind,
+    target_name: str,
+    method: MatchMethod,
+    score: float,
+) -> SurfaceCandidate:
+    start, end = normalized.source_span(*normalized_span)
+    return SurfaceCandidate(
+        candidate_id=f"{target_kind}:{target_name}:{start}:{end}:{method}",
+        target_kind=target_kind,
+        target_name=target_name,
+        evidence_text=original[start:end],
+        evidence_span=(start, end),
+        method=method,
+        score=round(score, 6),
+    )
+
+
+def _has_adjacent_negation(tokens: list[re.Match[str]], start_index: int) -> bool:
+    if start_index <= 0:
+        return False
+    return tokens[start_index - 1].group(0) in _NEGATION_TOKENS
+
+
+def analyze_question_surface(question: str) -> QuestionSurface:
+    """Find registry-grounded wording while retaining the untouched source text."""
+    if not question or not question.strip():
+        raise ValueError("question must not be blank")
+    normalized = _normalize_with_source_map(question)
+    candidates: list[SurfaceCandidate] = []
+    seen: set[tuple[str, str, int, int, str]] = set()
+    aliases = []
+
+    for locale, target_kind, target_name, phrase in _registry_aliases():
+        normalized_alias = _normalized_phrase(phrase)
+        if not normalized_alias:
+            continue
+        aliases.append((locale, target_kind, target_name, normalized_alias))
+        pattern = re.compile(rf"(?<!\w){re.escape(normalized_alias)}(?!\w)")
+        for match in pattern.finditer(normalized.text):
+            method: MatchMethod = "exact" if locale == "en" else "localized_alias"
+            key = (target_kind, target_name, match.start(), match.end(), method)
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(
+                _surface_candidate(
+                    original=question,
+                    normalized=normalized,
+                    normalized_span=(match.start(), match.end()),
+                    target_kind=target_kind,
+                    target_name=target_name,
+                    method=method,
+                    score=1.0,
+                )
+            )
+
+    tokens = list(_TOKEN_PATTERN.finditer(normalized.text))
+    for _locale, target_kind, target_name, alias in aliases:
+        if len(alias) < 4 or target_kind == "operator":
+            continue
+        alias_words = alias.split()
+        width = len(alias_words)
+        for token_index in range(0, len(tokens) - width + 1):
+            window = tokens[token_index : token_index + width]
+            start, end = window[0].start(), window[-1].end()
+            text = normalized.text[start:end]
+            if text == alias or any(character.isdigit() for character in text):
+                continue
+            if _has_adjacent_negation(tokens, token_index):
+                continue
+            score = SequenceMatcher(None, text, alias).ratio()
+            if score < 0.72:
+                continue
+            key = (target_kind, target_name, start, end, "fuzzy")
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append(
+                _surface_candidate(
+                    original=question,
+                    normalized=normalized,
+                    normalized_span=(start, end),
+                    target_kind=target_kind,
+                    target_name=target_name,
+                    method="fuzzy",
+                    score=score,
+                )
+            )
+
+    candidates.sort(
+        key=lambda item: (
+            item.evidence_span,
+            -item.score,
+            item.target_kind,
+            item.target_name,
+            item.method,
+        )
+    )
+    return QuestionSurface(
+        original_text=question,
+        reply_locale=_reply_locale(question),
+        candidates=tuple(candidates),
+    )
+
+
+def automatically_accepted_candidates(
+    surface: QuestionSurface,
+) -> tuple[SurfaceCandidate, ...]:
+    """Return exact aliases and only uniquely dominant high-confidence fuzzies."""
+    accepted = [
+        candidate
+        for candidate in surface.candidates
+        if candidate.method in {"exact", "localized_alias"}
+    ]
+    fuzzy = [
+        candidate for candidate in surface.candidates if candidate.method == "fuzzy"
+    ]
+    for candidate in fuzzy:
+        competitors = [
+            other
+            for other in fuzzy
+            if other.candidate_id != candidate.candidate_id
+            and other.evidence_span == candidate.evidence_span
+        ]
+        next_score = max((other.score for other in competitors), default=0.0)
+        if candidate.score >= 0.90 and candidate.score - next_score >= 0.08:
+            accepted.append(candidate)
+    return tuple(accepted)

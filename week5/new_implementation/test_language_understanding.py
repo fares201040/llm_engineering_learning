@@ -17,6 +17,8 @@ from week5.new_implementation.language_understanding import (
     MissingIntentClarification,
     QuestionSurface,
     SurfaceCandidate,
+    analyze_question_surface,
+    automatically_accepted_candidates,
     validate_localized_alias_registry,
 )
 
@@ -166,6 +168,93 @@ class TolerantInputContractTests(unittest.TestCase):
                 target_name="worked",
                 phrases=(" ",),
             )
+
+
+class QuestionSurfaceAnalysisTests(unittest.TestCase):
+    def test_english_normalization_preserves_original_text_and_offsets(self):
+        question = "  WOrKeD,   DAYS?!  "
+        surface = analyze_question_surface(question)
+
+        self.assertEqual(surface.original_text, question)
+        self.assertEqual(surface.reply_locale, "en")
+        interpretation = next(
+            candidate
+            for candidate in surface.candidates
+            if candidate.target_kind == "interpretation"
+            and candidate.target_name == "worked_days"
+        )
+        start, end = interpretation.evidence_span
+        self.assertEqual(question[start:end], interpretation.evidence_text)
+        self.assertEqual(interpretation.method, "exact")
+
+    def test_arabic_normalization_handles_diacritics_tatweel_and_digits(self):
+        question = "أَيّام الـغــياب للموظف A10018 في ١٤/٠٩/٢٠٢٦"
+        surface = analyze_question_surface(question)
+
+        self.assertEqual(surface.reply_locale, "ar")
+        self.assertTrue(
+            any(
+                candidate.target_kind == "interpretation"
+                and candidate.target_name == "absent_days"
+                and candidate.method == "localized_alias"
+                for candidate in surface.candidates
+            )
+        )
+        self.assertEqual(surface.original_text, question)
+
+    def test_mixed_language_locale_uses_alphabetic_token_majority(self):
+        self.assertEqual(
+            analyze_question_surface("Faris أيام الغياب").reply_locale,
+            "ar",
+        )
+        self.assertEqual(
+            analyze_question_surface("worked days للموظف Faris").reply_locale,
+            "en",
+        )
+
+    def test_uniquely_dominant_high_confidence_typo_is_automatic(self):
+        surface = analyze_question_surface("Faris wokred days")
+        accepted = automatically_accepted_candidates(surface)
+
+        correction = next(
+            candidate
+            for candidate in accepted
+            if candidate.target_kind == "interpretation"
+            and candidate.target_name == "worked_days"
+        )
+        self.assertEqual(correction.method, "fuzzy")
+        self.assertGreaterEqual(correction.score, 0.90)
+
+    def test_low_confidence_or_tied_typo_is_not_automatic(self):
+        surface = analyze_question_surface("Faris attendence")
+        self.assertFalse(
+            [
+                candidate
+                for candidate in automatically_accepted_candidates(surface)
+                if candidate.method == "fuzzy"
+            ]
+        )
+
+    def test_protected_values_and_logic_are_never_fuzzy_corrected(self):
+        protected_questions = (
+            "employee A1001B",
+            "on 31/13/2026",
+            "more than 12.5 hours",
+            "not wokred",
+            "worked nad absent",
+            "worked or absent",
+        )
+        for question in protected_questions:
+            with self.subTest(question=question):
+                fuzzy_evidence = {
+                    candidate.evidence_text.casefold()
+                    for candidate in analyze_question_surface(question).candidates
+                    if candidate.method == "fuzzy"
+                }
+                self.assertFalse(
+                    fuzzy_evidence
+                    & {"a1001b", "31/13/2026", "12.5", "wokred", "nad", "or"}
+                )
 
 
 if __name__ == "__main__":

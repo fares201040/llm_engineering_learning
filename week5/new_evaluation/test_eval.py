@@ -20,6 +20,111 @@ PRIVATE_FIXTURES_AVAILABLE = (
 
 
 class BaselineCapabilityParityTests(unittest.TestCase):
+    def test_date_qualified_sums_keep_temporal_filters_executable(self):
+        cases = (
+            ("on 2026-09-01", 3.0, {("eq", "2026-09-01")}),
+            ("before 2026-09-04", 3.0, {("lt", "2026-09-04")}),
+            ("after 2026-09-01", 4.0, {("gt", "2026-09-01")}),
+            ("on or before 2026-09-01", 3.0, {("lte", "2026-09-01")}),
+            ("on or after 2026-09-04", 4.0, {("gte", "2026-09-04")}),
+            ("since 2026-09-01", 7.0, {("gte", "2026-09-01")}),
+            ("until 2026-09-03", 3.0, {("lte", "2026-09-03")}),
+            ("in September 2026", 7.0, {("gte", "2026-09-01"), ("lte", "2026-09-30")}),
+            (
+                "from 2026-09-01 to 2026-09-03",
+                3.0,
+                {("gte", "2026-09-01"), ("lte", "2026-09-03")},
+            ),
+            (
+                "between 2026-09-02 and 2026-09-04",
+                4.0,
+                {("gte", "2026-09-02"), ("lte", "2026-09-04")},
+            ),
+            (
+                "between September 1, 2026 and 3",
+                3.0,
+                {("gte", "2026-09-01"), ("lte", "2026-09-03")},
+            ),
+        )
+        for scope, expected, temporal_filters in cases:
+            with self.subTest(scope=scope):
+                _, plan, result, _ = self.answer.fetch_context(f"Sum overtime {scope}")
+                self.assertEqual(
+                    (plan.aggregation, plan.aggregation_field, result["value"]),
+                    ("sum", "Total_OT", expected),
+                )
+                self.assertEqual(
+                    {
+                        (item.field, item.operator, item.value)
+                        for item in plan.filters
+                        if item.field != "chunk_type"
+                    },
+                    {("Date", operator, value) for operator, value in temporal_filters},
+                )
+
+    def test_numeric_operands_end_at_independent_temporal_clauses(self):
+        for clause, expected, numeric in (
+            (
+                "Total_Worked_Hrs greater than 2 on 2026-09-01",
+                2.0,
+                {("Total_Worked_Hrs", "gt", 2.0)},
+            ),
+            (
+                "Total_Worked_Hrs greater than 2 before 2026-09-04",
+                2.0,
+                {("Total_Worked_Hrs", "gt", 2.0)},
+            ),
+            (
+                "Total_Worked_Hrs greater than 2 in September 2026",
+                6.0,
+                {("Total_Worked_Hrs", "gt", 2.0)},
+            ),
+            (
+                "Total_Worked_Hrs greater than 2 and Total_OT less than 4 on 2026-09-01",
+                2.0,
+                {("Total_Worked_Hrs", "gt", 2.0), ("Total_OT", "lt", 4.0)},
+            ),
+            (
+                "above 2 Total_Worked_Hrs on 2026-09-01",
+                2.0,
+                {("Total_Worked_Hrs", "gt", 2.0)},
+            ),
+        ):
+            with self.subTest(clause=clause):
+                _, plan, result, _ = self.answer.fetch_context(
+                    f"Sum overtime where {clause}"
+                )
+                self.assertEqual(
+                    (plan.aggregation, plan.aggregation_field, result["value"]),
+                    ("sum", "Total_OT", expected),
+                )
+                self.assertEqual(
+                    {
+                        (item.field, item.operator, item.value)
+                        for item in plan.filters
+                        if item.field not in {"chunk_type", "Date"}
+                    },
+                    numeric,
+                )
+                self.assertTrue(any(item.field == "Date" for item in plan.filters))
+
+    def test_invalid_date_scopes_and_numeric_date_operands_reject_before_retrieval(
+        self,
+    ):
+        for question in (
+            "Sum overtime on 2026-02-30",
+            "Sum overtime between 2026-09-04 and 2026-09-01",
+            "Sum overtime where Total_Worked_Hrs equals 2026-09-01",
+            "Sum overtime where Total_Worked_Hrs greater than 2026-09-01",
+            "Sum overtime where Total_Worked_Hrs 2026-09-01",
+            "Sum overtime on 2026-09-01 or after 2026-09-03",
+        ):
+            with self.subTest(question=question):
+                self.store.get.reset_mock()
+                with self.assertRaises(self.answer.PlanValidationError):
+                    self.answer.fetch_context(question)
+                self.store.get.assert_not_called()
+
     def test_cross_field_numeric_aggregates_execute_only_requested_filter(self):
         for target, constrained, value, expected in (
             ("Total_OT", "Total_Worked_Hrs", 2, 1.0),

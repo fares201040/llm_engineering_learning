@@ -65,6 +65,35 @@ def registered_test_alias(field, alias):
 
 
 class BaselineOrderingGrammarTests(unittest.TestCase):
+    def test_numeric_aggregate_and_temporal_scopes_have_independent_roles(self):
+        for scope in (
+            "on 2026-09-01",
+            "before 2026-09-04",
+            "after 2026-09-01",
+            "in September 2026",
+            "from 2026-09-01 to 2026-09-04",
+            "between September 1, 2026 and 3",
+        ):
+            with self.subTest(scope=scope):
+                facts = detect_semantic_facts(
+                    f"Sum overtime {scope}", ResolutionContext({})
+                )
+                self.assertEqual(
+                    [
+                        (fact.field, fact.concept_name)
+                        for fact in facts
+                        if fact.kind == "calculation"
+                    ],
+                    [("Total_OT", "sum")],
+                )
+                self.assertFalse(any(fact.kind == "unsupported" for fact in facts))
+                self.assertFalse(
+                    any(
+                        fact.kind == "filter" and fact.field == "Total_OT"
+                        for fact in facts
+                    )
+                )
+
     def test_numeric_field_pair_constraints_do_not_filter_aggregate_targets(self):
         numeric_fields = [
             field

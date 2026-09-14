@@ -618,13 +618,14 @@ def _clause_operand_ends(question, start, fields, context, field, operator, cach
             for lo, _ in _raw_phrase_spans(question, fact.evidence_text)
             if start <= lo < hard_end
         )
-    for reference_start, _ in TemporalResolver.reference_spans(question):
-        if start <= reference_start < hard_end:
-            _, _, operator_start = TemporalResolver._operator(
-                question[start:reference_start]
-            )
-            if operator_start is not None:
-                ends.add(start + operator_start)
+    ends.update(
+        lo
+        for lo, hi in TemporalResolver.scope_spans(question)
+        if start <= lo < hard_end
+        and not any(
+            atom_start <= lo and hi <= atom_end for atom_start, atom_end in atomic_spans
+        )
+    )
     cache[key] = tuple(sorted(ends, reverse=True))
     return cache[key]
 
@@ -715,13 +716,18 @@ def _parse_constraint_clauses(
         candidates = _clause_operand_ends(
             question, operand_start, fields, context, field, operator
         )
-        if definition.resolution_kind == "numeric" and any(
-            end <= lo
-            and not question[end:lo].strip()
+        if (
+            definition.resolution_kind == "numeric"
+            and not preposed
             and any(
-                _trim_operand_span(question, end, stop)[1] == hi for stop in candidates
+                end <= lo
+                and not question[end:lo].strip()
+                and any(
+                    _trim_operand_span(question, end, stop)[1] == hi
+                    for stop in candidates
+                )
+                for lo, hi in TemporalResolver.scope_spans(question)
             )
-            for lo, hi in TemporalResolver.scope_spans(question)
         ):
             continue
         resolved = []
@@ -1193,6 +1199,11 @@ class EntityResolver(FieldResolver):
 
 class TemporalResolver(FieldResolver):
     kinds = frozenset({"temporal"})
+    _range_starts = frozenset({"from", "between"})
+    _range_connector = r"\s*(?:to|and)\s*"
+    _abbreviated_range_end = re.compile(
+        r"\s+and\s+(\d{1,2})(?:,?\s+(\d{4}))?(?![\d/-])\b", re.I
+    )
     _month = r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)"
     # Candidate shapes deliberately include malformed suffixes and short years.
     _literal_pattern = re.compile(
@@ -1263,18 +1274,75 @@ class TemporalResolver(FieldResolver):
 
     @classmethod
     def scope_spans(cls, question):
-        """Recognize a scope preposition bound to a complete calendar reference."""
-        return tuple(
-            (match.start(), end)
-            for start, end in cls.reference_spans(question)
-            if (
-                match := re.search(
-                    CONSTRAINT_CLAUSE_GRAMMAR["temporal_scope_prefix"],
-                    question[:start],
-                    re.I,
-                )
+        """Own reference/comparison/range boundaries without stealing numeric operands."""
+        fields = _registry_field_occurrences(question)
+        references = sorted(set(cls.reference_spans(question)))
+        scopes = []
+        previous_end = 0
+        range_open = False
+        for start, end in references:
+            if start < previous_end:
+                continue
+            prefix = question[previous_end:start]
+            target = max(
+                (item for item in fields if item[2] <= start),
+                key=lambda item: item[2],
+                default=None,
             )
-        )
+            temporal_target = bool(
+                target
+                and target[1] >= previous_end
+                and FIELD_DEFINITIONS[target[0]].resolution_kind == "temporal"
+            )
+            local_field = (
+                (target[1] - previous_end, target[2] - previous_end)
+                if temporal_target
+                else None
+            )
+            operator, phrase, operator_start = cls._operator(prefix, local_field)
+            scope_relation = re.search(
+                CONSTRAINT_CLAUSE_GRAMMAR["temporal_scope_prefix"], prefix, re.I
+            )
+            paired = range_open and re.fullmatch(cls._range_connector, prefix, re.I)
+            if paired:
+                scopes[-1] = (scopes[-1][0], end)
+                previous_end, range_open = end, False
+                continue
+            begin = (
+                previous_end + scope_relation.start()
+                if scope_relation
+                else previous_end + operator_start
+                if operator_start is not None
+                else target[1]
+                if temporal_target
+                else start
+            )
+            if temporal_target:
+                begin = min(begin, target[1])
+            # An adjacent numeric field with a native numeric relation owns its
+            # full operand, even if that operand has a date-shaped spelling.
+            numeric_binding = bool(
+                target
+                and FIELD_DEFINITIONS[target[0]].resolution_kind == "numeric"
+                and not question[target[2] : begin].strip()
+                and not scope_relation
+                and (operator_start is None or _registered_filter_operator(phrase)[0])
+            )
+            if numeric_binding or (operator is None and not scope_relation):
+                previous_end, range_open = end, False
+                continue
+            range_open = phrase in cls._range_starts
+            abbreviated = (
+                cls._abbreviated_range_end.match(question[end:])
+                if phrase == "between"
+                else None
+            )
+            if abbreviated:
+                end += abbreviated.end()
+                range_open = False
+            scopes.append((begin, end))
+            previous_end = end
+        return tuple(scopes)
 
     def detect(self, question, field, context):
         # All temporal filters come from the per-literal path, including times.
@@ -1383,7 +1451,7 @@ class TemporalResolver(FieldResolver):
                 target_span[0] if local_field else match.start(),
             )
             paired = bool(
-                range_start and re.fullmatch(r"\s*(?:to|and)\s*", prefix, re.I)
+                range_start and re.fullmatch(self._range_connector, prefix, re.I)
             )
             if paired:
                 target = range_start.field
@@ -1444,12 +1512,9 @@ class TemporalResolver(FieldResolver):
                 evidence_span=(evidence_start, match.end()),
             )
             facts.append(fact)
-            range_start = fact if phrase in {"from", "between"} else None
+            range_start = fact if phrase in self._range_starts else None
             abbreviated_end = (
-                re.match(
-                    r"\s+and\s+(\d{1,2})(?:,?\s+(\d{4}))?(?![\d/-])\b",
-                    question[match.end() :],
-                )
+                self._abbreviated_range_end.match(question[match.end() :])
                 if phrase == "between"
                 else None
             )
@@ -2210,23 +2275,35 @@ def detect_semantic_facts(
     )
     role_question = semantic_question
     constraint_question = question
-    for clause in constraint_clauses:
-        if clause.violation is None and any(
+    protected_spans = [
+        clause.consumed_span
+        for clause in constraint_clauses
+        if clause.violation is None
+        and any(
             fact.kind == "filter"
             and fact.strength == "strong"
             and (fact.field, fact.operator, fact.values)
             == (clause.field, clause.operator, clause.values)
             for fact in facts
-        ):
-            start, end = clause.consumed_span
-            role_question = (
-                role_question[:start] + " " * (end - start) + role_question[end:]
-            )
-            constraint_question = (
-                constraint_question[:start]
-                + " " * (end - start)
-                + constraint_question[end:]
-            )
+        )
+    ]
+    protected_spans.extend(
+        fact.evidence_span
+        for fact in facts
+        if fact.kind == "filter"
+        and fact.strength == "strong"
+        and fact.evidence_span is not None
+        and FIELD_DEFINITIONS[fact.field].resolution_kind == "temporal"
+    )
+    for start, end in protected_spans:
+        role_question = (
+            role_question[:start] + " " * (end - start) + role_question[end:]
+        )
+        constraint_question = (
+            constraint_question[:start]
+            + " " * (end - start)
+            + constraint_question[end:]
+        )
     role_field_matches = [
         (field, phrase)
         for field, phrase in maximal_field_matches

@@ -1053,7 +1053,7 @@ CONSTRAINT_CLAUSE_GRAMMAR = MappingProxyType(
     {
         "coordinator": r"(?:(?:\band\b|[,;])\s*(?:(?:where|with)\s+)?|\b(?:where|with)\s+)$",
         "scope_boundary": r"\s*(?:where|with|for|by|per)\b",
-        "temporal_scope_prefix": r"\b(?:over|under)\s+(?:the\s+)?$",
+        "temporal_scope_prefix": r"\b(?:in|during|within|over|under)\s+(?:the\s+)?$",
         "clause_separator": r"\b(?:and|where|with)\b|[,;]",
         "list_separator": r",|\band\b",
         "identity_scope": r"\bfor\b",

@@ -1,5 +1,6 @@
 import unittest
 import json
+from dataclasses import replace
 from datetime import date, datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -1041,6 +1042,14 @@ class EmployeeResolutionTests(unittest.TestCase):
         self.assertEqual(by_name.outcome, "unique")
         self.assertEqual(by_name.match_method, "exact_name")
 
+    def test_safe_arabic_variants_keep_an_exact_full_name_exact(self):
+        directory = [answer.EmployeeCandidate(employee_id="A10018", name="أحمد علي")]
+
+        resolution = answer.resolve_employee_reference("اَحْمَد علي", directory)
+
+        self.assertEqual(resolution.outcome, "unique")
+        self.assertEqual(resolution.match_method, "exact_name")
+
     def test_every_non_exact_name_requires_confirmation_even_when_unique(self):
         employee = answer.EmployeeCandidate(
             employee_id="A10018", name="Faris Ahmed North"
@@ -1072,6 +1081,22 @@ class EmployeeResolutionTests(unittest.TestCase):
                 key=lambda item: (item.name.casefold(), item.employee_id),
             ),
         )
+
+    def test_default_candidate_limit_uses_the_configured_display_bound(self):
+        directory = [
+            answer.EmployeeCandidate(employee_id="A10001", name="Faris Ahmed"),
+            answer.EmployeeCandidate(employee_id="A10002", name="Faris North"),
+        ]
+
+        with patch.object(
+            answer,
+            "settings",
+            replace(answer.settings, constraint_candidate_limit=1),
+        ):
+            resolution = answer.resolve_employee_reference("Faris", directory)
+
+        self.assertEqual(len(resolution.candidates), 1)
+        self.assertTrue(resolution.has_more_candidates)
 
     def test_arabic_option_number_and_multi_employee_policy(self):
         candidates = [
@@ -1842,6 +1867,59 @@ class TrustedClarificationStateTests(unittest.TestCase):
         self.assertIsNone(state.pending_proposal)
         planner.assert_not_called()
 
+    def test_complete_new_question_cancels_pending_catalog_selection(self):
+        pending_proposal = answer.PlannerProposal(
+            status="ready",
+            filters=[
+                answer.ProposedFilter(
+                    field="Department", operator="eq", value="Op", evidence_text="Op"
+                )
+            ],
+            answer_contract=answer.AnswerContract(
+                shape="rows", unit="value", subject_field=None, grain=[]
+            ),
+        )
+
+        catalog = {"Department": ("Operations East", "Operations West")}
+        with (
+            patch.object(answer, "propose_query", return_value=pending_proposal),
+            patch.object(
+                answer, "load_attendance_catalog_candidates", return_value=catalog
+            ),
+        ):
+            _text, _chunks, state = answer.answer_question_with_state(
+                "Show department Op", [], answer.ConversationState()
+            )
+
+        new_proposal = answer.PlannerProposal(
+            status="ready",
+            measure=answer.ProposedMeasureChoice(
+                name="employees", evidence_text="employees"
+            ),
+            answer_contract=answer.AnswerContract(
+                shape="scalar",
+                unit="employees",
+                subject_field="Employee_ID",
+                grain=["Employee_ID"],
+            ),
+        )
+        with (
+            patch.object(answer, "propose_query", return_value=new_proposal),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=([], {"operation": "distinct_count", "value": 7}, 7),
+            ),
+        ):
+            text, _chunks, state = answer.answer_question_with_state(
+                "How many employees have records?", [], state
+            )
+
+        self.assertIn("7", text)
+        self.assertIsNone(state.pending_clarification)
+
     def test_interpretation_choice_recompiles_the_saved_proposal(self):
         question = "How many attendance days were there?"
         proposal = answer.PlannerProposal(
@@ -1868,6 +1946,50 @@ class TrustedClarificationStateTests(unittest.TestCase):
         self.assertIn("0", text)
         self.assertIsNone(state.pending_proposal)
         planner.assert_not_called()
+
+    def test_complete_new_question_cancels_pending_interpretation(self):
+        pending_proposal = answer.PlannerProposal(
+            status="ambiguous",
+            interpretation_candidates=["worked_days", "scheduled_working_days"],
+        )
+        with (
+            patch.object(answer, "propose_query", return_value=pending_proposal),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+        ):
+            _text, _chunks, state = answer.answer_question_with_state(
+                "How many attendance days were there?",
+                [],
+                answer.ConversationState(),
+            )
+
+        new_proposal = answer.PlannerProposal(
+            status="ready",
+            measure=answer.ProposedMeasureChoice(
+                name="employees", evidence_text="employees"
+            ),
+            answer_contract=answer.AnswerContract(
+                shape="scalar",
+                unit="employees",
+                subject_field="Employee_ID",
+                grain=["Employee_ID"],
+            ),
+        )
+        with (
+            patch.object(answer, "propose_query", return_value=new_proposal),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=([], {"operation": "distinct_count", "value": 7}, 7),
+            ),
+        ):
+            text, _chunks, state = answer.answer_question_with_state(
+                "How many employees have records?", [], state
+            )
+
+        self.assertIn("7", text)
+        self.assertIsNone(state.pending_clarification)
 
     def test_stale_employee_selection_is_revalidated_before_retrieval(self):
         proposal = answer.PlannerProposal(
@@ -1964,12 +2086,18 @@ class RequestCompletenessTests(unittest.TestCase):
             employee_id="A10018", name="Faris Ahmed North"
         )
 
+    def test_tolerant_complete_questions_are_detected_for_pending_cancellation(self):
+        self.assertTrue(answer._is_complete_new_attendance_question("أيام الغياب"))
+        self.assertTrue(answer._is_complete_new_attendance_question("wokred days"))
+
     def test_bare_exact_employee_asks_for_intent_without_planning_or_retrieval(self):
         with (
             patch.object(
                 answer, "load_employee_directory", return_value=[self.employee]
             ),
-            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(
+                answer, "load_attendance_catalog_candidates", return_value={}
+            ) as catalog,
             patch.object(answer, "propose_query") as planner,
             patch.object(answer, "fetch_exact_chroma") as retrieval,
         ):
@@ -1983,6 +2111,7 @@ class RequestCompletenessTests(unittest.TestCase):
             "You selected Faris Ahmed North (A10018). What attendance information would you like?",
         )
         self.assertEqual(state.selected_employees, [self.employee])
+        catalog.assert_not_called()
         planner.assert_not_called()
         retrieval.assert_not_called()
 
@@ -2012,6 +2141,36 @@ class RequestCompletenessTests(unittest.TestCase):
         self.assertEqual(state.selected_employees, [self.employee])
         planner.assert_not_called()
         retrieval.assert_not_called()
+
+    def test_missing_intent_followup_preserves_the_saved_reply_locale(self):
+        employee = answer.EmployeeCandidate(employee_id="A10018", name="أحمد علي")
+        with (
+            patch.object(answer, "load_employee_directory", return_value=[employee]),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=(
+                    [],
+                    {
+                        "operation": "distinct_count",
+                        "value": 2,
+                        "measure": "distinct_dates",
+                    },
+                    2,
+                ),
+            ),
+        ):
+            _first, _chunks, state = answer.answer_question_with_state(
+                "أحمد علي", [], answer.ConversationState()
+            )
+            second, _chunks, state = answer.answer_question_with_state(
+                "worked days", [], state
+            )
+
+        self.assertIn("النتيجة", second)
+        self.assertIsNone(state.pending_clarification)
 
     def test_short_predicate_uses_the_unique_registered_interpretation(self):
         def propose(question, *args, **kwargs):
@@ -2189,6 +2348,24 @@ class SurfaceCorrectionRuntimeTests(unittest.TestCase):
         self.employee = answer.EmployeeCandidate(
             employee_id="A10018", name="Faris Ahmed North"
         )
+
+    def test_confirmed_meaning_retains_the_displayed_source_evidence(self):
+        option = answer.MeaningOption(
+            option_id="predicate:worked:0:5:fuzzy",
+            label="worked",
+            target_kind="predicate",
+            target_name="worked",
+            evidence_text="workd",
+            evidence_span=(0, 5),
+        )
+
+        facts = answer._facts_for_confirmed_meaning(
+            option, "workd for Faris Ahmed North"
+        )
+
+        self.assertEqual(facts[0].evidence_text, "workd")
+        self.assertEqual(facts[0].evidence_span, (0, 5))
+        self.assertEqual(facts[0].origin, "user_clarification")
 
     def test_high_confidence_typo_executes_and_discloses_material_correction(self):
         with (
@@ -2473,6 +2650,28 @@ class CoverageMetadataTests(unittest.TestCase):
 
 
 class DeterministicAggregationAnswerTests(unittest.TestCase):
+    def test_arabic_projection_localizes_the_truncation_footer(self):
+        plan = answer.QueryPlan(
+            mode="exact",
+            search_query="اعرض التواريخ",
+            projection=["Date"],
+            answer_contract=answer.AnswerContract(
+                shape="rows", unit="value", subject_field=None, grain=[]
+            ),
+        )
+        chunks = [
+            answer.Result(
+                page_content="Date: 2026-09-01", metadata={"Date": "2026-09-01"}
+            )
+        ]
+
+        text, _returned = answer._answer_from_context(
+            "اعرض التواريخ", [], chunks, plan, None, 2, locale="ar"
+        )
+
+        self.assertIn("عرض 1 من أصل 2 سجل مطابق", text)
+        self.assertNotIn("Showing", text)
+
     def test_employee_count_uses_measure_noun_and_predicate_qualifier(self):
         plan = _executable_plan(
             measure="employees",
@@ -2639,6 +2838,31 @@ class DeterministicAggregationAnswerTests(unittest.TestCase):
             "Relevant Context displays a 3-record evidence sample.",
         )
         self.assertEqual(returned, chunks)
+        completion.assert_not_called()
+
+    def test_arabic_truncated_record_summary_is_localized(self):
+        plan = answer.QueryPlan(
+            mode="exact",
+            search_query="attendance records",
+        )
+        chunks = [
+            answer.Result(page_content="record", metadata={"record_id": str(index)})
+            for index in range(3)
+        ]
+
+        with patch.object(answer, "completion") as completion:
+            text, _returned = answer._answer_from_context(
+                "اعرض attendance records لكل الموظفين",
+                [],
+                chunks,
+                plan,
+                None,
+                25,
+                locale="ar",
+            )
+
+        self.assertIn("طابق 25 سجل حضور المعايير المطلوبة", text)
+        self.assertNotIn("attendance records matched", text)
         completion.assert_not_called()
 
     def test_ordered_limited_record_lookup_answers_from_requested_rows(self):

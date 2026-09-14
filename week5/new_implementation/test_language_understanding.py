@@ -14,6 +14,8 @@ from week5.new_implementation.language_understanding import (
     InputUnderstanding,
     LocalizedAliasDefinition,
     LOCALIZED_ALIAS_DEFINITIONS,
+    MeaningClarification,
+    MeaningOption,
     MissingIntentClarification,
     QuestionSurface,
     SurfaceCandidate,
@@ -115,6 +117,23 @@ class TolerantInputContractTests(unittest.TestCase):
                     **values,
                 )
 
+    def test_meaning_clarification_rejects_evidence_outside_saved_question(self):
+        option = MeaningOption(
+            option_id="predicate:worked:0:5:fuzzy",
+            label="worked",
+            target_kind="predicate",
+            target_name="worked",
+            evidence_text="absent",
+            evidence_span=(0, 6),
+        )
+
+        with self.assertRaises(ValidationError):
+            MeaningClarification(
+                original_question="workd",
+                reply_locale="en",
+                options=(option,),
+            )
+
     def test_employee_profile_is_a_registered_strict_result_intent(self):
         definition = RESULT_INTENT_DEFINITIONS["employee_profile"]
         self.assertEqual(
@@ -202,6 +221,26 @@ class QuestionSurfaceAnalysisTests(unittest.TestCase):
             )
         )
         self.assertEqual(surface.original_text, question)
+
+    def test_longer_arabic_meaning_suppresses_conflicting_nested_alias(self):
+        surface = analyze_question_surface("كم عدد أيام العمل المجدولة؟")
+
+        accepted = automatically_accepted_candidates(surface)
+
+        self.assertTrue(
+            any(
+                candidate.target_kind == "interpretation"
+                and candidate.target_name == "scheduled_working_days"
+                for candidate in accepted
+            )
+        )
+        self.assertFalse(
+            any(
+                candidate.target_kind == "interpretation"
+                and candidate.target_name == "worked_days"
+                for candidate in accepted
+            )
+        )
 
     def test_mixed_language_locale_uses_alphabetic_token_majority(self):
         self.assertEqual(

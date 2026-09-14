@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from week5.new_implementation import answer
 from week5.new_implementation.language_understanding import (
@@ -50,6 +51,48 @@ class PublicTolerantInputRobustnessMatrix(unittest.TestCase):
                     if candidate.method == "fuzzy"
                 ]
                 self.assertEqual(accepted_fuzzy, [])
+
+    def test_scheduled_arabic_phrase_compiles_only_the_scheduled_predicate(self):
+        with (
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=([], {"operation": "distinct_count", "value": 4}, 4),
+            ) as retrieval,
+        ):
+            answer.answer_question_with_state(
+                "كم عدد أيام العمل المجدولة؟", [], answer.ConversationState()
+            )
+
+        plan = retrieval.call_args.args[0]
+        self.assertEqual(plan.business_predicates, ["scheduled_working_day"])
+        self.assertNotIn("worked", plan.business_predicates)
+
+    def test_unknown_arabic_modifier_clarifies_instead_of_executing_shorter_alias(self):
+        questions = (
+            "كم عدد أيام العمل الإضافية؟",
+            "كم عدد أيام العمل إضافية؟",
+            "كم عدد أيام العممل الإضافية؟",
+        )
+        for question in questions:
+            with (
+                self.subTest(question=question),
+                patch.object(answer, "load_attendance_catalog_candidates") as catalog,
+                patch.object(answer, "execute_exact_postgres") as retrieval,
+            ):
+                text, chunks, state = answer.answer_question_with_state(
+                    question, [], answer.ConversationState()
+                )
+
+                self.assertIn("تقصد", text)
+                self.assertEqual(chunks, [])
+                self.assertEqual(
+                    state.pending_clarification.kind, "semantic_interpretation"
+                )
+                catalog.assert_not_called()
+                retrieval.assert_not_called()
 
     def test_employee_identity_matrix(self):
         employees = [

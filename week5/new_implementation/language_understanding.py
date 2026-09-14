@@ -118,6 +118,18 @@ class MeaningOption(_StrictFrozenModel):
     label: str = Field(min_length=1)
     target_kind: TargetKind
     target_name: str = Field(min_length=1)
+    evidence_text: str | None = None
+    evidence_span: tuple[int, int] | None = None
+
+    @model_validator(mode="after")
+    def _source_evidence_is_complete(self):
+        if (self.evidence_text is None) != (self.evidence_span is None):
+            raise ValueError("meaning option evidence text and span must be paired")
+        if self.evidence_text is not None:
+            start, end = self.evidence_span
+            if not self.evidence_text.strip() or start < 0 or end <= start:
+                raise ValueError("meaning option source evidence must be non-empty")
+        return self
 
 
 class CatalogOption(_StrictFrozenModel):
@@ -145,6 +157,21 @@ class EmployeeClarification(_ClarificationBase):
 class MeaningClarification(_ClarificationBase):
     kind: Literal["semantic_interpretation"] = "semantic_interpretation"
     options: tuple[MeaningOption, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _option_evidence_matches_saved_question(self):
+        for option in self.options:
+            if option.evidence_text is None:
+                continue
+            start, end = option.evidence_span
+            if (
+                end > len(self.original_question)
+                or self.original_question[start:end] != option.evidence_text
+            ):
+                raise ValueError(
+                    "meaning option evidence must match the saved original question"
+                )
+        return self
 
 
 class CatalogClarification(_ClarificationBase):
@@ -254,6 +281,12 @@ LOCALIZED_ALIAS_DEFINITIONS: tuple[LocalizedAliasDefinition, ...] = (
     LocalizedAliasDefinition(
         locale="ar",
         target_kind="interpretation",
+        target_name="scheduled_working_days",
+        phrases=("أيام العمل المجدولة",),
+    ),
+    LocalizedAliasDefinition(
+        locale="ar",
+        target_kind="interpretation",
         target_name="absent_days",
         phrases=("أيام الغياب",),
     ),
@@ -356,6 +389,11 @@ def _normalize_with_source_map(text: str) -> _NormalizedText:
 
 def _normalized_phrase(text: str) -> str:
     return _normalize_with_source_map(text).text
+
+
+def normalize_for_matching(text: str) -> str:
+    """Normalize harmless surface variants without changing semantic values."""
+    return _normalized_phrase(text)
 
 
 def _reply_locale(question: str) -> ReplyLocale:
@@ -514,10 +552,21 @@ def automatically_accepted_candidates(
     surface: QuestionSurface,
 ) -> tuple[SurfaceCandidate, ...]:
     """Return exact aliases and only uniquely dominant high-confidence fuzzies."""
-    accepted = [
+    exact_candidates = [
         candidate
         for candidate in surface.candidates
         if candidate.method in {"exact", "localized_alias"}
+    ]
+    accepted = [
+        candidate
+        for candidate in exact_candidates
+        if not any(
+            other.evidence_span[0] <= candidate.evidence_span[0]
+            and other.evidence_span[1] >= candidate.evidence_span[1]
+            and other.evidence_span != candidate.evidence_span
+            for other in exact_candidates
+        )
+        and not _has_unregistered_arabic_residual(surface, candidate)
     ]
     fuzzy = [
         candidate for candidate in surface.candidates if candidate.method == "fuzzy"
@@ -530,6 +579,46 @@ def automatically_accepted_candidates(
             and other.evidence_span == candidate.evidence_span
         ]
         next_score = max((other.score for other in competitors), default=0.0)
-        if candidate.score >= 0.90 and candidate.score - next_score >= 0.08:
+        if (
+            candidate.score >= 0.90
+            and candidate.score - next_score >= 0.08
+            and not _has_unregistered_arabic_residual(surface, candidate)
+        ):
             accepted.append(candidate)
     return tuple(accepted)
+
+
+_ARABIC_CONTINUATION_TOKENS = frozenset(
+    {
+        "في",
+        "من",
+        "الي",
+        "خلال",
+        "بين",
+        "قبل",
+        "بعد",
+        "عن",
+        "مع",
+        "حتي",
+        "للموظف",
+        "للموظفة",
+    }
+)
+
+
+def _has_unregistered_arabic_residual(
+    surface: QuestionSurface, candidate: SurfaceCandidate
+) -> bool:
+    if (
+        candidate.method not in {"localized_alias", "fuzzy"}
+        or candidate.target_kind not in {"predicate", "interpretation"}
+        or not _ARABIC_ALPHA.search(candidate.evidence_text)
+    ):
+        return False
+    suffix = surface.original_text[candidate.evidence_span[1] :].lstrip()
+    if not suffix or suffix[0] in "،,.!?؟:;":
+        return False
+    next_word = re.match(r"[\u0600-\u06ff]+", suffix)
+    if next_word is None:
+        return False
+    return normalize_for_matching(next_word.group(0)) not in _ARABIC_CONTINUATION_TOKENS

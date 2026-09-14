@@ -96,6 +96,16 @@ def env_identifier(name: str, default: str) -> str:
 @dataclass(frozen=True)
 class Settings:
     rag_model: str
+    conversation_model: str
+    conversation_timeout_seconds: float
+    conversation_max_input_chars: int
+    conversation_max_output_tokens: int
+    conversation_recent_frame_limit: int
+    conversation_referent_limit: int
+    conversation_unit_limit: int
+    conversation_compiled_plan_limit: int
+    conversation_employee_binding_limit: int
+    max_derived_group_rows: int
     embedding_model: str
     embedding_encoding: str
     embedding_max_tokens: int
@@ -149,8 +159,33 @@ class Settings:
             "KNOWLEDGE_BASE_PATH",
             PROJECT_ROOT / "week5" / "new-knowledge-base",
         )
+        rag_model = env_str("RAG_MODEL", "openai/gpt-4.1-nano")
         return cls(
-            rag_model=env_str("RAG_MODEL", "openai/gpt-4.1-nano"),
+            rag_model=rag_model,
+            conversation_model=env_str("CONVERSATION_MODEL", rag_model),
+            conversation_timeout_seconds=env_float(
+                "CONVERSATION_TIMEOUT_SECONDS", 8.0, minimum=0.1
+            ),
+            conversation_max_input_chars=env_int(
+                "CONVERSATION_MAX_INPUT_CHARS", 16000, minimum=1
+            ),
+            conversation_max_output_tokens=env_int(
+                "CONVERSATION_MAX_OUTPUT_TOKENS", 1200, minimum=1
+            ),
+            conversation_recent_frame_limit=env_int(
+                "CONVERSATION_RECENT_FRAME_LIMIT", 8, minimum=1
+            ),
+            conversation_referent_limit=env_int(
+                "CONVERSATION_REFERENT_LIMIT", 24, minimum=1
+            ),
+            conversation_unit_limit=env_int("CONVERSATION_UNIT_LIMIT", 8, minimum=1),
+            conversation_compiled_plan_limit=env_int(
+                "CONVERSATION_COMPILED_PLAN_LIMIT", 12, minimum=1
+            ),
+            conversation_employee_binding_limit=env_int(
+                "CONVERSATION_EMPLOYEE_BINDING_LIMIT", 20, minimum=1
+            ),
+            max_derived_group_rows=env_int("MAX_DERIVED_GROUP_ROWS", 400, minimum=1),
             embedding_model=env_str(
                 "EMBEDDING_MODEL",
                 "text-embedding-3-large",

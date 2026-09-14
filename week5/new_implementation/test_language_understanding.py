@@ -9,6 +9,8 @@ from week5.new_implementation.attendance_schema import (
     RESULT_INTENT_DEFINITIONS,
 )
 from week5.new_implementation.language_understanding import (
+    ContextChoiceClarification,
+    ContextChoiceOption,
     EmployeeClarification,
     EmployeeOption,
     InputUnderstanding,
@@ -26,6 +28,35 @@ from week5.new_implementation.language_understanding import (
 
 
 class TolerantInputContractTests(unittest.TestCase):
+    def test_context_choice_clarification_is_finite_and_strict(self):
+        options = (
+            ContextChoiceOption(option_id="context:0", label="Previous result"),
+            ContextChoiceOption(option_id="context:1", label="Earlier result"),
+        )
+        clarification = ContextChoiceClarification(
+            original_question="what about that one?",
+            reply_locale="en",
+            options=options,
+        )
+
+        self.assertEqual(clarification.kind, "context_choice")
+        for invalid_options in ((), (options[0], options[0])):
+            with (
+                self.subTest(invalid_options=invalid_options),
+                self.assertRaises(ValidationError),
+            ):
+                ContextChoiceClarification(
+                    original_question="what about that one?",
+                    reply_locale="en",
+                    options=invalid_options,
+                )
+        with self.assertRaises(ValidationError):
+            ContextChoiceOption(
+                option_id="context:0",
+                label="Previous result",
+                unit_id="provider-cannot-select-runtime-ids",
+            )
+
     def test_surface_candidate_is_strict_and_rejects_invalid_evidence(self):
         candidate = SurfaceCandidate(
             candidate_id="predicate:worked:0",

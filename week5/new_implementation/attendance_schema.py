@@ -53,6 +53,13 @@ FilterScalar = str | float
 FilterValue = FilterScalar | list[FilterScalar]
 RegistryFilterValue = FilterScalar | tuple[FilterScalar, ...]
 AnswerUnit = Literal["dates", "records", "employees", "hours", "percentage", "value"]
+MultiEmployeeDateView = Literal[
+    "all_views",
+    "per_employee",
+    "employee_days",
+    "union_dates",
+    "intersection_dates",
+]
 
 
 def _validate_filter_value_shape(operator: FilterOperator, value: FilterValue):

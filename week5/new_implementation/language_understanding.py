@@ -152,6 +152,18 @@ class CatalogOption(_StrictFrozenModel):
     value: str = Field(min_length=1)
 
 
+class ContextChoiceOption(_StrictFrozenModel):
+    option_id: str = Field(min_length=1)
+    label: str = Field(min_length=1)
+
+    @field_validator("option_id", "label")
+    @classmethod
+    def _context_choice_text_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("context choice values must not be blank")
+        return value
+
+
 class _ClarificationBase(_StrictFrozenModel):
     original_question: str = Field(min_length=1)
     reply_locale: ReplyLocale
@@ -197,11 +209,27 @@ class MissingIntentClarification(_ClarificationBase):
     employee: EmployeeOption | None = None
 
 
+class ContextChoiceClarification(_ClarificationBase):
+    kind: Literal["context_choice"] = "context_choice"
+    options: tuple[ContextChoiceOption, ...] = Field(min_length=1)
+
+    @field_validator("options")
+    @classmethod
+    def _context_choice_identifiers_must_be_unique(
+        cls, value: tuple[ContextChoiceOption, ...]
+    ) -> tuple[ContextChoiceOption, ...]:
+        option_ids = [option.option_id for option in value]
+        if len(option_ids) != len(set(option_ids)):
+            raise ValueError("context choice identifiers must be unique")
+        return value
+
+
 PendingClarification = Annotated[
     EmployeeClarification
     | MeaningClarification
     | CatalogClarification
-    | MissingIntentClarification,
+    | MissingIntentClarification
+    | ContextChoiceClarification,
     Field(discriminator="kind"),
 ]
 

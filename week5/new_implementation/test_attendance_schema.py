@@ -1,10 +1,26 @@
 import importlib
 import unittest
+from typing import get_args
 
 from pydantic import ValidationError
 
 
 class SemanticSchemaContractTests(unittest.TestCase):
+    def test_multi_employee_date_views_are_separate_from_answer_units(self):
+        schema = importlib.import_module("week5.new_implementation.attendance_schema")
+
+        self.assertEqual(
+            set(get_args(schema.MultiEmployeeDateView)),
+            {
+                "all_views",
+                "per_employee",
+                "employee_days",
+                "union_dates",
+                "intersection_dates",
+            },
+        )
+        self.assertNotIn("employee_days", get_args(schema.AnswerUnit))
+
     def test_projection_is_rows_only_and_has_unique_fields(self):
         schema = importlib.import_module("week5.new_implementation.attendance_schema")
         for shape, projection in (("scalar", ["Date"]), ("rows", ["Date", "Date"])):

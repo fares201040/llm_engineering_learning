@@ -8,17 +8,30 @@ import unicodedata
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from week5.new_implementation.attendance_schema import (
-    BUSINESS_PREDICATE_DEFINITIONS,
-    CALCULATION_DEFINITIONS,
-    FIELD_DEFINITIONS,
-    FILTER_OPERATOR_DEFINITIONS,
-    INTERPRETATION_PRESETS,
-    MEASURE_DEFINITIONS,
-    RESULT_INTENT_DEFINITIONS,
-    PlannerProposal,
-)
-from week5.new_implementation.semantic_resolution import SemanticFact
+try:
+    from .attendance_schema import (
+        BUSINESS_PREDICATE_DEFINITIONS,
+        CALCULATION_DEFINITIONS,
+        FIELD_DEFINITIONS,
+        FILTER_OPERATOR_DEFINITIONS,
+        INTERPRETATION_PRESETS,
+        MEASURE_DEFINITIONS,
+        RESULT_INTENT_DEFINITIONS,
+        PlannerProposal,
+    )
+    from .semantic_resolution import SemanticFact
+except ImportError:  # Imported through answer.py's supported direct-script mode.
+    from attendance_schema import (
+        BUSINESS_PREDICATE_DEFINITIONS,
+        CALCULATION_DEFINITIONS,
+        FIELD_DEFINITIONS,
+        FILTER_OPERATOR_DEFINITIONS,
+        INTERPRETATION_PRESETS,
+        MEASURE_DEFINITIONS,
+        RESULT_INTENT_DEFINITIONS,
+        PlannerProposal,
+    )
+    from semantic_resolution import SemanticFact
 
 
 ReplyLocale = Literal["en", "ar"]

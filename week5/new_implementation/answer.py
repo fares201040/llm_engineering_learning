@@ -91,6 +91,7 @@ try:
         AttendanceUnitFrame,
         ConversationTurnFrame,
         PendingRequestFrame,
+        PendingConstraintSnapshot,
         ResolvedPendingMention,
         MeaningClarification,
         MeaningOption,
@@ -177,6 +178,7 @@ except ImportError:  # Running answer.py directly from its directory.
         AttendanceUnitFrame,
         ConversationTurnFrame,
         PendingRequestFrame,
+        PendingConstraintSnapshot,
         ResolvedPendingMention,
         MeaningClarification,
         MeaningOption,
@@ -4429,6 +4431,16 @@ def _write_pending_request(
     state.pending_question = request.original_question
     state.pending_proposal = request.prepared_proposal
     state.pending_facts = list(request.facts)
+    state.pending_candidates = [
+        EmployeeCandidate(employee_id=item.employee_id, name=item.name)
+        for item in request.pending_candidates
+    ]
+    state.pending_constraint = (
+        PendingConstraintData.model_validate(request.pending_constraint.model_dump())
+        if request.pending_constraint is not None
+        else None
+    )
+    state.pending_interpretations = list(request.pending_interpretations)
 
 
 def _sync_pending_request(state: ConversationState) -> None:
@@ -4462,6 +4474,18 @@ def _sync_pending_request(state: ConversationState) -> None:
             prepared_proposal=state.pending_proposal,
             clarification=state.pending_clarification,
             resolved_mentions=resolved_mentions,
+            pending_candidates=tuple(
+                EmployeeOption(employee_id=item.employee_id, name=item.name)
+                for item in state.pending_candidates
+            ),
+            pending_constraint=(
+                PendingConstraintSnapshot.model_validate(
+                    state.pending_constraint.model_dump()
+                )
+                if state.pending_constraint is not None
+                else None
+            ),
+            pending_interpretations=tuple(state.pending_interpretations),
         ),
     )
 

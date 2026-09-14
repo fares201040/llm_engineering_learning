@@ -15,6 +15,7 @@ try:
         FIELD_DEFINITIONS,
         FILTER_OPERATOR_DEFINITIONS,
         INTERPRETATION_PRESETS,
+        InterpretationName,
         MEASURE_DEFINITIONS,
         RESULT_INTENT_DEFINITIONS,
         AnswerContract,
@@ -28,6 +29,7 @@ except ImportError:  # Imported through answer.py's supported direct-script mode
         FIELD_DEFINITIONS,
         FILTER_OPERATOR_DEFINITIONS,
         INTERPRETATION_PRESETS,
+        InterpretationName,
         MEASURE_DEFINITIONS,
         RESULT_INTENT_DEFINITIONS,
         AnswerContract,
@@ -335,6 +337,18 @@ class ResolvedPendingMention(_StrictFrozenModel):
         return self
 
 
+class PendingConstraintCandidate(_StrictFrozenModel):
+    field: str = Field(min_length=1)
+    value: str = Field(min_length=1)
+    label: str | None = Field(default=None, min_length=1)
+
+
+class PendingConstraintSnapshot(_StrictFrozenModel):
+    field: str = Field(min_length=1)
+    reference: str = Field(min_length=1)
+    candidates: tuple[PendingConstraintCandidate, ...] = ()
+
+
 class PendingRequestFrame(_StrictFrozenModel):
     """The sole resumable request record; display state stays in PendingClarification."""
 
@@ -344,6 +358,9 @@ class PendingRequestFrame(_StrictFrozenModel):
     prepared_proposal: PlannerProposal | None = None
     clarification: PendingClarification | None = None
     resolved_mentions: tuple[ResolvedPendingMention, ...] = ()
+    pending_candidates: tuple[EmployeeOption, ...] = ()
+    pending_constraint: PendingConstraintSnapshot | None = None
+    pending_interpretations: tuple[InterpretationName, ...] = ()
 
     @field_validator("original_question")
     @classmethod

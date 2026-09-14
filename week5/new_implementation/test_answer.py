@@ -4032,6 +4032,76 @@ class ConversationMemoryStateTests(unittest.TestCase):
         )
         self.assertEqual(state.referents[0].name, "Morgan River Updated")
 
+    def test_pending_request_mirrors_every_resumable_pending_variant(self):
+        candidate = answer.EmployeeCandidate(employee_id="A10001", name="Morgan River")
+        state = answer.ConversationState()
+        request = answer.PendingRequestFrame(
+            original_question="worked days for Morgan",
+            reply_locale="en",
+            pending_candidates=(
+                answer.EmployeeOption(employee_id="A10001", name="Morgan River"),
+            ),
+            pending_constraint=answer.PendingConstraintSnapshot.model_validate(
+                {
+                    "field": "Department",
+                    "reference": "Op",
+                    "candidates": (
+                        {
+                            "field": "Department",
+                            "value": "Operations",
+                            "label": "Operations",
+                        },
+                    ),
+                }
+            ),
+            pending_interpretations=("worked_days",),
+        )
+
+        answer._write_pending_request(state, request)
+
+        self.assertEqual(state.pending_request, request)
+        self.assertEqual(state.pending_candidates, [candidate])
+        self.assertEqual(state.pending_constraint.field, "Department")
+        self.assertEqual(state.pending_interpretations, ["worked_days"])
+
+    def test_ambiguous_employee_turn_persists_only_after_public_confirmation(self):
+        candidate = answer.EmployeeCandidate(employee_id="A10001", name="Morgan River")
+        successful = answer.ContextFetchResult(
+            [],
+            answer.QueryPlan(mode="exact", search_query="worked days"),
+            {"value": 2},
+            2,
+            [candidate],
+        )
+        with patch.object(answer, "load_employee_directory", return_value=[candidate]):
+            first, chunks, state = answer.answer_question_with_state(
+                "worked days for Morgan", [], answer.ConversationState()
+            )
+
+        self.assertIn("Did you mean", first)
+        self.assertEqual(chunks, [])
+        self.assertEqual(state.referents, [])
+        self.assertEqual(
+            state.pending_request.pending_candidates,
+            (answer.EmployeeOption(employee_id="A10001", name="Morgan River"),),
+        )
+
+        with (
+            patch.object(answer, "load_employee_directory", return_value=[candidate]),
+            patch.object(
+                answer, "_fetch_context_result", return_value=successful
+            ) as fetch,
+            patch.object(answer, "_answer_from_context", return_value=("ok", [])),
+        ):
+            text, chunks, state = answer.answer_question_with_state("yes", [], state)
+
+        self.assertEqual(text, "ok")
+        self.assertEqual(chunks, [])
+        self.assertEqual(fetch.call_args.args[0], "worked days for Morgan")
+        self.assertEqual(
+            state.referents, [answer.EmployeeReferent(**candidate.model_dump())]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

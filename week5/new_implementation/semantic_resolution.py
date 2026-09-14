@@ -1415,7 +1415,13 @@ class TemporalResolver(FieldResolver):
             raise ValueError("Datetime fields require a complete timestamp.")
         return canonicalize_storage_value(field, literal)
 
-    def detect_literals(self, question, selected_fields, context):
+    def detect_literals(
+        self, question, selected_fields, context, *, evidence_source=None
+    ):
+        # ``question`` may have same-width masks for already-owned entity spans.
+        # Keep parsing against that role buffer, but slice user-facing evidence
+        # from the untouched source so evidence remains independently verifiable.
+        evidence_source = evidence_source or question
         del selected_fields  # Binding is local to each literal, not a global field set.
         facts = []
         matches = self.literal_matches(question)
@@ -1472,7 +1478,8 @@ class TemporalResolver(FieldResolver):
             if operator is None:
                 facts.append(
                     _unsupported_fact(
-                        "unsupported_operator", question[evidence_start : match.end()]
+                        "unsupported_operator",
+                        evidence_source[evidence_start : match.end()],
                     )
                 )
                 previous = match
@@ -1500,7 +1507,7 @@ class TemporalResolver(FieldResolver):
                 )
                 previous = match
                 continue
-            evidence = question[evidence_start : match.end()].strip()
+            evidence = evidence_source[evidence_start : match.end()].strip()
             consumed_start = (
                 segment_start
                 if paired
@@ -2306,7 +2313,10 @@ def detect_semantic_facts(
             )
     facts.extend(
         registry.for_kind("temporal").detect_literals(
-            semantic_question, selected_fields, context
+            semantic_question,
+            selected_fields,
+            context,
+            evidence_source=question,
         )
     )
     role_question = semantic_question

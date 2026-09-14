@@ -1026,6 +1026,33 @@ class BaselineOrderingGrammarTests(unittest.TestCase):
 
 
 class TemporalCompositionDetectorTests(unittest.TestCase):
+    def test_entity_mask_preserves_original_temporal_evidence_and_projection_roles(
+        self,
+    ):
+        question = "Show Date and Status from records for Morgan River on 2026-09-01"
+        facts = detect_semantic_facts(
+            question,
+            ResolutionContext(
+                {},
+                employees=(
+                    EmployeeReference(employee_id="A10018", name="Morgan River"),
+                ),
+            ),
+        )
+
+        temporal = next(
+            fact for fact in facts if fact.kind == "filter" and fact.field == "Date"
+        )
+        self.assertEqual(
+            temporal.evidence_text,
+            question[slice(*temporal.evidence_span)].strip(),
+        )
+        self.assertIn("Morgan River", temporal.evidence_text)
+        self.assertEqual(
+            [fact.field for fact in facts if fact.kind == "projection"],
+            ["Date", "Status"],
+        )
+
     def test_projection_delimiters_do_not_leak_from_correction_prefix(self):
         facts = detect_semantic_facts(
             "No, show department Op",

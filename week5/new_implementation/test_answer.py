@@ -23,6 +23,11 @@ def _compile_where(filters):
     return fragment.sql, list(fragment.params)
 
 
+def _proposal_from_facts(question, facts):
+    draft = answer.build_planning_draft(question, tuple(facts))
+    return answer.assemble_grounded_proposal(draft)
+
+
 def _proposal_side_effect(*plans):
     remaining = iter(plans)
 
@@ -158,11 +163,7 @@ def _proposal_side_effect(*plans):
             answer_contract=answer_contract,
             interpretation_candidates=plan.interpretation_candidates,
         )
-        return answer.PlannerProposal.model_validate(
-            answer._overlay_authoritative_facts(
-                proposal.model_dump(), kwargs.get("semantic_facts", ())
-            )
-        )
+        return proposal
 
     return propose
 
@@ -287,587 +288,42 @@ class RetrievalBoundaryTests(unittest.TestCase):
             backend.assert_not_called()
 
 
-class ProposalOperationNormalizationTests(unittest.TestCase):
-    def test_count_defaults_are_rejected_for_a_different_grounded_operation(self):
-        for question in (
-            "What is total overtime?",
-            "Show attendance on 2026-09-01",
-            "Find unusual attendance records",
-        ):
-            for choices in (
-                dict(
-                    measure=dict(name="attendance_records", evidence_text="attendance")
-                ),
-                dict(calculation=dict(operation="count", evidence_text="attendance")),
-            ):
-                with self.subTest(question=question, choices=choices):
-                    resolution = answer.ResolutionContext({})
-                    facts = answer.detect_semantic_facts(question, resolution)
-                    raw = dict(
-                        status="ready",
-                        answer_contract=dict(shape="scalar", unit="records"),
-                        **choices,
-                    )
-                    proposal = answer.PlannerProposal.model_validate(
-                        answer._overlay_authoritative_facts(raw, facts)
-                    )
-                    result = answer.compile_proposal(
-                        proposal, answer.CompilationContext(question, facts, resolution)
-                    )
-                    self.assertFalse(result.ready)
-                    self.assertTrue(result.violations)
-
-    def test_incompatible_provider_calculation_cannot_be_overwritten(self):
-        question = "What is total overtime?"
-        resolution = answer.ResolutionContext({})
-        facts = answer.detect_semantic_facts(question, resolution)
-        for operation, ready in (("average", False), ("sum", True)):
-            with self.subTest(operation=operation):
-                raw = dict(
-                    status="ready",
-                    calculation=dict(
-                        operation=operation,
-                        field="Total_OT",
-                        evidence_text="total overtime",
-                    ),
-                    answer_contract=dict(
-                        shape="scalar", unit="hours", subject_field="Total_OT"
-                    ),
-                )
-                proposal = answer.PlannerProposal.model_validate(
-                    answer._overlay_authoritative_facts(raw, facts)
-                )
-                result = answer.compile_proposal(
-                    proposal, answer.CompilationContext(question, facts, resolution)
-                )
-                self.assertEqual(result.ready, ready, result.violations)
-                if not ready:
-                    self.assertTrue(result.violations)
-
-    def test_incompatible_provider_measure_cannot_be_overwritten(self):
-        question = "How many dates were worked?"
-        resolution = answer.ResolutionContext({})
-        facts = answer.detect_semantic_facts(question, resolution)
-        for measure, ready in (("employees", False), ("distinct_dates", True)):
-            with self.subTest(measure=measure):
-                raw = dict(
-                    status="ready",
-                    measure=dict(name=measure, evidence_text="dates"),
-                    answer_contract=dict(
-                        shape="scalar", unit="dates", subject_field="Date"
-                    ),
-                )
-                proposal = answer.PlannerProposal.model_validate(
-                    answer._overlay_authoritative_facts(raw, facts)
-                )
-                result = answer.compile_proposal(
-                    proposal, answer.CompilationContext(question, facts, resolution)
-                )
-                self.assertEqual(result.ready, ready, result.violations)
-                if not ready:
-                    self.assertTrue(result.violations)
-
-    def test_incompatible_provider_numerator_cannot_be_overwritten(self):
-        question = "What percentage of records are Authorized?"
-        resolution = answer.ResolutionContext({})
-        facts = answer.detect_semantic_facts(question, resolution)
-        for field, value, ready in (
-            ("Exception", "Absent", False),
-            ("Status", "Authorized", True),
-        ):
-            with self.subTest(field=field):
-                raw = dict(
-                    status="ready",
-                    calculation=dict(
-                        operation="percentage",
-                        evidence_text="percentage",
-                        percentage_condition=dict(
-                            field=field,
-                            operator="eq",
-                            value=value,
-                            evidence_text="Authorized",
-                        ),
-                    ),
-                    answer_contract=dict(shape="scalar", unit="percentage"),
-                )
-                proposal = answer.PlannerProposal.model_validate(
-                    answer._overlay_authoritative_facts(raw, facts)
-                )
-                result = answer.compile_proposal(
-                    proposal, answer.CompilationContext(question, facts, resolution)
-                )
-                self.assertEqual(result.ready, ready, result.violations)
-                if not ready:
-                    self.assertTrue(result.violations)
-
-    def test_only_logically_redundant_provider_exclusion_is_removed(self):
-        question = "Count scheduled working days"
-        resolution = answer.ResolutionContext({})
-        facts = answer.detect_semantic_facts(question, resolution)
-        for field, value, ready in (
-            ("Day_Type", "OFF Day", True),
-            ("Day_Type", "Working Day", False),
-            ("Status", "Authorized", False),
-        ):
-            with self.subTest(field=field, value=value):
-                raw = dict(
-                    status="ready",
-                    filters=[
-                        dict(
-                            field=field,
-                            operator="ne",
-                            value=value,
-                            evidence_text="scheduled",
+class TemporalCompositionRuntimeTests(unittest.TestCase):
+    def test_projection_identity_and_date_compile_in_either_clause_order(self):
+        questions = (
+            "Show Date and Status from records for Morgan River on 2026-09-01",
+            "On 2026-09-01, show Date and Status from records for Morgan River",
+        )
+        for question in questions:
+            with (
+                self.subTest(question=question),
+                patch.object(
+                    answer,
+                    "load_employee_directory",
+                    return_value=[
+                        answer.EmployeeCandidate(
+                            employee_id="A10018", name="Morgan River"
                         )
                     ],
-                    answer_contract=dict(
-                        shape="scalar", unit="dates", subject_field="Date"
-                    ),
-                )
-                proposal = answer.PlannerProposal.model_validate(
-                    answer._overlay_authoritative_facts(raw, facts)
-                )
-                result = answer.compile_proposal(
-                    proposal, answer.CompilationContext(question, facts, resolution)
-                )
-                self.assertEqual(result.ready, ready, result.violations)
-                if ready:
-                    self.assertEqual(
-                        [
-                            (f.field, f.operator, f.value)
-                            for f in result.executable_plan.filters
-                        ],
-                        [("Day_Type", "eq", "Working Day")],
-                    )
-
-    def test_same_subject_count_is_not_equivalent_to_distinct_count(self):
-        question = "How many scheduled working days were there?"
-        resolution = answer.ResolutionContext({})
-        facts = answer.detect_semantic_facts(question, resolution)
-        for field in ("Date", "Employee_ID"):
-            with self.subTest(field=field):
-                raw = dict(
-                    status="ready",
-                    measure=dict(name="distinct_dates", evidence_text="days"),
-                    calculation=dict(
-                        operation="count", field=field, evidence_text="days"
-                    ),
-                    answer_contract=dict(
-                        shape="scalar", unit="dates", subject_field="Date"
-                    ),
-                )
-                proposal = answer.PlannerProposal.model_validate(
-                    answer._overlay_authoritative_facts(raw, facts)
-                )
-                result = answer.compile_proposal(
-                    proposal, answer.CompilationContext(question, facts, resolution)
-                )
-                self.assertFalse(result.ready)
-                self.assertTrue(result.violations)
-
-    def test_global_complete_facts_remove_only_default_interpretation_ambiguity(self):
-        for question in (
-            "Find unusual attendance records",
-            "What is total overtime?",
-            "What percentage of records are Authorized?",
-        ):
-            with self.subTest(question=question):
-                resolution = answer.ResolutionContext({})
-                facts = answer.detect_semantic_facts(question, resolution)
-                raw = dict(
-                    status="ambiguous",
-                    interpretation_candidates=["worked_days", "scheduled_working_days"],
-                )
-                proposal = answer.PlannerProposal.model_validate(
-                    answer._overlay_authoritative_facts(raw, facts)
-                )
-                result = answer.compile_proposal(
-                    proposal, answer.CompilationContext(question, facts, resolution)
-                )
-                self.assertTrue(result.ready, result.violations)
-
-    def test_entity_and_incomplete_interpretation_ambiguity_are_preserved(self):
-        for question in (
-            "Find unusual attendance records for Rowan",
-            "What percentage of records?",
-            "How many attendance days were there?",
-        ):
-            with self.subTest(question=question):
-                facts = answer.detect_semantic_facts(
-                    question, answer.ResolutionContext({})
-                )
-                raw = dict(
-                    status="ambiguous",
-                    interpretation_candidates=["worked_days", "scheduled_working_days"],
-                )
-                proposal = answer.PlannerProposal.model_validate(
-                    answer._overlay_authoritative_facts(raw, facts)
-                )
-                self.assertEqual(proposal.status, "ambiguous")
-                self.assertEqual(
-                    proposal.interpretation_candidates, raw["interpretation_candidates"]
-                )
-
-    def test_scoped_employee_count_is_not_equivalent_to_a_grounded_sum(self):
-        question = "What is total worked hours for A10001?"
-        resolution = answer.ResolutionContext({})
-        facts = answer.detect_semantic_facts(question, resolution)
-        raw = dict(
-            status="ready",
-            measure=dict(name="employees", evidence_text="A10001"),
-            calculation=dict(
-                operation="sum",
-                field="Total_Worked_Hrs",
-                evidence_text="total worked hours",
-            ),
-            answer_contract=dict(
-                shape="scalar", unit="hours", subject_field="Total_Worked_Hrs"
-            ),
-        )
-        proposal = answer.PlannerProposal.model_validate(
-            answer._overlay_authoritative_facts(raw, facts)
-        )
-        result = answer.compile_proposal(
-            proposal, answer.CompilationContext(question, facts, resolution)
-        )
-        self.assertFalse(result.ready)
-        self.assertTrue(result.violations)
-
-    def test_distinct_count_is_rejected_for_registered_narrative_intent(self):
-        question = "Which employees show unusual attendance patterns?"
-        resolution = answer.ResolutionContext({})
-        facts = answer.detect_semantic_facts(question, resolution)
-        raw = dict(
-            status="ready",
-            measure=dict(name="employees", evidence_text="employees"),
-            calculation=dict(
-                operation="distinct_count",
-                field="Employee_ID",
-                evidence_text="employees",
-            ),
-            answer_contract=dict(
-                shape="scalar", unit="employees", subject_field="Employee_ID"
-            ),
-        )
-        proposal = answer.PlannerProposal.model_validate(
-            answer._overlay_authoritative_facts(raw, facts)
-        )
-        result = answer.compile_proposal(
-            proposal, answer.CompilationContext(question, facts, resolution)
-        )
-        self.assertFalse(result.ready)
-        self.assertTrue(result.violations)
-
-    def test_registered_narrative_intent_corrects_only_narrative_capability_default(
-        self,
-    ):
-        question = "Find unusual attendance records"
-        resolution = answer.ResolutionContext({})
-        facts = answer.detect_semantic_facts(question, resolution)
-        for capability, ready in (
-            ("narrative_explanation", True),
-            ("nested_boolean_filters", False),
-        ):
-            with self.subTest(capability=capability):
-                raw = dict(status="unsupported", unsupported_capabilities=[capability])
-                proposal = answer.PlannerProposal.model_validate(
-                    answer._overlay_authoritative_facts(raw, facts)
-                )
-                result = answer.compile_proposal(
-                    proposal, answer.CompilationContext(question, facts, resolution)
-                )
-                self.assertEqual(result.ready, ready, result.violations)
-
-    def test_percentage_predicate_duplicate_is_only_a_numerator(self):
-        question = "What percentage of records are Authorized?"
-        resolution = answer.ResolutionContext({})
-        facts = answer.detect_semantic_facts(question, resolution)
-        raw = dict(
-            status="ready",
-            calculation=dict(
-                operation="percentage",
-                evidence_text="percentage",
-                percentage_condition=dict(
-                    field="Status",
-                    operator="eq",
-                    value="Authorized",
-                    evidence_text="Authorized",
                 ),
-            ),
-            business_predicates=[dict(name="authorized", evidence_text="Authorized")],
-            answer_contract=dict(shape="scalar", unit="percentage"),
-        )
-        proposal = answer.PlannerProposal.model_validate(
-            answer._overlay_authoritative_facts(raw, facts)
-        )
-        result = answer.compile_proposal(
-            proposal, answer.CompilationContext(question, facts, resolution)
-        )
-        self.assertTrue(result.ready, result.violations)
-        self.assertEqual(result.executable_plan.filters, [])
-
-    def test_missing_provider_operation_uses_complete_grounded_facts(self):
-        for question, operation, field, shape in (
-            ("How many dates were worked?", "distinct_count", "Date", "scalar"),
-            ("What is total overtime?", "sum", "Total_OT", "scalar"),
-            ("Show attendance on 2026-09-01", "none", None, "rows"),
-            ("Find unusual attendance records", "none", None, "narrative"),
-        ):
-            with self.subTest(question=question):
-                resolution = answer.ResolutionContext({})
-                facts = answer.detect_semantic_facts(question, resolution)
-                raw = dict(
-                    status="ready",
-                    answer_contract=dict(shape="scalar", unit="records"),
-                )
-                proposal = answer.PlannerProposal.model_validate(
-                    answer._overlay_authoritative_facts(raw, facts)
-                )
-                result = answer.compile_proposal(
-                    proposal, answer.CompilationContext(question, facts, resolution)
-                )
-                self.assertTrue(result.ready, result.violations)
-                plan = result.executable_plan
-                self.assertEqual(
-                    (
-                        plan.aggregation,
-                        plan.aggregation_field,
-                        plan.answer_contract.shape,
-                    ),
-                    (operation, field, shape),
-                )
-
-    def test_group_field_projection_is_redundant_with_grouped_result(self):
-        question = "Count attendance records by department"
-        resolution = answer.ResolutionContext({})
-        facts = answer.detect_semantic_facts(question, resolution)
-        raw = dict(
-            status="ready",
-            measure=dict(name="attendance_records", evidence_text="records"),
-            calculation=dict(operation="count", evidence_text="Count"),
-            group_by=[dict(field="Department", evidence_text="by department")],
-            projection=[dict(field="Department", evidence_text="department")],
-            answer_contract=dict(shape="scalar", unit="records"),
-        )
-        proposal = answer.PlannerProposal.model_validate(
-            answer._overlay_authoritative_facts(raw, facts)
-        )
-        result = answer.compile_proposal(
-            proposal, answer.CompilationContext(question, facts, resolution)
-        )
-        self.assertTrue(result.ready, result.violations)
-        self.assertEqual(result.executable_plan.answer_contract.grain, ["Department"])
-        self.assertEqual(result.executable_plan.projection, [])
-
-    def test_grouped_measure_subject_projection_is_redundant_with_contract(self):
-        question = "How many distinct employees are in each department?"
-        resolution = answer.ResolutionContext({})
-        facts = answer.detect_semantic_facts(question, resolution)
-        raw = dict(
-            status="ready",
-            measure=dict(name="employees", evidence_text="employees"),
-            calculation=dict(
-                operation="distinct_count",
-                field="Employee_ID",
-                evidence_text="distinct employees",
-            ),
-            group_by=[dict(field="Department", evidence_text="each department")],
-            projection=[
-                dict(field="Employee_ID", evidence_text="employees"),
-                dict(field="Department", evidence_text="department"),
-            ],
-            answer_contract=dict(
-                shape="scalar", unit="employees", subject_field="Employee_ID"
-            ),
-        )
-        proposal = answer.PlannerProposal.model_validate(
-            answer._overlay_authoritative_facts(raw, facts)
-        )
-        result = answer.compile_proposal(
-            proposal, answer.CompilationContext(question, facts, resolution)
-        )
-        self.assertTrue(result.ready, result.violations)
-        self.assertEqual(result.executable_plan.projection, [])
-        self.assertEqual(
-            result.executable_plan.answer_contract.grain, ["Department", "Employee_ID"]
-        )
-
-    def test_percentage_duplicate_numerator_does_not_narrow_population(self):
-        question = "What percentage of all records have Status equal to Authorized?"
-        resolution = answer.ResolutionContext({})
-        facts = answer.detect_semantic_facts(question, resolution)
-        condition = dict(
-            field="Status",
-            operator="eq",
-            value="Authorized",
-            evidence_text="Status equal to Authorized",
-        )
-        raw = dict(
-            status="ready",
-            measure=dict(name="attendance_records", evidence_text="records"),
-            calculation=dict(
-                operation="percentage",
-                evidence_text="percentage",
-                percentage_condition=condition,
-            ),
-            filters=[condition],
-            answer_contract=dict(shape="scalar", unit="percentage"),
-        )
-        proposal = answer.PlannerProposal.model_validate(
-            answer._overlay_authoritative_facts(raw, facts)
-        )
-        result = answer.compile_proposal(
-            proposal, answer.CompilationContext(question, facts, resolution)
-        )
-        self.assertTrue(result.ready, result.violations)
-        self.assertEqual(result.executable_plan.filters, [])
-        self.assertEqual(
-            result.executable_plan.percentage_condition.value, "Authorized"
-        )
-
-    def test_provider_absent_predicate_is_not_discarded_on_authorized_request(self):
-        question = "Count Authorized records"
-        resolution = answer.ResolutionContext({})
-        facts = answer.detect_semantic_facts(question, resolution)
-        raw = dict(
-            status="ready",
-            measure=dict(name="attendance_records", evidence_text="records"),
-            calculation=dict(operation="count", evidence_text="Count"),
-            business_predicates=[dict(name="absent", evidence_text="Authorized")],
-            answer_contract=dict(shape="scalar", unit="records"),
-        )
-        proposal = answer.PlannerProposal.model_validate(
-            answer._overlay_authoritative_facts(raw, facts)
-        )
-        result = answer.compile_proposal(
-            proposal, answer.CompilationContext(question, facts, resolution)
-        )
-        self.assertFalse(result.ready)
-        self.assertIn("ungrounded_constraint", {v.code for v in result.violations})
-
-    def test_percentage_rejects_different_provider_population_measure(self):
-        question = "What percentage of records have Status equal to Authorized?"
-        facts = answer.detect_semantic_facts(question, answer.ResolutionContext({}))
-        raw = dict(
-            status="ready",
-            measure=dict(name="employees", evidence_text="records"),
-            calculation=dict(
-                operation="percentage",
-                evidence_text="percentage",
-                percentage_condition=dict(
-                    field="Status",
-                    operator="eq",
-                    value="Authorized",
-                    evidence_text="Authorized",
+                patch.object(
+                    answer, "load_attendance_catalog_candidates", return_value={}
                 ),
-            ),
-            answer_contract=dict(shape="scalar", unit="percentage"),
-        )
-        prepared = answer._overlay_authoritative_facts(raw, facts)
-        self.assertIn(prepared["status"], {"ambiguous", "unsupported"})
+                patch.object(answer, "_postgres_enabled", return_value=True),
+                patch.object(
+                    answer, "execute_exact_postgres", return_value=([], None, 0)
+                ),
+            ):
+                result = answer._fetch_context_result(question)
 
-    def test_overlay_retains_nonredundant_provider_order_for_rejection(self):
-        question = "Count records with Status equal to Authorized"
-        resolution = answer.ResolutionContext({})
-        facts = answer.detect_semantic_facts(question, resolution)
-        raw = dict(
-            status="ready",
-            measure=dict(name="attendance_records", evidence_text="records"),
-            order_by=dict(field="Date", direction="desc", evidence_text="records"),
-            answer_contract=dict(shape="scalar", unit="records"),
-        )
-        proposal = answer.PlannerProposal.model_validate(
-            answer._overlay_authoritative_facts(raw, facts)
-        )
-        result = answer.compile_proposal(
-            proposal, answer.CompilationContext(question, facts, resolution)
-        )
-        self.assertFalse(result.ready)
-        self.assertIn("ungrounded_constraint", {v.code for v in result.violations})
+            self.assertEqual(result.plan.projection, ["Date", "Status"])
+            filters = {
+                (condition.field, condition.operator, condition.value)
+                for condition in result.plan.filters
+            }
+            self.assertIn(("Employee_ID", "eq", "A10018"), filters)
+            self.assertIn(("Date", "eq", "2026-09-01"), filters)
 
-    def test_record_projection_controls_returned_columns_without_model(self):
-        plan = _executable_plan(projection=["Date", "Status"], aggregation="none")
-        chunk = answer.Result(
-            page_content="Secret: hidden",
-            metadata={
-                "Date": "2026-09-03",
-                "Status": "Authorized",
-                "Department": "Hidden",
-            },
-        )
-        with patch.object(
-            answer,
-            "completion",
-            side_effect=AssertionError("Projection is deterministic"),
-        ):
-            text, _ = answer._answer_from_context(
-                "Show Date and Status from records", [], [chunk], plan, None, 1
-            )
-        self.assertIn("2026-09-03", text)
-        self.assertIn("Authorized", text)
-        self.assertNotIn("Hidden", text)
-
-    def test_authorized_count_normalizes_redundant_calculation(self):
-        question = "Count Authorized records"
-        facts = answer.detect_semantic_facts(question, answer.ResolutionContext({}))
-        raw = dict(
-            status="ready",
-            measure=dict(name="attendance_records", evidence_text="records"),
-            calculation=dict(operation="count", evidence_text="Count"),
-            answer_contract=dict(shape="scalar", unit="records"),
-        )
-        proposal = answer.PlannerProposal.model_validate(
-            answer._overlay_authoritative_facts(raw, facts)
-        )
-        self.assertIsNone(proposal.calculation)
-        self.assertEqual(proposal.measure.name, "attendance_records")
-
-    def test_pending_percentage_normalizes_conflicting_measure(self):
-        question = (
-            "What percentage of records have Status equal to Pending For Authorization?"
-        )
-        facts = answer.detect_semantic_facts(question, answer.ResolutionContext({}))
-        condition = dict(
-            field="Status",
-            operator="eq",
-            value="Pending For Authorization",
-            evidence_text="Status equal to Pending For Authorization",
-        )
-        raw = dict(
-            status="ready",
-            measure=dict(name="attendance_records", evidence_text="records"),
-            calculation=dict(
-                operation="percentage",
-                percentage_condition=condition,
-                evidence_text="percentage",
-            ),
-            answer_contract=dict(shape="scalar", unit="percentage"),
-        )
-        proposal = answer.PlannerProposal.model_validate(
-            answer._overlay_authoritative_facts(raw, facts)
-        )
-        self.assertIsNone(proposal.measure)
-        self.assertEqual(
-            proposal.calculation.percentage_condition.value, "Pending For Authorization"
-        )
-        self.assertEqual(proposal.filters, [])
-
-    def test_real_measure_calculation_conflict_is_not_silently_discarded(self):
-        question = "Count records and average worked hours"
-        facts = answer.detect_semantic_facts(question, answer.ResolutionContext({}))
-        raw = dict(
-            status="ready",
-            measure=dict(name="attendance_records", evidence_text="records"),
-            calculation=dict(
-                operation="average", field="Total_Worked_Hrs", evidence_text="average"
-            ),
-            answer_contract=dict(shape="scalar", unit="records"),
-        )
-        prepared = answer._overlay_authoritative_facts(raw, facts)
-        self.assertIn(prepared["status"], {"unsupported", "ambiguous"})
-
-
-class TemporalCompositionRuntimeTests(unittest.TestCase):
     def test_prior_constraints_reach_retrieval_with_temporal_bound(self):
         for question, expected in (
             (
@@ -892,15 +348,7 @@ class TemporalCompositionRuntimeTests(unittest.TestCase):
 
     def _assert_runtime_constraints(self, question, expected):
         def propose(question, *args, **kwargs):
-            return answer.PlannerProposal.model_validate(
-                answer._overlay_authoritative_facts(
-                    {
-                        "status": "ready",
-                        "answer_contract": {"shape": "rows", "unit": "value"},
-                    },
-                    kwargs["semantic_facts"],
-                )
-            )
+            return _proposal_from_facts(question, kwargs["semantic_facts"])
 
         with (
             patch.object(answer, "propose_query", side_effect=propose),
@@ -956,19 +404,7 @@ class EntityTemporalAnswerReviewTests(unittest.TestCase):
         new = answer.EmployeeCandidate(employee_id="A10018", name="Morgan River")
 
         def propose(question, *args, **kwargs):
-            return answer.PlannerProposal.model_validate(
-                answer._overlay_authoritative_facts(
-                    {
-                        "status": "ready",
-                        "name_hint": {
-                            "value": "morgan river",
-                            "evidence_text": "morgan river",
-                        },
-                        "answer_contract": {"shape": "rows", "unit": "value"},
-                    },
-                    kwargs["semantic_facts"],
-                )
-            )
+            return _proposal_from_facts(question, kwargs["semantic_facts"])
 
         with (
             patch.object(answer, "propose_query", side_effect=propose),
@@ -1168,32 +604,175 @@ class AccessScopeTests(unittest.TestCase):
 
 
 class PlannerProposalSchemaTests(unittest.TestCase):
-    def test_prompt_comes_once_from_safe_semantic_registry(self):
+    def test_fully_grounded_request_skips_provider_planning(self):
+        question = "How many days were worked?"
+        facts = answer.detect_semantic_facts(question, answer.ResolutionContext({}))
+
+        with patch.object(answer, "completion") as completion:
+            proposal = answer.propose_query(question, semantic_facts=facts)
+
+        completion.assert_not_called()
+        self.assertEqual(proposal.measure.name, "distinct_dates")
+        self.assertEqual(
+            [item.name for item in proposal.business_predicates], ["worked"]
+        )
+
+    def test_provider_receives_only_bounded_unresolved_decisions(self):
+        from week5.new_implementation.planning_decisions import (
+            PlanningCandidate,
+            PlanningDraft,
+            PlanningNeed,
+        )
+
+        fact = answer.SemanticFact(
+            kind="measure",
+            concept_name="attendance_records",
+            evidence_text="entries",
+            origin="question",
+            strength="candidate",
+        )
+        draft = PlanningDraft(
+            question="Count the entries",
+            facts=(fact,),
+            needs=(
+                PlanningNeed(
+                    need_id="need-0",
+                    kind="interpretation",
+                    candidates=(PlanningCandidate("candidate-0", 0),),
+                ),
+            ),
+        )
         response = SimpleNamespace(
             choices=[
                 SimpleNamespace(
                     message=SimpleNamespace(
                         content=(
-                            '{"status":"ready","filters":[],'
-                            '"measure":{"name":"distinct_dates","evidence_text":"days"},'
-                            '"answer_contract":{"shape":"scalar","unit":"dates",'
-                            '"subject_field":"Date","grain":["Date"]}}'
+                            '{"status":"resolved","selections":['
+                            '{"need_id":"need-0","candidate_id":"candidate-0"}]}'
                         )
                     )
                 )
             ]
         )
         with patch.object(answer, "completion", return_value=response) as completion:
-            answer.propose_query("How many days?")
+            decision = answer.decide_planning_needs("Count the entries", draft)
         prompt = completion.call_args.kwargs["messages"][0]["content"]
         self.assertIs(
-            completion.call_args.kwargs["response_format"], answer.PlannerProposal
+            completion.call_args.kwargs["response_format"], answer.PlannerDecision
         )
-        self.assertEqual(prompt.count("SEMANTIC REGISTRY"), 1)
-        self.assertIn("Schedule_From_Date", prompt)
-        self.assertNotIn("record_json ->>", prompt)
-        self.assertNotIn('"name":"chunk_type"', prompt)
-        self.assertNotIn("expected_sql", prompt)
+        self.assertEqual(decision.selections[0].candidate_id, "candidate-0")
+        self.assertIn("need-0", prompt)
+        self.assertIn("candidate-0", prompt)
+        self.assertNotIn("SEMANTIC REGISTRY", prompt)
+        for executable_slot in (
+            '"filters"',
+            '"field"',
+            '"measure"',
+            '"calculation"',
+            '"answer_contract"',
+            "expected_sql",
+        ):
+            self.assertNotIn(executable_slot, prompt)
+
+    def test_fully_grounded_public_path_never_calls_provider_planning(self):
+        with (
+            patch.object(answer, "completion") as completion,
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=([], {"value": 0}, 0),
+            ),
+        ):
+            result = answer._fetch_context_result("How many days were worked?")
+
+        completion.assert_not_called()
+        self.assertEqual(result.plan.measure, "distinct_dates")
+
+    def test_registered_exact_request_matrix_never_calls_provider_planning(self):
+        questions = (
+            "How many days were worked?",
+            "How many scheduled working days were there?",
+            "Count scheduled non-attended days",
+            "Count absent records",
+            "Count records with zero worked hours",
+            "Count Authorized records",
+            "What is total overtime?",
+            "What is the average worked hours?",
+            "What percentage of records are Authorized?",
+            "Count attendance records by Department",
+            "Show Date and Status from attendance records on 2026-09-01",
+        )
+        for question in questions:
+            with (
+                self.subTest(question=question),
+                patch.object(answer, "completion") as completion,
+                patch.object(
+                    answer, "load_attendance_catalog_candidates", return_value={}
+                ),
+                patch.object(answer, "_postgres_enabled", return_value=True),
+                patch.object(
+                    answer,
+                    "execute_exact_postgres",
+                    return_value=([], {"value": 0}, 0),
+                ),
+            ):
+                answer._fetch_context_result(question)
+            completion.assert_not_called()
+
+    def test_structurally_invalid_provider_decision_stops_before_retrieval(self):
+        from week5.new_implementation.planning_decisions import (
+            PlanningCandidate,
+            PlanningDraft,
+            PlanningNeed,
+        )
+
+        fact = answer.SemanticFact(
+            kind="measure",
+            concept_name="attendance_records",
+            evidence_text="entries",
+            origin="question",
+            strength="candidate",
+        )
+        draft = PlanningDraft(
+            question="Count the entries",
+            facts=(fact,),
+            needs=(
+                PlanningNeed(
+                    need_id="need-0",
+                    kind="interpretation",
+                    candidates=(PlanningCandidate("candidate-0", 0),),
+                ),
+            ),
+        )
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            '{"status":"resolved","selections":[],'
+                            '"filters":[{"field":"Status"}]}'
+                        )
+                    )
+                )
+            ]
+        )
+        with (
+            patch.object(answer, "build_planning_draft", return_value=draft),
+            patch.object(answer, "completion", return_value=response),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "execute_exact_postgres") as exact,
+            patch.object(answer, "fetch_semantic_chroma") as semantic,
+            self.assertRaises(answer.SemanticPlanValidationError) as raised,
+        ):
+            answer._fetch_context_result("Count the entries")
+
+        self.assertEqual(
+            {item.code for item in raised.exception.violations}, {"invalid_schema"}
+        )
+        exact.assert_not_called()
+        semantic.assert_not_called()
 
 
 class DateRangeResolutionTests(unittest.TestCase):
@@ -1471,16 +1050,7 @@ class EmployeeResolutionTests(unittest.TestCase):
         candidate = answer.EmployeeCandidate(
             employee_id="A10029", name="Example Employee Beta"
         )
-        plan = answer.QueryPlan(
-            mode="semantic",
-            search_query="unusual attendance",
-            name_hint="Example Employee Beta",
-        )
-
         with (
-            patch.object(
-                answer, "propose_query", side_effect=_proposal_side_effect(plan)
-            ),
             patch.object(answer, "load_employee_directory", return_value=[candidate]),
             patch.object(answer, "_postgres_vector_enabled", return_value=False),
             patch.object(answer, "fetch_semantic_chroma", return_value=[]) as semantic,
@@ -1666,15 +1236,7 @@ class ExecutablePlanSafetyTests(unittest.TestCase):
         )
 
         def propose(question, *args, **kwargs):
-            return answer.PlannerProposal.model_validate(
-                answer._overlay_authoritative_facts(
-                    {
-                        "status": "ready",
-                        "answer_contract": {"shape": "rows", "unit": "value"},
-                    },
-                    kwargs["semantic_facts"],
-                )
-            )
+            return _proposal_from_facts(question, kwargs["semantic_facts"])
 
         with (
             patch.object(answer, "propose_query", side_effect=propose),
@@ -1710,11 +1272,7 @@ class ExecutablePlanSafetyTests(unittest.TestCase):
                     for f in kwargs["semantic_facts"]
                 )
             )
-            return answer.PlannerProposal.model_validate(
-                answer._overlay_authoritative_facts(
-                    {"status": "ready"}, kwargs["semantic_facts"]
-                )
-            )
+            return _proposal_from_facts(question, kwargs["semantic_facts"])
 
         with (
             patch.object(answer, "load_employee_directory", side_effect=directory),
@@ -1762,11 +1320,7 @@ class ExecutablePlanSafetyTests(unittest.TestCase):
 
         def propose(question, *args, **kwargs):
             captured.extend(kwargs["semantic_facts"])
-            return answer.PlannerProposal.model_validate(
-                answer._overlay_authoritative_facts(
-                    {"status": "ready", "filters": []}, kwargs["semantic_facts"]
-                )
-            )
+            return _proposal_from_facts(question, kwargs["semantic_facts"])
 
         with (
             patch.object(answer, "propose_query", side_effect=propose),
@@ -1811,129 +1365,6 @@ class ExecutablePlanSafetyTests(unittest.TestCase):
         self.assertIn("ILIKE", sql)
         self.assertIn("LIMIT %s", sql)
         self.assertEqual(params, ["%Op%", "Op", 5])
-
-    def test_percentage_condition_is_not_duplicated_into_denominator_filters(self):
-        raw_proposal = {
-            "status": "ready",
-            "filters": [],
-            "calculation": {
-                "operation": "percentage",
-                "field": None,
-                "percentage_condition": {
-                    "field": "Status",
-                    "operator": "eq",
-                    "value": "Authorized",
-                    "evidence_text": "Status equal to Authorized",
-                },
-                "evidence_text": "percentage",
-            },
-            "answer_contract": {
-                "shape": "scalar",
-                "unit": "percentage",
-                "subject_field": None,
-                "grain": [],
-            },
-        }
-        facts = answer.detect_semantic_facts(
-            "What percentage of all attendance records have Status equal to Authorized?",
-            answer.ResolutionContext({}),
-        )
-
-        prepared = answer._overlay_authoritative_facts(raw_proposal, facts)
-
-        self.assertEqual(prepared["filters"], [])
-        self.assertEqual(
-            prepared["calculation"]["percentage_condition"]["value"], "Authorized"
-        )
-
-    def test_authoritative_facts_preserve_unrelated_choices_for_compiler_rejection(
-        self,
-    ):
-        raw_proposal = {
-            "status": "ready",
-            "filters": [],
-            "name_hint": {
-                "value": "/",
-                "evidence_text": "/",
-            },
-            "business_predicates": [
-                {
-                    "name": "scheduled_working_day",
-                    "evidence_text": "days",
-                }
-            ],
-            "measure": {
-                "name": "distinct_dates",
-                "evidence_text": "days",
-            },
-            "answer_contract": {
-                "shape": "scalar",
-                "unit": "dates",
-                "subject_field": "Date",
-                "grain": ["Date"],
-            },
-        }
-        facts = (
-            answer.SemanticFact(
-                kind="filter",
-                field="Day_Type",
-                operator="in",
-                values=("OFF Day", "OFF Day (ZAS)"),
-                concept_name="off_day",
-                evidence_text="off days",
-                origin="question",
-                strength="strong",
-            ),
-            answer.SemanticFact(
-                kind="filter",
-                field="Employee_ID",
-                operator="eq",
-                values=("A11017",),
-                evidence_text="A11017",
-                origin="question",
-                strength="strong",
-            ),
-            answer.SemanticFact(
-                kind="measure",
-                concept_name="distinct_dates",
-                evidence_text="days",
-                origin="question",
-                strength="strong",
-            ),
-        )
-
-        prepared = answer._overlay_authoritative_facts(raw_proposal, facts)
-
-        self.assertEqual(prepared["name_hint"]["value"], "/")
-        self.assertEqual(
-            prepared["business_predicates"][0]["name"], "scheduled_working_day"
-        )
-        self.assertEqual(prepared["measure"]["name"], "distinct_dates")
-        result = answer.compile_proposal(
-            answer.PlannerProposal.model_validate(prepared),
-            answer.CompilationContext(
-                "Count off days for A11017", facts, answer.ResolutionContext({})
-            ),
-        )
-        self.assertFalse(result.ready)
-        self.assertIn("ungrounded_constraint", {v.code for v in result.violations})
-        self.assertEqual(
-            prepared["filters"],
-            [
-                {
-                    "field": "Day_Type",
-                    "operator": "in",
-                    "value": ["OFF Day", "OFF Day (ZAS)"],
-                    "evidence_text": "off days",
-                },
-                {
-                    "field": "Employee_ID",
-                    "operator": "eq",
-                    "value": "A11017",
-                    "evidence_text": "A11017",
-                },
-            ],
-        )
 
     def test_unsupported_capability_stops_before_all_retrieval(self):
         proposal = answer.PlannerProposal(
@@ -2179,15 +1610,7 @@ class TrustedClarificationStateTests(unittest.TestCase):
         ]
 
         def propose(question, *args, **kwargs):
-            return answer.PlannerProposal.model_validate(
-                answer._overlay_authoritative_facts(
-                    {
-                        "status": "ready",
-                        "answer_contract": {"shape": "rows", "unit": "value"},
-                    },
-                    kwargs["semantic_facts"],
-                )
-            )
+            return _proposal_from_facts(question, kwargs["semantic_facts"])
 
         with (
             patch.object(answer, "propose_query", side_effect=propose),

@@ -195,7 +195,26 @@ def assemble_grounded_proposal(
     if decision is not None and decision.status == "ambiguous":
         return PlannerProposal(status="ambiguous")
 
-    facts = tuple(fact for fact in draft.facts if fact.strength == "strong")
+    selected_indexes = set()
+    if decision is not None:
+        validate_planner_decision(draft, decision)
+        candidates = {
+            (need.need_id, candidate.candidate_id): candidate
+            for need in draft.needs
+            for candidate in need.candidates
+        }
+        selected_indexes = {
+            candidates[(selection.need_id, selection.candidate_id)].fact_index
+            for selection in decision.selections
+        }
+
+    facts = tuple(
+        fact
+        if fact.strength == "strong"
+        else fact.model_copy(update={"strength": "strong"})
+        for index, fact in enumerate(draft.facts)
+        if fact.strength == "strong" or index in selected_indexes
+    )
     unsupported = _unique_facts(facts, "unsupported")
     if unsupported:
         return _unsupported_proposal(fact.concept_name for fact in unsupported)

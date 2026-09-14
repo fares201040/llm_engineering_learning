@@ -1,10 +1,32 @@
 import json
 import unittest
+from unittest.mock import patch
 
+from week5.new_implementation import answer
 from week5.new_implementation.observability import EventLogger, redact
 
 
 class ObservabilityTests(unittest.TestCase):
+    def test_grounded_planning_events_expose_counts_but_not_request_content(self):
+        events = []
+        logger = EventLogger(sink=lambda value: events.append(value), json_format=True)
+        question = "How many days were worked?"
+        facts = answer.detect_semantic_facts(question, answer.ResolutionContext({}))
+
+        with patch.object(answer, "completion") as completion:
+            answer.propose_query(
+                question,
+                semantic_facts=facts,
+                event_logger=logger,
+                request_id="request-1",
+            )
+
+        completion.assert_not_called()
+        payload = json.loads(events[0])
+        self.assertEqual(payload["event"], "planning_draft_built")
+        self.assertEqual(payload["need_count"], 0)
+        self.assertNotIn(question, events[0])
+
     def test_default_redaction_hides_query_identity_and_dsn(self):
         payload = redact(
             {

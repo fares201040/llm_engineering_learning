@@ -12,7 +12,7 @@ import uuid
 
 from openai import OpenAI
 from litellm import completion
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from tenacity import retry, wait_exponential, stop_after_attempt
 
 try:
@@ -28,6 +28,7 @@ try:
         MEASURE_DEFINITIONS,
         NUMERIC_FILTER_FIELDS,
         POSTGRES_FIELD_MAP,
+        PlannerDecision,
         PlannerProposal,
         ProposedFilter,
         ProposedMeasureChoice,
@@ -35,12 +36,10 @@ try:
         FilterCondition,
         LOCAL_DEMO_ACCESS,
         QueryPlan,
-        RETRIEVAL_INTENT_DEFINITIONS,
         VALUE_CONCEPT_DEFINITIONS,
         ExecutableQueryPlan,
         effective_grouping_fields,
         relevant_field_definitions,
-        render_planner_schema,
     )
     from .semantic_resolution import SemanticFact
     from .semantic_resolution import (
@@ -72,6 +71,13 @@ try:
     from .chroma_client import create_chroma_client
     from .config import settings
     from .observability import EventLogger
+    from .planning_decisions import (
+        PlanningDecisionError,
+        PlanningDraft,
+        assemble_grounded_proposal,
+        build_planning_draft,
+        validate_planner_decision,
+    )
 except ImportError:  # Running answer.py directly from its directory.
     from attendance_schema import (
         AccessContext,
@@ -85,6 +91,7 @@ except ImportError:  # Running answer.py directly from its directory.
         MEASURE_DEFINITIONS,
         NUMERIC_FILTER_FIELDS,
         POSTGRES_FIELD_MAP,
+        PlannerDecision,
         PlannerProposal,
         ProposedFilter,
         ProposedMeasureChoice,
@@ -92,12 +99,10 @@ except ImportError:  # Running answer.py directly from its directory.
         FilterCondition,
         LOCAL_DEMO_ACCESS,
         QueryPlan,
-        RETRIEVAL_INTENT_DEFINITIONS,
         VALUE_CONCEPT_DEFINITIONS,
         ExecutableQueryPlan,
         effective_grouping_fields,
         relevant_field_definitions,
-        render_planner_schema,
     )
     from semantic_resolution import SemanticFact
     from semantic_resolution import (
@@ -129,6 +134,13 @@ except ImportError:  # Running answer.py directly from its directory.
     from chroma_client import create_chroma_client
     from config import settings
     from observability import EventLogger
+    from planning_decisions import (
+        PlanningDecisionError,
+        PlanningDraft,
+        assemble_grounded_proposal,
+        build_planning_draft,
+        validate_planner_decision,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -563,405 +575,119 @@ def _field_definition_context_text(question: str):
 # ---------------------------------------------------------------------------
 
 
+def _planning_decision_prompt(
+    question: str, draft: PlanningDraft, history: list[dict] | None
+) -> str:
+    needs = []
+    for need in draft.needs:
+        candidates = []
+        for candidate in need.candidates:
+            if candidate.fact_index < 0 or candidate.fact_index >= len(draft.facts):
+                raise ValueError("planning candidate references an unknown fact")
+            fact = draft.facts[candidate.fact_index]
+            if fact.kind not in {"measure", "predicate", "semantic_intent"}:
+                raise ValueError("provider decisions cannot own executable literals")
+            candidates.append(
+                {
+                    "candidate_id": candidate.candidate_id,
+                    "meaning": fact.concept_name,
+                }
+            )
+        needs.append(
+            {
+                "need_id": need.need_id,
+                "kind": need.kind,
+                "candidates": candidates,
+            }
+        )
+    return "\n\n".join(
+        (
+            "PLANNING DECISION CONTRACT\n"
+            "Select only candidate IDs supplied for each need. "
+            "Do not return fields, values, filters, operations, answer contracts, "
+            "backend choices, search rewrites, or SQL. Return ambiguous when the "
+            "bounded candidates are insufficient and unsupported only with a "
+            "controlled capability identifier.",
+            "BOUNDED NEEDS\n"
+            + json.dumps(needs, ensure_ascii=False, separators=(",", ":")),
+            "RECENT CONVERSATION\n"
+            + json.dumps(
+                (history or [])[-4:], ensure_ascii=False, separators=(",", ":")
+            ),
+            f"QUESTION\n{question}",
+        )
+    )
+
+
 @_retry()
+def _request_planning_decision(prompt: str) -> str:
+    response = completion(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        response_format=PlannerDecision,
+        temperature=0,
+        timeout=settings.planner_timeout_seconds,
+    )
+    return response.choices[0].message.content
+
+
+def decide_planning_needs(
+    question: str,
+    draft: PlanningDraft,
+    history: list[dict] | None = None,
+) -> PlannerDecision:
+    """Ask the provider to select only request-local unresolved candidates."""
+    prompt = _planning_decision_prompt(question, draft, history)
+    decision = PlannerDecision.model_validate_json(_request_planning_decision(prompt))
+    return validate_planner_decision(draft, decision)
+
+
 def propose_query(
     question: str,
     history: list[dict] | None = None,
     trusted_employees: list[EmployeeCandidate] | None = None,
     semantic_facts: tuple[SemanticFact, ...] = (),
     candidate_catalog: Mapping[str, tuple[str, ...]] | None = None,
+    event_logger: EventLogger | None = None,
+    request_id: str | None = None,
 ) -> PlannerProposal:
-    """Ask for an untrusted semantic proposal using registry-generated context."""
-    generic_contract = """Return PlannerProposal, never SQL.
-Use only definitions and values supplied by the semantic registry or candidate context.
-Attach exact question evidence to every semantic choice.
-Do not invent a field, value, predicate, measure, grouping, order, or limit.
-Treat every strong deterministic fact as authoritative and copy it into the matching proposal choice.
-For a filter fact, copy its field, operator, canonical values, and evidence; use a scalar for one value unless the operator is in.
-For a measure or predicate fact, copy concept_name into the corresponding named choice instead of creating a calculation.
-Build AnswerContract from the selected measure definition, including its answer unit and aggregation field.
-When strong facts fully describe the request, return status ready and an empty interpretation_candidates list.
-Only ambiguous status may contain interpretation candidates, and only unsupported status may contain capability identifiers.
-Return ambiguous when evidence supports multiple meanings.
-Return unsupported with controlled capability identifiers when the typed proposal cannot express the request."""
-    fact_context = {
-        "date_context": _date_context_text(question),
-        "semantic_facts": [fact.model_dump(mode="json") for fact in semantic_facts],
-        "recent_history": (history or [])[-4:],
-    }
-    candidate_context = {
-        "trusted_employees": [
-            {"name": candidate.name, "employee_id": candidate.employee_id}
-            for candidate in trusted_employees or []
-        ],
-        "catalog": {
-            field: list(values)
-            for field, values in sorted((candidate_catalog or {}).items())
-            if field in FIELD_DEFINITIONS and FIELD_DEFINITIONS[field].planner_visible
-        },
-    }
-    prompt = "\n\n".join(
-        (
-            f"PLANNER CONTRACT\n{generic_contract}",
-            f"SEMANTIC REGISTRY\n{render_planner_schema()}",
-            "DETERMINISTIC CONTEXT\n"
-            + json.dumps(fact_context, ensure_ascii=False, separators=(",", ":")),
-            "BOUNDED CANDIDATE CONTEXT\n"
-            + json.dumps(candidate_context, ensure_ascii=False, separators=(",", ":"))
-            + f"\nQUESTION\n{question}",
+    """Assemble the strict compiler input from facts and bounded decisions."""
+    del trusted_employees, candidate_catalog
+    draft = build_planning_draft(question, semantic_facts)
+    if event_logger is not None:
+        event_logger.emit(
+            "planning_draft_built",
+            request_id=request_id,
+            stage="planning",
+            state="success",
+            need_count=len(draft.needs),
         )
-    )
-    response = completion(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        response_format=PlannerProposal,
-        temperature=0,
-        timeout=settings.planner_timeout_seconds,
-    )
-    raw_proposal = json.loads(response.choices[0].message.content)
-    prepared = _overlay_authoritative_facts(raw_proposal, semantic_facts)
-    return PlannerProposal.model_validate_json(
-        json.dumps(prepared, ensure_ascii=False, separators=(",", ":"))
-    )
-
-
-def _overlay_authoritative_facts(raw_proposal: dict, facts: tuple[SemanticFact, ...]):
-    """Ensure independently detected strong facts survive an untrusted proposal."""
-    prepared = dict(raw_proposal)
-    strong_facts = tuple(fact for fact in facts if fact.strength == "strong")
-    measure_facts = {
-        fact.concept_name: fact
-        for fact in strong_facts
-        if fact.kind == "measure" and fact.concept_name in MEASURE_DEFINITIONS
-    }
-    calculation_facts = {
-        (fact.concept_name, fact.field): fact
-        for fact in strong_facts
-        if fact.kind == "calculation"
-    }
-    unsupported = [fact for fact in strong_facts if fact.kind == "unsupported"]
-    grounded_narrative = any(
-        fact.kind == "semantic_intent"
-        and fact.concept_name in RETRIEVAL_INTENT_DEFINITIONS
-        for fact in strong_facts
-    )
-    complete_calculation = len(calculation_facts) == 1 and (
-        next(iter(calculation_facts))[0] != "percentage"
-        or any(fact.scope == "percentage_numerator" for fact in strong_facts)
-    )
-    if (
-        prepared.get("status") == "ambiguous"
-        and not (measure_facts or unsupported)
-        and (complete_calculation or (grounded_narrative and not calculation_facts))
-        and not any(
-            fact.kind == "entity" or fact.strength != "strong" for fact in facts
-        )
-    ):
-        # Only a fully specified global operation can disprove a provider's
-        # default interpretation menu. Entity and unresolved scope facts survive.
-        prepared.update(status="ready", interpretation_candidates=[])
-    if (
-        prepared.get("status") == "unsupported"
-        and set(prepared.get("unsupported_capabilities") or [])
-        == {"narrative_explanation"}
-        and grounded_narrative
-        and not (measure_facts or calculation_facts or unsupported)
-    ):
-        prepared.update(status="ready", unsupported_capabilities=[])
-    if prepared.get("status") != "ready":
-        return prepared
-    if unsupported:
-        return {
-            "status": "unsupported",
-            "unsupported_capabilities": ["unsupported_constraint"],
-        }
-    if (
-        len(measure_facts) > 1
-        or len(calculation_facts) > 1
-        or (measure_facts and calculation_facts)
-    ):
-        return {
-            "status": "unsupported",
-            "unsupported_capabilities": ["multi_stage_aggregation"],
-        }
-    raw_calculation = prepared.get("calculation") or {}
-    raw_measure = prepared.get("measure") or {}
-    requested_shape = next(
-        (fact.concept_name for fact in strong_facts if fact.kind == "result_shape"),
-        "narrative" if grounded_narrative else None,
-    )
-    nonaggregate_shape = requested_shape is not None and not (
-        measure_facts or calculation_facts
-    )
-    if nonaggregate_shape:
-        if raw_measure or raw_calculation:
-            return {
-                "status": "unsupported",
-                "unsupported_capabilities": ["unsupported_constraint"],
-            }
-        prepared["answer_contract"] = {
-            "shape": requested_shape,
-            "unit": "value",
-            "subject_field": None,
-            "grain": [],
-        }
-    if len(measure_facts) == 1 and raw_calculation:
-        definition = MEASURE_DEFINITIONS[next(iter(measure_facts))]
-        if raw_calculation.get("percentage_condition") is not None or any(
-            raw_calculation.get(key) is not None and raw_calculation[key] != expected
-            for key, expected in (
-                ("operation", definition.aggregation),
-                ("field", definition.aggregation_field),
-            )
-        ):
-            return {
-                "status": "unsupported",
-                "unsupported_capabilities": ["multi_stage_aggregation"],
-            }
-    if len(calculation_facts) == 1:
-        (operation, field), fact = next(iter(calculation_facts.items()))
-        if any(
-            raw_calculation.get(key) is not None and raw_calculation[key] != expected
-            for key, expected in (("operation", operation), ("field", field))
-        ):
-            return {
-                "status": "unsupported",
-                "unsupported_capabilities": ["multi_stage_aggregation"],
-            }
-        raw_measure = prepared.get("measure")
-        if raw_measure:
-            definition = MEASURE_DEFINITIONS.get(raw_measure.get("name"))
-            equivalent = definition is not None and (
-                (definition.aggregation, definition.aggregation_field)
-                == (operation, field)
-                or (operation == "percentage" and definition.aggregation_field == field)
-            )
-            if not equivalent:
-                return {
-                    "status": "unsupported",
-                    "unsupported_capabilities": ["multi_stage_aggregation"],
-                }
-        calculation = dict(raw_calculation)
-        calculation.update(
-            operation=operation, field=field, evidence_text=fact.evidence_text
-        )
-        prepared["calculation"] = calculation
-        prepared["measure"] = None
-        prepared["answer_contract"] = {
-            "shape": "grouped" if prepared.get("group_by") else "scalar",
-            "unit": (
-                "percentage"
-                if operation == "percentage"
-                else FIELD_DEFINITIONS[field].output_unit
-                if field
-                else "value"
-            ),
-            "subject_field": field,
-            "grain": [field] if field else [],
-        }
-    population_constraints = [
-        (fact.field, fact.operator, fact.values)
-        for fact in strong_facts
-        if fact.kind == "filter" and fact.scope == "population"
-    ]
-    population_constraints.extend(
-        (
-            condition.field,
-            condition.operator,
-            condition.value
-            if isinstance(condition.value, tuple)
-            else (condition.value,),
-        )
-        for fact in strong_facts
-        if fact.kind == "predicate" and fact.scope == "population"
-        for condition in BUSINESS_PREDICATE_DEFINITIONS[
-            fact.concept_name
-        ].required_filters
-    )
-    # A finite, independently required population can prove an exclusion redundant.
-    # Contradictory exclusions and constraints on any other field remain untrusted.
-    filters = [
-        item
-        for item in prepared.get("filters") or []
-        if not (
-            item.get("operator") == "ne"
-            and any(
-                item.get("field") == field
-                and operator in {"eq", "in"}
-                and values
-                and all(type(item.get("value")) is type(value) for value in values)
-                and item.get("value") not in values
-                for field, operator, values in population_constraints
-            )
-        )
-    ]
-    calculation = prepared.get("calculation") or {}
-    nested_filters = [
-        item
-        for item in (calculation.get("percentage_condition"),)
-        if isinstance(item, dict)
-    ]
-    for fact in facts:
-        if fact.strength != "strong" or fact.kind != "filter" or not fact.field:
-            continue
-        authoritative = {
-            "field": fact.field,
-            "operator": fact.operator,
-            "value": (list(fact.values) if fact.operator == "in" else fact.values[0]),
-            "evidence_text": fact.evidence_text,
-        }
-        if fact.scope == "percentage_numerator":
-            if calculation.get("operation") == "percentage":
-                existing = calculation.get("percentage_condition") or {}
-                if any(
-                    key in existing and existing[key] != authoritative[key]
-                    for key in ("field", "operator", "value")
-                ):
-                    return {
-                        "status": "unsupported",
-                        "unsupported_capabilities": ["percentage_population"],
-                    }
-                calculation["percentage_condition"] = authoritative
-                prepared["calculation"] = calculation
-                filters = [
-                    item
-                    for item in filters
-                    if not all(
-                        item.get(key) == authoritative[key]
-                        for key in ("field", "operator", "value")
-                    )
-                ]
-            continue
-        if not any(
-            item.get("field") == fact.field
-            and item.get("operator") == fact.operator
-            and item.get("value") == authoritative["value"]
-            for item in [*filters, *nested_filters]
-        ):
-            filters.append(authoritative)
-    prepared["filters"] = filters
-
-    if len(measure_facts) == 1:
-        measure_name, fact = next(iter(measure_facts.items()))
-        definition = MEASURE_DEFINITIONS[measure_name]
-        proposed_measure = (prepared.get("measure") or {}).get("name")
-        if proposed_measure is not None and proposed_measure != measure_name:
-            return {
-                "status": "unsupported",
-                "unsupported_capabilities": ["multi_stage_aggregation"],
-            }
-        prepared["measure"] = {
-            "name": measure_name,
-            "evidence_text": fact.evidence_text,
-        }
-        prepared["calculation"] = None
-        prepared["interpretation_candidates"] = []
-        prepared["answer_contract"] = {
-            "shape": (
-                "grouped"
-                if prepared.get("group_by")
-                else definition.default_answer_shape
-            ),
-            "unit": definition.answer_unit,
-            "subject_field": definition.aggregation_field,
-            "grain": (
-                [definition.aggregation_field] if definition.aggregation_field else []
-            ),
-        }
-
-    predicates = list(prepared.get("business_predicates") or [])
-    numerator_conditions = {
-        (fact.field, fact.operator, tuple(fact.values))
-        for fact in strong_facts
-        if fact.kind == "filter" and fact.scope == "percentage_numerator"
-    }
-    if calculation.get("operation") == "percentage" and numerator_conditions:
-        predicates = [
-            item
-            for item in predicates
-            if item.get("name") not in BUSINESS_PREDICATE_DEFINITIONS
-            or any(
-                fact.kind == "predicate" and fact.concept_name == item.get("name")
-                for fact in strong_facts
-            )
-            or not {
-                (condition.field, condition.operator, (condition.value,))
-                for condition in BUSINESS_PREDICATE_DEFINITIONS[
-                    item["name"]
-                ].required_filters
-            }.issubset(numerator_conditions)
-        ]
-    existing_predicates = {item.get("name") for item in predicates}
-    for fact in facts:
-        if (
-            fact.strength == "strong"
-            and fact.kind == "predicate"
-            and fact.concept_name in BUSINESS_PREDICATE_DEFINITIONS
-            and fact.concept_name not in existing_predicates
-        ):
-            predicates.append(
-                {"name": fact.concept_name, "evidence_text": fact.evidence_text}
-            )
-            existing_predicates.add(fact.concept_name)
-    prepared["business_predicates"] = predicates
-    for kind in ("group_by", "projection"):
-        choices = list(prepared.get(kind) or [])
-        for fact in strong_facts:
-            if fact.kind == kind and not any(
-                item.get("field") == fact.field for item in choices
-            ):
-                choices.append(
-                    {"field": fact.field, "evidence_text": fact.evidence_text}
+    decision = None
+    if draft.needs:
+        try:
+            decision = decide_planning_needs(question, draft, history)
+        except (PlanningDecisionError, ValidationError):
+            if event_logger is not None:
+                event_logger.emit(
+                    "planner_decision_rejected",
+                    request_id=request_id,
+                    stage="planning",
+                    state="rejected",
+                    failure_code="invalid_schema",
+                    need_count=len(draft.needs),
                 )
-        prepared[kind] = choices
-    grounded_groups = {fact.field for fact in strong_facts if fact.kind == "group_by"}
-    if (measure_facts or calculation_facts) and grounded_groups:
-        intrinsic_fields = (
-            grounded_groups
-            | {MEASURE_DEFINITIONS[name].aggregation_field for name in measure_facts}
-            | {field for _, field in calculation_facts}
-        )
-        prepared["projection"] = [
-            choice
-            for choice in prepared["projection"]
-            if choice.get("field") not in intrinsic_fields
-            or any(
-                fact.kind == "projection" and fact.field == choice.get("field")
-                for fact in strong_facts
+            raise
+        if event_logger is not None:
+            event_logger.emit(
+                "planner_decision_received",
+                request_id=request_id,
+                stage="planning",
+                state="success",
+                status=decision.status,
+                selection_count=len(decision.selections),
+                need_count=len(draft.needs),
             )
-        ]
-    if prepared.get("group_by") and prepared.get("answer_contract"):
-        prepared["answer_contract"]["shape"] = "grouped"
-        subject = prepared["answer_contract"].get("subject_field")
-        prepared["answer_contract"]["grain"] = list(
-            dict.fromkeys(
-                [
-                    *(item["field"] for item in prepared["group_by"]),
-                    *([subject] if subject else []),
-                ]
-            )
-        )
-    if prepared.get("projection"):
-        prepared["answer_contract"] = {
-            "shape": "rows",
-            "unit": "value",
-            "subject_field": None,
-            "grain": [item["field"] for item in prepared["projection"]],
-        }
-    for kind in ("order_by", "limit"):
-        choices = [fact for fact in strong_facts if fact.kind == kind]
-        if len(choices) == 1 and not prepared.get(kind):
-            fact = choices[0]
-            prepared[kind] = (
-                {
-                    "field": fact.field,
-                    "direction": fact.direction,
-                    "evidence_text": fact.evidence_text,
-                }
-                if kind == "order_by"
-                else {"value": int(fact.values[0]), "evidence_text": fact.evidence_text}
-            )
-    return prepared
+    return assemble_grounded_proposal(draft, decision)
 
 
 # ---------------------------------------------------------------------------
@@ -3026,17 +2752,30 @@ def _fetch_context_result(
         fact_count=len(initial_facts),
         fact_kinds=sorted({fact.kind for fact in initial_facts}),
     )
-    proposal = prepared_proposal or propose_query(
-        question,
-        history,
-        trusted_employees=default_employees,
-        semantic_facts=initial_facts,
-        candidate_catalog=pre_catalog,
-    )
+    try:
+        proposal = prepared_proposal or propose_query(
+            question,
+            history,
+            trusted_employees=default_employees,
+            semantic_facts=initial_facts,
+            candidate_catalog=pre_catalog,
+            event_logger=event_logger,
+            request_id=request_id,
+        )
+    except (PlanningDecisionError, ValidationError) as exc:
+        raise SemanticPlanValidationError(
+            (
+                PlanViolation(
+                    "invalid_schema",
+                    "provider_decision",
+                    "The provider decision failed structural validation.",
+                ),
+            )
+        ) from exc
     if entity_resolution is not None and entity_resolution.outcome != "unique":
         raise EmployeeClarificationRequired(proposal, initial_facts, entity_resolution)
     event_logger.emit(
-        "planner_proposal_received",
+        "planner_proposal_assembled",
         request_id=request_id,
         stage="planning",
         state="success",

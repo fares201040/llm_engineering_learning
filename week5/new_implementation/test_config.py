@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from unittest.mock import patch
 
@@ -5,6 +6,34 @@ from week5.new_implementation import config
 
 
 class ConfigParsingTests(unittest.TestCase):
+    def test_legacy_settings_positional_constructor_remains_compatible(self):
+        with patch.dict("os.environ", {}, clear=True):
+            configured = config.Settings.from_environment()
+
+        conversation_fields = {
+            "conversation_model",
+            "conversation_timeout_seconds",
+            "conversation_max_input_chars",
+            "conversation_max_output_tokens",
+            "conversation_recent_frame_limit",
+            "conversation_referent_limit",
+            "conversation_unit_limit",
+            "conversation_compiled_plan_limit",
+            "conversation_employee_binding_limit",
+            "max_derived_group_rows",
+        }
+        parameter_names = tuple(inspect.signature(config.Settings).parameters)
+        legacy_names = tuple(
+            name for name in parameter_names if name not in conversation_fields
+        )
+        reconstructed = config.Settings(
+            *(getattr(configured, name) for name in legacy_names)
+        )
+
+        self.assertEqual(reconstructed.embedding_model, configured.embedding_model)
+        self.assertEqual(reconstructed.log_level, configured.log_level)
+        self.assertEqual(reconstructed.conversation_model, reconstructed.rag_model)
+
     def test_integer_parser_uses_default_for_missing_value(self):
         with patch.dict("os.environ", {}, clear=True):
             self.assertEqual(config.env_int("MISSING_TEST_INT", 17), 17)
@@ -13,6 +42,23 @@ class ConfigParsingTests(unittest.TestCase):
         with patch.dict("os.environ", {"BAD_TEST_INT": "not-an-int"}, clear=True):
             with self.assertRaisesRegex(ValueError, "BAD_TEST_INT"):
                 config.env_int("BAD_TEST_INT", 17)
+
+    def test_float_parser_rejects_non_finite_values(self):
+        for raw in ("nan", "inf", "-inf"):
+            with (
+                self.subTest(raw=raw),
+                patch.dict("os.environ", {"BAD_TEST_FLOAT": raw}, clear=True),
+                self.assertRaisesRegex(ValueError, "BAD_TEST_FLOAT must be finite"),
+            ):
+                config.env_float("BAD_TEST_FLOAT", 8.0, minimum=0.1)
+
+        with patch.dict(
+            "os.environ", {"CONVERSATION_TIMEOUT_SECONDS": "nan"}, clear=True
+        ):
+            with self.assertRaisesRegex(
+                ValueError, "CONVERSATION_TIMEOUT_SECONDS must be finite"
+            ):
+                config.Settings.from_environment()
 
     def test_settings_read_operational_values_from_environment(self):
         with patch.dict(

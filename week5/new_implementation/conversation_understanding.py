@@ -11,12 +11,6 @@ from pydantic import (
     model_validator,
 )
 
-try:
-    from .attendance_schema import MultiEmployeeDateView
-except ImportError:  # Direct execution from week5/new_implementation.
-    from attendance_schema import MultiEmployeeDateView
-
-
 ConversationRoute = Literal["attendance", "social", "unrelated"]
 ConversationRelation = Literal[
     "new",
@@ -103,9 +97,9 @@ class AttendanceUnitDecision(_ConversationUnitDecision):
     base_unit_choice_id: str | None = None
     fact_ids: tuple[str, ...] = ()
     employee_mentions: tuple[ConversationEmployeeMention, ...] = ()
-    view: MultiEmployeeDateView | None = None
+    view_choice_id: str | None = None
 
-    @field_validator("base_unit_choice_id")
+    @field_validator("base_unit_choice_id", "view_choice_id")
     @classmethod
     def _base_identifier_is_not_blank(cls, value: str | None) -> str | None:
         if value is not None:
@@ -131,16 +125,25 @@ class AttendanceUnitDecision(_ConversationUnitDecision):
         elif self.base_unit_choice_id is None:
             raise ValueError(f"{self.relation} attendance units require a base unit")
 
+        if self.relation == "modify_scope" and not (
+            self.fact_ids or self.employee_mentions
+        ):
+            raise ValueError("modify_scope requires a scope fact or employee mention")
+        if self.relation == "replace_result" and not self.fact_ids:
+            raise ValueError("replace_result requires a result fact")
+        if self.relation == "add_constraints" and not self.fact_ids:
+            raise ValueError("add_constraints requires a constraint fact")
+
         if self.relation == "change_view":
-            if self.view is None:
-                raise ValueError("change_view attendance units require a view")
+            if self.view_choice_id is None:
+                raise ValueError("change_view attendance units require a view choice")
             if self.fact_ids or self.employee_mentions:
                 raise ValueError("change_view cannot also change facts or employees")
-        elif self.view is not None and self.relation != "new":
-            raise ValueError("a view is valid only for new or change_view units")
+        elif self.view_choice_id is not None and self.relation != "new":
+            raise ValueError("a view choice is valid only for new or change_view units")
 
         if self.relation in {"repeat", "explain_previous"} and (
-            self.fact_ids or self.employee_mentions or self.view is not None
+            self.fact_ids or self.employee_mentions or self.view_choice_id is not None
         ):
             raise ValueError(
                 f"{self.relation} attendance units cannot contain modifications"
@@ -208,6 +211,7 @@ class ConversationDecisionContext(_StrictFrozenModel):
     message: str = Field(min_length=1)
     employee_choice_ids: tuple[str, ...] = ()
     prior_unit_choice_ids: tuple[str, ...] = ()
+    view_choice_ids: tuple[str, ...] = ()
     fact_choice_ids: tuple[str, ...] = ()
     strong_fact_ids: tuple[str, ...] = ()
     max_units: int = Field(gt=0)
@@ -222,6 +226,7 @@ class ConversationDecisionContext(_StrictFrozenModel):
     @field_validator(
         "employee_choice_ids",
         "prior_unit_choice_ids",
+        "view_choice_ids",
         "fact_choice_ids",
         "strong_fact_ids",
     )
@@ -289,6 +294,7 @@ def validate_conversation_decision(
 
     known_employees = set(context.employee_choice_ids)
     known_bases = set(context.prior_unit_choice_ids)
+    known_views = set(context.view_choice_ids)
     known_facts = set(context.fact_choice_ids) | set(context.strong_fact_ids)
     covered_facts: set[str] = set()
 
@@ -300,6 +306,8 @@ def validate_conversation_decision(
             and unit.base_unit_choice_id not in known_bases
         ):
             raise ConversationDecisionValidationError("unknown base-unit choice ID")
+        if unit.view_choice_id is not None and unit.view_choice_id not in known_views:
+            raise ConversationDecisionValidationError("unknown view choice ID")
         unknown_facts = set(unit.fact_ids) - known_facts
         if unknown_facts:
             raise ConversationDecisionValidationError("unknown fact choice ID")

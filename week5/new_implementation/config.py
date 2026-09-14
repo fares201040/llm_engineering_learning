@@ -7,6 +7,7 @@ an individual script.
 
 from dataclasses import dataclass
 from pathlib import Path
+import math
 import os
 import re
 
@@ -55,6 +56,8 @@ def env_float(
         except ValueError as exc:
             raise ValueError(f"{name} must be a number; got {raw!r}.") from exc
 
+    if not math.isfinite(value):
+        raise ValueError(f"{name} must be finite; got {raw!r}.")
     if minimum is not None and value < minimum:
         raise ValueError(f"{name} must be at least {minimum}; got {value}.")
     return value
@@ -96,16 +99,6 @@ def env_identifier(name: str, default: str) -> str:
 @dataclass(frozen=True)
 class Settings:
     rag_model: str
-    conversation_model: str
-    conversation_timeout_seconds: float
-    conversation_max_input_chars: int
-    conversation_max_output_tokens: int
-    conversation_recent_frame_limit: int
-    conversation_referent_limit: int
-    conversation_unit_limit: int
-    conversation_compiled_plan_limit: int
-    conversation_employee_binding_limit: int
-    max_derived_group_rows: int
     embedding_model: str
     embedding_encoding: str
     embedding_max_tokens: int
@@ -152,6 +145,20 @@ class Settings:
     benchmark_warmups: int
     benchmark_runs: int
     log_level: str
+    conversation_model: str = ""
+    conversation_timeout_seconds: float = 8.0
+    conversation_max_input_chars: int = 16000
+    conversation_max_output_tokens: int = 1200
+    conversation_recent_frame_limit: int = 8
+    conversation_referent_limit: int = 24
+    conversation_unit_limit: int = 8
+    conversation_compiled_plan_limit: int = 12
+    conversation_employee_binding_limit: int = 20
+    max_derived_group_rows: int = 400
+
+    def __post_init__(self):
+        if not self.conversation_model.strip():
+            object.__setattr__(self, "conversation_model", self.rag_model)
 
     @classmethod
     def from_environment(cls) -> "Settings":

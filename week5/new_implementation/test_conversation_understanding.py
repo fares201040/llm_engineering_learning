@@ -161,7 +161,7 @@ class ConversationContractTests(unittest.TestCase):
                 "source_span": (0, 5),
                 "relation": "repeat",
                 "base_unit_choice_id": "prior:latest",
-                "view": "union_dates",
+                "view_choice_id": "view:union",
             },
         )
         for values in invalid:
@@ -172,9 +172,92 @@ class ConversationContractTests(unittest.TestCase):
             source_span=(0, 5),
             relation="change_view",
             base_unit_choice_id="prior:latest",
-            view="intersection_dates",
+            view_choice_id="view:intersection",
         )
-        self.assertEqual(changed.view, "intersection_dates")
+        self.assertEqual(changed.view_choice_id, "view:intersection")
+
+    def test_provider_selects_only_request_local_view_choice_ids(self):
+        from week5.new_implementation.conversation_understanding import (
+            AttendanceUnitDecision,
+            ConversationDecision,
+            ConversationDecisionValidationError,
+            validate_conversation_decision,
+        )
+
+        with self.assertRaises(ValidationError):
+            AttendanceUnitDecision(
+                source_span=(0, 5),
+                relation="change_view",
+                base_unit_choice_id="prior:latest",
+                view="intersection_dates",
+            )
+
+        decision = ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": (
+                    {
+                        "route": "attendance",
+                        "source_span": (0, 5),
+                        "relation": "change_view",
+                        "base_unit_choice_id": "prior:latest",
+                        "view_choice_id": "view:intersection",
+                    },
+                ),
+            }
+        )
+        validate_conversation_decision(
+            decision,
+            self._context(
+                message="those",
+                strong_fact_ids=(),
+                view_choice_ids=("view:intersection",),
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            ConversationDecisionValidationError, "unknown view choice"
+        ):
+            validate_conversation_decision(
+                decision,
+                self._context(message="those", strong_fact_ids=()),
+            )
+
+    def test_modifying_relations_require_relation_specific_changes(self):
+        from week5.new_implementation.conversation_understanding import (
+            AttendanceUnitDecision,
+        )
+
+        for relation in ("modify_scope", "replace_result", "add_constraints"):
+            with self.subTest(relation=relation), self.assertRaises(ValidationError):
+                AttendanceUnitDecision(
+                    source_span=(0, 5),
+                    relation=relation,
+                    base_unit_choice_id="prior:latest",
+                )
+
+        scope = AttendanceUnitDecision(
+            source_span=(0, 5),
+            relation="modify_scope",
+            base_unit_choice_id="prior:latest",
+            employee_mentions=({"kind": "resolve", "source_span": (0, 5)},),
+        )
+        replacement = AttendanceUnitDecision(
+            source_span=(0, 5),
+            relation="replace_result",
+            base_unit_choice_id="prior:latest",
+            fact_ids=("fact:new-result",),
+        )
+        constrained = AttendanceUnitDecision(
+            source_span=(0, 5),
+            relation="add_constraints",
+            base_unit_choice_id="prior:latest",
+            fact_ids=("fact:new-constraint",),
+        )
+
+        self.assertTrue(scope.employee_mentions)
+        self.assertTrue(replacement.fact_ids)
+        self.assertTrue(constrained.fact_ids)
 
     def test_context_validation_rejects_unknown_choices_and_uncovered_facts(self):
         from week5.new_implementation.conversation_understanding import (

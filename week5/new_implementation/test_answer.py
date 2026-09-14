@@ -1027,6 +1027,83 @@ class BackendLoggingTests(unittest.TestCase):
 
 
 class EmployeeResolutionTests(unittest.TestCase):
+    def test_exact_employee_id_and_unique_full_name_proceed(self):
+        employee = answer.EmployeeCandidate(
+            employee_id="A10018", name="Faris Ahmed North"
+        )
+        directory = [employee]
+
+        by_id = answer.resolve_employee_reference("a10018", directory)
+        by_name = answer.resolve_employee_reference("FARIS AHMED NORTH", directory)
+
+        self.assertEqual(by_id.outcome, "unique")
+        self.assertEqual(by_id.match_method, "exact_id")
+        self.assertEqual(by_name.outcome, "unique")
+        self.assertEqual(by_name.match_method, "exact_name")
+
+    def test_every_non_exact_name_requires_confirmation_even_when_unique(self):
+        employee = answer.EmployeeCandidate(
+            employee_id="A10018", name="Faris Ahmed North"
+        )
+        references = ("Faris", "Ahmed North", "North Faris Ahmed", "Faris Ahmd North")
+
+        for reference in references:
+            with self.subTest(reference=reference):
+                resolution = answer.resolve_employee_reference(reference, [employee])
+                self.assertEqual(resolution.outcome, "confirmation")
+                self.assertEqual(resolution.candidates, [employee])
+
+    def test_candidate_limit_is_quality_ordered_and_reports_overflow(self):
+        directory = [
+            answer.EmployeeCandidate(employee_id="A10003", name="Faris South"),
+            answer.EmployeeCandidate(employee_id="A10001", name="Faris Ahmed"),
+            answer.EmployeeCandidate(employee_id="A10002", name="Faris North"),
+        ]
+
+        resolution = answer.resolve_employee_reference("Faris", directory, limit=2)
+
+        self.assertEqual(resolution.outcome, "ambiguous")
+        self.assertTrue(resolution.has_more_candidates)
+        self.assertEqual(len(resolution.candidates), 2)
+        self.assertEqual(
+            resolution.candidates,
+            sorted(
+                resolution.candidates,
+                key=lambda item: (item.name.casefold(), item.employee_id),
+            ),
+        )
+
+    def test_arabic_option_number_and_multi_employee_policy(self):
+        candidates = [
+            answer.EmployeeCandidate(employee_id="A10001", name="Faris Ahmed"),
+            answer.EmployeeCandidate(employee_id="A10002", name="Faris North"),
+        ]
+
+        self.assertEqual(answer._select_pending_employees("٢", candidates), [candidates[1]])
+        self.assertEqual(answer._select_pending_employees("all", candidates), [])
+        self.assertEqual(
+            answer._select_pending_employees("all", candidates, allow_multiple=True),
+            candidates,
+        )
+
+    def test_unresolved_employee_pauses_before_catalog_planning_and_retrieval(self):
+        employees = [
+            answer.EmployeeCandidate(employee_id="A10001", name="Faris Ahmed"),
+            answer.EmployeeCandidate(employee_id="A10002", name="Faris North"),
+        ]
+        with (
+            patch.object(answer, "load_employee_directory", return_value=employees),
+            patch.object(answer, "load_attendance_catalog_candidates") as catalog,
+            patch.object(answer, "propose_query") as planner,
+            patch.object(answer, "fetch_exact_chroma") as retrieval,
+        ):
+            with self.assertRaises(answer.EmployeeClarificationRequired):
+                answer._fetch_context_result("Show worked days for Faris")
+
+        catalog.assert_not_called()
+        planner.assert_not_called()
+        retrieval.assert_not_called()
+
     def test_population_query_strips_planner_generated_employee_filter(self):
         selected = answer.EmployeeCandidate(
             employee_id="A11017", name="Example Employee Alpha"
@@ -1849,13 +1926,13 @@ class TrustedClarificationStateTests(unittest.TestCase):
 
         self.assertIn("Which employee", text)
         self.assertEqual(chunks, [])
-        self.assertEqual(state.pending_proposal, proposal)
+        self.assertIsNone(state.pending_proposal)
         self.assertTrue(state.pending_facts)
         retrieval.assert_not_called()
-        planner.assert_called_once()
+        planner.assert_not_called()
 
         with (
-            patch.object(answer, "propose_query") as planner,
+            patch.object(answer, "propose_query", return_value=proposal) as planner,
             patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
             patch.object(answer, "load_employee_directory", return_value=employees),
             patch.object(answer, "_postgres_enabled", return_value=True),
@@ -1875,7 +1952,7 @@ class TrustedClarificationStateTests(unittest.TestCase):
         self.assertEqual(state.selected_employees, [employees[0]])
         self.assertIsNone(state.pending_proposal)
         self.assertEqual(state.pending_facts, [])
-        planner.assert_not_called()
+        planner.assert_called_once()
         retrieval.assert_called_once()
 
 

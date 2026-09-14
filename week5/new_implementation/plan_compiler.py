@@ -278,7 +278,7 @@ class GroundingInvariant(PlanInvariant):
                 continue
             evidence_present = (
                 evidence_occurs(context.compilation.question, item.evidence_text)
-                or item.origin == "trusted_state"
+                or item.origin in {"trusted_state", "user_clarification"}
             )
             grounded = any(
                 fact.strength == "strong" and _fact_matches_provenance(fact, item)
@@ -286,7 +286,7 @@ class GroundingInvariant(PlanInvariant):
             )
             if item.target_kind == "entity" and evidence_present:
                 grounded = True
-            if item.origin == "trusted_state":
+            if item.origin in {"trusted_state", "user_clarification"}:
                 grounded = True
             if not evidence_present or not grounded:
                 violations.append(

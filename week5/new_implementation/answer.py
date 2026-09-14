@@ -294,6 +294,17 @@ class EmployeeResolution(BaseModel):
     outcome: Literal["unique", "confirmation", "ambiguous", "none"]
     candidates: list[EmployeeCandidate]
     reference: str
+    match_method: Literal[
+        "exact_id",
+        "exact_name",
+        "prefix",
+        "substring",
+        "reordered_tokens",
+        "transliteration",
+        "fuzzy",
+        "none",
+    ] = "none"
+    has_more_candidates: bool = False
 
 
 class ConversationState(BaseModel):
@@ -307,7 +318,9 @@ class ConversationState(BaseModel):
 
 
 class PlanningClarificationRequired(ValueError):
-    def __init__(self, proposal: PlannerProposal, facts: tuple[SemanticFact, ...]):
+    def __init__(
+        self, proposal: PlannerProposal | None, facts: tuple[SemanticFact, ...]
+    ):
         super().__init__("planning clarification required")
         self.proposal = proposal
         self.facts = facts
@@ -316,7 +329,12 @@ class PlanningClarificationRequired(ValueError):
 class EmployeeClarificationRequired(PlanningClarificationRequired):
     """Retrieval must pause until the employee reference is clarified."""
 
-    def __init__(self, proposal, facts, resolution: EmployeeResolution):
+    def __init__(
+        self,
+        proposal: PlannerProposal | None,
+        facts: tuple[SemanticFact, ...],
+        resolution: EmployeeResolution,
+    ):
         super().__init__(proposal, facts)
         self.resolution = resolution
 
@@ -716,6 +734,52 @@ def _employee_fuzzy_score(reference: str, candidate: EmployeeCandidate):
     )
 
 
+_ARABIC_NAME_TRANSLITERATION = str.maketrans(
+    {
+        "ا": "a",
+        "أ": "a",
+        "إ": "a",
+        "آ": "a",
+        "ب": "b",
+        "ت": "t",
+        "ث": "th",
+        "ج": "j",
+        "ح": "h",
+        "خ": "kh",
+        "د": "d",
+        "ذ": "th",
+        "ر": "r",
+        "ز": "z",
+        "س": "s",
+        "ش": "sh",
+        "ص": "s",
+        "ض": "d",
+        "ط": "t",
+        "ظ": "z",
+        "ع": "",
+        "غ": "gh",
+        "ف": "f",
+        "ق": "q",
+        "ك": "k",
+        "ل": "l",
+        "م": "m",
+        "ن": "n",
+        "ه": "h",
+        "ة": "a",
+        "و": "w",
+        "ؤ": "w",
+        "ي": "y",
+        "ى": "a",
+        "ئ": "y",
+        "ء": "",
+    }
+)
+
+
+def _transliterate_arabic_name(value: str) -> str:
+    return _normalize_name(value.translate(_ARABIC_NAME_TRANSLITERATION))
+
+
 def resolve_employee_reference(
     reference: str,
     directory: list[EmployeeCandidate],
@@ -736,6 +800,27 @@ def resolve_employee_reference(
             candidate.employee_id,
         ),
     )
+    exact_id = [
+        candidate
+        for candidate in ordered
+        if candidate.employee_id.casefold() == normalized_reference
+    ]
+    if exact_id:
+        return EmployeeResolution(
+            outcome="unique",
+            candidates=exact_id,
+            reference=reference,
+            match_method="exact_id",
+        )
+
+    if re.fullmatch(r"[a-z]+[a-z0-9]*\d+[a-z0-9]*", normalized_reference):
+        return EmployeeResolution(
+            outcome="none",
+            candidates=[],
+            reference=reference,
+            match_method="none",
+        )
+
     exact = [
         candidate
         for candidate in ordered
@@ -746,18 +831,60 @@ def resolve_employee_reference(
             outcome="unique" if len(exact) == 1 else "ambiguous",
             candidates=exact[:limit],
             reference=reference,
+            match_method="exact_name",
+            has_more_candidates=len(exact) > limit,
         )
 
-    partial = [
-        candidate
-        for candidate in ordered
-        if normalized_reference in _normalize_name(candidate.name)
-    ]
-    if partial:
+    ranked_partial = []
+    reference_tokens = normalized_reference.split()
+    for candidate in ordered:
+        normalized_name = _normalize_name(candidate.name)
+        if normalized_name.startswith(normalized_reference):
+            ranked_partial.append((0, "prefix", candidate))
+        elif sorted(reference_tokens) == sorted(normalized_name.split()):
+            ranked_partial.append((1, "reordered_tokens", candidate))
+        elif normalized_reference in normalized_name:
+            ranked_partial.append((2, "substring", candidate))
+    if ranked_partial:
+        ranked_partial.sort(
+            key=lambda item: (
+                item[0],
+                _normalize_name(item[2].name),
+                item[2].employee_id,
+            )
+        )
+        partial = [candidate for _quality, _method, candidate in ranked_partial]
         return EmployeeResolution(
-            outcome="unique" if len(partial) == 1 else "ambiguous",
+            outcome="confirmation" if len(partial) == 1 else "ambiguous",
             candidates=partial[:limit],
             reference=reference,
+            match_method=ranked_partial[0][1],
+            has_more_candidates=len(partial) > limit,
+        )
+
+    transliterated_reference = _transliterate_arabic_name(normalized_reference)
+    transliterated = []
+    if transliterated_reference != normalized_reference:
+        transliterated = [
+            candidate
+            for candidate in ordered
+            if _employee_fuzzy_score(transliterated_reference, candidate)
+            >= FUZZY_NAME_THRESHOLD
+        ]
+    if transliterated:
+        transliterated.sort(
+            key=lambda candidate: (
+                -_employee_fuzzy_score(transliterated_reference, candidate),
+                _normalize_name(candidate.name),
+                candidate.employee_id,
+            )
+        )
+        return EmployeeResolution(
+            outcome="confirmation" if len(transliterated) == 1 else "ambiguous",
+            candidates=transliterated[:limit],
+            reference=reference,
+            match_method="transliteration",
+            has_more_candidates=len(transliterated) > limit,
         )
 
     scored = [
@@ -774,22 +901,19 @@ def resolve_employee_reference(
     )
     candidates = [candidate for _score, candidate in scored[:limit]]
     if candidates:
-        if len(candidates) > 1:
-            outcome = "ambiguous"
-        elif scored[0][0] >= settings.auto_match_threshold:
-            outcome = "unique"
-        else:
-            outcome = "confirmation"
         return EmployeeResolution(
-            outcome=outcome,
+            outcome="ambiguous" if len(candidates) > 1 else "confirmation",
             candidates=candidates,
             reference=reference,
+            match_method="fuzzy",
+            has_more_candidates=len(scored) > limit,
         )
 
     return EmployeeResolution(
         outcome="none",
         candidates=[],
         reference=reference,
+        match_method="none",
     )
 
 
@@ -2652,31 +2776,18 @@ def _fetch_context_result(
     request_id = request_id or uuid.uuid4().hex
     started = perf_counter()
     planning_started = perf_counter()
-    pre_catalog = load_attendance_catalog_candidates(question)
-    pre_context = ResolutionContext(
-        catalog=pre_catalog,
+    identity_context = ResolutionContext(
+        catalog={},
         employees=_employee_references(default_employees),
         reference_date=_current_local_date(),
     )
-    detected_facts = detect_semantic_facts(question, pre_context)
-    if any(
-        fact.kind == "unsupported" and fact.strength == "strong"
-        for fact in detected_facts
-    ):
-        violations = CapabilityInvariant().check(
-            InvariantContext(
-                CompilationContext(question, detected_facts, pre_context),
-                None,
-                QueryPlan(mode="exact", search_query=question),
-                (),
-            )
-        )
-        raise SemanticPlanValidationError(violations)
+    detected_facts = detect_semantic_facts(question, identity_context)
     entity_resolution = None
     directory = None
     entity_facts = [fact for fact in detected_facts if fact.kind == "entity"]
     trusted_selection = any(
-        fact.field == "Employee_ID" and fact.origin == "trusted_state"
+        fact.field == "Employee_ID"
+        and fact.origin in {"trusted_state", "user_clarification"}
         for fact in prepared_facts
     )
     if entity_facts and not trusted_selection:
@@ -2711,30 +2822,59 @@ def _fetch_context_result(
             default_employees = list(
                 {item.employee_id: item for item in selected}.values()
             )
+        else:
+            raise EmployeeClarificationRequired(
+                None, tuple(detected_facts), entity_resolution
+            )
+
+    pre_catalog = load_attendance_catalog_candidates(question)
+    pre_context = ResolutionContext(
+        catalog=pre_catalog,
+        employees=_employee_references(default_employees),
+        reference_date=_current_local_date(),
+    )
+    detected_facts = detect_semantic_facts(question, pre_context)
+    if any(
+        fact.kind == "unsupported" and fact.strength == "strong"
+        for fact in detected_facts
+    ):
+        violations = CapabilityInvariant().check(
+            InvariantContext(
+                CompilationContext(question, detected_facts, pre_context),
+                None,
+                QueryPlan(mode="exact", search_query=question),
+                (),
+            )
+        )
+        raise SemanticPlanValidationError(violations)
     if (
         default_employees
         and (entity_facts or trusted_selection or _is_employee_followup(question))
         and (entity_resolution is None or entity_resolution.outcome == "unique")
     ):
         ids = tuple(item.employee_id for item in default_employees)
-        prepared_facts = merge_semantic_facts(
-            prepared_facts,
-            (
-                SemanticFact(
-                    kind="filter",
-                    field="Employee_ID",
-                    operator="eq" if len(ids) == 1 else "in",
-                    values=ids,
-                    evidence_text=" ".join(ids),
-                    origin="trusted_state",
-                    strength="strong",
+        if not trusted_selection:
+            prepared_facts = merge_semantic_facts(
+                prepared_facts,
+                (
+                    SemanticFact(
+                        kind="filter",
+                        field="Employee_ID",
+                        operator="eq" if len(ids) == 1 else "in",
+                        values=ids,
+                        evidence_text=" ".join(ids),
+                        origin="trusted_state",
+                        strength="strong",
+                    ),
                 ),
-            ),
-        )
+            )
         detected_facts = tuple(
             fact
             for fact in detected_facts
-            if not (fact.kind == "filter" and fact.field in {"Employee_ID", "Name"})
+            if not (
+                (fact.kind == "filter" and fact.field in {"Employee_ID", "Name"})
+                or fact.kind == "entity"
+            )
         )
     relative_dates = resolve_relative_date_filters(question)
     date_facts = tuple(
@@ -2778,6 +2918,26 @@ def _fetch_context_result(
                 ),
             )
         ) from exc
+    if trusted_selection and default_employees:
+        selected_ids = [employee.employee_id for employee in default_employees]
+        selected_operator = "eq" if len(selected_ids) == 1 else "in"
+        selected_value = selected_ids[0] if len(selected_ids) == 1 else selected_ids
+        selected_evidence = " ".join(selected_ids)
+        proposal = proposal.model_copy(deep=True)
+        proposal.name_hint = None
+        proposal.filters = [
+            condition
+            for condition in proposal.filters
+            if condition.field not in {"Employee_ID", "Name"}
+        ]
+        proposal.filters.append(
+            ProposedFilter(
+                field="Employee_ID",
+                operator=selected_operator,
+                value=selected_value,
+                evidence_text=selected_evidence,
+            )
+        )
     if entity_resolution is not None and entity_resolution.outcome != "unique":
         raise EmployeeClarificationRequired(proposal, initial_facts, entity_resolution)
     event_logger.emit(
@@ -3248,16 +3408,26 @@ def _format_employee_clarification(resolution: EmployeeResolution):
         heading = "Did you mean this employee?"
     else:
         heading = "Which employee did you mean?"
-    return f"{heading}\n{choices}\nReply with a number, full name, or employee ID."
+    overflow = (
+        "\nMore employees matched. Enter more characters to narrow the list."
+        if resolution.has_more_candidates
+        else ""
+    )
+    return (
+        f"{heading}\n{choices}\n"
+        f"Reply with a number, full name, or employee ID.{overflow}"
+    )
 
 
 def _select_pending_employees(
     response: str,
     candidates: list[EmployeeCandidate],
+    *,
+    allow_multiple: bool = False,
 ):
     normalized = _normalize_name(response)
     if normalized in {"both", "all"}:
-        return candidates
+        return candidates if allow_multiple else []
 
     if normalized.isdigit():
         index = int(normalized) - 1
@@ -3278,6 +3448,10 @@ def _select_pending_employees(
         for candidate in candidates
         if _normalize_name(candidate.name) == normalized
     ]
+
+
+def _question_allows_multiple_employee_selection(question: str) -> bool:
+    return bool(re.search(r"\b(?:all|both)\b", question, re.IGNORECASE))
 
 
 def _interpretation_label(name: InterpretationName):
@@ -3488,11 +3662,16 @@ def answer_question_with_state(
 
     if (
         prepared_proposal is None
-        and state.pending_proposal is not None
         and state.pending_question
         and state.pending_candidates
     ):
-        selected = _select_pending_employees(question, state.pending_candidates)
+        selected = _select_pending_employees(
+            question,
+            state.pending_candidates,
+            allow_multiple=_question_allows_multiple_employee_selection(
+                state.pending_question
+            ),
+        )
         if not selected:
             resolution = EmployeeResolution(
                 outcome="ambiguous",
@@ -3540,33 +3719,41 @@ def answer_question_with_state(
 
         selected = [candidate for candidate in validated if candidate is not None]
         effective_question = state.pending_question
-        prepared_proposal = state.pending_proposal.model_copy(deep=True)
-        prepared_proposal.name_hint = None
-        prepared_proposal.filters = [
-            condition
-            for condition in prepared_proposal.filters
-            if condition.field not in {"Employee_ID", "Name"}
-        ]
         selected_ids = [candidate.employee_id for candidate in selected]
         selected_operator = "eq" if len(selected_ids) == 1 else "in"
         selected_value = selected_ids[0] if len(selected_ids) == 1 else selected_ids
         selected_evidence = " ".join(selected_ids)
-        prepared_proposal.filters.append(
-            ProposedFilter(
-                field="Employee_ID",
-                operator=selected_operator,
-                value=selected_value,
-                evidence_text=selected_evidence,
+        if state.pending_proposal is not None:
+            prepared_proposal = state.pending_proposal.model_copy(deep=True)
+            prepared_proposal.name_hint = None
+            prepared_proposal.filters = [
+                condition
+                for condition in prepared_proposal.filters
+                if condition.field not in {"Employee_ID", "Name"}
+            ]
+            prepared_proposal.filters.append(
+                ProposedFilter(
+                    field="Employee_ID",
+                    operator=selected_operator,
+                    value=selected_value,
+                    evidence_text=selected_evidence,
+                )
             )
-        )
-        prepared_facts = tuple(state.pending_facts) + (
+        prepared_facts = tuple(
+            fact
+            for fact in state.pending_facts
+            if not (
+                fact.kind == "entity"
+                or (fact.kind == "filter" and fact.field in {"Employee_ID", "Name"})
+            )
+        ) + (
             SemanticFact(
                 kind="filter",
                 field="Employee_ID",
                 operator=selected_operator,
                 values=tuple(selected_ids),
                 evidence_text=selected_evidence,
-                origin="trusted_state",
+                origin="user_clarification",
                 strength="strong",
             ),
         )

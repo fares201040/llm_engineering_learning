@@ -32,6 +32,7 @@ UnsupportedCapability = Literal[
     "unsupported_calculation",
     "narrative_explanation",
     "percentage_population",
+    "grouped_percentage",
     "unsupported_constraint",
 ]
 FilterOperator = Literal[
@@ -294,6 +295,49 @@ class PlannerProposal(_StrictPlannerModel):
             grouped = self.answer_contract.shape == "grouped"
             if grouped != bool(self.group_by):
                 raise ValueError("grouped answer shape and group_by must agree")
+        return self
+
+
+class PlannerDecisionSelection(_StrictPlannerModel):
+    need_id: str = Field(min_length=1)
+    candidate_id: str = Field(min_length=1)
+
+    @field_validator("need_id", "candidate_id")
+    @classmethod
+    def _identifier_must_not_be_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("decision identifiers must not be blank")
+        return value
+
+
+class PlannerDecision(_StrictPlannerModel):
+    """Untrusted provider response limited to request-local candidate IDs."""
+
+    status: Literal["resolved", "ambiguous", "unsupported"]
+    selections: list[PlannerDecisionSelection] = Field(default_factory=list)
+    clarification_need_ids: list[str] = Field(default_factory=list)
+    unsupported_capabilities: list[UnsupportedCapability] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _validate_decision_shape(self):
+        selected_needs = [selection.need_id for selection in self.selections]
+        if len(selected_needs) != len(set(selected_needs)):
+            raise ValueError("each planning need may be selected at most once")
+        if len(self.clarification_need_ids) != len(set(self.clarification_need_ids)):
+            raise ValueError("clarification need identifiers must be unique")
+        if self.status == "resolved":
+            if self.clarification_need_ids or self.unsupported_capabilities:
+                raise ValueError("resolved decisions cannot clarify or reject")
+        elif self.status == "ambiguous":
+            if not self.clarification_need_ids:
+                raise ValueError("ambiguous decisions require clarification needs")
+            if self.selections or self.unsupported_capabilities:
+                raise ValueError("ambiguous decisions cannot select or reject")
+        else:
+            if not self.unsupported_capabilities:
+                raise ValueError("unsupported decisions require capabilities")
+            if self.selections or self.clarification_need_ids:
+                raise ValueError("unsupported decisions cannot select or clarify")
         return self
 
 

@@ -428,6 +428,34 @@ files, push `main` to the configured `origin` without force, and verify
 Run status in the primary and review worktrees and report the final commit hash,
 remote synchronization, and clean state.
 
+## Tolerant multilingual input continuation (completed 2026-09-14)
+
+The subsequent tolerant-input work preserves this plan's provider boundary. A
+new source-preserving layer runs after access/preflight checks and before draft
+assembly. It recognizes English, Arabic, and mixed-language registry aliases,
+performs conservative surface normalization, resolves exact identities, and
+returns strict `InputUnderstanding` outcomes: `ready`, employee clarification,
+meaning clarification, missing intent, or unsupported.
+
+Uncertain surface candidates never enter `PlanningDraft` and never reach the
+provider. Employee, semantic, catalog, and missing-intent follow-ups share a
+typed `PendingClarification` lifecycle that preserves the original request and
+locale. Only a reply validated against the finite stored options can create a
+`user_clarification` fact. Once complete, the request is rebuilt from verified
+facts and passes through the same proposal compiler, invariant chain,
+`ExecutableQueryPlan`, backend compiler, and answer contract as exact input.
+
+The new `employee_profile` intent is also compiler-owned. Its projection is fixed
+by the registry, revalidated in the executable plan, parameterized for
+PostgreSQL, mirrored in Chroma, and rendered deterministically. The provider
+cannot select profile fields, query operators, values, backend behavior, or SQL.
+
+The implementation and final review are documented in
+`docs/superpowers/plans/2026-09-14-apdc-tolerant-multilingual-input-implementation.md`.
+Merged deterministic verification passed 489 discovered tests. The local
+evaluator's visible `Question` column is an analyst-facing table field only;
+production events and diagnostics remain redacted.
+
 ## Acceptance Criteria
 
 - Fully grounded supported questions do not call the provider planner.

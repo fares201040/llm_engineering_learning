@@ -12,16 +12,17 @@ The attendance assistant accepts concise, noisy, English, Arabic, and mixed-lang
 4. Resolve employee identity against the authorized directory.
 5. Pause for every non-exact employee name. Exact IDs and unique exact full names may proceed.
 6. Promote only exact aliases or one fuzzy semantic candidate with score at least `0.90` and a margin of at least `0.08` over a candidate for the same source span.
-7. Pause for lower-confidence semantic candidates and expose only finite registry-derived choices.
-8. Verify that the request identifies a supported result operation. A predicate-only request may use exactly one entailed `INTERPRETATION_PRESETS` entry. A bare employee never retrieves records.
-9. Assemble a proposal from strong facts, compile it to an `ExecutableQueryPlan`, revalidate all executable choices, and only then retrieve.
-10. Render deterministic profiles, projections, and calculations in the preserved reply locale. Narrative answers receive a verified reply-language instruction and bounded evidence.
+7. Prefer the longest registered meaning when aliases overlap. Validate unmatched semantic residue; unknown Arabic modifiers and noisy or ambiguous fragments become a meaning clarification rather than being silently ignored.
+8. Pause for lower-confidence semantic candidates and expose only finite registry-derived choices. Each choice retains evidence that must exactly match the saved original question span.
+9. Verify that the request identifies a supported result operation before catalog expansion. A predicate-only request may use exactly one entailed `INTERPRETATION_PRESETS` entry. A bare employee never retrieves records.
+10. Assemble a proposal from strong facts, compile it to an `ExecutableQueryPlan`, revalidate all executable choices, and only then retrieve.
+11. Render deterministic profiles, projections, calculations, record summaries, and truncation notices in the preserved reply locale. Narrative answers receive a verified reply-language instruction and bounded evidence.
 
 No unresolved request reaches catalog expansion, provider planning, retrieval, reranking, calculation, or final completion.
 
 ## Employee policy
 
-Resolution precedence is exact employee ID, exact full name, duplicate exact name, then prefix/substring/reordered/transliterated/fuzzy matching. Every match in the last group requires confirmation, even when there is only one candidate.
+Resolution precedence is exact employee ID, exact normalized full name, duplicate exact name, then prefix/substring/reordered/transliterated/fuzzy matching. Exact Arabic-name comparison removes diacritics and uses the documented conservative letter normalization. Every match in the last group requires confirmation, even when there is only one candidate.
 
 Choices contain only `Name — Employee ID`, are bounded by the configured constraint candidate limit, and are ordered by match quality, normalized name, and employee ID. Arabic-Indic selection numbers are accepted. `all` and `both` are accepted only if the saved original request explicitly requested multiple employees.
 
@@ -49,7 +50,7 @@ Material automatic corrections may be disclosed, for example: `I understood “w
 
 Input events may contain only request ID, stage/state, reply locale, understanding or clarification kind, candidate/correction counts, and match-method counts. Questions, source evidence, employee names, employee IDs, candidate labels, catalog values, scores, SQL, and SQL parameters are not emitted.
 
-The local evaluator may display its separately requested `Question` column. That UI behavior is not part of diagnostic serialization and is intentionally kept in separate uncommitted work in the original checkout.
+The local evaluator displays its separately requested `Question` column in behavior, retrieval, and answer detail tables. That analyst-facing UI behavior is not part of diagnostic serialization; production telemetry remains redacted.
 
 ## Preserved fail-closed boundaries
 
@@ -62,3 +63,14 @@ The feature does not add raw SQL, model-generated SQL, complete-question templat
 - Low-confidence wording is clarified rather than guessed, so some uncommon paraphrases still require one user choice.
 - Arabic business aliases cover registered attendance concepts; unsupported advanced operations remain unsupported regardless of language.
 - Provider-backed quality checks and private-corpus checks remain separate from deterministic correctness and require their authorized runtime data and provider health.
+
+## Implementation and verification status
+
+The boundary is implemented in the local `main` history through `ca639fdc`, with
+the final documentation/evaluator commit recorded separately. The definitive
+architecture and implementation record is
+`docs/superpowers/plans/2026-09-14-apdc-tolerant-multilingual-input-implementation.md`.
+
+Merged verification passed 489 discovered `week5` tests, scoped Ruff lint, the
+38-file `week5/new_implementation` format check, and Git whitespace validation.
+Direct execution of the evaluator is supported in addition to package imports.

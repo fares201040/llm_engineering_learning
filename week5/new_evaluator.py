@@ -73,6 +73,7 @@ def run_behavior_evaluation(maximum, progress=gr.Progress()):
                 {
                     "Case": index - 1,
                     "Category": case.category,
+                    "Question": case.question,
                     "Status": "Passed" if case_passed else "Failed",
                     "Failed checks": ", ".join(failed_checks),
                     "Cause": diagnostic.cause if diagnostic else "",
@@ -84,6 +85,7 @@ def run_behavior_evaluation(maximum, progress=gr.Progress()):
                 {
                     "Case": index - 1,
                     "Category": case.category,
+                    "Question": case.question,
                     "Status": f"Failed ({type(exc).__name__})",
                     "Failed checks": "evaluation_error",
                     "Cause": "provider_structural_failure",
@@ -97,7 +99,7 @@ def run_behavior_evaluation(maximum, progress=gr.Progress()):
     categories = _category_frame(category_scores, "Pass Rate")
     detail_frame = pd.DataFrame(
         details,
-        columns=["Case", "Category", "Status", "Failed checks", "Cause"],
+        columns=["Case", "Category", "Question", "Status", "Failed checks", "Cause"],
     )
     return summary, categories, detail_frame
 
@@ -117,6 +119,7 @@ def run_retrieval_evaluation(maximum, progress=gr.Progress()):
                 {
                     "Case": index - 1,
                     "Category": case.category,
+                    "Question": case.question,
                     "MRR": result.mrr,
                     "nDCG": result.ndcg,
                     "Coverage %": result.keyword_coverage,
@@ -128,6 +131,7 @@ def run_retrieval_evaluation(maximum, progress=gr.Progress()):
                 {
                     "Case": index - 1,
                     "Category": case.category,
+                    "Question": case.question,
                     "MRR": None,
                     "nDCG": None,
                     "Coverage %": None,
@@ -157,6 +161,7 @@ def run_retrieval_evaluation(maximum, progress=gr.Progress()):
         columns=[
             "Case",
             "Category",
+            "Question",
             "MRR",
             "nDCG",
             "Coverage %",
@@ -183,6 +188,7 @@ def run_answer_evaluation(maximum, progress=gr.Progress()):
                 {
                     "Case": index - 1,
                     "Category": case.category,
+                    "Question": case.question,
                     "Accuracy": result.accuracy,
                     "Completeness": result.completeness,
                     "Relevance": result.relevance,
@@ -195,6 +201,7 @@ def run_answer_evaluation(maximum, progress=gr.Progress()):
                 {
                     "Case": index - 1,
                     "Category": case.category,
+                    "Question": case.question,
                     "Accuracy": None,
                     "Completeness": None,
                     "Relevance": None,
@@ -223,6 +230,7 @@ def run_answer_evaluation(maximum, progress=gr.Progress()):
         columns=[
             "Case",
             "Category",
+            "Question",
             "Accuracy",
             "Completeness",
             "Relevance",

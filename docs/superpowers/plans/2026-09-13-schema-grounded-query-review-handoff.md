@@ -67,32 +67,37 @@ The intended question-answering boundary is:
 ```text
 Question + trusted access/session state
   -> deterministic access and malformed-input checks
+  -> source-preserving multilingual surface analysis
+  -> exact employee resolution or typed employee clarification
+  -> request-completeness and semantic-ambiguity gating
   -> registry-derived semantic facts and bounded candidate context
-  -> LLM PlannerProposal (untrusted, no SQL and no backend authority)
+  -> deterministic PlanningDraft and complete internal PlannerProposal
+  -> optional bounded PlannerDecision (untrusted candidate IDs only)
   -> semantic compiler and invariant chain
   -> ExecutableQueryPlan with constraint provenance and AnswerContract
-  -> employee/catalog clarification when required
   -> parameterized PostgreSQL compiler or controlled Chroma retrieval
   -> deterministic calculation where representable
-  -> bounded evidence and deterministic/evidence-grounded answer
+  -> localized deterministic answer or bounded evidence-grounded narrative
 ```
 
 The main code review order is:
 
 1. `week5/new_implementation/attendance_schema.py`
-2. `week5/new_implementation/semantic_resolution.py`
-3. `week5/new_implementation/plan_compiler.py`
-4. `week5/new_implementation/postgres_compiler.py`
-5. `week5/new_implementation/answer.py`
-6. `week5/new_implementation/query.py`
-7. `week5/new_implementation/retrieval.py`
-8. `week5/new_implementation/calculations.py`
-9. `week5/new_implementation/resolution.py`
-10. `week5/new_app.py`
-11. `week5/new_evaluation/test.py`
-12. `week5/new_evaluation/eval.py`
-13. `week5/new_evaluation/benchmark.py`
-14. All adjacent `test_*.py` contract and regression tests.
+2. `week5/new_implementation/language_understanding.py`
+3. `week5/new_implementation/semantic_resolution.py`
+4. `week5/new_implementation/planning_decisions.py`
+5. `week5/new_implementation/plan_compiler.py`
+6. `week5/new_implementation/postgres_compiler.py`
+7. `week5/new_implementation/answer.py`
+8. `week5/new_implementation/query.py`
+9. `week5/new_implementation/retrieval.py`
+10. `week5/new_implementation/calculations.py`
+11. `week5/new_implementation/resolution.py`
+12. `week5/new_app.py`
+13. `week5/new_evaluation/test.py`
+14. `week5/new_evaluation/eval.py`
+15. `week5/new_evaluation/benchmark.py`
+16. All adjacent `test_*.py` contract and regression tests.
 
 ## What was implemented and hardened
 
@@ -240,6 +245,76 @@ Nested Boolean filters, HAVING, window calculations, cross-period comparisons,
 grouped percentages, genuine multi-stage aggregation, and ungrounded positional
 first/last requests remain explicitly unsupported and stop before retrieval.
 Synthetic public-path regressions lock those decisions.
+
+## 2026-09-14 tolerant multilingual input completion
+
+The tolerant-input continuation is implemented and merged locally through
+`ca639fdc`. Its definitive implementation record is
+`docs/superpowers/plans/2026-09-14-apdc-tolerant-multilingual-input-implementation.md`.
+The feature changes only how user wording becomes verified facts; it does not
+weaken the provider, compiler, query, or privacy boundaries described above.
+
+`language_understanding.py` preserves the original question and source spans,
+selects an English or Arabic reply locale, applies conservative presentation
+normalization, and emits registry-referenced candidates. Exact aliases and only
+one uniquely dominant high-confidence fuzzy semantic candidate can become strong
+facts. Unknown Arabic residual modifiers, lower-confidence matches, ties, and
+unsupported structures stop as typed clarification or unsupported outcomes
+before catalog expansion or planning.
+
+Employee resolution now proceeds by exact ID, unique exact normalized full name,
+duplicate exact name, and then uncertain matching. Arabic diacritics and safe
+letter variants are normalized for exact-name comparison. Prefix, substring,
+reordered-token, transliterated, and fuzzy names always require confirmation,
+including a single match. Choices come from the authorized directory, are
+bounded by `CONSTRAINT_CANDIDATE_LIMIT`, and expose only `Name — Employee ID`.
+The selected option is revalidated before execution.
+
+A unified discriminated pending-clarification state preserves the original
+question, locale, grounded facts, safe proposal when available, and only the
+finite choices shown. It covers employee, meaning, catalog, and missing-intent
+turns. Confirmed facts use `user_clarification` provenance. Meaning choices carry
+original source evidence, and model validation rejects evidence text or spans
+that do not match the saved question. A complete new attendance question cancels
+any pending branch. A valid answer resumes and recompiles the original request.
+
+Request completeness is checked before retrieval: a registered measure or
+calculation, record-list intent, field projection, semantic retrieval intent, or
+employee-profile intent is required. Exactly one entailed interpretation preset
+may complete a short predicate request. A bare employee produces one localized
+missing-intent question and never retrieves.
+
+`employee_profile` is a registry-owned typed result intent. Its immutable field
+allowlist is `Employee_ID`, `Name`, `Department`, `Position`, and
+`Work_Location`. PostgreSQL compiles a parameterized distinct projection from the
+verified executable plan; Chroma applies matching projection/deduplication
+semantics. Multiple recorded values remain explicit. Profiles, projections,
+aggregations, record summaries, truncation notices, and clarifications have
+deterministic localized renderers. Narrative completion receives only bounded
+evidence, the verified answer contract, and the verified reply locale.
+
+The final review additionally closed residual-token execution gaps, longest-alias
+overlap, clarification-evidence forgery, locale loss across missing-intent turns,
+and direct evaluator-script import compatibility. Privacy-safe telemetry contains
+only controlled stages, statuses, locale, counts, match-method aggregates, and
+failure codes. It excludes questions, evidence text, names, IDs, option labels,
+scores, catalog values, SQL, and parameters.
+
+Fresh merged verification completed 489 discovered `week5` tests in 228.677
+seconds with no failures. Scoped Ruff lint passed, all 38 files in
+`week5/new_implementation` passed the format check, and Git whitespace validation
+passed. The independent final review reported no Critical or Important findings.
+Provider-backed and private-corpus reruns were intentionally not used as proof of
+this feature; the earlier verified provider/corpus results above remain separate.
+
+The local evaluator detail tables now deliberately include a `Question` column
+for behavior, retrieval, and answer evaluation. This local analyst UI is separate
+from production diagnostics and does not relax diagnostic redaction.
+
+Remaining limits are intentional: the supported language surface is English,
+Arabic, and mixtures of the two; transliteration remains heuristic and always
+confirms; uncommon or ambiguous paraphrases may require a finite clarification;
+and the advanced unsupported operations listed above remain fail-closed.
 
 ## Historical remaining work after Task 5 (superseded 2026-09-14)
 

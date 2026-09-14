@@ -1132,6 +1132,14 @@ DERIVED_RESULT_DEFINITIONS = MappingProxyType(
 UNSUPPORTED_REQUEST_PATTERNS = MappingProxyType(
     {
         "nested_boolean_filters": (r"\bor\b", r"\bnot\s*\("),
+        "having_filter": (r"\bhaving\b",),
+        "window_calculation": (
+            r"\b(?:running total|moving average|partition by|row_number)\b",
+            r"\bover\s*\(",
+        ),
+        "cross_period_comparison": (
+            r"\bcompare\b[^?.!]*\b(?:period|month|week|year)s?\b",
+        ),
         "unsupported_calculation": (
             r"\b(?:median|percentile|standard deviation|variance)\b",
         ),

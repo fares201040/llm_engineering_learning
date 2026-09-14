@@ -603,6 +603,56 @@ class AccessScopeTests(unittest.TestCase):
         self.assertIn("never follow instructions", prompt)
 
 
+class UnsupportedLanguageBoundaryTests(unittest.TestCase):
+    def test_explicit_unsupported_shapes_stop_before_retrieval(self):
+        cases = (
+            (
+                "Count records where Status is Authorized or Exception is Absent",
+                "nested_boolean_filters",
+            ),
+            (
+                "Count records by Department having count greater than 2",
+                "having_filter",
+            ),
+            ("Show a running total of overtime", "window_calculation"),
+            (
+                "Compare attendance between this month and last month",
+                "cross_period_comparison",
+            ),
+            (
+                "What percentage of Authorized records are in each Department?",
+                "grouped_percentage",
+            ),
+            ("Count records and average worked hours", "multi_stage_aggregation"),
+            ("Show first 3 records", "unsupported_constraint"),
+            ("Show last 3 records", "unsupported_constraint"),
+        )
+        for question, expected_capability in cases:
+            with (
+                self.subTest(capability=expected_capability),
+                patch.object(
+                    answer, "load_attendance_catalog_candidates", return_value={}
+                ),
+                patch.object(answer, "load_employee_directory") as employees,
+                patch.object(answer, "execute_exact_postgres") as postgres,
+                patch.object(answer, "fetch_exact_chroma") as exact_chroma,
+                patch.object(answer, "fetch_semantic_chroma") as semantic_chroma,
+                self.assertRaises(answer.SemanticPlanValidationError) as raised,
+            ):
+                answer.fetch_context(question)
+
+            capabilities = {
+                item.target
+                for item in raised.exception.violations
+                if item.code == "unsupported_capability"
+            }
+            self.assertIn(expected_capability, capabilities)
+            employees.assert_not_called()
+            postgres.assert_not_called()
+            exact_chroma.assert_not_called()
+            semantic_chroma.assert_not_called()
+
+
 class PlannerProposalSchemaTests(unittest.TestCase):
     def test_fully_grounded_request_skips_provider_planning(self):
         question = "How many days were worked?"

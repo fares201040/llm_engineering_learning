@@ -418,6 +418,7 @@ def evaluate_behavior(test: TestQuestion) -> BehaviorEval:
     except Exception as exc:
         expected_error_ok = bool(
             test.expected_error
+            and test.expected_exception_type == type(exc).__name__
             and test.expected_error.casefold() in str(exc).casefold()
         )
         return BehaviorEval(

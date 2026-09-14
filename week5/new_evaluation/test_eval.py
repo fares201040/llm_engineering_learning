@@ -177,6 +177,28 @@ class PrivacySafeDiagnosticTests(unittest.TestCase):
 
 
 class BaselineCapabilityParityTests(unittest.TestCase):
+    def test_projection_employee_and_date_compose_through_evaluator_fixture(self):
+        questions = (
+            "Show Date and Status from records for Morgan River on 2026-09-01",
+            "On 2026-09-01, show Date and Status from records for Morgan River",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                chunks, plan, calculation, count = self.answer.fetch_context(question)
+
+            self.assertEqual(plan.projection, ["Date", "Status"])
+            self.assertIsNone(calculation)
+            self.assertEqual(count, 2)
+            self.assertEqual(len(chunks), 2)
+            self.assertIn(
+                ("Employee_ID", "eq", "A10001"),
+                {(item.field, item.operator, item.value) for item in plan.filters},
+            )
+            self.assertIn(
+                ("Date", "eq", "2026-09-01"),
+                {(item.field, item.operator, item.value) for item in plan.filters},
+            )
+
     def test_temporal_filters_preserve_projection_and_returned_rows(self):
         for fields, projection in (
             (("Date", "Status"), ["Date", "Status"]),
@@ -1494,6 +1516,67 @@ class BaselineCapabilityParityTests(unittest.TestCase):
 
 
 class EvaluationWiringTests(unittest.TestCase):
+    def test_semantic_rejection_cannot_pass_via_legacy_message_substring(self):
+        from week5.new_implementation.plan_compiler import PlanViolation
+
+        test = TestQuestion(
+            question="Synthetic malformed attendance request",
+            keywords=[],
+            reference_answer="A controlled rejection.",
+            category="malformed_input",
+            expected_error="not supported",
+            expected_exception_type="PlanValidationError",
+        )
+        rejection = evaluation.SemanticPlanValidationError(
+            (
+                PlanViolation(
+                    "unsupported_capability",
+                    "unsupported_calculation",
+                    "This request is not supported.",
+                ),
+            )
+        )
+
+        with patch.object(evaluation, "fetch_context", side_effect=rejection):
+            result = evaluation.evaluate_behavior(test)
+
+        self.assertFalse(result.plan_ok)
+        self.assertFalse(result.expected_error_ok)
+        self.assertFalse(result.unsupported_capabilities_ok)
+
+    def test_preflight_error_requires_exact_controlled_exception_type(self):
+        from week5.new_implementation.answer import PlanValidationError
+
+        test = TestQuestion(
+            question="Synthetic malformed attendance request",
+            keywords=[],
+            reference_answer="A controlled rejection.",
+            category="malformed_input",
+            expected_error="invalid numeric comparison",
+            expected_exception_type="PlanValidationError",
+        )
+
+        with patch.object(
+            evaluation,
+            "fetch_context",
+            side_effect=PlanValidationError("Invalid numeric comparison"),
+        ):
+            result = evaluation.evaluate_behavior(test)
+
+        self.assertTrue(result.expected_error_ok)
+        self.assertTrue(result.plan_ok)
+
+        wrong_type = test.model_copy(
+            update={"expected_exception_type": "DomainAccessDeniedError"}
+        )
+        with patch.object(
+            evaluation,
+            "fetch_context",
+            side_effect=PlanValidationError("Invalid numeric comparison"),
+        ):
+            rejected = evaluation.evaluate_behavior(wrong_type)
+        self.assertFalse(rejected.expected_error_ok)
+
     def test_missing_private_corpus_has_an_actionable_error(self):
         missing = Path(__file__).with_name("missing-private-corpus.jsonl")
         with (

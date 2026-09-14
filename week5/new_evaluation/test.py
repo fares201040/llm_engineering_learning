@@ -1,8 +1,10 @@
 import json
 from pathlib import Path
+from typing import Literal
 from pydantic import BaseModel, Field
 
 TEST_FILE = str(Path(__file__).parent / "tests.jsonl")
+ExpectedErrorType = Literal["DomainAccessDeniedError", "PlanValidationError"]
 
 
 class TestQuestion(BaseModel):
@@ -28,6 +30,7 @@ class TestQuestion(BaseModel):
     expected_unsupported_capabilities: list[str] = Field(default_factory=list)
     turns: list[dict] = Field(default_factory=list)
     expected_error: str | None = None
+    expected_exception_type: ExpectedErrorType | None = None
 
 
 def load_tests(loader=None, tests=None, pattern=None):

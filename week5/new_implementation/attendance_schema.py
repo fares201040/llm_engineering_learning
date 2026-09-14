@@ -21,7 +21,9 @@ ResolutionKind = Literal[
     "catalog",
     "free_text",
 ]
-EvidenceOrigin = Literal["question", "trusted_state", "deterministic_default"]
+EvidenceOrigin = Literal[
+    "question", "trusted_state", "deterministic_default", "user_clarification"
+]
 PlanningStatus = Literal["ready", "ambiguous", "unsupported"]
 UnsupportedCapability = Literal[
     "nested_boolean_filters",
@@ -97,6 +99,7 @@ InterpretationName = Literal[
     "authorized_records",
     "employees",
 ]
+ResultIntentName = Literal["employee_profile"]
 
 
 class QueryPlan(BaseModel):
@@ -129,6 +132,7 @@ class QueryPlan(BaseModel):
     measure: MeasureName | None = None
     business_predicates: list[BusinessPredicateName] = Field(default_factory=list)
     interpretation_candidates: list[InterpretationName] = Field(default_factory=list)
+    result_intent: ResultIntentName | None = None
 
     @field_validator("group_by", "projection")
     @classmethod
@@ -188,6 +192,10 @@ class ProposedLimit(_EvidenceChoice):
     value: int = Field(gt=0)
 
 
+class ProposedResultIntentChoice(_EvidenceChoice):
+    name: ResultIntentName
+
+
 class ProposedCalculation(_EvidenceChoice):
     operation: Literal[
         "count", "distinct_count", "sum", "average", "min", "max", "percentage"
@@ -216,7 +224,7 @@ class ProposedCalculation(_EvidenceChoice):
 
 
 class AnswerContract(_StrictPlannerModel):
-    shape: Literal["scalar", "grouped", "rows", "narrative"]
+    shape: Literal["scalar", "grouped", "rows", "narrative", "profile"]
     unit: AnswerUnit
     subject_field: str | None = None
     grain: list[str] = Field(default_factory=list)
@@ -235,6 +243,7 @@ class PlannerProposal(_StrictPlannerModel):
     limit: ProposedLimit | None = None
     answer_contract: AnswerContract | None = None
     interpretation_candidates: list[InterpretationName] = Field(default_factory=list)
+    result_intent: ProposedResultIntentChoice | None = None
     unsupported_capabilities: list[UnsupportedCapability] = Field(default_factory=list)
     explanation: str | None = None
 
@@ -276,6 +285,7 @@ class PlannerProposal(_StrictPlannerModel):
                 or self.limit is not None
                 or self.answer_contract is not None
                 or self.interpretation_candidates
+                or self.result_intent is not None
             )
             if execution_choices:
                 raise ValueError(
@@ -285,6 +295,13 @@ class PlannerProposal(_StrictPlannerModel):
             raise ValueError("measure and calculation are mutually exclusive")
         if self.projection and (self.measure or self.calculation or self.group_by):
             raise ValueError("record projection cannot be combined with aggregation")
+        if self.result_intent is not None and (
+            self.measure is not None
+            or self.calculation is not None
+            or self.group_by
+            or self.projection
+        ):
+            raise ValueError("result intent cannot be combined with other result choices")
         if (
             self.projection
             and self.answer_contract
@@ -295,6 +312,15 @@ class PlannerProposal(_StrictPlannerModel):
             grouped = self.answer_contract.shape == "grouped"
             if grouped != bool(self.group_by):
                 raise ValueError("grouped answer shape and group_by must agree")
+            profile = self.answer_contract.shape == "profile"
+            has_profile_intent = (
+                self.result_intent is not None
+                and self.result_intent.name == "employee_profile"
+            )
+            if profile != has_profile_intent:
+                raise ValueError(
+                    "profile answer shape requires the employee_profile result intent"
+                )
         return self
 
 
@@ -480,6 +506,15 @@ class ValueConceptDefinition:
 class RetrievalIntentDefinition:
     description: str
     natural_names: tuple[str, ...]
+    phrase_priority: int = 20
+
+
+@dataclass(frozen=True, kw_only=True)
+class ResultIntentDefinition:
+    description: str
+    natural_names: tuple[str, ...]
+    projection: tuple[str, ...]
+    answer_shape: Literal["profile"] = "profile"
     phrase_priority: int = 20
 
 
@@ -1234,6 +1269,23 @@ RETRIEVAL_INTENT_DEFINITIONS = MappingProxyType(
                 "repeated attendance patterns",
             ),
         ),
+    }
+)
+
+
+RESULT_INTENT_DEFINITIONS = MappingProxyType(
+    {
+        "employee_profile": ResultIntentDefinition(
+            description="Return the authorized identity and workplace profile fields.",
+            natural_names=("who is", "employee profile", "profile of"),
+            projection=(
+                "Employee_ID",
+                "Name",
+                "Department",
+                "Position",
+                "Work_Location",
+            ),
+        )
     }
 )
 

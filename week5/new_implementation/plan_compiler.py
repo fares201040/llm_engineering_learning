@@ -218,7 +218,8 @@ class SchemaInvariant(PlanInvariant):
             employee_filters = [
                 condition
                 for condition in context.candidate_plan.filters
-                if condition.field == "Employee_ID" and condition.operator in {"eq", "in"}
+                if condition.field == "Employee_ID"
+                and condition.operator in {"eq", "in"}
             ]
             if len(employee_filters) != 1:
                 violations.append(
@@ -303,10 +304,9 @@ class GroundingInvariant(PlanInvariant):
         for index, item in enumerate(context.provenance):
             if item.origin == "deterministic_default":
                 continue
-            evidence_present = (
-                evidence_occurs(context.compilation.question, item.evidence_text)
-                or item.origin in {"trusted_state", "user_clarification"}
-            )
+            evidence_present = evidence_occurs(
+                context.compilation.question, item.evidence_text
+            ) or item.origin in {"trusted_state", "user_clarification"}
             grounded = any(
                 fact.strength == "strong" and _fact_matches_provenance(fact, item)
                 for fact in context.compilation.facts

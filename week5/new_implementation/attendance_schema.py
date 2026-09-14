@@ -301,7 +301,9 @@ class PlannerProposal(_StrictPlannerModel):
             or self.group_by
             or self.projection
         ):
-            raise ValueError("result intent cannot be combined with other result choices")
+            raise ValueError(
+                "result intent cannot be combined with other result choices"
+            )
         if (
             self.projection
             and self.answer_contract

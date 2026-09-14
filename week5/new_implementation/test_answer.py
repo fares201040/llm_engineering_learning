@@ -1079,7 +1079,9 @@ class EmployeeResolutionTests(unittest.TestCase):
             answer.EmployeeCandidate(employee_id="A10002", name="Faris North"),
         ]
 
-        self.assertEqual(answer._select_pending_employees("٢", candidates), [candidates[1]])
+        self.assertEqual(
+            answer._select_pending_employees("٢", candidates), [candidates[1]]
+        )
         self.assertEqual(answer._select_pending_employees("all", candidates), [])
         self.assertEqual(
             answer._select_pending_employees("all", candidates, allow_multiple=True),
@@ -1964,7 +1966,9 @@ class RequestCompletenessTests(unittest.TestCase):
 
     def test_bare_exact_employee_asks_for_intent_without_planning_or_retrieval(self):
         with (
-            patch.object(answer, "load_employee_directory", return_value=[self.employee]),
+            patch.object(
+                answer, "load_employee_directory", return_value=[self.employee]
+            ),
             patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
             patch.object(answer, "propose_query") as planner,
             patch.object(answer, "fetch_exact_chroma") as retrieval,
@@ -1984,7 +1988,9 @@ class RequestCompletenessTests(unittest.TestCase):
 
     def test_partial_bare_name_confirms_then_asks_for_intent(self):
         with (
-            patch.object(answer, "load_employee_directory", return_value=[self.employee]),
+            patch.object(
+                answer, "load_employee_directory", return_value=[self.employee]
+            ),
             patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
             patch.object(answer, "propose_query") as planner,
             patch.object(answer, "fetch_exact_chroma") as retrieval,
@@ -2012,7 +2018,9 @@ class RequestCompletenessTests(unittest.TestCase):
             return _proposal_from_facts(question, kwargs["semantic_facts"])
 
         with (
-            patch.object(answer, "load_employee_directory", return_value=[self.employee]),
+            patch.object(
+                answer, "load_employee_directory", return_value=[self.employee]
+            ),
             patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
             patch.object(answer, "propose_query", side_effect=propose),
             patch.object(answer, "_postgres_enabled", return_value=True),
@@ -2021,7 +2029,11 @@ class RequestCompletenessTests(unittest.TestCase):
                 "execute_exact_postgres",
                 return_value=(
                     [],
-                    {"operation": "distinct_count", "value": 2, "measure": "distinct_dates"},
+                    {
+                        "operation": "distinct_count",
+                        "value": 2,
+                        "measure": "distinct_dates",
+                    },
                     2,
                 ),
             ) as retrieval,
@@ -2037,7 +2049,9 @@ class RequestCompletenessTests(unittest.TestCase):
 
     def test_vague_attendance_with_employee_asks_for_missing_intent(self):
         with (
-            patch.object(answer, "load_employee_directory", return_value=[self.employee]),
+            patch.object(
+                answer, "load_employee_directory", return_value=[self.employee]
+            ),
             patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
             patch.object(answer, "propose_query") as planner,
             patch.object(answer, "fetch_exact_chroma") as retrieval,
@@ -2065,7 +2079,10 @@ class RequestCompletenessTests(unittest.TestCase):
                 name="employees", evidence_text="employees"
             ),
             answer_contract=answer.AnswerContract(
-                shape="scalar", unit="employees", subject_field="Employee_ID", grain=["Employee_ID"]
+                shape="scalar",
+                unit="employees",
+                subject_field="Employee_ID",
+                grain=["Employee_ID"],
             ),
         )
         with (
@@ -2118,7 +2135,9 @@ class EmployeeProfileTests(unittest.TestCase):
             patch.object(answer, "load_employee_directory", return_value=employees),
             patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
             patch.object(answer, "_postgres_enabled", return_value=False),
-            patch.object(answer, "fetch_exact_chroma", return_value=profile_rows) as retrieve,
+            patch.object(
+                answer, "fetch_exact_chroma", return_value=profile_rows
+            ) as retrieve,
             patch.object(answer, "completion") as final_llm,
         ):
             first, chunks, state = answer.answer_question_with_state(
@@ -2173,7 +2192,9 @@ class SurfaceCorrectionRuntimeTests(unittest.TestCase):
 
     def test_high_confidence_typo_executes_and_discloses_material_correction(self):
         with (
-            patch.object(answer, "load_employee_directory", return_value=[self.employee]),
+            patch.object(
+                answer, "load_employee_directory", return_value=[self.employee]
+            ),
             patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
             patch.object(answer, "_postgres_enabled", return_value=True),
             patch.object(
@@ -2192,7 +2213,9 @@ class SurfaceCorrectionRuntimeTests(unittest.TestCase):
 
     def test_lower_confidence_typo_clarifies_then_resumes_original_request(self):
         with (
-            patch.object(answer, "load_employee_directory", return_value=[self.employee]),
+            patch.object(
+                answer, "load_employee_directory", return_value=[self.employee]
+            ),
             patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
             patch.object(answer, "_postgres_enabled", return_value=True),
             patch.object(

@@ -226,8 +226,7 @@ def compile_profile_query(
     )
     order = ", ".join(POSTGRES_FIELD_MAP[field] for field in definition.projection)
     return _query(
-        f"SELECT DISTINCT {columns} FROM {table} "
-        f"WHERE {where.sql} ORDER BY {order}",
+        f"SELECT DISTINCT {columns} FROM {table} WHERE {where.sql} ORDER BY {order}",
         where.params,
         "profile",
     )

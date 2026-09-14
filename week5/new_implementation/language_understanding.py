@@ -91,9 +91,13 @@ class QuestionSurface(_StrictFrozenModel):
         for candidate in self.candidates:
             start, end = candidate.evidence_span
             if end > len(self.original_text):
-                raise ValueError("candidate evidence span exceeds the original question")
+                raise ValueError(
+                    "candidate evidence span exceeds the original question"
+                )
             if self.original_text[start:end] != candidate.evidence_text:
-                raise ValueError("candidate evidence must match its original source span")
+                raise ValueError(
+                    "candidate evidence must match its original source span"
+                )
         return self
 
 

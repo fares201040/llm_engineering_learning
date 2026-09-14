@@ -44,8 +44,9 @@ class TolerantInputContractTests(unittest.TestCase):
             {"unexpected": "value"},
         )
         for replacement in invalid_values:
-            with self.subTest(replacement=replacement), self.assertRaises(
-                ValidationError
+            with (
+                self.subTest(replacement=replacement),
+                self.assertRaises(ValidationError),
             ):
                 SurfaceCandidate.model_validate(
                     {**candidate.model_dump(), **replacement}

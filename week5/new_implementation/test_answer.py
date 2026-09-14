@@ -626,6 +626,8 @@ class UnsupportedLanguageBoundaryTests(unittest.TestCase):
             ("Count records and average worked hours", "multi_stage_aggregation"),
             ("Show first 3 records", "unsupported_constraint"),
             ("Show last 3 records", "unsupported_constraint"),
+            ("Show records from not a Date to tomorrow", "unsupported_constraint"),
+            ("Show records from not-a-Date to tomorrow", "unsupported_constraint"),
         )
         for question, expected_capability in cases:
             with (
@@ -651,6 +653,20 @@ class UnsupportedLanguageBoundaryTests(unittest.TestCase):
             postgres.assert_not_called()
             exact_chroma.assert_not_called()
             semantic_chroma.assert_not_called()
+
+    def test_unknown_employee_subject_clarifies_before_retrieval(self):
+        with (
+            patch.object(answer, "load_employee_directory", return_value=[]),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "execute_exact_postgres") as postgres,
+            patch.object(answer, "fetch_exact_chroma") as exact_chroma,
+            self.assertRaises(answer.EmployeeClarificationRequired) as raised,
+        ):
+            answer.fetch_context("Show employee Quill attendance")
+
+        self.assertEqual(raised.exception.resolution.outcome, "none")
+        postgres.assert_not_called()
+        exact_chroma.assert_not_called()
 
 
 class PlannerProposalSchemaTests(unittest.TestCase):

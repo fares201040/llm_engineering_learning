@@ -1053,6 +1053,15 @@ class TemporalCompositionDetectorTests(unittest.TestCase):
             ["Date", "Status"],
         )
 
+    def test_longer_group_field_does_not_inherit_embedded_measure_subject(self):
+        facts = detect_semantic_facts(
+            "Count attendance records by day type", ResolutionContext({})
+        )
+
+        self.assertEqual(
+            [fact.field for fact in facts if fact.kind == "group_by"], ["Day_Type"]
+        )
+
     def test_projection_delimiters_do_not_leak_from_correction_prefix(self):
         facts = detect_semantic_facts(
             "No, show department Op",
@@ -1081,6 +1090,32 @@ class TemporalCompositionDetectorTests(unittest.TestCase):
                 self.assertFalse(
                     [f for f in facts if f.kind in {"calculation", "unsupported"}],
                     facts,
+                )
+
+    def test_employee_subject_syntax_creates_a_bounded_entity_candidate(self):
+        facts = detect_semantic_facts(
+            "Show employee Quill attendance", ResolutionContext({})
+        )
+
+        self.assertEqual(
+            [(fact.field, fact.values) for fact in facts if fact.kind == "entity"],
+            [("Name", ("Quill",))],
+        )
+
+    def test_numeric_field_semantic_and_calculation_suffixes_are_not_filters(self):
+        cases = (
+            "Find suspicious lateness patterns for A10018",
+            "Find unusual overtime patterns for A10018",
+            "Find unusual leave hours attendance for A10018",
+            "Find unusual leave hour attendance for A10018",
+            "Find unusual leave history attendance for A10018",
+            ("What is the combined total worked hours sum for A10018 and A10019"),
+        )
+        for question in cases:
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(question, ResolutionContext({}))
+                self.assertFalse(
+                    [fact for fact in facts if fact.kind == "unsupported"], facts
                 )
 
     def test_non_temporal_on_preserves_employee_and_catalog_constraint(self):
@@ -1342,6 +1377,18 @@ class SemanticResolutionTests(unittest.TestCase):
                             for f in facts
                         )
                     )
+
+        numeric_subject = detect_semantic_facts(
+            "Show employee 12345 attendance", ResolutionContext({})
+        )
+        self.assertIn(
+            "malformed_identifier",
+            {
+                fact.concept_name
+                for fact in numeric_subject
+                if fact.kind == "unsupported"
+            },
+        )
 
     def test_possessive_id_does_not_create_an_unresolved_name(self):
         facts = detect_semantic_facts(

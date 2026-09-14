@@ -635,10 +635,20 @@ def _clause_operand_ends(question, start, fields, context, field, operator, cach
 def _parse_constraint_clauses(
     question, context, *, excluded_spans=(), include_typed=False
 ):
-    fields = tuple(
+    detected_fields = tuple(
         item
         for item in _registry_field_occurrences(question)
         if not any(lo <= item[1] and item[2] <= hi for lo, hi in excluded_spans)
+    )
+    fields = tuple(
+        item
+        for item in detected_fields
+        if not any(
+            other[1] <= item[1]
+            and item[2] <= other[2]
+            and (item[1], item[2]) != (other[1], other[2])
+            for other in detected_fields
+        )
     )
     value_spans = {
         span
@@ -676,6 +686,11 @@ def _parse_constraint_clauses(
             remainder = remainder[:lo] + " " * (hi - lo) + remainder[hi:]
         if re.sub(r"\b(?:and|the|only)\b|[\s,?.!]", "", remainder, flags=re.I):
             projection_fields = []
+    semantic_request = any(
+        evidence_occurs(question, phrase)
+        for intent in RETRIEVAL_INTENT_DEFINITIONS.values()
+        for phrase in intent.natural_names
+    )
     clauses = []
     for field, start, end in fields:
         definition = FIELD_DEFINITIONS[field]
@@ -713,6 +728,22 @@ def _parse_constraint_clauses(
             continue
         if not recognized and not preposed and re.match(r"\s*[,;?!]", question[end:]):
             continue
+        if definition.resolution_kind == "numeric" and not recognized and not preposed:
+            semantic_suffix = re.match(
+                CONSTRAINT_CLAUSE_GRAMMAR["semantic_field_suffix"],
+                question[end:],
+                re.I,
+            )
+            calculation_suffix = any(
+                re.match(
+                    rf"\s*{re.escape(normalize_semantic_text(phrase))}\b",
+                    normalize_semantic_text(question[end:]),
+                )
+                for calculation in CALCULATION_DEFINITIONS.values()
+                for phrase in calculation.natural_names
+            )
+            if semantic_request or semantic_suffix or calculation_suffix:
+                continue
         operator = operator if recognized else "eq"
         operand_start = operator_end if recognized else end
         candidates = _clause_operand_ends(
@@ -768,6 +799,7 @@ def _parse_constraint_clauses(
             and not resolved
             and (
                 non_constraint_role
+                or semantic_request
                 or not question[end:].strip(" \t\r\n?.!")
                 or (
                     any(not question[end:candidate].strip() for candidate in candidates)
@@ -984,6 +1016,16 @@ class IdentifierResolver(FieldResolver):
 
     def detect(self, question, field, context):
         facts = []
+        malformed_numeric_subjects = tuple(
+            match.group("value")
+            for match in re.finditer(
+                r"\bemployees?\s+(?P<value>\d{4,})\b", question, re.I
+            )
+        )
+        facts.extend(
+            _unsupported_fact("malformed_identifier", value)
+            for value in malformed_numeric_subjects
+        )
         for match in re.finditer(
             r"\b[A-Za-z][A-Za-z0-9_-]*\d[A-Za-z0-9_-]*\b", question
         ):
@@ -1114,6 +1156,13 @@ class EntityResolver(FieldResolver):
             while name_end > start and question[name_end - 1].isspace():
                 name_end -= 1
             syntax_spans.append((start, name_end))
+        for match in re.finditer(
+            r"\bemployee\s+(?P<name>[^\W\d_][\w'-]*(?:\s+[^\W\d_][\w'-]*)*?)"
+            r"\s+(?=(?:attendance|records?)\b)",
+            question,
+            re.I,
+        ):
+            syntax_spans.append(match.span("name"))
         known_spans = [
             span
             for employee in context.employees
@@ -2158,7 +2207,8 @@ def _grouping_facts(
         and FIELD_DEFINITIONS[definition.aggregation_field].groupable
         for phrase in definition.natural_names
         if not any(
-            set(_token_forms(phrase)) & set(_token_forms(field_phrase))
+            evidence_occurs(phrase, field_phrase)
+            or evidence_occurs(field_phrase, phrase)
             for _, field_phrase in field_matches
         )
     ]

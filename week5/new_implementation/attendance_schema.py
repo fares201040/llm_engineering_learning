@@ -881,6 +881,8 @@ MEASURE_DEFINITIONS = MappingProxyType(
                 "attendance records",
                 "record",
                 "records",
+                "entry",
+                "entries",
                 "row",
                 "rows",
             ),
@@ -1102,6 +1104,7 @@ CONSTRAINT_CLAUSE_GRAMMAR = MappingProxyType(
         "list_separator": r",|\band\b",
         "identity_scope": r"\bfor\b",
         "non_constraint_prefix": r"\b(?:which|what|by|per|each|every|all|any|show|list|display)\s*$",
+        "semantic_field_suffix": r"\s*(?:patterns?|behaviou?r|issues?|summar(?:y|ies)|attendance)\b",
         "projection": r"\b(?:show|list|display|select)\s+(.+?)(?:\s+(?:from|for|where|with|ordered|sorted)\b|$)",
     }
 )
@@ -1140,6 +1143,7 @@ UNSUPPORTED_REQUEST_PATTERNS = MappingProxyType(
         "cross_period_comparison": (
             r"\bcompare\b[^?.!]*\b(?:period|month|week|year)s?\b",
         ),
+        "unsupported_constraint": (r"\bnot[-\s]+(?:a[-\s]+)?(?:date|day)\b",),
         "unsupported_calculation": (
             r"\b(?:median|percentile|standard deviation|variance)\b",
         ),

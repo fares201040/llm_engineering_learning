@@ -22,6 +22,7 @@ class TestQuestion(BaseModel):
     expected_calculation: dict | None = None
     expected_answer_facts: list[str] = Field(default_factory=list)
     expected_clarification_ids: list[str] = Field(default_factory=list)
+    expected_clarification_outcome: Literal["none", "ambiguous"] | None = None
     expected_record_ids: list[str] = Field(default_factory=list)
     expected_group_values: list[dict] = Field(default_factory=list)
     expected_normalized_result: dict | None = None

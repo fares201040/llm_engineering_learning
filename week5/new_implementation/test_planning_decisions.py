@@ -169,6 +169,14 @@ class DeterministicPlanningDraftTests(unittest.TestCase):
                     (plan.aggregation, plan.aggregation_field), (operation, field)
                 )
 
+    def test_entries_mean_records_even_when_employee_is_a_filter_subject(self):
+        _proposal, plan = self._assemble(
+            "How many entries are listed for employee A10018?"
+        )
+
+        self.assertEqual(plan.measure, "attendance_records")
+        self.assertEqual((plan.aggregation, plan.aggregation_field), ("count", None))
+
 
 if __name__ == "__main__":
     unittest.main()

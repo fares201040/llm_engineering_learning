@@ -15,6 +15,7 @@ if __package__ and __package__.startswith("week5."):
         POSTGRES_ATTENDANCE_TABLE,
         POSTGRES_DSN,
         ConversationState,
+        EmployeeClarificationRequired,
         QueryPlan,
         SemanticPlanValidationError,
         _import_psycopg,
@@ -30,6 +31,7 @@ elif __package__ == "new_evaluation":
         POSTGRES_ATTENDANCE_TABLE,
         POSTGRES_DSN,
         ConversationState,
+        EmployeeClarificationRequired,
         QueryPlan,
         SemanticPlanValidationError,
         _import_psycopg,
@@ -49,6 +51,7 @@ else:
         POSTGRES_ATTENDANCE_TABLE,
         POSTGRES_DSN,
         ConversationState,
+        EmployeeClarificationRequired,
         QueryPlan,
         SemanticPlanValidationError,
         _import_psycopg,
@@ -160,6 +163,11 @@ def classify_case_diagnostic(
         return "excess_or_ungrounded_fact"
     if "answer_contract_mismatch" in violation_codes:
         return "answer_contract_mismatch"
+    if {
+        "violation_codes_ok",
+        "unsupported_capabilities_ok",
+    }.intersection(failed_checks):
+        return "unsupported_plan_shape"
     if stage == "session_state" or {
         "clarification_ok",
         "multi_turn_ok",
@@ -244,10 +252,14 @@ def diagnose_behavior_result(
     )
     if not failed_checks:
         return None
-    if {"clarification_ok", "multi_turn_ok", "employee_ids_ok"}.intersection(
+    if {"violation_codes_ok", "unsupported_capabilities_ok"}.intersection(
         failed_checks
     ):
-        stage: DiagnosticStage = "session_state"
+        stage: DiagnosticStage = "semantic_validation"
+    elif {"clarification_ok", "multi_turn_ok", "employee_ids_ok"}.intersection(
+        failed_checks
+    ):
+        stage = "session_state"
     elif {
         "matched_count_ok",
         "calculation_ok",
@@ -388,6 +400,29 @@ def evaluate_behavior(test: TestQuestion) -> BehaviorEval:
 
     try:
         _chunks, plan, calculation, matched_count = fetch_context(test.question)
+    except EmployeeClarificationRequired as exc:
+        actual_ids = [item.employee_id for item in exc.resolution.candidates]
+        outcome_ok = test.expected_clarification_outcome == exc.resolution.outcome
+        ids_ok = (
+            actual_ids == test.expected_clarification_ids
+            if test.expected_clarification_ids
+            else True
+        )
+        expected = test.expected_clarification_outcome is not None
+        accepted = expected and outcome_ok and ids_ok
+        return BehaviorEval(
+            plan_ok=accepted,
+            employee_ids_ok=accepted,
+            matched_count_ok=accepted,
+            calculation_ok=accepted,
+            clarification_ok=accepted,
+            answer_facts_ok=accepted,
+            normalized_result_ok=accepted,
+            expected_error_ok=test.expected_error is None,
+            violation_codes_ok=not test.expected_violation_codes,
+            answer_contract_ok=test.expected_answer_contract is None,
+            unsupported_capabilities_ok=not test.expected_unsupported_capabilities,
+        )
     except SemanticPlanValidationError as exc:
         actual_codes = sorted({item.code for item in exc.violations})
         actual_capabilities = sorted(

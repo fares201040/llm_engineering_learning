@@ -146,6 +146,26 @@ class PrivacySafeDiagnosticTests(unittest.TestCase):
         self.assertEqual(diagnostic.failed_checks, ("matched_count_ok",))
         self.assertNotIn("question", diagnostic.model_dump())
 
+    def test_semantic_expectation_mismatch_outranks_cascaded_session_checks(self):
+        behavior = evaluation.BehaviorEval(
+            plan_ok=False,
+            employee_ids_ok=False,
+            matched_count_ok=False,
+            calculation_ok=False,
+            clarification_ok=False,
+            violation_codes_ok=False,
+            unsupported_capabilities_ok=False,
+        )
+
+        diagnostic = evaluation.diagnose_behavior_result(
+            index=9,
+            category="synthetic",
+            result=behavior,
+        )
+
+        self.assertEqual(diagnostic.stage, "semantic_validation")
+        self.assertEqual(diagnostic.cause, "unsupported_plan_shape")
+
     def test_sub_five_answer_diagnostic_uses_the_scored_execution_documents(self):
         judged = evaluation.AnswerEval(
             feedback="Synthetic feedback",
@@ -1576,6 +1596,35 @@ class EvaluationWiringTests(unittest.TestCase):
         ):
             rejected = evaluation.evaluate_behavior(wrong_type)
         self.assertFalse(rejected.expected_error_ok)
+
+    def test_employee_resolution_failure_uses_typed_clarification_outcome(self):
+        from week5.new_implementation import answer
+
+        test = TestQuestion(
+            question="Show attendance for Synthetic Unknown Person",
+            keywords=[],
+            reference_answer="A controlled clarification.",
+            category="malformed_input",
+            expected_clarification_outcome="none",
+        )
+        proposal = answer.PlannerProposal(
+            status="ready",
+            answer_contract=answer.AnswerContract(shape="rows", unit="value"),
+        )
+        rejection = answer.EmployeeClarificationRequired(
+            proposal,
+            (),
+            answer.EmployeeResolution(
+                outcome="none",
+                candidates=[],
+                reference="Synthetic Unknown Person",
+            ),
+        )
+
+        with patch.object(evaluation, "fetch_context", side_effect=rejection):
+            result = evaluation.evaluate_behavior(test)
+
+        self.assertTrue(all(result.model_dump().values()), result.model_dump())
 
     def test_missing_private_corpus_has_an_actionable_error(self):
         missing = Path(__file__).with_name("missing-private-corpus.jsonl")

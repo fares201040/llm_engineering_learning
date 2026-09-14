@@ -4,7 +4,9 @@ import hashlib
 import json
 import math
 from pathlib import Path
-from pydantic import BaseModel, Field
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field
 from litellm import completion
 
 if __package__ and __package__.startswith("week5."):
@@ -113,6 +115,179 @@ class BehaviorEval(BaseModel):
     violation_codes_ok: bool = True
     answer_contract_ok: bool = True
     unsupported_capabilities_ok: bool = True
+
+
+FailureCause = Literal[
+    "provider_structural_failure",
+    "unsupported_provider_decision",
+    "missing_deterministic_fact",
+    "excess_or_ungrounded_fact",
+    "unsupported_plan_shape",
+    "answer_contract_mismatch",
+    "retrieval_or_calculation_mismatch",
+    "renderer_incomplete",
+    "irrelevant_evidence",
+    "session_state_failure",
+    "evaluator_expectation_drift",
+]
+DiagnosticStage = Literal[
+    "provider_response_validation",
+    "semantic_validation",
+    "result_validation",
+    "answer_rendering",
+    "session_state",
+    "answer_judging",
+]
+
+
+def classify_case_diagnostic(
+    *,
+    stage: DiagnosticStage,
+    violation_codes: tuple[str, ...] = (),
+    unsupported_capabilities: tuple[str, ...] = (),
+    failed_checks: tuple[str, ...] = (),
+    sub_five_dimensions: tuple[str, ...] = (),
+    evidence_count: int | None = None,
+) -> FailureCause:
+    """Classify one failure using controlled, non-sensitive structure only."""
+    if stage == "provider_response_validation":
+        return "provider_structural_failure"
+    if unsupported_capabilities:
+        return "unsupported_plan_shape"
+    if "uncovered_fact" in violation_codes:
+        return "missing_deterministic_fact"
+    if "ungrounded_constraint" in violation_codes:
+        return "excess_or_ungrounded_fact"
+    if "answer_contract_mismatch" in violation_codes:
+        return "answer_contract_mismatch"
+    if stage == "session_state" or {
+        "clarification_ok",
+        "multi_turn_ok",
+        "employee_ids_ok",
+    }.intersection(failed_checks):
+        return "session_state_failure"
+    if stage == "result_validation" or {
+        "matched_count_ok",
+        "calculation_ok",
+        "normalized_result_ok",
+        "record_ids_ok",
+        "group_values_ok",
+    }.intersection(failed_checks):
+        return "retrieval_or_calculation_mismatch"
+    if stage == "answer_rendering" or "answer_facts_ok" in failed_checks:
+        return "renderer_incomplete"
+    if "relevance" in sub_five_dimensions and (evidence_count or 0) > 0:
+        return "irrelevant_evidence"
+    if violation_codes:
+        return "unsupported_provider_decision"
+    return "evaluator_expectation_drift"
+
+
+class CaseDiagnostic(BaseModel):
+    """Privacy-safe structural classification for one corpus case."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    index: int = Field(ge=0)
+    category: str = Field(min_length=1)
+    stage: DiagnosticStage
+    cause: FailureCause
+    violation_codes: tuple[str, ...] = ()
+    unsupported_capabilities: tuple[str, ...] = ()
+    failed_checks: tuple[str, ...] = ()
+    sub_five_dimensions: tuple[str, ...] = ()
+    fact_kind_counts: dict[str, int] = Field(default_factory=dict)
+    evidence_count: int | None = Field(default=None, ge=0)
+
+    @classmethod
+    def from_failure(
+        cls,
+        *,
+        index: int,
+        category: str,
+        stage: DiagnosticStage,
+        violation_codes: tuple[str, ...] = (),
+        unsupported_capabilities: tuple[str, ...] = (),
+        failed_checks: tuple[str, ...] = (),
+        sub_five_dimensions: tuple[str, ...] = (),
+        fact_kind_counts: dict[str, int] | None = None,
+        evidence_count: int | None = None,
+    ) -> "CaseDiagnostic":
+        cause = classify_case_diagnostic(
+            stage=stage,
+            violation_codes=violation_codes,
+            unsupported_capabilities=unsupported_capabilities,
+            failed_checks=failed_checks,
+            sub_five_dimensions=sub_five_dimensions,
+            evidence_count=evidence_count,
+        )
+        return cls(
+            index=index,
+            category=category,
+            stage=stage,
+            cause=cause,
+            violation_codes=tuple(sorted(set(violation_codes))),
+            unsupported_capabilities=tuple(sorted(set(unsupported_capabilities))),
+            failed_checks=tuple(sorted(set(failed_checks))),
+            sub_five_dimensions=tuple(sorted(set(sub_five_dimensions))),
+            fact_kind_counts=dict(sorted((fact_kind_counts or {}).items())),
+            evidence_count=evidence_count,
+        )
+
+
+def diagnose_behavior_result(
+    *, index: int, category: str, result: BehaviorEval
+) -> CaseDiagnostic | None:
+    """Convert failed deterministic checks into one privacy-safe diagnosis."""
+    failed_checks = tuple(
+        name for name, value in result.model_dump().items() if not value
+    )
+    if not failed_checks:
+        return None
+    if {"clarification_ok", "multi_turn_ok", "employee_ids_ok"}.intersection(
+        failed_checks
+    ):
+        stage: DiagnosticStage = "session_state"
+    elif {
+        "matched_count_ok",
+        "calculation_ok",
+        "normalized_result_ok",
+        "record_ids_ok",
+        "group_values_ok",
+    }.intersection(failed_checks):
+        stage = "result_validation"
+    elif "answer_facts_ok" in failed_checks:
+        stage = "answer_rendering"
+    else:
+        stage = "semantic_validation"
+    return CaseDiagnostic.from_failure(
+        index=index,
+        category=category,
+        stage=stage,
+        failed_checks=failed_checks,
+    )
+
+
+def evaluate_answer_with_diagnostic(
+    test: TestQuestion, *, index: int
+) -> tuple[AnswerEval, CaseDiagnostic | None]:
+    """Judge one answer and classify sub-perfect scores from that same run."""
+    result, _generated_answer, documents = evaluate_answer(test)
+    dimensions = tuple(
+        name
+        for name in ("accuracy", "completeness", "relevance")
+        if getattr(result, name) < 5
+    )
+    if not dimensions:
+        return result, None
+    diagnostic = CaseDiagnostic.from_failure(
+        index=index,
+        category=test.category,
+        stage="answer_judging",
+        sub_five_dimensions=dimensions,
+        evidence_count=len(documents),
+    )
+    return result, diagnostic
 
 
 def _expected_subset(actual: dict | None, expected: dict | None):

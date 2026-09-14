@@ -19,6 +19,163 @@ PRIVATE_FIXTURES_AVAILABLE = (
 )
 
 
+class PrivacySafeDiagnosticTests(unittest.TestCase):
+    def test_case_diagnostic_contains_structure_without_private_text(self):
+        diagnostic = evaluation.CaseDiagnostic.from_failure(
+            index=7,
+            category="worked_days",
+            stage="semantic_validation",
+            violation_codes=("uncovered_fact",),
+            fact_kind_counts={"measure": 1, "predicate": 1},
+        )
+
+        payload = diagnostic.model_dump(mode="json")
+
+        self.assertEqual(payload["cause"], "missing_deterministic_fact")
+        self.assertEqual(payload["index"], 7)
+        self.assertEqual(payload["fact_kind_counts"], {"measure": 1, "predicate": 1})
+        for forbidden in (
+            "question",
+            "reference_answer",
+            "generated_answer",
+            "evidence_text",
+            "record_ids",
+            "employee_ids",
+            "provider_payload",
+            "exception",
+        ):
+            self.assertNotIn(forbidden, payload)
+
+    def test_failure_classifier_uses_stable_architectural_precedence(self):
+        cases = (
+            (
+                {"stage": "provider_response_validation"},
+                "provider_structural_failure",
+            ),
+            (
+                {
+                    "stage": "semantic_validation",
+                    "unsupported_capabilities": ("grouped_percentage",),
+                },
+                "unsupported_plan_shape",
+            ),
+            (
+                {
+                    "stage": "semantic_validation",
+                    "violation_codes": ("uncovered_fact",),
+                },
+                "missing_deterministic_fact",
+            ),
+            (
+                {
+                    "stage": "semantic_validation",
+                    "violation_codes": ("ungrounded_constraint",),
+                },
+                "excess_or_ungrounded_fact",
+            ),
+            (
+                {
+                    "stage": "semantic_validation",
+                    "violation_codes": ("answer_contract_mismatch",),
+                },
+                "answer_contract_mismatch",
+            ),
+            (
+                {"stage": "result_validation", "failed_checks": ("calculation_ok",)},
+                "retrieval_or_calculation_mismatch",
+            ),
+            (
+                {"stage": "answer_rendering", "failed_checks": ("answer_facts_ok",)},
+                "renderer_incomplete",
+            ),
+            (
+                {"stage": "session_state", "failed_checks": ("multi_turn_ok",)},
+                "session_state_failure",
+            ),
+            (
+                {
+                    "stage": "answer_judging",
+                    "sub_five_dimensions": ("relevance",),
+                    "evidence_count": 4,
+                },
+                "irrelevant_evidence",
+            ),
+            (
+                {
+                    "stage": "answer_judging",
+                    "sub_five_dimensions": ("accuracy",),
+                },
+                "evaluator_expectation_drift",
+            ),
+        )
+
+        for inputs, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertEqual(
+                    evaluation.classify_case_diagnostic(**inputs), expected
+                )
+
+    def test_case_diagnostic_rejects_arbitrary_private_fields(self):
+        with self.assertRaises(Exception):
+            evaluation.CaseDiagnostic.model_validate(
+                {
+                    "index": 0,
+                    "category": "synthetic",
+                    "stage": "answer_judging",
+                    "cause": "evaluator_expectation_drift",
+                    "question": "private text",
+                }
+            )
+
+    def test_behavior_diagnostic_classifies_failed_checks_without_case_text(self):
+        behavior = evaluation.BehaviorEval(
+            plan_ok=True,
+            employee_ids_ok=True,
+            matched_count_ok=False,
+            calculation_ok=True,
+            clarification_ok=True,
+        )
+
+        diagnostic = evaluation.diagnose_behavior_result(
+            index=3,
+            category="synthetic_exact",
+            result=behavior,
+        )
+
+        self.assertEqual(diagnostic.cause, "retrieval_or_calculation_mismatch")
+        self.assertEqual(diagnostic.failed_checks, ("matched_count_ok",))
+        self.assertNotIn("question", diagnostic.model_dump())
+
+    def test_sub_five_answer_diagnostic_uses_the_scored_execution_documents(self):
+        judged = evaluation.AnswerEval(
+            feedback="Synthetic feedback",
+            accuracy=5,
+            completeness=5,
+            relevance=4,
+        )
+        documents = [Result(page_content="Synthetic evidence", metadata={})]
+        test = TestQuestion(
+            question="Synthetic question",
+            keywords=[],
+            reference_answer="Synthetic reference",
+            category="semantic",
+        )
+
+        with patch.object(
+            evaluation,
+            "evaluate_answer",
+            return_value=(judged, "Synthetic answer", documents),
+        ):
+            result, diagnostic = evaluation.evaluate_answer_with_diagnostic(
+                test, index=9
+            )
+
+        self.assertIs(result, judged)
+        self.assertEqual(diagnostic.cause, "irrelevant_evidence")
+        self.assertEqual(diagnostic.evidence_count, 1)
+        self.assertEqual(diagnostic.sub_five_dimensions, ("relevance",))
+
+
 class BaselineCapabilityParityTests(unittest.TestCase):
     def test_temporal_filters_preserve_projection_and_returned_rows(self):
         for fields, projection in (

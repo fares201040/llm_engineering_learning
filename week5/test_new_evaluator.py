@@ -65,6 +65,7 @@ class ApdcEvaluationDashboardTests(unittest.TestCase):
             ],
         )
         self.assertEqual(details.loc[1, "Failed checks"], "employee_ids_ok")
+        self.assertNotIn("Question", details.columns)
 
     def test_retrieval_evaluation_aggregates_apdc_metrics(self):
         dashboard = self.dashboard()
@@ -97,6 +98,7 @@ class ApdcEvaluationDashboardTests(unittest.TestCase):
             [{"Category": "identity", "Average MRR": 0.75}],
         )
         self.assertEqual(len(details), 2)
+        self.assertNotIn("Question", details.columns)
 
     def test_answer_evaluation_reports_errors_without_exception_details(self):
         dashboard = self.dashboard()
@@ -119,6 +121,29 @@ class ApdcEvaluationDashboardTests(unittest.TestCase):
         self.assertTrue(category_rows.empty)
         self.assertEqual(details.loc[0, "Status"], "Failed (RuntimeError)")
         self.assertNotIn("password", details.to_string().lower())
+        self.assertNotIn("Question", details.columns)
+
+    def test_answer_evaluation_reports_privacy_safe_failure_causes(self):
+        dashboard = self.dashboard()
+        cases = [SimpleNamespace(question="Private question", category="identity")]
+        result = SimpleNamespace(accuracy=4.0, completeness=5.0, relevance=5.0)
+        diagnostic = SimpleNamespace(cause="evaluator_expectation_drift")
+
+        with (
+            patch.object(dashboard.apdc_evaluation, "load_tests", return_value=cases),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "evaluate_answer_with_diagnostic",
+                return_value=(result, diagnostic),
+            ),
+        ):
+            _summary, _category_rows, details = dashboard.run_answer_evaluation(
+                0, progress=None
+            )
+
+        self.assertEqual(details.loc[0, "Cause"], "evaluator_expectation_drift")
+        self.assertNotIn("Question", details.columns)
+        self.assertNotIn("Private question", details.to_string())
 
     def test_dataset_verification_renders_manifest_summary(self):
         dashboard = self.dashboard()

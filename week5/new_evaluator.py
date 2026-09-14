@@ -58,18 +58,24 @@ def run_behavior_evaluation(maximum, progress=gr.Progress()):
 
     for index, case in enumerate(cases, start=1):
         try:
-            checks = apdc_evaluation.evaluate_behavior(case).model_dump()
+            behavior_result = apdc_evaluation.evaluate_behavior(case)
+            checks = behavior_result.model_dump()
             failed_checks = [name for name, value in checks.items() if not value]
             case_passed = not failed_checks
+            diagnostic = apdc_evaluation.diagnose_behavior_result(
+                index=index - 1,
+                category=case.category,
+                result=behavior_result,
+            )
             passed += int(case_passed)
             category_scores[case.category].append(100.0 if case_passed else 0.0)
             details.append(
                 {
                     "Case": index - 1,
                     "Category": case.category,
-                    "Question": case.question,
                     "Status": "Passed" if case_passed else "Failed",
                     "Failed checks": ", ".join(failed_checks),
+                    "Cause": diagnostic.cause if diagnostic else "",
                 }
             )
         except Exception as exc:
@@ -78,9 +84,9 @@ def run_behavior_evaluation(maximum, progress=gr.Progress()):
                 {
                     "Case": index - 1,
                     "Category": case.category,
-                    "Question": case.question,
                     "Status": f"Failed ({type(exc).__name__})",
                     "Failed checks": "evaluation_error",
+                    "Cause": "provider_structural_failure",
                 }
             )
         _update_progress(progress, index, len(cases), f"Behavior case {index}")
@@ -91,7 +97,7 @@ def run_behavior_evaluation(maximum, progress=gr.Progress()):
     categories = _category_frame(category_scores, "Pass Rate")
     detail_frame = pd.DataFrame(
         details,
-        columns=["Case", "Category", "Question", "Status", "Failed checks"],
+        columns=["Case", "Category", "Status", "Failed checks", "Cause"],
     )
     return summary, categories, detail_frame
 
@@ -111,7 +117,6 @@ def run_retrieval_evaluation(maximum, progress=gr.Progress()):
                 {
                     "Case": index - 1,
                     "Category": case.category,
-                    "Question": case.question,
                     "MRR": result.mrr,
                     "nDCG": result.ndcg,
                     "Coverage %": result.keyword_coverage,
@@ -123,7 +128,6 @@ def run_retrieval_evaluation(maximum, progress=gr.Progress()):
                 {
                     "Case": index - 1,
                     "Category": case.category,
-                    "Question": case.question,
                     "MRR": None,
                     "nDCG": None,
                     "Coverage %": None,
@@ -153,7 +157,6 @@ def run_retrieval_evaluation(maximum, progress=gr.Progress()):
         columns=[
             "Case",
             "Category",
-            "Question",
             "MRR",
             "nDCG",
             "Coverage %",
@@ -171,18 +174,20 @@ def run_answer_evaluation(maximum, progress=gr.Progress()):
 
     for index, case in enumerate(cases, start=1):
         try:
-            result, _answer, _documents = apdc_evaluation.evaluate_answer(case)
+            result, diagnostic = apdc_evaluation.evaluate_answer_with_diagnostic(
+                case, index=index - 1
+            )
             results.append(result)
             category_accuracy[case.category].append(result.accuracy)
             details.append(
                 {
                     "Case": index - 1,
                     "Category": case.category,
-                    "Question": case.question,
                     "Accuracy": result.accuracy,
                     "Completeness": result.completeness,
                     "Relevance": result.relevance,
                     "Status": "Completed",
+                    "Cause": diagnostic.cause if diagnostic else "",
                 }
             )
         except Exception as exc:
@@ -190,11 +195,11 @@ def run_answer_evaluation(maximum, progress=gr.Progress()):
                 {
                     "Case": index - 1,
                     "Category": case.category,
-                    "Question": case.question,
                     "Accuracy": None,
                     "Completeness": None,
                     "Relevance": None,
                     "Status": f"Failed ({type(exc).__name__})",
+                    "Cause": "provider_structural_failure",
                 }
             )
         _update_progress(progress, index, len(cases), f"Answer case {index}")
@@ -218,11 +223,11 @@ def run_answer_evaluation(maximum, progress=gr.Progress()):
         columns=[
             "Case",
             "Category",
-            "Question",
             "Accuracy",
             "Completeness",
             "Relevance",
             "Status",
+            "Cause",
         ],
     )
     return summary, categories, detail_frame

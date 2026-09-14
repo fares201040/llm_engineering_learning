@@ -463,7 +463,11 @@ def analyze_question_surface(question: str) -> QuestionSurface:
             window = tokens[token_index : token_index + width]
             start, end = window[0].start(), window[-1].end()
             text = normalized.text[start:end]
-            if text == alias or any(character.isdigit() for character in text):
+            if (
+                text == alias
+                or any(character.isdigit() for character in text)
+                or any(token.group(0) in {"and", "or", "not"} for token in window)
+            ):
                 continue
             if _has_adjacent_negation(tokens, token_index):
                 continue

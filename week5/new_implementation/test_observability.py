@@ -7,6 +7,32 @@ from week5.new_implementation.observability import EventLogger, redact
 
 
 class ObservabilityTests(unittest.TestCase):
+    def test_input_clarification_events_contain_counts_not_identity_or_question(self):
+        events = []
+        logger = EventLogger(sink=events.append, json_format=True)
+        employees = [
+            answer.EmployeeCandidate(employee_id="A10018", name="Faris Ahmed"),
+            answer.EmployeeCandidate(employee_id="A10019", name="Faris North"),
+        ]
+        with (
+            patch.object(answer, "event_logger", logger),
+            patch.object(answer, "load_employee_directory", return_value=employees),
+            self.assertRaises(answer.EmployeeClarificationRequired),
+        ):
+            answer._fetch_context_result("who is Faris", request_id="request-1")
+
+        rendered = "\n".join(events)
+        payloads = [json.loads(event) for event in events]
+        clarification = next(
+            payload
+            for payload in payloads
+            if payload["event"] == "input_clarification_required"
+        )
+        self.assertEqual(clarification["candidate_count"], 2)
+        self.assertEqual(clarification["clarification_kind"], "employee_selection")
+        for private_value in ("who is Faris", "Faris Ahmed", "A10018", "score"):
+            self.assertNotIn(private_value, rendered)
+
     def test_grounded_planning_events_expose_counts_but_not_request_content(self):
         events = []
         logger = EventLogger(sink=lambda value: events.append(value), json_format=True)

@@ -2046,7 +2046,8 @@ class RequestCompletenessTests(unittest.TestCase):
                 "attendance for Faris Ahmed North", [], answer.ConversationState()
             )
 
-        self.assertIn("What attendance information would you like?", text)
+        self.assertIn("Which meaning", text)
+        self.assertIn("attendance records", text)
         planner.assert_not_called()
         retrieval.assert_not_called()
 
@@ -2162,6 +2163,78 @@ class EmployeeProfileTests(unittest.TestCase):
         self.assertIn("أي موظف", first)
         self.assertIn("اسم الموظف", second)
         self.assertIn("A10018", second)
+
+
+class SurfaceCorrectionRuntimeTests(unittest.TestCase):
+    def setUp(self):
+        self.employee = answer.EmployeeCandidate(
+            employee_id="A10018", name="Faris Ahmed North"
+        )
+
+    def test_high_confidence_typo_executes_and_discloses_material_correction(self):
+        with (
+            patch.object(answer, "load_employee_directory", return_value=[self.employee]),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=([], {"operation": "distinct_count", "value": 4}, 4),
+            ),
+        ):
+            text, _chunks, _state = answer.answer_question_with_state(
+                "wokred days for Faris Ahmed North", [], answer.ConversationState()
+            )
+
+        self.assertIn("understood", text.casefold())
+        self.assertIn("worked days", text.casefold())
+        self.assertIn("4", text)
+
+    def test_lower_confidence_typo_clarifies_then_resumes_original_request(self):
+        with (
+            patch.object(answer, "load_employee_directory", return_value=[self.employee]),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=([], {"operation": "distinct_count", "value": 3}, 3),
+            ) as retrieval,
+        ):
+            first, chunks, state = answer.answer_question_with_state(
+                "workd for Faris Ahmed North", [], answer.ConversationState()
+            )
+            second, chunks, state = answer.answer_question_with_state("yes", [], state)
+
+        self.assertIn("Did you mean", first)
+        self.assertEqual(chunks, [])
+        self.assertIn("3", second)
+        self.assertIsNone(state.pending_clarification)
+        retrieval.assert_called_once()
+
+    def test_arabic_short_request_resolves_name_then_renders_arabic_result(self):
+        employees = [
+            answer.EmployeeCandidate(employee_id="A10018", name="Faris Ahmed"),
+            answer.EmployeeCandidate(employee_id="A10019", name="Faris North"),
+        ]
+        with (
+            patch.object(answer, "load_employee_directory", return_value=employees),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=([], {"operation": "distinct_count", "value": 2}, 2),
+            ),
+        ):
+            first, _chunks, state = answer.answer_question_with_state(
+                "أيام الغياب للموظف فارس", [], answer.ConversationState()
+            )
+            second, _chunks, _state = answer.answer_question_with_state("١", [], state)
+
+        self.assertIn("أي موظف", first)
+        self.assertIn("النتيجة", second)
+        self.assertIn("أيام غياب", second)
 
 
 class CoverageMetadataTests(unittest.TestCase):

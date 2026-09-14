@@ -1020,6 +1020,12 @@ def compile_proposal(
                     operator=required.operator,
                     values=tuple(values),
                     name=proposed.name,
+                    origin=_choice_origin(
+                        context,
+                        kind="predicate",
+                        evidence_text=proposed.evidence_text,
+                        name=proposed.name,
+                    ),
                     evidence_text=proposed.evidence_text,
                 )
             )

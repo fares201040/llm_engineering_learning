@@ -546,6 +546,35 @@ validations, and `git diff --check` passed. The only warning remained the known
 third-party protobuf deprecation warning. Independent final re-review reported
 no Critical or Important findings.
 
+## 2026-09-14 provider-boundary and corpus closure
+
+The planner no longer asks a model to reproduce deterministic filters, measures,
+predicates, calculations, grouping, projection, ordering, limits, or answer
+contracts. Registered semantic facts assemble the internal compiler proposal.
+Only genuinely unresolved request-local candidate identifiers may cross the
+provider decision boundary, and supported fully grounded requests make zero
+provider planning calls. The former authoritative-fact overlay has been deleted.
+
+The projection + identity + temporal composition defect was traced to evidence
+being sliced from a same-width entity-masked buffer. Parsing still uses that role
+buffer, but evidence is now sliced from the untouched request. Public synthetic
+tests cover both clause orders and preserve `Date`/`Status`, the resolved employee
+ID, and the date filter.
+
+The local private evaluator corpus now uses typed semantic violation and
+unsupported-capability expectations, exact preflight exception types, and typed
+employee-clarification outcomes. No private corpus text or generated answer was
+committed or logged. The final behavior run passed 311/311. The final
+trace-backed provider answer window completed 311/311, averaging 4.402 accuracy,
+4.241 completeness, and 4.521 relevance. The 137 sub-5 results balance to 121
+judge/expectation-variance cases with passing execution traces and 16 objective
+keyword-coverage gaps in the exact evidence used by the scored answer.
+
+Unsupported language remains deliberate and typed: nested Boolean filters,
+HAVING, windows, cross-period comparisons, grouped percentages, genuine
+multi-stage aggregation, and positional first/last without a grounded order
+basis all stop before retrieval.
+
 ## APDC evaluation dashboard
 
 `week5/new_evaluator.py` is the Gradio UI for the current APDC evaluator. It

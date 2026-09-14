@@ -108,7 +108,7 @@ class ApdcEvaluationDashboardTests(unittest.TestCase):
             patch.object(dashboard.apdc_evaluation, "load_tests", return_value=cases),
             patch.object(
                 dashboard.apdc_evaluation,
-                "evaluate_answer",
+                "evaluate_answer_with_diagnostic",
                 side_effect=RuntimeError("database password must not leak"),
             ),
         ):

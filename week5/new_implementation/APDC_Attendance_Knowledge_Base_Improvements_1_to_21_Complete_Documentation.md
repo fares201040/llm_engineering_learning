@@ -2463,18 +2463,53 @@ The dashboard and its tests were added after commit
 current suite and a real browser construction/rendering smoke test. They were
 not committed or pushed at the time this documentation was updated.
 
-The next answer-quality defect is separate from the already-fixed
-single-interpretation issue. For `who is faris`, the assistant displays two
-valid candidates. The first numeric choice is revalidated and receives a typed
-employee filter, but the saved `measure="employees"` causes later population
-cleanup to remove that trusted filter. The exact backend then returns the full
-568-employee count. A second numeric reply is treated as a new turn and can
-produce the intended profile.
+The employee first-choice scope defect described in the original section-21
+handoff is now fixed. A directory-revalidated numeric clarification selection
+keeps its typed trusted employee filter through retrieval. Independent
+population, grouping, and ranking questions still clear stale employee scope.
+The paired end-to-end regressions use synthetic identities and cover both
+preservation and cleanup, so this behavior is no longer an open item.
 
-The correction must preserve an explicitly trusted, directory-validated
-clarification scope through retrieval while retaining the existing rule that
-genuine population/group/ranking questions cannot inherit stale employee
-scope. This remains diagnosed but unimplemented. Before changing production
-code, create a failing end-to-end regression for the first-choice flow and a
-paired population-scope safety regression. Do not patch the employee name,
-choice number, or screenshot wording.
+# 22. Deterministic Planning Ownership and Final Corpus Verification
+
+The planning ownership boundary was redesigned after the strict review exposed
+systematic conflicts between provider-generated proposals and independently
+detected facts. The runtime now creates a `PlanningDraft` from occurrence-bound
+facts and deterministically assembles the complete internal `PlannerProposal`.
+If a future grammar introduces a genuine finite ambiguity, the provider may
+return only request-local need/candidate IDs in a strict `PlannerDecision`.
+Executable fields and literals never appear in that response contract.
+
+This removed triple ownership of semantic choices: the provider no longer
+guesses a full proposal, the overlay no longer rewrites it, and the compiler no
+longer has to reject routine disagreement between those copies. The compiler is
+still mandatory and fail-closed. Privacy-safe observability records need count,
+decision status, selection count, and controlled error codes only.
+
+Several corpus-wide grammar defects were corrected at their shared boundaries:
+
+- temporal evidence uses original request text even when entity spans are masked
+  for role analysis;
+- record-entry aliases cannot be displaced by an employee filter subject;
+- longer field phrases suppress embedded measure subjects during grouping;
+- semantic field mentions without an operator remain retrieval context, while
+  explicit operators still create filters;
+- malformed identifiers and invalid temporal nouns reject before retrieval; and
+- equivalent calculation wording does not become an accidental numeric operand.
+
+The local evaluator contract now distinguishes semantic violations, controlled
+unsupported capabilities, preflight exception classes, and employee
+clarification outcomes. Private cases and answers remain ignored and untracked.
+The final behavior corpus passed 311/311. The final trace-backed answer-quality
+provider window completed 311/311, averaging 4.402 accuracy, 4.241 completeness,
+and 4.521 relevance. Every one of the 137 sub-5 results is present in the ignored
+privacy-safe report: 121 judge/expectation-variance cases with passing execution
+traces and 16 objective keyword-coverage gaps in the exact evidence used by the
+scored answer. Merely retrieving documents is not classified as irrelevant
+evidence.
+
+The plan language intentionally still rejects nested Boolean filters, HAVING,
+window calculations, cross-period comparisons, grouped percentages, genuine
+multi-stage aggregation, and first/last requests without a grounded order basis.
+These decisions are covered by synthetic public-path tests and must not be
+weakened merely to improve model scores.

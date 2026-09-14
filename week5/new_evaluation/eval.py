@@ -23,6 +23,7 @@ if __package__ and __package__.startswith("week5."):
         answer_question_with_state,
         fetch_context,
         _format_aggregation_answer,
+        _answer_question_with_evaluation_trace,
     )
     from ..new_implementation.config import settings
 elif __package__ == "new_evaluation":
@@ -39,6 +40,7 @@ elif __package__ == "new_evaluation":
         answer_question_with_state,
         fetch_context,
         _format_aggregation_answer,
+        _answer_question_with_evaluation_trace,
     )
     from new_implementation.config import settings
 else:
@@ -59,6 +61,7 @@ else:
         answer_question_with_state,
         fetch_context,
         _format_aggregation_answer,
+        _answer_question_with_evaluation_trace,
     )
     from new_implementation.config import settings
 
@@ -120,6 +123,17 @@ class BehaviorEval(BaseModel):
     unsupported_capabilities_ok: bool = True
 
 
+class AnswerExecutionTrace(BaseModel):
+    """Non-sensitive structure captured from the exact answer execution."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    outcome: Literal["executed", "controlled_nonexecution"] = "executed"
+    plan: QueryPlan | None
+    calculation: dict | None
+    matched_count: int | None
+
+
 FailureCause = Literal[
     "provider_structural_failure",
     "unsupported_provider_decision",
@@ -132,6 +146,7 @@ FailureCause = Literal[
     "irrelevant_evidence",
     "session_state_failure",
     "evaluator_expectation_drift",
+    "execution_plan_mismatch",
 ]
 DiagnosticStage = Literal[
     "provider_response_validation",
@@ -163,6 +178,8 @@ def classify_case_diagnostic(
         return "excess_or_ungrounded_fact"
     if "answer_contract_mismatch" in violation_codes:
         return "answer_contract_mismatch"
+    if "answer_contract_ok" in failed_checks:
+        return "answer_contract_mismatch"
     if {
         "violation_codes_ok",
         "unsupported_capabilities_ok",
@@ -182,10 +199,10 @@ def classify_case_diagnostic(
         "group_values_ok",
     }.intersection(failed_checks):
         return "retrieval_or_calculation_mismatch"
+    if "plan_ok" in failed_checks:
+        return "execution_plan_mismatch"
     if stage == "answer_rendering" or "answer_facts_ok" in failed_checks:
         return "renderer_incomplete"
-    if "relevance" in sub_five_dimensions and (evidence_count or 0) > 0:
-        return "irrelevant_evidence"
     if violation_codes:
         return "unsupported_provider_decision"
     return "evaluator_expectation_drift"
@@ -284,7 +301,7 @@ def evaluate_answer_with_diagnostic(
     test: TestQuestion, *, index: int
 ) -> tuple[AnswerEval, CaseDiagnostic | None]:
     """Judge one answer and classify sub-perfect scores from that same run."""
-    result, _generated_answer, documents = evaluate_answer(test)
+    result, generated_answer, documents, trace = evaluate_answer_execution(test)
     dimensions = tuple(
         name
         for name in ("accuracy", "completeness", "relevance")
@@ -292,12 +309,54 @@ def evaluate_answer_with_diagnostic(
     )
     if not dimensions:
         return result, None
-    diagnostic = CaseDiagnostic.from_failure(
-        index=index,
-        category=test.category,
-        stage="answer_judging",
-        sub_five_dimensions=dimensions,
-        evidence_count=len(documents),
+    diagnostic = None
+    if trace.plan is not None:
+        behavior = _evaluate_successful_behavior(
+            test,
+            documents,
+            trace.plan,
+            trace.calculation,
+            trace.matched_count,
+            generated_answer=generated_answer,
+        )
+        diagnostic = diagnose_behavior_result(
+            index=index, category=test.category, result=behavior
+        )
+    elif not (
+        test.expected_error
+        or test.expected_violation_codes
+        or test.expected_unsupported_capabilities
+        or test.expected_clarification_ids
+        or test.expected_clarification_outcome
+    ):
+        diagnostic = CaseDiagnostic.from_failure(
+            index=index,
+            category=test.category,
+            stage="session_state",
+            failed_checks=("clarification_ok",),
+        )
+    if diagnostic is None:
+        missing_keywords = any(
+            not any(
+                keyword.casefold() in document.page_content.casefold()
+                for document in documents
+            )
+            for keyword in test.keywords
+        )
+        diagnostic = CaseDiagnostic.from_failure(
+            index=index,
+            category=test.category,
+            stage="answer_judging",
+            sub_five_dimensions=dimensions,
+            evidence_count=(0 if missing_keywords else None),
+        )
+        if missing_keywords:
+            diagnostic = diagnostic.model_copy(update={"cause": "irrelevant_evidence"})
+    diagnostic = diagnostic.model_copy(
+        update={
+            "sub_five_dimensions": tuple(sorted(set(dimensions))),
+            "evidence_count": len(documents),
+        }
     )
     return result, diagnostic
 
@@ -349,6 +408,101 @@ def _plan_employee_ids(plan: QueryPlan):
         else:
             employee_ids.append(str(condition.value))
     return employee_ids
+
+
+def _evaluate_successful_behavior(
+    test: TestQuestion,
+    chunks: list,
+    plan: QueryPlan,
+    calculation: dict | None,
+    matched_count: int | None,
+    *,
+    generated_answer: str | None = None,
+) -> BehaviorEval:
+    """Evaluate expectations against one already-completed public execution."""
+    expected_plan = test.expected_plan or {}
+    if test.category in {"semantic", "hybrid"} and "mode" not in expected_plan:
+        expected_plan = {**expected_plan, "mode": test.category}
+    required_filter = expected_plan.get("required_filter")
+    required_filters = expected_plan.get("required_filters", [])
+    expected_business_predicates = expected_plan.get("business_predicates")
+    plan_values = plan.model_dump()
+    plan_ok = all(
+        plan_values.get(key) == value
+        for key, value in expected_plan.items()
+        if key not in {"required_filter", "required_filters", "business_predicates"}
+    )
+    if expected_business_predicates is not None:
+        plan_ok = plan_ok and set(plan.business_predicates) == set(
+            expected_business_predicates
+        )
+    actual_filters = [condition.model_dump() for condition in plan.filters]
+    if required_filter:
+        plan_ok = plan_ok and required_filter in actual_filters
+    if required_filters:
+        plan_ok = plan_ok and all(
+            required in actual_filters for required in required_filters
+        )
+
+    answer_facts_ok = True
+    if test.expected_answer_facts:
+        if generated_answer is None and calculation is not None:
+            generated_answer = _format_aggregation_answer(plan, calculation)
+        elif generated_answer is None:
+            generated_answer, _documents = answer_question(test.question)
+        answer_facts_ok = all(
+            fact.casefold() in generated_answer.casefold()
+            for fact in test.expected_answer_facts
+        )
+
+    normalized_actual = {
+        "plan": plan.model_dump(),
+        "calculation": calculation,
+        "matched_count": matched_count,
+    }
+    actual_record_ids = {
+        str(chunk.metadata.get("record_id"))
+        for chunk in chunks
+        if chunk.metadata.get("record_id") is not None
+    }
+    return BehaviorEval(
+        plan_ok=plan_ok,
+        employee_ids_ok=(
+            not test.expected_employee_ids
+            or _plan_employee_ids(plan) == test.expected_employee_ids
+        ),
+        matched_count_ok=(
+            test.expected_matched_count is None
+            or matched_count == test.expected_matched_count
+        ),
+        calculation_ok=_expected_subset(calculation, test.expected_calculation),
+        clarification_ok=True,
+        answer_facts_ok=answer_facts_ok,
+        normalized_result_ok=_expected_subset(
+            normalized_actual, test.expected_normalized_result
+        ),
+        expected_error_ok=test.expected_error is None,
+        record_ids_ok=(
+            not test.expected_record_ids
+            or set(test.expected_record_ids).issubset(actual_record_ids)
+        ),
+        group_values_ok=_expected_group_values_match(
+            calculation, test.expected_group_values
+        ),
+        violation_codes_ok=not test.expected_violation_codes,
+        answer_contract_ok=(
+            test.expected_answer_contract is None
+            or _expected_subset(
+                (
+                    getattr(plan, "answer_contract", None).model_dump()
+                    if getattr(plan, "answer_contract", None) is not None
+                    else None
+                ),
+                test.expected_answer_contract,
+            )
+        ),
+        unsupported_capabilities_ok=not test.expected_unsupported_capabilities,
+    )
 
 
 def evaluate_behavior(test: TestQuestion) -> BehaviorEval:
@@ -467,90 +621,12 @@ def evaluate_behavior(test: TestQuestion) -> BehaviorEval:
             expected_error_ok=expected_error_ok,
         )
 
-    expected_plan = test.expected_plan or {}
-    if test.category in {"semantic", "hybrid"} and "mode" not in expected_plan:
-        expected_plan = {**expected_plan, "mode": test.category}
-    required_filter = expected_plan.get("required_filter")
-    required_filters = expected_plan.get("required_filters", [])
-    expected_business_predicates = expected_plan.get("business_predicates")
-    plan_values = plan.model_dump()
-    plan_ok = all(
-        plan_values.get(key) == value
-        for key, value in expected_plan.items()
-        if key not in {"required_filter", "required_filters", "business_predicates"}
-    )
-    if expected_business_predicates is not None:
-        plan_ok = plan_ok and set(plan.business_predicates) == set(
-            expected_business_predicates
-        )
-    if required_filter:
-        plan_ok = plan_ok and required_filter in [
-            condition.model_dump() for condition in plan.filters
-        ]
-    if required_filters:
-        actual_filters = [condition.model_dump() for condition in plan.filters]
-        plan_ok = plan_ok and all(
-            required in actual_filters for required in required_filters
-        )
-
-    answer_facts_ok = True
-    if test.expected_answer_facts:
-        if calculation is not None:
-            generated_answer = _format_aggregation_answer(plan, calculation)
-        else:
-            generated_answer, _documents = answer_question(test.question)
-        answer_facts_ok = all(
-            fact.casefold() in generated_answer.casefold()
-            for fact in test.expected_answer_facts
-        )
-
-    normalized_actual = {
-        "plan": plan.model_dump(),
-        "calculation": calculation,
-        "matched_count": matched_count,
-    }
-    actual_record_ids = {
-        str(chunk.metadata.get("record_id"))
-        for chunk in _chunks
-        if chunk.metadata.get("record_id") is not None
-    }
-    return BehaviorEval(
-        plan_ok=plan_ok,
-        employee_ids_ok=(
-            not test.expected_employee_ids
-            or _plan_employee_ids(plan) == test.expected_employee_ids
-        ),
-        matched_count_ok=(
-            test.expected_matched_count is None
-            or matched_count == test.expected_matched_count
-        ),
-        calculation_ok=_expected_subset(calculation, test.expected_calculation),
-        clarification_ok=True,
-        answer_facts_ok=answer_facts_ok,
-        normalized_result_ok=_expected_subset(
-            normalized_actual, test.expected_normalized_result
-        ),
-        expected_error_ok=test.expected_error is None,
-        record_ids_ok=(
-            not test.expected_record_ids
-            or set(test.expected_record_ids).issubset(actual_record_ids)
-        ),
-        group_values_ok=_expected_group_values_match(
-            calculation, test.expected_group_values
-        ),
-        violation_codes_ok=not test.expected_violation_codes,
-        answer_contract_ok=(
-            test.expected_answer_contract is None
-            or _expected_subset(
-                (
-                    getattr(plan, "answer_contract", None).model_dump()
-                    if getattr(plan, "answer_contract", None) is not None
-                    else None
-                ),
-                test.expected_answer_contract,
-            )
-        ),
-        unsupported_capabilities_ok=not test.expected_unsupported_capabilities,
+    return _evaluate_successful_behavior(
+        test,
+        _chunks,
+        plan,
+        calculation,
+        matched_count,
     )
 
 
@@ -668,18 +744,19 @@ def evaluate_retrieval(test: TestQuestion, k: int = 10) -> RetrievalEval:
     )
 
 
-def evaluate_answer(test: TestQuestion) -> tuple[AnswerEval, str, list]:
-    """
-    Evaluate answer quality using an LLM judge.
-
-    Args:
-        test: TestQuestion object containing question and reference answer
-
-    Returns:
-        Tuple of (AnswerEval object, generated_answer string, retrieved_docs list)
-    """
-    # Get RAG response using shared answer module
-    generated_answer, retrieved_docs = answer_question(test.question)
+def evaluate_answer_execution(
+    test: TestQuestion,
+) -> tuple[AnswerEval, str, list, AnswerExecutionTrace]:
+    """Judge an answer and retain non-sensitive structure from that exact run."""
+    generated_answer, retrieved_docs, _state, context = (
+        _answer_question_with_evaluation_trace(test.question)
+    )
+    trace = AnswerExecutionTrace(
+        outcome="executed" if context is not None else "controlled_nonexecution",
+        plan=context.plan if context is not None else None,
+        calculation=context.aggregation if context is not None else None,
+        matched_count=context.matched_count if context is not None else None,
+    )
 
     # LLM judge prompt
     judge_messages = [
@@ -716,7 +793,13 @@ Provide detailed feedback and scores from 1 (very poor) to 5 (ideal) for each di
         judge_response.choices[0].message.content
     )
 
-    return answer_eval, generated_answer, retrieved_docs
+    return answer_eval, generated_answer, retrieved_docs, trace
+
+
+def evaluate_answer(test: TestQuestion) -> tuple[AnswerEval, str, list]:
+    """Evaluate answer quality while preserving the historical public tuple."""
+    result, generated_answer, retrieved_docs, _trace = evaluate_answer_execution(test)
+    return result, generated_answer, retrieved_docs
 
 
 def evaluate_all_retrieval():

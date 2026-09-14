@@ -98,7 +98,7 @@ class PrivacySafeDiagnosticTests(unittest.TestCase):
                     "sub_five_dimensions": ("relevance",),
                     "evidence_count": 4,
                 },
-                "irrelevant_evidence",
+                "evaluator_expectation_drift",
             ),
             (
                 {
@@ -166,7 +166,43 @@ class PrivacySafeDiagnosticTests(unittest.TestCase):
         self.assertEqual(diagnostic.stage, "semantic_validation")
         self.assertEqual(diagnostic.cause, "unsupported_plan_shape")
 
-    def test_sub_five_answer_diagnostic_uses_the_scored_execution_documents(self):
+    def test_sub_five_answer_diagnostic_uses_the_scored_execution_trace(self):
+        judged = evaluation.AnswerEval(
+            feedback="Synthetic feedback",
+            accuracy=5,
+            completeness=5,
+            relevance=4,
+        )
+        documents = [Result(page_content="Synthetic evidence", metadata={})]
+        test = TestQuestion(
+            question="Synthetic question",
+            keywords=[],
+            reference_answer="Synthetic reference",
+            category="semantic",
+            expected_matched_count=2,
+        )
+        plan = evaluation.QueryPlan(mode="semantic", search_query="Synthetic")
+        trace = evaluation.AnswerExecutionTrace(
+            plan=plan,
+            calculation=None,
+            matched_count=1,
+        )
+
+        with patch.object(
+            evaluation,
+            "evaluate_answer_execution",
+            return_value=(judged, "Synthetic answer", documents, trace),
+        ):
+            result, diagnostic = evaluation.evaluate_answer_with_diagnostic(
+                test, index=9
+            )
+
+        self.assertIs(result, judged)
+        self.assertEqual(diagnostic.cause, "retrieval_or_calculation_mismatch")
+        self.assertEqual(diagnostic.evidence_count, 1)
+        self.assertEqual(diagnostic.sub_five_dimensions, ("relevance",))
+
+    def test_documents_alone_do_not_prove_irrelevant_evidence(self):
         judged = evaluation.AnswerEval(
             feedback="Synthetic feedback",
             accuracy=5,
@@ -180,20 +216,22 @@ class PrivacySafeDiagnosticTests(unittest.TestCase):
             reference_answer="Synthetic reference",
             category="semantic",
         )
+        trace = evaluation.AnswerExecutionTrace(
+            plan=evaluation.QueryPlan(mode="semantic", search_query="Synthetic"),
+            calculation=None,
+            matched_count=1,
+        )
 
         with patch.object(
             evaluation,
-            "evaluate_answer",
-            return_value=(judged, "Synthetic answer", documents),
+            "evaluate_answer_execution",
+            return_value=(judged, "Synthetic answer", documents, trace),
         ):
-            result, diagnostic = evaluation.evaluate_answer_with_diagnostic(
-                test, index=9
+            _result, diagnostic = evaluation.evaluate_answer_with_diagnostic(
+                test, index=10
             )
 
-        self.assertIs(result, judged)
-        self.assertEqual(diagnostic.cause, "irrelevant_evidence")
-        self.assertEqual(diagnostic.evidence_count, 1)
-        self.assertEqual(diagnostic.sub_five_dimensions, ("relevance",))
+        self.assertEqual(diagnostic.cause, "evaluator_expectation_drift")
 
 
 class BaselineCapabilityParityTests(unittest.TestCase):
@@ -1459,6 +1497,20 @@ class BaselineCapabilityParityTests(unittest.TestCase):
                 self.assertEqual(plan.answer_contract.unit, unit)
                 self.assertEqual(calculation["value"], value)
                 self.assertTrue(chunks)
+
+    def test_answer_evaluation_trace_is_from_the_rendered_public_execution(self):
+        text, chunks, _state, trace = (
+            self.answer._answer_question_with_evaluation_trace(
+                "Count attendance records"
+            )
+        )
+
+        self.assertIn("5", text)
+        self.assertIsNotNone(trace)
+        self.assertIs(trace.chunks, chunks)
+        self.assertEqual(trace.plan.aggregation, "count")
+        self.assertEqual(trace.aggregation["value"], 5)
+        self.assertEqual(trace.matched_count, 5)
 
     def test_equivalent_worked_wording_compiles_the_same_operation_and_scope(self):
         plans = [

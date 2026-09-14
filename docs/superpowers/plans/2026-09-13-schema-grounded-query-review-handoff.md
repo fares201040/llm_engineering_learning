@@ -182,7 +182,66 @@ borrowing, temporal/numeric overlap, and projection loss from broad temporal
 evidence spans. Each fix was preceded by a failing regression and reviewed through
 the public executable-plan/result path.
 
-## Remaining work after Task 5
+## 2026-09-14 continuation outcome
+
+The provider/proposal mismatch is resolved without restoring permissive
+normalization. Deterministic semantic facts now build a `PlanningDraft` and the
+complete internal `PlannerProposal`. A provider can return only a strict
+`PlannerDecision` containing request-local need and candidate identifiers. The
+current supported grammar produces no provider-owned unresolved choices, so
+grounded requests skip provider planning entirely. The obsolete full-proposal
+overlay was removed from production and tests; `compile_proposal()` remains the
+mandatory executable boundary.
+
+The continuation also completed these native corrections:
+
+- original-source temporal evidence is preserved while same-width entity masks
+  remain available for role parsing, fixing projection + employee + date in
+  either clause order;
+- `entry`/`entries` are registered record-measure aliases, and longer field
+  phrases such as `day type` no longer inherit an embedded date subject;
+- explicit employee-number syntax, malformed numeric identifiers, semantic
+  field suffixes, and repeated calculation synonyms are handled at their owning
+  grammar boundaries;
+- provider decision lifecycle events expose only counts, status, and controlled
+  failure codes;
+- evaluator semantic rejections use typed violation/capability expectations,
+  preflight errors require an exact controlled exception class, and employee
+  resolution failures use typed clarification outcomes. Private corpus changes
+  remain local and ignored.
+
+A fresh non-private bounded-decision provider probe was responsive. The final
+complete behavior run passed **311/311 (100%)**, including every previously
+zero-pass category. The final trace-backed answer-quality window also completed
+**311/311**. Scores were accuracy **4.402/5**, completeness **4.241/5**, and
+relevance **4.521/5**. All 137 scores below 5 were represented once in the
+privacy-safe diagnostic report: 121 had a passing plan/result/contract/render
+trace and remain judge/expectation variance, while 16 had objective keyword
+coverage gaps in the exact evidence used for the scored answer. Document count
+alone is never treated as proof of irrelevant evidence.
+
+The final-code verification passed 441 discovered tests with no skips, Ruff lint
+and formatting across 45 files, Python compilation, five notebook schema checks,
+and Git whitespace validation. Dataset identity remained 3,964 records, 568
+employees, 2026-09-01 through 2026-09-07, fingerprint
+`6860e7657deb91023d6f199c230edf9b7d40cd3e402a1ad23ccea39f3487dde9`.
+The final 2-warmup/10-run benchmark had zero failures; median/p95 seconds were
+0.000428/0.000830 planning, 0.000016/0.000031 grouped calculation,
+0.000005/0.000005 projection, and 0.082573/0.114204 PostgreSQL snapshot.
+
+For comparison, the accepted strict baseline was 107/311 behavior with
+2.33/2.49/2.68 answer scores; the historical permissive result was 233/311 with
+3.93/3.75/4.05. The current result preserves the strict compiler boundary while
+exceeding both. Score changes remain provider-window observations, not proof of
+semantic correctness; the 311/311 deterministic behavior run is the correctness
+evidence.
+
+Nested Boolean filters, HAVING, window calculations, cross-period comparisons,
+grouped percentages, genuine multi-stage aggregation, and ungrounded positional
+first/last requests remain explicitly unsupported and stop before retrieval.
+Synthetic public-path regressions lock those decisions.
+
+## Historical remaining work after Task 5 (superseded 2026-09-14)
 
 Do not weaken the fail-closed boundary merely to recover provider pass rates. The
 next agent should create a new written plan and address these items in order:
@@ -225,9 +284,9 @@ next agent should create a new written plan and address these items in order:
    capabilities only after verifying each case; do not add compatibility error
    mappings.
 
-Task 5 is complete as an architectural hardening task, but release-quality provider
-behavior and answer quality are not achieved. The next agent must report both
-deterministic safety and provider effectiveness; neither substitutes for the other.
+The numbered items above describe the state before the 2026-09-14 continuation.
+They are retained as review history; the continuation outcome supersedes their
+status while preserving their safety constraints.
 
 ## Review risks that require special attention
 

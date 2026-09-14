@@ -1,5 +1,6 @@
 from datetime import date, datetime, time as dt_time, timedelta
 from collections.abc import Mapping
+from contextvars import ContextVar
 from difflib import SequenceMatcher
 from time import perf_counter
 from typing import Literal, NamedTuple, Sequence
@@ -282,6 +283,11 @@ class ContextFetchResult(NamedTuple):
     aggregation: dict | None
     matched_count: int | None
     resolved_employees: list[EmployeeCandidate]
+
+
+_EVALUATION_TRACE_SINK: ContextVar[list[ContextFetchResult] | None] = ContextVar(
+    "apdc_evaluation_trace_sink", default=None
+)
 
 
 class EmployeeResolution(BaseModel):
@@ -3031,7 +3037,7 @@ def _fetch_context_result(
         duration_seconds=perf_counter() - started,
     )
 
-    return ContextFetchResult(
+    result = ContextFetchResult(
         chunks=chunks,
         plan=plan,
         aggregation=aggregation,
@@ -3043,6 +3049,10 @@ def _fetch_context_result(
             else []
         ),
     )
+    trace_sink = _EVALUATION_TRACE_SINK.get()
+    if trace_sink is not None:
+        trace_sink.append(result)
+    return result
 
 
 def fetch_context(
@@ -3646,3 +3656,24 @@ def answer_question(
         access_context=access_context,
     )
     return text, chunks
+
+
+def _answer_question_with_evaluation_trace(
+    question: str,
+    history: list[dict] | None = None,
+    *,
+    access_context: AccessContext | None = None,
+) -> tuple[str, list[Result], ConversationState, ContextFetchResult | None]:
+    """Run the public answer path while capturing its successful execution once."""
+    captured: list[ContextFetchResult] = []
+    token = _EVALUATION_TRACE_SINK.set(captured)
+    try:
+        text, chunks, state = answer_question_with_state(
+            question,
+            history,
+            ConversationState(),
+            access_context=access_context,
+        )
+    finally:
+        _EVALUATION_TRACE_SINK.reset(token)
+    return text, chunks, state, captured[-1] if captured else None

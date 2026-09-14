@@ -1169,7 +1169,11 @@ DERIVED_RESULT_DEFINITIONS = MappingProxyType(
 
 UNSUPPORTED_REQUEST_PATTERNS = MappingProxyType(
     {
-        "nested_boolean_filters": (r"\bor\b", r"\bnot\s*\("),
+        "nested_boolean_filters": (
+            r"\bor\b",
+            r"\bnot\s*\(",
+            r"\bnested\b[^?.!]*\b(?:condition|filter)s?\b",
+        ),
         "having_filter": (r"\bhaving\b",),
         "window_calculation": (
             r"\b(?:running total|moving average|partition by|row_number)\b",

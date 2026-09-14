@@ -1956,6 +1956,135 @@ class TrustedClarificationStateTests(unittest.TestCase):
         retrieval.assert_called_once()
 
 
+class RequestCompletenessTests(unittest.TestCase):
+    def setUp(self):
+        self.employee = answer.EmployeeCandidate(
+            employee_id="A10018", name="Faris Ahmed North"
+        )
+
+    def test_bare_exact_employee_asks_for_intent_without_planning_or_retrieval(self):
+        with (
+            patch.object(answer, "load_employee_directory", return_value=[self.employee]),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "propose_query") as planner,
+            patch.object(answer, "fetch_exact_chroma") as retrieval,
+        ):
+            text, chunks, state = answer.answer_question_with_state(
+                "Faris Ahmed North", [], answer.ConversationState()
+            )
+
+        self.assertEqual(chunks, [])
+        self.assertEqual(
+            text,
+            "You selected Faris Ahmed North (A10018). What attendance information would you like?",
+        )
+        self.assertEqual(state.selected_employees, [self.employee])
+        planner.assert_not_called()
+        retrieval.assert_not_called()
+
+    def test_partial_bare_name_confirms_then_asks_for_intent(self):
+        with (
+            patch.object(answer, "load_employee_directory", return_value=[self.employee]),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "propose_query") as planner,
+            patch.object(answer, "fetch_exact_chroma") as retrieval,
+        ):
+            first, chunks, state = answer.answer_question_with_state(
+                "Faris", [], answer.ConversationState()
+            )
+            second, chunks, state = answer.answer_question_with_state("yes", [], state)
+
+        self.assertIn("Did you mean", first)
+        self.assertEqual(
+            state.pending_clarification.kind,
+            "missing_intent",
+        )
+        self.assertEqual(
+            second,
+            "You selected Faris Ahmed North (A10018). What attendance information would you like?",
+        )
+        self.assertEqual(state.selected_employees, [self.employee])
+        planner.assert_not_called()
+        retrieval.assert_not_called()
+
+    def test_short_predicate_uses_the_unique_registered_interpretation(self):
+        def propose(question, *args, **kwargs):
+            return _proposal_from_facts(question, kwargs["semantic_facts"])
+
+        with (
+            patch.object(answer, "load_employee_directory", return_value=[self.employee]),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "propose_query", side_effect=propose),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=(
+                    [],
+                    {"operation": "distinct_count", "value": 2, "measure": "distinct_dates"},
+                    2,
+                ),
+            ) as retrieval,
+        ):
+            text, _chunks, _state = answer.answer_question_with_state(
+                "absent for Faris Ahmed North", [], answer.ConversationState()
+            )
+
+        self.assertIn("2", text)
+        plan = retrieval.call_args.args[0]
+        self.assertEqual(plan.measure, "distinct_dates")
+        self.assertEqual(plan.business_predicates, ["absent"])
+
+    def test_vague_attendance_with_employee_asks_for_missing_intent(self):
+        with (
+            patch.object(answer, "load_employee_directory", return_value=[self.employee]),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "propose_query") as planner,
+            patch.object(answer, "fetch_exact_chroma") as retrieval,
+        ):
+            text, _chunks, _state = answer.answer_question_with_state(
+                "attendance for Faris Ahmed North", [], answer.ConversationState()
+            )
+
+        self.assertIn("What attendance information would you like?", text)
+        planner.assert_not_called()
+        retrieval.assert_not_called()
+
+    def test_complete_new_question_cancels_pending_employee_selection(self):
+        with patch.object(
+            answer, "load_employee_directory", return_value=[self.employee]
+        ):
+            _text, _chunks, state = answer.answer_question_with_state(
+                "Faris", [], answer.ConversationState()
+            )
+
+        proposal = answer.PlannerProposal(
+            status="ready",
+            measure=answer.ProposedMeasureChoice(
+                name="employees", evidence_text="employees"
+            ),
+            answer_contract=answer.AnswerContract(
+                shape="scalar", unit="employees", subject_field="Employee_ID", grain=["Employee_ID"]
+            ),
+        )
+        with (
+            patch.object(answer, "propose_query", return_value=proposal),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=([], {"operation": "distinct_count", "value": 7}, 7),
+            ),
+        ):
+            text, _chunks, state = answer.answer_question_with_state(
+                "How many employees have records?", [], state
+            )
+
+        self.assertIn("7", text)
+        self.assertEqual(state.pending_candidates, [])
+
+
 class CoverageMetadataTests(unittest.TestCase):
     def test_chroma_coverage_uses_only_daily_attendance_dates(self):
         stored = {

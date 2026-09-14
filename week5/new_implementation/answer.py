@@ -79,6 +79,17 @@ try:
         build_planning_draft,
         validate_planner_decision,
     )
+    from .language_understanding import (
+        CatalogClarification,
+        CatalogOption,
+        EmployeeClarification,
+        EmployeeOption,
+        MeaningClarification,
+        MeaningOption,
+        MissingIntentClarification,
+        PendingClarification,
+        analyze_question_surface,
+    )
 except ImportError:  # Running answer.py directly from its directory.
     from attendance_schema import (
         AccessContext,
@@ -142,6 +153,17 @@ except ImportError:  # Running answer.py directly from its directory.
         build_planning_draft,
         validate_planner_decision,
     )
+    from language_understanding import (
+        CatalogClarification,
+        CatalogOption,
+        EmployeeClarification,
+        EmployeeOption,
+        MeaningClarification,
+        MeaningOption,
+        MissingIntentClarification,
+        PendingClarification,
+        analyze_question_surface,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -191,7 +213,9 @@ def _require_attendance_access(access_context: AccessContext | None):
 
 
 def _require_supported_attendance_question(question: str):
-    if not question.strip() or not re.search(r"[A-Za-z0-9]", question):
+    if not question.strip() or not any(
+        character.isalpha() or character.isdigit() for character in question
+    ):
         raise PlanValidationError("Please enter an attendance question using words.")
     if _UNSUPPORTED_DOMAIN_PATTERN.search(question):
         raise DomainAccessDeniedError(ACCESS_DENIED_MESSAGE)
@@ -309,6 +333,7 @@ class EmployeeResolution(BaseModel):
 
 class ConversationState(BaseModel):
     selected_employees: list[EmployeeCandidate] = Field(default_factory=list)
+    pending_clarification: PendingClarification | None = None
     pending_question: str | None = None
     pending_proposal: PlannerProposal | None = None
     pending_facts: list[SemanticFact] = Field(default_factory=list)
@@ -353,6 +378,14 @@ class InterpretationClarificationRequired(PlanningClarificationRequired):
     def __init__(self, proposal, facts, candidates: list[InterpretationName]):
         super().__init__(proposal, facts)
         self.candidates = candidates
+
+
+class MissingIntentRequired(ValueError):
+    """An employee or constraint was understood, but no result was requested."""
+
+    def __init__(self, employees: list[EmployeeCandidate]):
+        super().__init__("attendance result intent required")
+        self.employees = employees
 
 
 def _retry():
@@ -2755,6 +2788,100 @@ def _select_context_content(content: str, fields: set[str] | None):
     return "\n".join(selected_lines) or content
 
 
+_RESULT_FACT_KINDS = frozenset(
+    {
+        "measure",
+        "calculation",
+        "projection",
+        "semantic_intent",
+        "result_intent",
+        "result_shape",
+    }
+)
+
+
+def _complete_registered_short_form(
+    question: str,
+    facts: tuple[SemanticFact, ...],
+) -> tuple[SemanticFact, ...]:
+    if any(
+        fact.kind in _RESULT_FACT_KINDS and fact.strength == "strong"
+        for fact in facts
+    ):
+        return facts
+    summary_match = re.search(
+        r"\b(?:summarize|summary|review)\b[^?.!]*\battendance\b",
+        question,
+        re.IGNORECASE,
+    )
+    if summary_match:
+        return merge_semantic_facts(
+            facts,
+            (
+                SemanticFact(
+                    kind="semantic_intent",
+                    concept_name="attendance_pattern",
+                    evidence_text=summary_match.group(0),
+                    evidence_span=summary_match.span(),
+                    origin="question",
+                    strength="strong",
+                ),
+            ),
+        )
+    predicates = {
+        fact.concept_name
+        for fact in facts
+        if fact.kind == "predicate" and fact.strength == "strong"
+    }
+    if not predicates:
+        return facts
+    interpretations = [
+        definition
+        for definition in INTERPRETATION_PRESETS.values()
+        if definition.business_predicates
+        and set(definition.business_predicates) == predicates
+    ]
+    if len(interpretations) != 1:
+        return facts
+    definition = interpretations[0]
+    evidence = next(
+        fact.evidence_text for fact in facts if fact.kind == "predicate"
+    )
+    return merge_semantic_facts(
+        facts,
+        (
+            SemanticFact(
+                kind="measure",
+                concept_name=definition.measure,
+                evidence_text=evidence,
+                origin="deterministic_default",
+                strength="strong",
+            ),
+        ),
+    )
+
+
+def _request_has_supported_result(facts: tuple[SemanticFact, ...]) -> bool:
+    return any(
+        fact.kind in _RESULT_FACT_KINDS and fact.strength == "strong"
+        for fact in facts
+    )
+
+
+def _implicit_bare_employee_resolution(
+    question: str,
+    facts: tuple[SemanticFact, ...],
+    directory: list[EmployeeCandidate],
+) -> EmployeeResolution | None:
+    if any(fact.kind == "entity" for fact in facts):
+        return None
+    words = re.findall(r"[^\W\d_]+", question, flags=re.UNICODE)
+    if not 1 <= len(words) <= 5:
+        return None
+    resolution = resolve_employee_reference(question.strip(" \t\r\n.,?!"), directory)
+    return resolution if resolution.outcome != "none" else None
+
+
 # ---------------------------------------------------------------------------
 # Unified retrieval
 # ---------------------------------------------------------------------------
@@ -2790,8 +2917,37 @@ def _fetch_context_result(
         and fact.origin in {"trusted_state", "user_clarification"}
         for fact in prepared_facts
     )
-    if entity_facts and not trusted_selection:
+    if (
+        not entity_facts
+        and not trusted_selection
+        and not _request_has_supported_result(tuple(detected_facts))
+        and not any(
+            fact.kind == "unsupported" and fact.strength == "strong"
+            for fact in detected_facts
+        )
+    ):
         directory = load_employee_directory()
+        implicit_resolution = _implicit_bare_employee_resolution(
+            question, tuple(detected_facts), directory
+        )
+        if implicit_resolution is not None:
+            entity_resolution = implicit_resolution
+            detected_facts = merge_semantic_facts(
+                tuple(detected_facts),
+                (
+                    SemanticFact(
+                        kind="entity",
+                        field="Name",
+                        values=(implicit_resolution.reference,),
+                        evidence_text=implicit_resolution.reference,
+                        origin="question",
+                        strength="strong",
+                    ),
+                ),
+            )
+            entity_facts = [fact for fact in detected_facts if fact.kind == "entity"]
+    if entity_facts and not trusted_selection:
+        directory = directory if directory is not None else load_employee_directory()
         selected = []
         for fact in entity_facts:
             if fact.field == "Employee_ID":
@@ -2890,6 +3046,9 @@ def _fetch_context_result(
         for condition in relative_dates
     )
     initial_facts = merge_semantic_facts(prepared_facts, detected_facts, date_facts)
+    initial_facts = _complete_registered_short_form(question, initial_facts)
+    if not _request_has_supported_result(initial_facts):
+        raise MissingIntentRequired(default_employees or [])
     event_logger.emit(
         "semantic_facts_detected",
         request_id=request_id,
@@ -2980,7 +3139,8 @@ def _fetch_context_result(
     )
     refreshed_facts = detect_semantic_facts(question, resolution_context)
     trusted_scope = any(
-        fact.field == "Employee_ID" and fact.origin == "trusted_state"
+        fact.field == "Employee_ID"
+        and fact.origin in {"trusted_state", "user_clarification"}
         for fact in initial_facts
     )
     if trusted_scope:
@@ -3419,6 +3579,16 @@ def _format_employee_clarification(resolution: EmployeeResolution):
     )
 
 
+def _format_missing_intent(employees: list[EmployeeCandidate]) -> str:
+    if len(employees) == 1:
+        employee = employees[0]
+        return (
+            f"You selected {employee.name} ({employee.employee_id}). "
+            "What attendance information would you like?"
+        )
+    return "What attendance information would you like?"
+
+
 def _select_pending_employees(
     response: str,
     candidates: list[EmployeeCandidate],
@@ -3426,6 +3596,8 @@ def _select_pending_employees(
     allow_multiple: bool = False,
 ):
     normalized = _normalize_name(response)
+    if len(candidates) == 1 and normalized in {"yes", "y", "نعم", "اجل", "أجل"}:
+        return candidates
     if normalized in {"both", "all"}:
         return candidates if allow_multiple else []
 
@@ -3452,6 +3624,96 @@ def _select_pending_employees(
 
 def _question_allows_multiple_employee_selection(question: str) -> bool:
     return bool(re.search(r"\b(?:all|both)\b", question, re.IGNORECASE))
+
+
+def _is_complete_new_attendance_question(question: str) -> bool:
+    facts = detect_semantic_facts(
+        question,
+        ResolutionContext(catalog={}, reference_date=_current_local_date()),
+    )
+    return _request_has_supported_result(
+        _complete_registered_short_form(question, facts)
+    )
+
+
+def _clear_pending_state(state: ConversationState) -> None:
+    state.pending_clarification = None
+    state.pending_question = None
+    state.pending_proposal = None
+    state.pending_facts = []
+    state.pending_candidates = []
+    state.pending_constraint = None
+    state.pending_interpretations = []
+
+
+def _store_employee_clarification(
+    state: ConversationState,
+    question: str,
+    proposal: PlannerProposal | None,
+    facts: tuple[SemanticFact, ...],
+    resolution: EmployeeResolution,
+) -> None:
+    state.pending_clarification = EmployeeClarification(
+        original_question=question,
+        reply_locale=analyze_question_surface(question).reply_locale,
+        facts=facts,
+        prepared_proposal=proposal,
+        options=tuple(
+            EmployeeOption(employee_id=item.employee_id, name=item.name)
+            for item in resolution.candidates
+        ),
+        confirmation_required=resolution.outcome == "confirmation",
+        allow_multiple=_question_allows_multiple_employee_selection(question),
+        has_more_candidates=resolution.has_more_candidates,
+    )
+
+
+def _store_interpretation_clarification(
+    state: ConversationState,
+    question: str,
+    proposal: PlannerProposal,
+    facts: tuple[SemanticFact, ...],
+    candidates: list[InterpretationName],
+) -> None:
+    state.pending_clarification = MeaningClarification(
+        original_question=question,
+        reply_locale=analyze_question_surface(question).reply_locale,
+        facts=facts,
+        prepared_proposal=proposal,
+        options=tuple(
+            MeaningOption(
+                option_id=name,
+                label=_interpretation_label(name),
+                target_kind="interpretation",
+                target_name=name,
+            )
+            for name in candidates
+        ),
+    )
+
+
+def _store_catalog_clarification(
+    state: ConversationState,
+    question: str,
+    proposal: PlannerProposal,
+    facts: tuple[SemanticFact, ...],
+    pending: PendingConstraintData,
+) -> None:
+    state.pending_clarification = CatalogClarification(
+        original_question=question,
+        reply_locale=analyze_question_surface(question).reply_locale,
+        facts=facts,
+        prepared_proposal=proposal,
+        options=tuple(
+            CatalogOption(
+                option_id=str(index),
+                display_value=candidate.label or candidate.value,
+                field=pending.field,
+                value=candidate.value,
+            )
+            for index, candidate in enumerate(pending.candidates, start=1)
+        ),
+    )
 
 
 def _interpretation_label(name: InterpretationName):
@@ -3673,6 +3935,14 @@ def answer_question_with_state(
             ),
         )
         if not selected:
+            if _is_complete_new_attendance_question(question):
+                _clear_pending_state(state)
+                return answer_question_with_state(
+                    question,
+                    history,
+                    state,
+                    access_context=access_context,
+                )
             resolution = EmployeeResolution(
                 outcome="ambiguous",
                 candidates=state.pending_candidates,
@@ -3778,43 +4048,60 @@ def answer_question_with_state(
         state.pending_proposal = exc.proposal
         state.pending_facts = list(exc.facts)
         state.pending_constraint = exc.pending
+        _store_catalog_clarification(
+            state, effective_question, exc.proposal, exc.facts, exc.pending
+        )
         return _format_constraint_clarification(exc.pending), [], state
     except InterpretationClarificationRequired as exc:
         state.pending_question = effective_question
         state.pending_proposal = exc.proposal
         state.pending_facts = list(exc.facts)
         state.pending_interpretations = exc.candidates
+        _store_interpretation_clarification(
+            state, effective_question, exc.proposal, exc.facts, exc.candidates
+        )
         return _format_interpretation_clarification(exc.candidates), [], state
     except EmployeeClarificationRequired as exc:
         if exc.resolution.outcome == "none":
-            state.pending_question = None
-            state.pending_proposal = None
-            state.pending_facts = []
-            state.pending_candidates = []
-            state.pending_constraint = None
-            state.pending_interpretations = []
+            _clear_pending_state(state)
             return _format_employee_clarification(exc.resolution), [], state
         state.pending_question = effective_question
         state.pending_proposal = exc.proposal
         state.pending_facts = list(exc.facts)
         state.pending_candidates = exc.resolution.candidates
         state.pending_interpretations = []
+        _store_employee_clarification(
+            state,
+            effective_question,
+            exc.proposal,
+            exc.facts,
+            exc.resolution,
+        )
         return _format_employee_clarification(exc.resolution), [], state
+    except MissingIntentRequired as exc:
+        _clear_pending_state(state)
+        if exc.employees:
+            state.selected_employees = exc.employees
+        state.pending_clarification = MissingIntentClarification(
+            original_question=effective_question,
+            reply_locale=analyze_question_surface(effective_question).reply_locale,
+            facts=prepared_facts,
+            prepared_proposal=prepared_proposal,
+            employee=(
+                EmployeeOption(
+                    employee_id=exc.employees[0].employee_id,
+                    name=exc.employees[0].name,
+                )
+                if len(exc.employees) == 1
+                else None
+            ),
+        )
+        return _format_missing_intent(exc.employees), [], state
     except PlanValidationError as exc:
-        state.pending_question = None
-        state.pending_proposal = None
-        state.pending_facts = []
-        state.pending_candidates = []
-        state.pending_constraint = None
-        state.pending_interpretations = []
+        _clear_pending_state(state)
         return f"I could not safely interpret that request: {exc}", [], state
 
-    state.pending_question = None
-    state.pending_proposal = None
-    state.pending_facts = []
-    state.pending_candidates = []
-    state.pending_constraint = None
-    state.pending_interpretations = []
+    _clear_pending_state(state)
     if resolved_employees:
         state.selected_employees = resolved_employees
     elif not _is_employee_followup(effective_question, plan):

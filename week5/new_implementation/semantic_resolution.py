@@ -160,6 +160,8 @@ class SemanticFact(BaseModel):
     origin: EvidenceOrigin
     strength: str
     evidence_span: tuple[int, int] | None = None
+    # Supporting evidence may mention other roles; only this span is exclusive.
+    consumed_span: tuple[int, int] | None = None
     direction: Literal["asc", "desc"] | None = None
     scope: Literal["population", "percentage_numerator"] = "population"
 
@@ -1317,8 +1319,6 @@ class TemporalResolver(FieldResolver):
                 if temporal_target
                 else start
             )
-            if temporal_target:
-                begin = min(begin, target[1])
             # An adjacent numeric field with a native numeric relation owns its
             # full operand, even if that operand has a date-shaped spelling.
             numeric_binding = bool(
@@ -1501,6 +1501,13 @@ class TemporalResolver(FieldResolver):
                 previous = match
                 continue
             evidence = question[evidence_start : match.end()].strip()
+            consumed_start = (
+                segment_start
+                if paired
+                else segment_start + operator_start
+                if operator_start is not None
+                else match.start()
+            )
             fact = SemanticFact(
                 kind="filter",
                 field=target,
@@ -1510,6 +1517,7 @@ class TemporalResolver(FieldResolver):
                 origin="question",
                 strength="strong",
                 evidence_span=(evidence_start, match.end()),
+                consumed_span=(consumed_start, match.end()),
             )
             facts.append(fact)
             range_start = fact if phrase in self._range_starts else None
@@ -1531,6 +1539,10 @@ class TemporalResolver(FieldResolver):
                             operator="lte",
                             values=(end.isoformat(),),
                             evidence_text=abbreviated_end.group(0).strip(),
+                            consumed_span=(
+                                match.end(),
+                                match.end() + abbreviated_end.end(),
+                            ),
                             origin="question",
                             strength="strong",
                         )
@@ -1909,8 +1921,10 @@ def _overlapping_facts_conflict(left: SemanticFact, right: SemanticFact) -> bool
 
 
 def _fact_token_spans(question, fact):
-    if fact.evidence_span is not None:
-        start, end = fact.evidence_span
+    # Role arbitration must not make supporting evidence exclusive either.
+    span = fact.consumed_span or fact.evidence_span
+    if span is not None:
+        start, end = span
         return (
             (
                 len(normalize_semantic_text(question[:start]).split()),
@@ -1918,6 +1932,27 @@ def _fact_token_spans(question, fact):
             ),
         )
     return _evidence_spans(question, fact.evidence_text)
+
+
+def _filter_consumed_spans(question, fact):
+    if fact.consumed_span is not None:
+        return (fact.consumed_span,)
+    if FIELD_DEFINITIONS[fact.field].resolution_kind == "temporal":
+        # Temporal supporting evidence is not proof of exclusive consumption.
+        return ()
+    if fact.evidence_span is not None:
+        return (fact.evidence_span,)
+    return _raw_phrase_spans(question, fact.evidence_text)
+
+
+def _filter_consumed_token_spans(question, fact):
+    return tuple(
+        (
+            len(normalize_semantic_text(question[:start]).split()),
+            len(normalize_semantic_text(question[:end]).split()),
+        )
+        for start, end in _filter_consumed_spans(question, fact)
+    )
 
 
 def _select_longest_supported_facts(
@@ -1991,8 +2026,9 @@ def _earliest_measure_facts(question: str, existing_facts=()) -> list[SemanticFa
     filter_spans = [
         span
         for fact in existing_facts
-        if fact.kind == "filter" and fact.evidence_span is not None
-        for span in _fact_token_spans(question, fact)
+        if fact.kind == "filter"
+        and (fact.evidence_span is not None or fact.consumed_span is not None)
+        for span in _filter_consumed_token_spans(question, fact)
     ]
     for fact in candidates:
         unbound = [
@@ -2033,7 +2069,7 @@ def _calculation_matches(question, definition, facts):
         span
         for fact in facts
         if fact.kind == "filter"
-        for span in _fact_token_spans(question, fact)
+        for span in _filter_consumed_token_spans(question, fact)
     ]
     return [
         match
@@ -2288,11 +2324,11 @@ def detect_semantic_facts(
         )
     ]
     protected_spans.extend(
-        fact.evidence_span
+        fact.consumed_span
         for fact in facts
         if fact.kind == "filter"
         and fact.strength == "strong"
-        and fact.evidence_span is not None
+        and fact.consumed_span is not None
         and FIELD_DEFINITIONS[fact.field].resolution_kind == "temporal"
     )
     for start, end in protected_spans:
@@ -2366,11 +2402,7 @@ def _executable_choice_facts(question, field_matches, facts, *, original_questio
     role_question = question
     for fact in facts:
         if fact.strength == "strong" and fact.kind == "filter":
-            value_spans = (
-                (fact.evidence_span,)
-                if fact.evidence_span is not None
-                else _raw_phrase_spans(question, fact.evidence_text)
-            )
+            value_spans = _filter_consumed_spans(question, fact)
             # Never guess that every identical word has the resolved value role.
             # Source offsets survive entity masking and normalization happens last.
             if len(value_spans) == 1:

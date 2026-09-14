@@ -20,6 +20,108 @@ PRIVATE_FIXTURES_AVAILABLE = (
 
 
 class BaselineCapabilityParityTests(unittest.TestCase):
+    def test_temporal_filters_preserve_projection_and_returned_rows(self):
+        for fields, projection in (
+            (("Date", "Status"), ["Date", "Status"]),
+            (("Date", "Total_OT"), ["Date", "Total_OT"]),
+            (("Status", "Total_OT"), ["Status", "Total_OT"]),
+            (("Status", "Date"), ["Date", "Status"]),
+            (("Total_OT", "Date"), ["Date", "Total_OT"]),
+        ):
+            for scope, indexes, temporal_filters in (
+                ("on 2026-09-01", (0, 1), {("eq", "2026-09-01")}),
+                ("before 2026-09-04", (0, 1, 2, 3), {("lt", "2026-09-04")}),
+                ("after 2026-09-03", (4,), {("gt", "2026-09-03")}),
+                ("on or before 2026-09-01", (0, 1), {("lte", "2026-09-01")}),
+                ("on or after 2026-09-04", (4,), {("gte", "2026-09-04")}),
+                (
+                    "from 2026-09-02 to 2026-09-03",
+                    (2, 3),
+                    {("gte", "2026-09-02"), ("lte", "2026-09-03")},
+                ),
+                (
+                    "between September 1, 2026 and 3",
+                    (0, 1, 2, 3),
+                    {("gte", "2026-09-01"), ("lte", "2026-09-03")},
+                ),
+                (
+                    "in September 2026",
+                    (0, 1, 2, 3, 4),
+                    {("gte", "2026-09-01"), ("lte", "2026-09-30")},
+                ),
+            ):
+                with self.subTest(fields=fields, scope=scope):
+                    chunks, plan, result, count = self.answer.fetch_context(
+                        f"Show {' and '.join(fields)} from records {scope}"
+                    )
+                    self.assertEqual(plan.projection, projection)
+                    self.assertEqual(plan.answer_contract.grain, projection)
+                    self.assertEqual(
+                        (plan.aggregation, result, count), ("none", None, len(indexes))
+                    )
+                    self.assertEqual(
+                        {
+                            (item.field, item.operator, item.value)
+                            for item in plan.filters
+                            if item.field != "chunk_type"
+                        },
+                        {
+                            ("Date", operator, value)
+                            for operator, value in temporal_filters
+                        },
+                    )
+                    self.assertEqual(
+                        [
+                            tuple(chunk.metadata[field] for field in fields)
+                            for chunk in chunks
+                        ],
+                        [
+                            tuple(self.rows[index][field] for field in fields)
+                            for index in indexes
+                        ],
+                    )
+
+    def test_repeated_date_constraint_does_not_consume_projection(self):
+        for clause, expected, numeric in (
+            ("Date equals 2026-09-01", (0, 1), set()),
+            ("Date on or before 2026-09-01", (0, 1), set()),
+            ("Total_OT equals 2 on 2026-09-01", (0,), {("Total_OT", "eq", 2.0)}),
+        ):
+            with self.subTest(clause=clause):
+                chunks, plan, _, count = self.answer.fetch_context(
+                    f"Show Date and Status and Total_OT from records where {clause}"
+                )
+                self.assertEqual(plan.projection, ["Date", "Status", "Total_OT"])
+                self.assertEqual(count, len(expected))
+                self.assertEqual(
+                    [chunk.metadata["Total_OT"] for chunk in chunks],
+                    [self.rows[index]["Total_OT"] for index in expected],
+                )
+                self.assertEqual(
+                    {
+                        (item.field, item.operator, item.value)
+                        for item in plan.filters
+                        if item.field not in {"chunk_type", "Date"}
+                    },
+                    numeric,
+                )
+
+    def test_projection_cannot_hide_invalid_temporal_or_numeric_constraints(self):
+        for clause in (
+            "on 2026-02-30",
+            "between 2026-09-04 and 2026-09-01",
+            "where Date approximately 2026-09-01",
+            "where Total_OT equals 2026-09-01",
+            "where Total_OT greater than 2026-09-01",
+        ):
+            with self.subTest(clause=clause):
+                self.store.get.reset_mock()
+                with self.assertRaises(self.answer.PlanValidationError):
+                    self.answer.fetch_context(
+                        f"Show Date and Status from records {clause}"
+                    )
+                self.store.get.assert_not_called()
+
     def test_date_qualified_sums_keep_temporal_filters_executable(self):
         cases = (
             ("on 2026-09-01", 3.0, {("eq", "2026-09-01")}),

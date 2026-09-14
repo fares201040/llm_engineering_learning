@@ -65,6 +65,61 @@ def registered_test_alias(field, alias):
 
 
 class BaselineOrderingGrammarTests(unittest.TestCase):
+    def test_temporal_consumption_does_not_own_supporting_projection_mentions(self):
+        from week5.new_implementation.semantic_resolution import TemporalResolver
+
+        for scope, consumed in (
+            ("on 2026-09-01", ("on 2026-09-01",)),
+            ("on or before 2026-09-01", ("on or before 2026-09-01",)),
+            (
+                "from 2026-09-01 to 2026-09-03",
+                ("from 2026-09-01", "to 2026-09-03"),
+            ),
+            (
+                "between September 1, 2026 and 3",
+                ("between September 1, 2026", "and 3"),
+            ),
+        ):
+            with self.subTest(scope=scope):
+                question = f"Show Date and Status from records {scope}"
+                facts = detect_semantic_facts(question, ResolutionContext({}))
+                self.assertEqual(
+                    [fact.field for fact in facts if fact.kind == "projection"],
+                    ["Date", "Status"],
+                )
+                temporal = [fact for fact in facts if fact.kind == "filter"]
+                self.assertLess(
+                    temporal[0].evidence_span[0], temporal[0].consumed_span[0]
+                )
+                self.assertEqual(
+                    tuple(
+                        question[slice(*fact.consumed_span)].strip()
+                        for fact in temporal
+                    ),
+                    consumed,
+                )
+                self.assertEqual(
+                    tuple(
+                        question[slice(*span)]
+                        for span in TemporalResolver.scope_spans(question)
+                    ),
+                    (scope,),
+                )
+
+    def test_temporal_scope_boundary_never_starts_at_projected_field(self):
+        from week5.new_implementation.semantic_resolution import TemporalResolver
+
+        for scope in ("on 2026-09-01", "in September 2026"):
+            with self.subTest(scope=scope):
+                question = f"Show Status and Date from records {scope}"
+                self.assertEqual(
+                    tuple(
+                        question[slice(*span)]
+                        for span in TemporalResolver.scope_spans(question)
+                    ),
+                    (scope,),
+                )
+
     def test_numeric_aggregate_and_temporal_scopes_have_independent_roles(self):
         for scope in (
             "on 2026-09-01",

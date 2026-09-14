@@ -174,9 +174,31 @@ class _ClarificationBase(_StrictFrozenModel):
 class EmployeeClarification(_ClarificationBase):
     kind: Literal["employee_selection"] = "employee_selection"
     options: tuple[EmployeeOption, ...] = Field(min_length=1)
+    resolved_options: tuple[EmployeeOption, ...] = ()
+    reference_text: str | None = None
+    reference_span: tuple[int, int] | None = None
     confirmation_required: bool
     allow_multiple: bool = False
     has_more_candidates: bool = False
+
+    @model_validator(mode="after")
+    def _reference_matches_saved_question(self):
+        if (self.reference_text is None) != (self.reference_span is None):
+            raise ValueError("employee reference text and span must be paired")
+        if self.reference_text is None:
+            return self
+        start, end = self.reference_span
+        if (
+            not self.reference_text.strip()
+            or start < 0
+            or end <= start
+            or end > len(self.original_question)
+            or self.original_question[start:end] != self.reference_text
+        ):
+            raise ValueError(
+                "employee reference must match the saved original question"
+            )
+        return self
 
 
 class MeaningClarification(_ClarificationBase):
@@ -452,6 +474,10 @@ _CONVERSATION_CONTROL_REFERENCES = frozenset(
         "them",
         "both",
         "all",
+        "former",
+        "the former",
+        "latter",
+        "the latter",
         "separately",
         "together",
         "مرة أخرى",
@@ -469,6 +495,14 @@ _CONVERSATION_CONTROL_REFERENCES = frozenset(
         "كلاهما",
         "كليهما",
         "الجميع",
+        "السابق",
+        "السابقة",
+        "الأول",
+        "الأولى",
+        "الثاني",
+        "الثانية",
+        "الأخير",
+        "الأخيرة",
         "معا",
         "معاً",
         "بشكل منفصل",

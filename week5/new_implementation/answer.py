@@ -370,9 +370,12 @@ class EmployeeClarificationRequired(PlanningClarificationRequired):
         proposal: PlannerProposal | None,
         facts: tuple[SemanticFact, ...],
         resolution: EmployeeResolution,
+        *,
+        resolved_employees: Sequence[EmployeeCandidate] = (),
     ):
         super().__init__(proposal, facts)
         self.resolution = resolution
+        self.resolved_employees = list(resolved_employees)
 
 
 class ConstraintClarificationRequired(PlanningClarificationRequired):
@@ -1115,13 +1118,41 @@ def _malformed_employee_id_resolution(
     )
 
 
+def _first_malformed_employee_id(
+    question: str,
+    directory: list[EmployeeCandidate],
+) -> tuple[str, tuple[int, int], EmployeeResolution | None] | None:
+    """Return the first malformed ID-like token and its authorized resolution."""
+    for match in _EMPLOYEE_ID_LIKE_PATTERN.finditer(question):
+        reference = match.group(0)
+        if not _EMPLOYEE_ID_PATTERN.fullmatch(reference):
+            return (
+                reference,
+                match.span(),
+                _malformed_employee_id_resolution(reference, directory),
+            )
+    return None
+
+
 def _replace_confirmed_malformed_employee_id(
     question: str,
     selected: Sequence[EmployeeCandidate],
+    *,
+    reference_text: str | None = None,
+    reference_span: tuple[int, int] | None = None,
 ) -> str:
     if len(selected) != 1:
         return question
     employee_id = selected[0].employee_id
+    if reference_text is not None and reference_span is not None:
+        start, end = reference_span
+        if (
+            0 <= start < end <= len(question)
+            and question[start:end] == reference_text
+            and _is_edit_distance_one(reference_text, employee_id)
+        ):
+            return question[:start] + employee_id + question[end:]
+        return question
     for match in _EMPLOYEE_ID_LIKE_PATTERN.finditer(question):
         reference = match.group(0)
         if not _EMPLOYEE_ID_PATTERN.fullmatch(reference) and _is_edit_distance_one(
@@ -3525,7 +3556,10 @@ def _fetch_context_result(
                 candidate_count=len(entity_resolution.candidates),
             )
             raise EmployeeClarificationRequired(
-                None, tuple(detected_facts), entity_resolution
+                None,
+                tuple(detected_facts),
+                entity_resolution,
+                resolved_employees=selected,
             )
 
     if any(
@@ -4279,6 +4313,12 @@ def _format_employee_clarification(
     return f"{heading}\n{choices}\n{instruction}{overflow}"
 
 
+def _format_malformed_employee_id_guidance(*, locale: str = "en") -> str:
+    if locale == "ar":
+        return "يرجى إدخال معرّف موظف صالح بالتنسيق A12345."
+    return "Please enter a valid employee ID in the format A12345."
+
+
 def _format_missing_intent(
     employees: list[EmployeeCandidate], *, locale: str = "en"
 ) -> str:
@@ -4366,6 +4406,10 @@ def _store_employee_clarification(
     proposal: PlannerProposal | None,
     facts: tuple[SemanticFact, ...],
     resolution: EmployeeResolution,
+    *,
+    resolved_employees: Sequence[EmployeeCandidate] = (),
+    reference_text: str | None = None,
+    reference_span: tuple[int, int] | None = None,
 ) -> None:
     state.pending_clarification = EmployeeClarification(
         original_question=question,
@@ -4376,6 +4420,12 @@ def _store_employee_clarification(
             EmployeeOption(employee_id=item.employee_id, name=item.name)
             for item in resolution.candidates
         ),
+        resolved_options=tuple(
+            EmployeeOption(employee_id=item.employee_id, name=item.name)
+            for item in resolved_employees
+        ),
+        reference_text=reference_text,
+        reference_span=reference_span,
         confirmation_required=resolution.outcome == "confirmation",
         allow_multiple=_question_allows_multiple_employee_selection(question),
         has_more_candidates=resolution.has_more_candidates,
@@ -4593,28 +4643,22 @@ def answer_question_with_state(
         return f"I could not safely interpret that request: {exc}", [], state
 
     if state.pending_clarification is None:
-        malformed_tokens = tuple(
-            match.group(0)
+        malformed = None
+        if any(
+            not _EMPLOYEE_ID_PATTERN.fullmatch(match.group(0))
             for match in _EMPLOYEE_ID_LIKE_PATTERN.finditer(question)
-            if not _EMPLOYEE_ID_PATTERN.fullmatch(match.group(0))
-        )
-        malformed_resolution = None
-        if malformed_tokens:
+        ):
             directory = load_employee_directory()
-            malformed_resolution = next(
-                (
-                    resolution
-                    for reference in malformed_tokens
-                    if (
-                        resolution := _malformed_employee_id_resolution(
-                            reference, directory
-                        )
-                    )
-                    is not None
-                ),
-                None,
-            )
-        if malformed_resolution is not None:
+            malformed = _first_malformed_employee_id(question, directory)
+        if malformed is not None:
+            malformed_reference, malformed_span, malformed_resolution = malformed
+            if malformed_resolution is None:
+                _clear_pending_state(state)
+                return (
+                    _format_malformed_employee_id_guidance(locale=reply_locale),
+                    [],
+                    state,
+                )
             state.pending_question = question
             state.pending_proposal = None
             state.pending_facts = []
@@ -4625,6 +4669,8 @@ def answer_question_with_state(
                 None,
                 (),
                 malformed_resolution,
+                reference_text=malformed_reference,
+                reference_span=malformed_span,
             )
             return (
                 _format_employee_clarification(
@@ -4795,14 +4841,14 @@ def answer_question_with_state(
         and state.pending_question
         and state.pending_candidates
     ):
-        selected = _select_pending_employees(
+        selected_choice = _select_pending_employees(
             question,
             state.pending_candidates,
             allow_multiple=_question_allows_multiple_employee_selection(
                 state.pending_question
             ),
         )
-        if not selected:
+        if not selected_choice:
             if _is_complete_new_attendance_question(question):
                 _clear_pending_state(state)
                 return answer_question_with_state(
@@ -4831,13 +4877,47 @@ def answer_question_with_state(
             ): candidate
             for candidate in current_directory
         }
-        validated = [
+        pending_employee = (
+            state.pending_clarification
+            if isinstance(state.pending_clarification, EmployeeClarification)
+            else None
+        )
+        prior_scope = (
+            [
+                EmployeeCandidate(
+                    employee_id=option.employee_id,
+                    name=option.name,
+                )
+                for option in pending_employee.resolved_options
+            ]
+            if pending_employee is not None
+            else []
+        )
+        validated_prior = [
             current_by_identity.get(
                 (candidate.employee_id.casefold(), _normalize_name(candidate.name))
             )
-            for candidate in selected
+            for candidate in prior_scope
         ]
-        if any(candidate is None for candidate in validated):
+        if any(candidate is None for candidate in validated_prior):
+            locale = (
+                pending_employee.reply_locale if pending_employee is not None else "en"
+            )
+            _clear_pending_state(state)
+            message = (
+                "تعذر العثور على موظف تم تحديده سابقًا. يرجى إرسال الطلب مرة أخرى."
+                if locale == "ar"
+                else "A previously resolved employee is no longer available. Please ask again."
+            )
+            return message, [], state
+
+        validated_choice = [
+            current_by_identity.get(
+                (candidate.employee_id.casefold(), _normalize_name(candidate.name))
+            )
+            for candidate in selected_choice
+        ]
+        if any(candidate is None for candidate in validated_choice):
             pending_ids = {
                 candidate.employee_id.casefold()
                 for candidate in state.pending_candidates
@@ -4865,10 +4945,66 @@ def answer_question_with_state(
                 state,
             )
 
-        selected = [candidate for candidate in validated if candidate is not None]
+        current_selection = [
+            candidate for candidate in validated_choice if candidate is not None
+        ]
+        selected = []
+        selected_ids_seen: set[str] = set()
+        for candidate in [
+            candidate for candidate in validated_prior if candidate is not None
+        ] + current_selection:
+            employee_key = candidate.employee_id.casefold()
+            if employee_key not in selected_ids_seen:
+                selected.append(candidate)
+                selected_ids_seen.add(employee_key)
         effective_question = _replace_confirmed_malformed_employee_id(
-            state.pending_question, selected
+            state.pending_question,
+            current_selection,
+            reference_text=(
+                pending_employee.reference_text
+                if pending_employee is not None
+                else None
+            ),
+            reference_span=(
+                pending_employee.reference_span
+                if pending_employee is not None
+                else None
+            ),
         )
+        malformed = _first_malformed_employee_id(effective_question, current_directory)
+        if malformed is not None:
+            malformed_reference, malformed_span, malformed_resolution = malformed
+            if malformed_resolution is None:
+                _clear_pending_state(state)
+                return (
+                    _format_malformed_employee_id_guidance(locale=reply_locale),
+                    [],
+                    state,
+                )
+            state.pending_question = effective_question
+            state.pending_proposal = None
+            state.pending_facts = []
+            state.pending_candidates = malformed_resolution.candidates
+            state.pending_constraint = None
+            state.pending_interpretations = []
+            _store_employee_clarification(
+                state,
+                effective_question,
+                None,
+                (),
+                malformed_resolution,
+                resolved_employees=selected,
+                reference_text=malformed_reference,
+                reference_span=malformed_span,
+            )
+            return (
+                _format_employee_clarification(
+                    malformed_resolution,
+                    locale=reply_locale,
+                ),
+                [],
+                state,
+            )
         selected_ids = [candidate.employee_id for candidate in selected]
         selected_operator = "eq" if len(selected_ids) == 1 else "in"
         selected_value = selected_ids[0] if len(selected_ids) == 1 else selected_ids
@@ -4977,6 +5113,7 @@ def answer_question_with_state(
             exc.proposal,
             exc.facts,
             exc.resolution,
+            resolved_employees=exc.resolved_employees,
         )
         return (
             _format_employee_clarification(

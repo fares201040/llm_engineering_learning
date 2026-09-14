@@ -1155,13 +1155,153 @@ class EmployeeResolutionTests(unittest.TestCase):
         self.assertEqual(blocker.reference, "Sam")
         self.assertEqual(blocker.candidates, [sam_north, sam_south])
 
+    def test_employee_clarification_carries_prior_source_ordered_matches(self):
+        morgan = answer.EmployeeCandidate(employee_id="A10001", name="Morgan River")
+        sam_north = answer.EmployeeCandidate(employee_id="A10002", name="Sam North")
+        sam_south = answer.EmployeeCandidate(employee_id="A10003", name="Sam South")
+        blocker = answer.EmployeeResolution(
+            outcome="ambiguous",
+            candidates=[sam_north, sam_south],
+            reference="Sam",
+            match_method="prefix",
+        )
+        facts = (
+            answer.SemanticFact(
+                kind="entity",
+                field="Name",
+                values=("Morgan River",),
+                evidence_text="Morgan River",
+                origin="question",
+                strength="strong",
+            ),
+            answer.SemanticFact(
+                kind="entity",
+                field="Name",
+                values=("Sam",),
+                evidence_text="Sam",
+                origin="question",
+                strength="strong",
+            ),
+        )
+
+        with (
+            patch.object(answer, "detect_semantic_facts", return_value=facts),
+            patch.object(answer, "_facts_from_question_surface", return_value=()),
+            patch.object(
+                answer,
+                "load_employee_directory",
+                return_value=[morgan, sam_north, sam_south],
+            ),
+            patch.object(
+                answer,
+                "_resolve_employee_mentions",
+                return_value=([morgan], blocker),
+            ),
+            self.assertRaises(answer.EmployeeClarificationRequired) as raised,
+        ):
+            answer._fetch_context_result("worked days for Morgan River and Sam")
+
+        self.assertEqual(raised.exception.resolved_employees, [morgan])
+
+    def test_employee_clarification_resume_revalidates_and_keeps_complete_scope(self):
+        morgan = answer.EmployeeCandidate(employee_id="A10001", name="Morgan River")
+        sam_north = answer.EmployeeCandidate(employee_id="A10002", name="Sam North")
+        sam_south = answer.EmployeeCandidate(employee_id="A10003", name="Sam South")
+        blocker = answer.EmployeeResolution(
+            outcome="ambiguous",
+            candidates=[sam_north, sam_south],
+            reference="Sam",
+            match_method="prefix",
+        )
+        exception = answer.EmployeeClarificationRequired(
+            None, (), blocker, resolved_employees=[morgan]
+        )
+        successful = answer.ContextFetchResult(
+            [],
+            answer.QueryPlan(mode="exact", search_query="worked days"),
+            {"value": 2},
+            2,
+            [morgan, sam_north],
+        )
+
+        with patch.object(answer, "_fetch_context_result", side_effect=exception):
+            _text, _chunks, state = answer.answer_question_with_state(
+                "worked days for Morgan River and Sam",
+                [],
+                answer.ConversationState(),
+            )
+
+        self.assertEqual(
+            state.pending_clarification.resolved_options,
+            (answer.EmployeeOption(employee_id="A10001", name="Morgan River"),),
+        )
+        with (
+            patch.object(
+                answer,
+                "load_employee_directory",
+                return_value=[morgan, sam_north, sam_south],
+            ),
+            patch.object(
+                answer, "_fetch_context_result", return_value=successful
+            ) as fetch,
+            patch.object(answer, "_answer_from_context", return_value=("ok", [])),
+        ):
+            text, _chunks, state = answer.answer_question_with_state("1", [], state)
+
+        self.assertEqual(text, "ok")
+        self.assertEqual(
+            fetch.call_args.kwargs["default_employees"], [morgan, sam_north]
+        )
+        self.assertEqual(state.selected_employees, [morgan, sam_north])
+
+    def test_employee_clarification_resume_rejects_stale_prior_scope(self):
+        morgan = answer.EmployeeCandidate(employee_id="A10001", name="Morgan River")
+        sam_north = answer.EmployeeCandidate(employee_id="A10002", name="Sam North")
+        blocker = answer.EmployeeResolution(
+            outcome="confirmation",
+            candidates=[sam_north],
+            reference="Sam",
+            match_method="prefix",
+        )
+        exception = answer.EmployeeClarificationRequired(
+            None, (), blocker, resolved_employees=[morgan]
+        )
+
+        with patch.object(answer, "_fetch_context_result", side_effect=exception):
+            _text, _chunks, state = answer.answer_question_with_state(
+                "worked days for Morgan River and Sam",
+                [],
+                answer.ConversationState(),
+            )
+
+        with (
+            patch.object(answer, "load_employee_directory", return_value=[sam_north]),
+            patch.object(answer, "_fetch_context_result") as fetch,
+        ):
+            text, chunks, state = answer.answer_question_with_state("yes", [], state)
+
+        self.assertIn("previously resolved employee", text)
+        self.assertEqual(chunks, [])
+        self.assertIsNone(state.pending_clarification)
+        fetch.assert_not_called()
+
     def test_bare_conversation_controls_are_not_treated_as_employee_names(self):
         directory = [
             answer.EmployeeCandidate(employee_id="A10001", name="Agin Person"),
             answer.EmployeeCandidate(employee_id="A10002", name="نفسه علي"),
         ]
 
-        for control in ("again", "same employee", "both", "نفسه", "كلاهما"):
+        for control in (
+            "again",
+            "same employee",
+            "both",
+            "former",
+            "the latter",
+            "نفسه",
+            "كلاهما",
+            "السابق",
+            "الأخيرة",
+        ):
             with self.subTest(control=control):
                 self.assertIsNone(
                     answer._implicit_bare_employee_resolution(control, (), directory)
@@ -1222,6 +1362,100 @@ class EmployeeResolutionTests(unittest.TestCase):
                 self.assertEqual(state.pending_candidates, [candidate])
                 catalog.assert_not_called()
                 retrieval.assert_not_called()
+
+    def test_unmatched_malformed_id_gets_localized_format_guidance_without_retrieval(
+        self,
+    ):
+        candidate = answer.EmployeeCandidate(
+            employee_id="A11017", name="Example Employee"
+        )
+
+        for question, expected_text in (
+            ("How many worked days for A999999?", "format A12345"),
+            ("كم يوم عمل للموظف A999999؟", "بالتنسيق A12345"),
+        ):
+            with (
+                self.subTest(question=question),
+                patch.object(
+                    answer, "load_employee_directory", return_value=[candidate]
+                ),
+                patch.object(answer, "load_attendance_catalog_candidates") as catalog,
+                patch.object(answer, "execute_exact_postgres") as retrieval,
+            ):
+                text, chunks, state = answer.answer_question_with_state(
+                    question, [], answer.ConversationState()
+                )
+
+                self.assertIn(expected_text, text)
+                self.assertEqual(chunks, [])
+                self.assertIsNone(state.pending_clarification)
+                catalog.assert_not_called()
+                retrieval.assert_not_called()
+
+    def test_multiple_malformed_ids_are_confirmed_independently_in_source_order(self):
+        first = answer.EmployeeCandidate(employee_id="A11017", name="First Employee")
+        second = answer.EmployeeCandidate(employee_id="A10029", name="Second Employee")
+        question = "How many worked days for A110177 and A100299?"
+        successful = answer.ContextFetchResult(
+            [],
+            answer.QueryPlan(mode="exact", search_query="worked days"),
+            {"value": 2},
+            2,
+            [first, second],
+        )
+
+        with patch.object(
+            answer, "load_employee_directory", return_value=[first, second]
+        ):
+            _text, _chunks, state = answer.answer_question_with_state(
+                question, [], answer.ConversationState()
+            )
+            self.assertEqual(state.pending_candidates, [first])
+
+            _text, _chunks, state = answer.answer_question_with_state("yes", [], state)
+            self.assertEqual(state.pending_candidates, [second])
+            self.assertEqual(
+                state.pending_clarification.resolved_options,
+                (answer.EmployeeOption(employee_id="A11017", name="First Employee"),),
+            )
+
+            with (
+                patch.object(
+                    answer, "_fetch_context_result", return_value=successful
+                ) as fetch,
+                patch.object(answer, "_answer_from_context", return_value=("ok", [])),
+            ):
+                text, _chunks, state = answer.answer_question_with_state(
+                    "yes", [], state
+                )
+
+        self.assertEqual(text, "ok")
+        self.assertEqual(
+            fetch.call_args.args[0],
+            "How many worked days for A11017 and A10029?",
+        )
+        self.assertEqual(fetch.call_args.kwargs["default_employees"], [first, second])
+        self.assertEqual(state.selected_employees, [first, second])
+
+    def test_first_unmatched_malformed_id_blocks_later_suggestions(self):
+        second = answer.EmployeeCandidate(employee_id="A10029", name="Second Employee")
+        with (
+            patch.object(answer, "load_employee_directory", return_value=[second]),
+            patch.object(answer, "load_attendance_catalog_candidates") as catalog,
+            patch.object(answer, "execute_exact_postgres") as retrieval,
+        ):
+            text, chunks, state = answer.answer_question_with_state(
+                "How many worked days for A999999 and A100299?",
+                [],
+                answer.ConversationState(),
+            )
+
+        self.assertIn("format A12345", text)
+        self.assertNotIn("Did you mean", text)
+        self.assertEqual(chunks, [])
+        self.assertIsNone(state.pending_clarification)
+        catalog.assert_not_called()
+        retrieval.assert_not_called()
 
     def test_direct_fetch_keeps_malformed_employee_ids_fail_closed(self):
         with (

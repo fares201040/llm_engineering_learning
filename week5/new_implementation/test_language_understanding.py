@@ -23,6 +23,7 @@ from week5.new_implementation.language_understanding import (
     SurfaceCandidate,
     analyze_question_surface,
     automatically_accepted_candidates,
+    is_conversation_control_reference,
     validate_localized_alias_registry,
 )
 
@@ -147,6 +148,49 @@ class TolerantInputContractTests(unittest.TestCase):
                     reply_locale="en",
                     **values,
                 )
+
+    def test_employee_clarification_preserves_resolved_scope_and_source_reference(self):
+        resolved = EmployeeOption(employee_id="A10001", name="Morgan River")
+        option = EmployeeOption(employee_id="A10002", name="Sam North")
+        question = "worked days for Morgan River and A100022"
+        start = question.index("A100022")
+
+        clarification = EmployeeClarification(
+            original_question=question,
+            reply_locale="en",
+            options=(option,),
+            resolved_options=(resolved,),
+            reference_text="A100022",
+            reference_span=(start, start + len("A100022")),
+            confirmation_required=True,
+        )
+
+        self.assertEqual(clarification.resolved_options, (resolved,))
+        self.assertEqual(
+            question[slice(*clarification.reference_span)],
+            clarification.reference_text,
+        )
+        with self.assertRaises(ValidationError):
+            EmployeeClarification.model_validate(
+                {
+                    **clarification.model_dump(),
+                    "reference_span": (0, len("A100022")),
+                }
+            )
+
+    def test_former_and_latter_controls_are_never_person_references(self):
+        for control in (
+            "former",
+            "the latter",
+            "السابق",
+            "السابقة",
+            "الأول",
+            "الثانية",
+            "الأخير",
+            "الأخيرة",
+        ):
+            with self.subTest(control=control):
+                self.assertTrue(is_conversation_control_reference(control))
 
     def test_meaning_clarification_rejects_evidence_outside_saved_question(self):
         option = MeaningOption(

@@ -446,10 +446,7 @@ class MultiEmployeeDateEmployeeResult(BaseModel):
 class MultiEmployeeDateViewsResult(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    views: tuple[
-        Literal["per_employee", "employee_days", "union_dates", "intersection_dates"],
-        ...,
-    ]
+    views: tuple[MultiEmployeeDateView, ...]
     per_employee: tuple[MultiEmployeeDateEmployeeResult, ...] = ()
     employee_days: int | None = Field(default=None, ge=0)
     union_dates: int | None = Field(default=None, ge=0)

@@ -2,7 +2,7 @@
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, get_args
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -134,10 +134,7 @@ class CompiledMultiEmployeeDateViews:
     """Compiler-owned primitives for verified multi-employee date reductions."""
 
     employee_ids: tuple[str, ...]
-    views: tuple[
-        Literal["per_employee", "employee_days", "union_dates", "intersection_dates"],
-        ...,
-    ]
+    views: tuple[MultiEmployeeDateView, ...]
     per_employee: ExecutableQueryPlan | None = None
     union_dates: ExecutableQueryPlan | None = None
     intersection_dates: ExecutableQueryPlan | None = None
@@ -1190,17 +1187,9 @@ def compile_multi_employee_date_views(
     )
     if employee_filter is None:
         raise ValueError("Date views require the verified employee scope filter.")
-    if provenance:
-        checked = revalidate_executable_plan(plan, context, provenance)
-        if not checked.ready or checked.executable_plan is None:
-            raise ValueError("Date views require a revalidated executable plan.")
-    else:
-        try:
-            ExecutableQueryPlan.model_validate(plan.model_dump())
-        except ValidationError as exc:
-            raise ValueError(
-                "Date views require a revalidated executable plan."
-            ) from exc
+    checked = revalidate_executable_plan(plan, context, provenance)
+    if not checked.ready or checked.executable_plan is None:
+        raise ValueError("Date views require a revalidated executable plan.")
     if (
         plan.mode != "exact"
         or plan.aggregation != "distinct_count"
@@ -1208,7 +1197,9 @@ def compile_multi_employee_date_views(
     ):
         raise ValueError("Date views require a verified distinct-date exact plan.")
 
-    selected = (
+    if view is not None and view not in get_args(MultiEmployeeDateView):
+        raise ValueError("Unsupported multi-employee date view.")
+    selected: tuple[MultiEmployeeDateView, ...] = (
         ("per_employee", "employee_days", "union_dates", "intersection_dates")
         if view in (None, "all_views")
         else (view,)

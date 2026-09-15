@@ -7,6 +7,32 @@ from pydantic import TypeAdapter, ValidationError
 
 
 class ConversationProviderTests(unittest.TestCase):
+    def test_grounded_projection_both_is_not_a_contextual_employee_reference(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        cases = (
+            ("Show both Date and Status for A10001", False),
+            ("Show both Status and Date for A10001", False),
+            ("Show both Date and Status for both", True),
+            ("Show both Date and Status for A10001 again", True),
+            ("Show Date and Status for both", True),
+        )
+        for message, expected in cases:
+            facts = tuple(
+                c.SemanticFact(
+                    kind="projection",
+                    field=field,
+                    evidence_text=field,
+                    origin="question",
+                    strength="strong",
+                )
+                for field in ("Date", "Status")
+            )
+            with self.subTest(message=message):
+                self.assertEqual(
+                    c.needs_conversation_decision(message, facts), expected
+                )
+
     def test_oversized_typed_frame_is_rejected_before_provider_input(self):
         from week5.new_implementation import conversation_understanding as c
         from week5.new_implementation.language_understanding import ResultSnapshot
@@ -415,11 +441,21 @@ class ConversationContractTests(unittest.TestCase):
         values = {
             "message": "worked days for Morgan and the same for Sam",
             "employee_choice_ids": ("employee:morgan", "employee:sam"),
+            "employee_span_choices": (
+                {"source_span": (16, 22), "choice_ids": ("employee:morgan",)},
+                {"source_span": (40, 43), "choice_ids": ("employee:sam",)},
+            ),
             "prior_unit_choice_ids": ("prior:latest",),
             "strong_fact_ids": ("fact:worked",),
             "max_units": 8,
         }
         values.update(replacements)
+        if "message" in replacements:
+            values["employee_span_choices"] = tuple(
+                item
+                for item in values["employee_span_choices"]
+                if item["source_span"][1] <= len(values["message"])
+            )
         return ConversationDecisionContext(**values)
 
     def _resolved_payload(self):
@@ -800,7 +836,7 @@ class ConversationContractTests(unittest.TestCase):
             {
                 "kind": "reference_choice",
                 "source_span": (16, 22),
-                "choice_id": "employee:sam",
+                "choice_id": "employee:morgan",
             },
         )
         validate_conversation_decision(

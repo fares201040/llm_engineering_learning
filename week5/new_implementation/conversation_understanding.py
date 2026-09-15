@@ -236,6 +236,22 @@ class ConversationFactSource(_StrictFrozenModel):
     _source_span_is_forward = field_validator("source_span")(_validate_source_span)
 
 
+class ConversationEmployeeSource(_StrictFrozenModel):
+    """Directory-verified allowable identities for one original source span."""
+
+    source_span: tuple[int, int]
+    employee_ids: tuple[str, ...]
+
+    _source_span_is_forward = field_validator("source_span")(_validate_source_span)
+
+
+class ConversationEmployeeSpanChoices(_StrictFrozenModel):
+    source_span: tuple[int, int]
+    choice_ids: tuple[str, ...]
+
+    _source_span_is_forward = field_validator("source_span")(_validate_source_span)
+
+
 class ConversationDecisionContext(_StrictFrozenModel):
     """Trusted request-local identifiers and bounds for one provider decision."""
 
@@ -248,6 +264,7 @@ class ConversationDecisionContext(_StrictFrozenModel):
     fact_choice_ids: tuple[str, ...] = ()
     strong_fact_ids: tuple[str, ...] = ()
     fact_sources: tuple[ConversationFactSource, ...] = ()
+    employee_span_choices: tuple[ConversationEmployeeSpanChoices, ...] = ()
     max_units: int = Field(gt=0)
     max_employee_bindings: int = Field(default=20, gt=0)
 
@@ -281,6 +298,16 @@ class ConversationDecisionContext(_StrictFrozenModel):
             self.fact_choice_ids
         ):
             raise ValueError("strong fact identifiers must be known fact choices")
+        spans = [item.source_span for item in self.employee_span_choices]
+        if len(spans) != len(set(spans)):
+            raise ValueError("employee binding spans must be unique")
+        for item in self.employee_span_choices:
+            if item.source_span[1] > len(self.message) or not set(
+                item.choice_ids
+            ) <= set(self.employee_choice_ids):
+                raise ValueError(
+                    "employee bindings must use bounded spans and known choices"
+                )
         return self
 
 
@@ -328,6 +355,9 @@ def validate_conversation_decision(
     _validate_non_overlapping_spans(unit_spans, label="conversation unit")
 
     known_employees = set(context.employee_choice_ids)
+    employee_bindings = {
+        item.source_span: item.choice_ids for item in context.employee_span_choices
+    }
     known_bases = set(context.prior_unit_choice_ids)
     known_views = set(context.view_choice_ids)
     known_facts = set(context.fact_choice_ids) | set(context.strong_fact_ids)
@@ -396,6 +426,12 @@ def validate_conversation_decision(
                 if mention.choice_id not in known_employees:
                     raise ConversationDecisionValidationError(
                         "unknown employee choice ID"
+                    )
+                if mention.choice_id not in employee_bindings.get(
+                    mention.source_span, ()
+                ):
+                    raise ConversationDecisionValidationError(
+                        "employee choice conflicts with source binding"
                     )
             elif isinstance(mention, PreviousUnitEmployeeMention):
                 if mention.unit_index >= unit_index:
@@ -471,8 +507,6 @@ def needs_conversation_decision(message: str, facts: tuple[SemanticFact, ...]) -
         if fact.kind == "result_intent" and fact.evidence_span:
             start, end = fact.evidence_span
             contextual_text[start:end] = " " * (end - start)
-    if _CONTEXTUAL_LANGUAGE.search("".join(contextual_text)):
-        return True
     if sum(fact.kind == "entity" for fact in facts) > 1:
         return True
     remaining = list(message)
@@ -486,7 +520,7 @@ def needs_conversation_decision(message: str, facts: tuple[SemanticFact, ...]) -
             )
         for start, end in spans:
             remaining[start:end] = " " * (end - start)
-        if fact.kind == "projection":
+        if fact.kind == "projection" and fact.strength == "strong":
             projections.extend(
                 match.span()
                 for match in re.finditer(re.escape(fact.evidence_text), message, re.I)
@@ -495,6 +529,13 @@ def needs_conversation_decision(message: str, facts: tuple[SemanticFact, ...]) -
     for left, right in zip(projections, projections[1:]):
         if re.fullmatch(r"[\s,،]*(?:and|و)[\s,،]*", message[left[1] : right[0]], re.I):
             remaining[left[1] : right[0]] = " " * (right[0] - left[1])
+            # Here "both" quantifies two grounded projected fields, not employees.
+            quantifier = re.search(r"\bboth\s+$", message[: left[0]], re.I)
+            if quantifier:
+                start, end = quantifier.span()
+                contextual_text[start:end] = " " * (end - start)
+    if _CONTEXTUAL_LANGUAGE.search("".join(contextual_text)):
+        return True
     return bool(facts and re.search(r"\band\b|[;؛]|\bو\b", "".join(remaining), re.I))
 
 
@@ -521,6 +562,8 @@ def build_conversation_request(
     referents: tuple[EmployeeReferent, ...] = (),
     frames: tuple[ConversationTurnFrame, ...] = (),
     active_referent_ids: tuple[str, ...] = (),
+    *,
+    employee_sources: tuple[ConversationEmployeeSource, ...] = (),
 ) -> ConversationRequest:
     """Keep authoritative objects local; expose fresh opaque choices per request."""
     if any(
@@ -577,6 +620,18 @@ def build_conversation_request(
     context = ConversationDecisionContext(
         message=message,
         employee_choice_ids=tuple(key for key, _ in employees),
+        employee_span_choices=tuple(
+            ConversationEmployeeSpanChoices(
+                source_span=source.source_span,
+                choice_ids=tuple(
+                    key
+                    for key, item in employees
+                    if item.employee_id.casefold()
+                    in {identity.casefold() for identity in source.employee_ids}
+                ),
+            )
+            for source in employee_sources
+        ),
         prior_unit_choice_ids=tuple(key for key, _ in priors),
         view_choice_ids=tuple(key for key, _ in views),
         fact_choice_ids=tuple(key for key, _ in fact_choices),
@@ -611,6 +666,9 @@ def _conversation_prompt(request: ConversationRequest) -> str:
         "employees": [
             {"choice_id": key, "active": key in request.active_choices}
             for key, _ in request.employees
+        ],
+        "employee_bindings": [
+            item.model_dump() for item in request.context.employee_span_choices
         ],
         "views": [{"choice_id": key, "meaning": view} for key, view in request.views],
         "prior_units": [

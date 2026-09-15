@@ -4827,6 +4827,50 @@ def _conversation_employee_blocker(question: str, facts: tuple[SemanticFact, ...
     return _resolve_employee_mentions(tuple(references), load_employee_directory())
 
 
+def _conversation_employee_sources(
+    question: str,
+    facts: tuple[SemanticFact, ...],
+    selected: Sequence[EmployeeCandidate],
+    referents: Sequence[EmployeeReferent] = (),
+) -> tuple[conversation.ConversationEmployeeSource, ...]:
+    """Bind explicit source text using the already verified employee resolution."""
+    bindings = {}
+    for fact in facts:
+        if fact.origin != "question" or not (
+            fact.kind == "entity"
+            or (fact.kind == "filter" and fact.field == "Employee_ID")
+        ):
+            continue
+        spans = (
+            (fact.evidence_span,)
+            if fact.evidence_span
+            else tuple(
+                match.span()
+                for match in re.finditer(re.escape(fact.evidence_text), question, re.I)
+            )
+        )
+        if is_conversation_control_reference(fact.evidence_text):
+            allowed = tuple(item.employee_id for item in referents)
+        else:
+            resolution = resolve_employee_reference(fact.evidence_text, list(selected))
+            allowed = (
+                tuple(item.employee_id for item in resolution.candidates)
+                if (
+                    resolution.outcome == "unique"
+                    and resolution.match_method in {"exact_id", "exact_name"}
+                )
+                else ()
+            )
+        for span in spans:
+            bindings[span] = allowed
+    return tuple(
+        conversation.ConversationEmployeeSource(
+            source_span=span, employee_ids=identities
+        )
+        for span, identities in sorted(bindings.items())
+    )
+
+
 def answer_question_with_state(
     question: str,
     history: list[dict] | None,
@@ -4906,6 +4950,9 @@ def answer_question_with_state(
                     tuple(request_state.referents),
                     tuple(request_state.recent_frames),
                     tuple(request_state.active_referent_ids),
+                    employee_sources=_conversation_employee_sources(
+                        question, conversation_facts, selected, request_state.referents
+                    ),
                 )
                 conversation.request_conversation_decision(request)
             except conversation.ConversationDecisionValidationError:

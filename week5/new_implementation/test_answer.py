@@ -3937,6 +3937,277 @@ class PostgresResultTests(unittest.TestCase):
 
 
 class ConversationGatewayTests(unittest.TestCase):
+    def test_grounded_both_projection_reaches_deterministic_path_without_completion(
+        self,
+    ):
+        from week5.new_implementation import conversation_understanding as c
+
+        question = "Show both Date and Status for A10001"
+        # Exercise the gateway with the certified facts in the review finding;
+        # expanding the detector's projection grammar is outside this fix.
+        facts = tuple(
+            answer.SemanticFact(
+                kind="projection",
+                field=field,
+                evidence_text=field,
+                origin="question",
+                strength="strong",
+            )
+            for field in ("Date", "Status")
+        ) + (
+            answer.SemanticFact(
+                kind="entity",
+                field="Employee_ID",
+                values=("A10001",),
+                evidence_text="A10001",
+                origin="question",
+                strength="strong",
+            ),
+        )
+        result = answer.ContextFetchResult(
+            [], answer.QueryPlan(mode="exact", search_query=question), None, 0, []
+        )
+        with (
+            patch.object(answer, "detect_semantic_facts", return_value=facts),
+            patch.object(answer, "_fetch_context_result", return_value=result) as fetch,
+            patch.object(
+                answer, "_answer_from_context", return_value=("verified projection", [])
+            ),
+            patch.object(c, "completion") as completion,
+        ):
+            text, _, _ = answer.answer_question_with_state(
+                question, [], answer.ConversationState()
+            )
+        self.assertEqual(text, "verified projection")
+        self.assertEqual(fetch.call_count, 1)
+        completion.assert_not_called()
+
+    def test_source_binding_matrix_rejects_swapped_and_unapproved_spans(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        directory = [
+            answer.EmployeeCandidate(employee_id="A10001", name="Morgan River"),
+            answer.EmployeeCandidate(employee_id="A10002", name="سام شمال"),
+        ]
+        referents = tuple(
+            answer.EmployeeReferent(**item.model_dump()) for item in directory
+        )
+        for reference, expected_id in (
+            ("A10001", "A10001"),
+            ("a10001", "A10001"),
+            ("Morgan River", "A10001"),
+            ("سام شمال", "A10002"),
+        ):
+            question = f"for {reference} again"
+            span = (4, 4 + len(reference))
+            fact = answer.SemanticFact(
+                kind="entity",
+                field="Name",
+                evidence_text=reference,
+                evidence_span=span,
+                origin="question",
+                strength="strong",
+            )
+            sources = answer._conversation_employee_sources(
+                question, (fact,), directory, referents
+            )
+            request = c.build_conversation_request(
+                question, (fact,), referents, employee_sources=sources
+            )
+            matching = next(
+                key
+                for key, item in request.employees
+                if item.employee_id == expected_id
+            )
+            conflicting = next(
+                key
+                for key, item in request.employees
+                if item.employee_id != expected_id
+            )
+            for choice, selected_span, accepted in (
+                (matching, span, True),
+                (conflicting, span, False),
+                (conflicting, (0, span[1]), False),
+                (matching, (span[1] + 1, len(question)), False),
+            ):
+                payload = {
+                    "status": "resolved",
+                    "units": [
+                        {
+                            "route": "attendance",
+                            "relation": "new",
+                            "source_span": [0, len(question)],
+                            "fact_ids": list(request.context.fact_choice_ids),
+                            "employee_mentions": [
+                                {
+                                    "kind": "reference_choice",
+                                    "source_span": list(selected_span),
+                                    "choice_id": choice,
+                                }
+                            ],
+                        }
+                    ],
+                }
+                response = SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            finish_reason="stop",
+                            message=SimpleNamespace(content=json.dumps(payload)),
+                        )
+                    ]
+                )
+                with (
+                    self.subTest(
+                        reference=reference, accepted=accepted, span=selected_span
+                    ),
+                    patch.object(c, "completion", return_value=response) as completion,
+                    patch.object(c.uuid, "uuid4", wraps=c.uuid.uuid4) as allocate,
+                ):
+                    validated = c.request_conversation_decision(request)
+                    self.assertEqual(validated is not None, accepted)
+                    self.assertEqual(allocate.call_count, int(accepted))
+                    self.assertEqual(completion.call_count, 1)
+
+    def test_contextual_employee_choice_uses_revalidated_referents(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        employee = answer.EmployeeCandidate(employee_id="A10001", name="Morgan River")
+        state = answer.ConversationState(
+            referents=[answer.EmployeeReferent(**employee.model_dump())]
+        )
+        observed = []
+        real_gateway = c.request_conversation_decision
+
+        def inspect_gateway(request):
+            payload = {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "relation": "new",
+                        "source_span": [0, 19],
+                        "fact_ids": list(request.context.fact_choice_ids),
+                        "employee_mentions": [
+                            {
+                                "kind": "reference_choice",
+                                "source_span": [16, 19],
+                                "choice_id": request.context.employee_choice_ids[0],
+                            }
+                        ],
+                    }
+                ],
+            }
+            response = SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content=json.dumps(payload)),
+                    )
+                ]
+            )
+            with patch.object(c, "completion", return_value=response) as completion:
+                result = real_gateway(request)
+            observed.append((result, completion.call_count))
+            return result
+
+        with (
+            patch.object(answer, "load_employee_directory", return_value=[employee]),
+            patch.object(
+                c, "request_conversation_decision", side_effect=inspect_gateway
+            ),
+        ):
+            _, _, returned = answer.answer_question_with_state(
+                "worked days for him", [], state
+            )
+        self.assertEqual(len(observed), 1)
+        self.assertIsNotNone(observed[0][0])
+        self.assertEqual(len(observed[0][0].unit_ids), 1)
+        self.assertEqual(observed[0][1], 1)
+        self.assertEqual(returned, state)
+
+    def test_explicit_employee_cannot_select_a_conflicting_known_referent(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        question = "worked days for A10001 again"
+        directory = [
+            answer.EmployeeCandidate(employee_id="A10001", name="Morgan River"),
+            answer.EmployeeCandidate(employee_id="A10002", name="Sam North"),
+        ]
+        state = answer.ConversationState(
+            referents=[
+                answer.EmployeeReferent(**employee.model_dump())
+                for employee in directory
+            ]
+        )
+        original = state.model_dump()
+        facts = tuple(
+            fact.model_copy(update={"strength": "strong"})
+            if fact.kind == "entity"
+            else fact
+            for fact in answer.detect_semantic_facts(
+                question, answer.ResolutionContext(catalog={})
+            )
+        )
+        observed = []
+        real_gateway = c.request_conversation_decision
+
+        def inspect_gateway(request):
+            conflicting = next(
+                key
+                for key, employee in request.employees
+                if employee.employee_id == "A10002"
+            )
+            payload = {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "relation": "new",
+                        "source_span": [0, 28],
+                        "fact_ids": list(request.context.fact_choice_ids),
+                        "employee_mentions": [
+                            {
+                                "kind": "reference_choice",
+                                "source_span": [16, 22],
+                                "choice_id": conflicting,
+                            }
+                        ],
+                    }
+                ],
+            }
+            response = SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason="stop",
+                        message=SimpleNamespace(content=json.dumps(payload)),
+                    )
+                ]
+            )
+            with (
+                patch.object(c, "completion", return_value=response) as completion,
+                patch.object(c.uuid, "uuid4") as allocate,
+            ):
+                result = real_gateway(request)
+            observed.append((result, completion.call_count, allocate.call_count))
+            return result
+
+        with (
+            patch.object(answer, "detect_semantic_facts", return_value=facts),
+            patch.object(answer, "load_employee_directory", return_value=directory),
+            patch.object(
+                c, "request_conversation_decision", side_effect=inspect_gateway
+            ),
+            patch.object(answer, "_fetch_context_result") as fetch,
+        ):
+            _, chunks, returned = answer.answer_question_with_state(question, [], state)
+        self.assertEqual(len(observed), 1)
+        self.assertIsNone(observed[0][0])
+        self.assertEqual(observed[0][1:], (1, 0))
+        fetch.assert_not_called()
+        self.assertEqual(chunks, [])
+        self.assertEqual(returned.model_dump(), original)
+        self.assertEqual(state.model_dump(), original)
+
     def test_provider_choices_revalidate_referents_without_mutating_saved_state(self):
         from week5.new_implementation import conversation_understanding as c
 

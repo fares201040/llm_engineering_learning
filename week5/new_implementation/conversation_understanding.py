@@ -494,6 +494,8 @@ def conversation_preflight_route(
     normalized = normalize_for_matching(message)
     if re.search(
         r"\b(?:payroll|salar(?:y|ies)|loans?|repayments?|benefits?|raw_source_rows)\b|\bprivate\s+raw\b"
+        r"|\b(?:ignore|disregard)\s+(?:previous|prior|all)\s+instructions?\b"
+        r"|\b(?:reveal|show|print)\s+(?:your\s+)?(?:hidden\s+)?system\s+prompt\b"
         r"|(?:رواتب|راتب|قروض|قرض|سداد|مزايا|المصدر الخام)",
         normalized,
         re.I,

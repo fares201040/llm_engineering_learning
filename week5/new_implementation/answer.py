@@ -1,9 +1,11 @@
 from datetime import date, datetime, time as dt_time, timedelta
 from collections.abc import Mapping
 from contextvars import ContextVar
+from contextlib import ExitStack, nullcontext
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 from time import perf_counter
-from typing import Literal, NamedTuple, Sequence
+from typing import Annotated, Literal, NamedTuple, Sequence
 from zoneinfo import ZoneInfo
 import math
 import json
@@ -97,10 +99,10 @@ try:
         PendingRequestFrame as BasePendingRequestFrame,
         PendingConstraintSnapshot,
         ResolvedPendingMention,
-        MeaningClarification,
+        MeaningClarification as BaseMeaningClarification,
         MeaningOption,
         MissingIntentClarification,
-        PendingClarification,
+        PendingClarification,  # noqa: F401 - canonical public clarification union
         SurfaceCandidate,
         analyze_question_surface,
         automatically_accepted_candidates,
@@ -188,10 +190,10 @@ except ImportError:  # Running answer.py directly from its directory.
         PendingRequestFrame as BasePendingRequestFrame,
         PendingConstraintSnapshot,
         ResolvedPendingMention,
-        MeaningClarification,
+        MeaningClarification as BaseMeaningClarification,
         MeaningOption,
         MissingIntentClarification,
-        PendingClarification,
+        PendingClarification,  # noqa: F401 - canonical public clarification union
         SurfaceCandidate,
         analyze_question_surface,
         automatically_accepted_candidates,
@@ -339,6 +341,7 @@ class AttendanceUnitFrame(BaseAttendanceUnitFrame):
     """Task-5 execution frame with the selected request-local view retained."""
 
     view: MultiEmployeeDateView | None = None
+    model_config = {"str_strip_whitespace": False}
 
 
 class ConversationTurnFrame(BaseConversationTurnFrame):
@@ -347,10 +350,42 @@ class ConversationTurnFrame(BaseConversationTurnFrame):
     units: tuple[AttendanceUnitFrame, ...] = Field(min_length=1)
 
 
+class PendingConversation(BaseModel):
+    """Retain validated clause choices while directory confirmations are pending."""
+
+    model_config = {"extra": "forbid", "frozen": True, "strict": True}
+    context: conversation.ConversationDecisionContext
+    decision: conversation.ConversationDecision
+    unit_ids: tuple[str, ...]
+    facts: tuple[tuple[str, SemanticFact], ...]
+    employees: tuple[tuple[str, EmployeeReferent], ...]
+    prior_units: tuple[tuple[str, AttendanceUnitFrame], ...]
+    active_choices: tuple[str, ...]
+    views: tuple[tuple[str, MultiEmployeeDateView], ...]
+
+
+class MeaningClarification(BaseMeaningClarification):
+    """Preserve offsets in same-width compound clause masks."""
+
+    model_config = {"str_strip_whitespace": False}
+
+
+_SessionClarification = Annotated[
+    EmployeeClarification
+    | MeaningClarification
+    | CatalogClarification
+    | MissingIntentClarification
+    | ContextChoiceClarification,
+    Field(discriminator="kind"),
+]
+
+
 class PendingRequestFrame(BasePendingRequestFrame):
     """Authoritative Task-5 resumable request, including effective unit scope."""
 
     employees: tuple[EmployeeReferent, ...] = ()
+    clarification: _SessionClarification | None = None
+    model_config = {"str_strip_whitespace": False}
     view: MultiEmployeeDateView | None = None
     unit_id: str | None = Field(default=None, min_length=1)
     relation: (
@@ -368,6 +403,11 @@ class PendingRequestFrame(BasePendingRequestFrame):
     explain_previous: bool = False
     prior_result: ResultSnapshot | None = None
     context_units: tuple[AttendanceUnitFrame, ...] = ()
+    compound_units: tuple["PendingRequestFrame", ...] = ()
+    compound_index: int = Field(default=0, ge=0)
+    clarification_text: str = ""
+    conversation_employee_pending: bool = False
+    conversation_decision: PendingConversation | None = None
 
 
 class ContextFetchResult(NamedTuple):
@@ -377,6 +417,64 @@ class ContextFetchResult(NamedTuple):
     matched_count: int | None
     resolved_employees: list[EmployeeCandidate]
     facts: tuple[SemanticFact, ...] = ()
+
+
+@dataclass(frozen=True)
+class PreparedPostgresQueries:
+    profile: CompiledPostgresQuery | None = None
+    aggregation: tuple[CompiledPostgresQuery, ...] = ()
+    count: CompiledPostgresQuery | None = None
+    sample: CompiledPostgresQuery | None = None
+    coverage: CompiledPostgresQuery | None = None
+
+
+@dataclass(frozen=True)
+class PreparedContextRequest:
+    question: str
+    plan: ExecutableQueryPlan
+    facts: tuple[SemanticFact, ...]
+    employees: tuple[EmployeeReferent, ...]
+    access: AccessContext
+    backend: str
+    request_id: str
+    started: float
+    postgres_queries: PreparedPostgresQueries | None = None
+
+
+@dataclass(frozen=True)
+class PreparedTurn:
+    requests: tuple[PreparedContextRequest, ...]
+
+
+@dataclass(frozen=True)
+class TurnBlocker:
+    unit_index: int
+    text: str
+    pending: PendingRequestFrame | None
+
+
+@dataclass(frozen=True)
+class TurnPreparationResult:
+    turn: PreparedTurn | None
+    blockers: tuple[TurnBlocker, ...]
+    units: tuple[PendingRequestFrame, ...]
+
+
+@dataclass(frozen=True)
+class TurnExecutionResult:
+    results: tuple[ContextFetchResult, ...]
+
+
+@dataclass(frozen=True)
+class TurnExecutionResources:
+    connection: object = None
+    chroma_snapshot: tuple[Result, ...] | None = None
+    coverage: CoverageWindow | None = None
+
+
+_PREPARED_POSTGRES_EXECUTION: ContextVar[
+    tuple[ExecutableQueryPlan, PreparedPostgresQueries] | None
+] = ContextVar("apdc_prepared_postgres_execution", default=None)
 
 
 _EVALUATION_TRACE_SINK: ContextVar[list[ContextFetchResult] | None] = ContextVar(
@@ -407,7 +505,7 @@ class ConversationState(BaseModel):
     referents: list[EmployeeReferent] = Field(default_factory=list)
     active_referent_ids: list[str] = Field(default_factory=list)
     recent_frames: list[ConversationTurnFrame] = Field(default_factory=list)
-    pending_clarification: PendingClarification | None = None
+    pending_clarification: _SessionClarification | None = None
     pending_request: PendingRequestFrame | None = None
     pending_question: str | None = None
     pending_proposal: PlannerProposal | None = None
@@ -2252,18 +2350,63 @@ def _map_compiled_aggregation(plan: ExecutableQueryPlan, queries, connection):
     return result
 
 
-def execute_exact_postgres(plan: ExecutableQueryPlan):
+def _prepare_postgres_queries(plan: ExecutableQueryPlan) -> PreparedPostgresQueries:
+    if plan.result_intent == "employee_profile":
+        return PreparedPostgresQueries(
+            profile=compile_profile_query(plan, POSTGRES_ATTENDANCE_TABLE)
+        )
+    aggregation = compile_aggregation_queries(plan, POSTGRES_ATTENDANCE_TABLE)
+    sample_plan = plan.model_copy(deep=True)
+    if aggregation:
+        sample_plan.order_by = None
+        sample_plan.order_direction = "asc"
+    sample_limit = (
+        settings.evidence_sample_size
+        if aggregation
+        else min(plan.limit or MAX_EXACT_RESULTS, MAX_EXACT_RESULTS)
+    )
+    return PreparedPostgresQueries(
+        aggregation=aggregation,
+        count=compile_count_query(plan, POSTGRES_ATTENDANCE_TABLE),
+        sample=compile_sample_query(
+            sample_plan, POSTGRES_ATTENDANCE_TABLE, limit=sample_limit
+        ),
+        coverage=(
+            compile_coverage_query(POSTGRES_ATTENDANCE_TABLE)
+            if aggregation and requested_date_window(plan) is not None
+            else None
+        ),
+    )
+
+
+def execute_exact_postgres(
+    plan: ExecutableQueryPlan,
+    *,
+    prepared_queries: PreparedPostgresQueries | None = None,
+    resources: TurnExecutionResources | None = None,
+):
     """Execute only compiler-produced SQL within one read-only snapshot."""
     if type(plan) is not ExecutableQueryPlan:
         raise TypeError("Exact PostgreSQL execution requires ExecutableQueryPlan.")
-    psycopg, dict_row = _import_psycopg()
-    with psycopg.connect(POSTGRES_DSN, row_factory=dict_row) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+    bound = _PREPARED_POSTGRES_EXECUTION.get()
+    queries = prepared_queries or (
+        bound[1]
+        if bound is not None and bound[0] is plan
+        else _prepare_postgres_queries(plan)
+    )
+    if resources is None:
+        psycopg, dict_row = _import_psycopg()
+        connection_scope = psycopg.connect(POSTGRES_DSN, row_factory=dict_row)
+    else:
+        connection_scope = nullcontext(resources.connection)
+    with connection_scope as connection:
+        if resources is None:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+                )
         if plan.result_intent == "employee_profile":
-            rows = _execute_rows_query(
-                compile_profile_query(plan, POSTGRES_ATTENDANCE_TABLE), connection
-            )
+            rows = _execute_rows_query(queries.profile, connection)
             chunks = [
                 Result(
                     page_content="\n".join(
@@ -2278,15 +2421,13 @@ def execute_exact_postgres(plan: ExecutableQueryPlan):
             return chunks, None, len(chunks)
         aggregation = _map_compiled_aggregation(
             plan,
-            compile_aggregation_queries(plan, POSTGRES_ATTENDANCE_TABLE),
+            queries.aggregation,
             connection,
         )
         if aggregation is not None:
-            available = None
-            if requested_date_window(plan) is not None:
-                coverage_row = _execute_scalar_query(
-                    compile_coverage_query(POSTGRES_ATTENDANCE_TABLE), connection
-                )
+            available = resources.coverage if resources is not None else None
+            if resources is None and queries.coverage is not None:
+                coverage_row = _execute_scalar_query(queries.coverage, connection)
                 if (
                     coverage_row
                     and coverage_row.get("date_min") is not None
@@ -2297,24 +2438,9 @@ def execute_exact_postgres(plan: ExecutableQueryPlan):
                         date_max=coverage_row["date_max"],
                     )
             aggregation = attach_coverage_metadata(plan, aggregation, available)
-        matched_count = int(
-            _execute_scalar_query(
-                compile_count_query(plan, POSTGRES_ATTENDANCE_TABLE), connection
-            )["value"]
-        )
-        sample_limit = (
-            settings.evidence_sample_size
-            if aggregation is not None
-            else min(plan.limit or MAX_EXACT_RESULTS, MAX_EXACT_RESULTS)
-        )
-        sample_plan = plan.model_copy(deep=True)
-        if aggregation is not None:
-            sample_plan.order_by = None
-            sample_plan.order_direction = "asc"
+        matched_count = int(_execute_scalar_query(queries.count, connection)["value"])
         rows = _execute_rows_query(
-            compile_sample_query(
-                sample_plan, POSTGRES_ATTENDANCE_TABLE, limit=sample_limit
-            ),
+            queries.sample,
             connection,
         )
         chunks = [_postgres_row_to_result(row) for row in rows]
@@ -3481,7 +3607,7 @@ def _implicit_bare_employee_resolution(
 # ---------------------------------------------------------------------------
 
 
-def _fetch_context_result(
+def _prepare_context_request(
     question: str,
     history=None,
     prepared_proposal: PlannerProposal | None = None,
@@ -3491,7 +3617,7 @@ def _fetch_context_result(
     request_view: MultiEmployeeDateView | None = None,
     *,
     access_context: AccessContext | None = None,
-) -> ContextFetchResult:
+) -> PreparedContextRequest:
     trusted_access = _require_attendance_access(access_context)
     _require_supported_attendance_question(question)
     _numeric_comparison_value(question)
@@ -4026,17 +4152,73 @@ def _fetch_context_result(
         duration_seconds=planning_seconds,
     )
 
+    return PreparedContextRequest(
+        question=question,
+        plan=plan,
+        facts=facts,
+        employees=tuple(
+            EmployeeReferent(employee_id=item.employee_id, name=item.name)
+            for item in (
+                employee_resolution.candidates
+                if employee_resolution is not None
+                and employee_resolution.outcome == "unique"
+                else []
+            )
+        ),
+        access=trusted_access,
+        backend=backend,
+        request_id=request_id,
+        started=started,
+        postgres_queries=(
+            _prepare_postgres_queries(plan)
+            if plan.mode == "exact" and _postgres_enabled()
+            else None
+        ),
+    )
+
+
+def _execute_prepared_context(
+    prepared: PreparedContextRequest,
+    *,
+    resources: TurnExecutionResources | None = None,
+) -> ContextFetchResult:
+    question = prepared.question
+    plan = prepared.plan.model_copy(deep=True)
+    trusted_access = prepared.access
+    backend = prepared.backend
+    request_id = prepared.request_id
+    started = prepared.started
     aggregation = None
     matched_count = None
 
     if plan.mode == "exact":
-        if _postgres_enabled():
-            chunks, aggregation, matched_count = execute_exact_postgres(plan)
+        if prepared.postgres_queries is not None:
+            if resources is None:
+                # Keep the existing one-argument execution seam. Bind only this
+                # plan's compiler artifacts and always restore the calling context.
+                token = _PREPARED_POSTGRES_EXECUTION.set(
+                    (plan, prepared.postgres_queries)
+                )
+                try:
+                    chunks, aggregation, matched_count = execute_exact_postgres(plan)
+                finally:
+                    _PREPARED_POSTGRES_EXECUTION.reset(token)
+            else:
+                chunks, aggregation, matched_count = execute_exact_postgres(
+                    plan,
+                    prepared_queries=prepared.postgres_queries,
+                    resources=resources,
+                )
 
         else:
-            all_chunks = fetch_exact_chroma(
-                plan.filters,
-                domain=trusted_access.domain,
+            all_chunks = (
+                [
+                    chunk.model_copy(deep=True)
+                    for chunk in resources.chroma_snapshot
+                    if _metadata_matches(chunk.metadata, plan.filters)
+                ]
+                if resources is not None and resources.chroma_snapshot is not None
+                else fetch_exact_chroma(plan.filters, domain=trusted_access.domain)
             )
             matched_count = len(all_chunks)
             aggregation = calculate_aggregation_chroma(
@@ -4045,9 +4227,13 @@ def _fetch_context_result(
             )
             if aggregation is not None:
                 available = (
-                    fetch_chroma_coverage(domain=trusted_access.domain)
-                    if requested_date_window(plan) is not None
-                    else None
+                    resources.coverage
+                    if resources is not None
+                    else (
+                        fetch_chroma_coverage(domain=trusted_access.domain)
+                        if requested_date_window(plan) is not None
+                        else None
+                    )
                 )
                 aggregation = attach_coverage_metadata(plan, aggregation, available)
             sample_limit = (
@@ -4121,18 +4307,118 @@ def _fetch_context_result(
         plan=plan,
         aggregation=aggregation,
         matched_count=matched_count,
-        resolved_employees=(
-            employee_resolution.candidates
-            if employee_resolution is not None
-            and employee_resolution.outcome == "unique"
-            else []
-        ),
-        facts=facts,
+        resolved_employees=[
+            EmployeeCandidate(employee_id=item.employee_id, name=item.name)
+            for item in prepared.employees
+        ],
+        facts=prepared.facts,
     )
     trace_sink = _EVALUATION_TRACE_SINK.get()
     if trace_sink is not None:
         trace_sink.append(result)
     return result
+
+
+def _execute_prepared_turn(turn: PreparedTurn) -> TurnExecutionResult:
+    """Execute a fully prepared attendance batch without publishing partial traces."""
+    postgres = any(item.postgres_queries is not None for item in turn.requests)
+    chroma = any(
+        item.plan.mode == "exact" and item.postgres_queries is None
+        for item in turn.requests
+    )
+    needs_coverage = any(
+        item.plan.mode == "exact"
+        and item.plan.aggregation != "none"
+        and requested_date_window(item.plan) is not None
+        for item in turn.requests
+    )
+    coverage_query = next(
+        (
+            item.postgres_queries.coverage
+            for item in turn.requests
+            if item.postgres_queries is not None
+            and item.postgres_queries.coverage is not None
+        ),
+        None,
+    )
+    trace = []
+    parent_trace = _EVALUATION_TRACE_SINK.get()
+    token = _EVALUATION_TRACE_SINK.set(trace)
+    try:
+        with ExitStack() as stack:
+            connection = None
+            coverage = None
+            snapshot = None
+            if postgres:
+                psycopg, dict_row = _import_psycopg()
+                connection = stack.enter_context(
+                    psycopg.connect(POSTGRES_DSN, row_factory=dict_row)
+                )
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+                    )
+                if coverage_query is not None:
+                    row = _execute_scalar_query(coverage_query, connection)
+                    if (
+                        row
+                        and row.get("date_min") is not None
+                        and row.get("date_max") is not None
+                    ):
+                        coverage = CoverageWindow(
+                            date_min=row["date_min"], date_max=row["date_max"]
+                        )
+            if chroma:
+                snapshot = tuple(fetch_exact_chroma([], domain="attendance"))
+                if needs_coverage:
+                    dates = []
+                    for chunk in snapshot:
+                        if chunk.metadata.get("chunk_type") == "attendance_record":
+                            try:
+                                dates.append(
+                                    date.fromisoformat(str(chunk.metadata.get("Date")))
+                                )
+                            except (TypeError, ValueError):
+                                continue
+                    if dates:
+                        coverage = CoverageWindow(
+                            date_min=min(dates), date_max=max(dates)
+                        )
+            resources = TurnExecutionResources(connection, snapshot, coverage)
+            results = tuple(
+                _execute_prepared_context(item, resources=resources)
+                for item in turn.requests
+            )
+    finally:
+        _EVALUATION_TRACE_SINK.reset(token)
+    if parent_trace is not None:
+        parent_trace.extend(trace)
+    return TurnExecutionResult(results)
+
+
+def _fetch_context_result(
+    question: str,
+    history=None,
+    prepared_proposal: PlannerProposal | None = None,
+    prepared_facts: tuple[SemanticFact, ...] = (),
+    default_employees: list[EmployeeCandidate] | None = None,
+    request_id: str | None = None,
+    request_view: MultiEmployeeDateView | None = None,
+    *,
+    access_context: AccessContext | None = None,
+) -> ContextFetchResult:
+    return _execute_prepared_context(
+        _prepare_context_request(
+            question,
+            history,
+            prepared_proposal,
+            prepared_facts,
+            default_employees,
+            request_id,
+            request_view,
+            access_context=access_context,
+        )
+    )
 
 
 def fetch_context(
@@ -5147,6 +5433,20 @@ def _resolve_conversation_employee_mentions(
     for unit_index, mention_index, mention in resolve_mentions:
         start, end = mention.source_span
         reference = message[start:end]
+        choices = next(
+            (
+                item.choice_ids
+                for item in validated.request.context.employee_span_choices
+                if item.source_span == mention.source_span
+            ),
+            (),
+        )
+        if choices:
+            employees = dict(validated.request.employees)
+            resolved[(unit_index, mention_index)] = tuple(
+                employees[key] for key in choices
+            )
+            continue
         resolution = resolve_employee_reference(reference, directory)
         if resolution.outcome != "unique" or resolution.match_method not in {
             "exact_id",
@@ -5160,6 +5460,482 @@ def _resolve_conversation_employee_mentions(
     return resolved, None
 
 
+def _resume_conversation_employees(question, state, *, access_context=None):
+    pending = state.pending_request
+    clarification = pending.clarification
+    locale = pending.reply_locale
+    selected = _select_pending_employees(
+        question,
+        [
+            EmployeeCandidate(employee_id=item.employee_id, name=item.name)
+            for item in clarification.options
+        ],
+        allow_multiple=False,
+    )
+    if not selected:
+        return (
+            _format_employee_clarification(
+                EmployeeResolution(
+                    outcome="ambiguous",
+                    candidates=[
+                        EmployeeCandidate(employee_id=item.employee_id, name=item.name)
+                        for item in clarification.options
+                    ],
+                    reference=clarification.reference_text or "",
+                ),
+                locale=locale,
+            ),
+            [],
+            state,
+        )
+    directory = load_employee_directory()
+    identities = {
+        (item.employee_id.casefold(), _normalize_name(item.name)) for item in directory
+    }
+    confirmed = list(pending.resolved_mentions) + [
+        ResolvedPendingMention(
+            source_text=clarification.reference_text,
+            source_span=clarification.reference_span,
+            referent=EmployeeReferent(employee_id=item.employee_id, name=item.name),
+        )
+        for item in selected
+    ]
+    if any(
+        (item.referent.employee_id.casefold(), _normalize_name(item.referent.name))
+        not in identities
+        for item in confirmed
+    ):
+        return _format_conversation_help(locale), [], state
+    if pending.conversation_decision is not None:
+        saved = pending.conversation_decision
+        employees = list(saved.employees)
+        bindings = {
+            item.source_span: item for item in saved.context.employee_span_choices
+        }
+        for span in {item.source_span for item in confirmed}:
+            choices = []
+            for item in confirmed:
+                if item.source_span == span:
+                    key = uuid.uuid4().hex
+                    employees.append((key, item.referent))
+                    choices.append(key)
+            bindings[span] = conversation.ConversationEmployeeSpanChoices(
+                source_span=span, choice_ids=tuple(choices)
+            )
+        request = conversation.ConversationRequest(
+            context=saved.context.model_copy(
+                update={
+                    "employee_choice_ids": tuple(key for key, _ in employees),
+                    "employee_span_choices": tuple(bindings.values()),
+                }
+            ),
+            facts=saved.facts,
+            employees=tuple(employees),
+            prior_units=saved.prior_units,
+            active_choices=saved.active_choices,
+            views=saved.views,
+        )
+        validated = conversation.ValidatedConversation(
+            request, saved.decision, saved.unit_ids
+        )
+        resolved, blocker = _resolve_conversation_employee_mentions(validated)
+        if blocker is not None:
+            resolution, reference, span = blocker
+            if resolution.outcome == "none":
+                return (
+                    _format_employee_clarification(resolution, locale=locale),
+                    [],
+                    state,
+                )
+            updated = state.model_copy(deep=True)
+            _store_employee_clarification(
+                updated,
+                pending.original_question,
+                None,
+                pending.facts,
+                resolution,
+                reference_text=reference,
+                reference_span=span,
+            )
+            _write_pending_request(
+                updated,
+                updated.pending_request.model_copy(
+                    update={
+                        "conversation_employee_pending": True,
+                        "conversation_decision": saved,
+                        "resolved_mentions": tuple(confirmed),
+                    }
+                ),
+            )
+            return (
+                _format_employee_clarification(resolution, locale=locale),
+                [],
+                updated,
+            )
+        materialized = conversation.materialize_conversation_units(
+            validated, resolved_mentions=resolved
+        )
+        if not materialized or any(unit.route != "attendance" for unit in materialized):
+            return _format_conversation_help(locale), [], state
+        return _answer_compound_turn(
+            pending.original_question,
+            tuple(_pending_unit(unit, locale) for unit in materialized),
+            state,
+            locale=locale,
+            access_context=access_context,
+        )
+    sources = {}
+    for item in confirmed:
+        sources.setdefault(item.source_span, []).append(item.referent)
+    for fact in pending.facts:
+        if (
+            fact.kind != "entity"
+            or fact.evidence_span is None
+            or is_conversation_control_reference(fact.evidence_text)
+        ):
+            continue
+        if fact.evidence_span in sources:
+            continue
+        resolution = resolve_employee_reference(fact.evidence_text, directory)
+        if resolution.outcome != "unique":
+            if resolution.outcome == "none":
+                return (
+                    _format_employee_clarification(resolution, locale=locale),
+                    [],
+                    state,
+                )
+            updated = state.model_copy(deep=True)
+            _store_employee_clarification(
+                updated,
+                pending.original_question,
+                None,
+                pending.facts,
+                resolution,
+                reference_text=fact.evidence_text,
+                reference_span=fact.evidence_span,
+            )
+            _write_pending_request(
+                updated,
+                updated.pending_request.model_copy(
+                    update={
+                        "conversation_employee_pending": True,
+                        "resolved_mentions": tuple(confirmed),
+                    }
+                ),
+            )
+            return (
+                _format_employee_clarification(resolution, locale=locale),
+                [],
+                updated,
+            )
+        referents = [
+            EmployeeReferent(employee_id=item.employee_id, name=item.name)
+            for item in resolution.candidates
+        ]
+        sources[fact.evidence_span] = referents
+        confirmed.extend(
+            ResolvedPendingMention(
+                source_text=fact.evidence_text,
+                source_span=fact.evidence_span,
+                referent=item,
+            )
+            for item in referents
+        )
+    request_state = state.model_copy(deep=True)
+    _revalidate_referents(request_state, directory)
+    referents = tuple(
+        {
+            item.employee_id.casefold(): item
+            for item in (
+                *request_state.referents,
+                *(item.referent for item in confirmed),
+            )
+        }.values()
+    )
+    request = conversation.build_conversation_request(
+        pending.original_question,
+        pending.facts,
+        referents,
+        tuple(request_state.recent_frames),
+        tuple(request_state.active_referent_ids),
+        employee_sources=tuple(
+            conversation.ConversationEmployeeSource(
+                source_span=span,
+                employee_ids=tuple(item.employee_id for item in items),
+            )
+            for span, items in sorted(sources.items())
+        ),
+    )
+    validated = conversation.request_conversation_decision(request)
+    if validated is None or validated.decision.status != "resolved":
+        return _format_conversation_help(locale), [], state
+    resolved, blocker = _resolve_conversation_employee_mentions(validated)
+    if blocker is not None:
+        return _format_conversation_help(locale), [], state
+    materialized = conversation.materialize_conversation_units(
+        validated, resolved_mentions=resolved
+    )
+    if not materialized or any(unit.route != "attendance" for unit in materialized):
+        return _format_conversation_help(locale), [], state
+    if len(materialized) > 1:
+        return _answer_compound_turn(
+            pending.original_question,
+            tuple(_pending_unit(unit, locale) for unit in materialized),
+            state,
+            locale=locale,
+            access_context=access_context,
+        )
+    _clear_pending_state(request_state)
+    return _answer_question_with_state(
+        pending.original_question,
+        [],
+        request_state,
+        contextual_unit=materialized[0],
+        access_context=access_context,
+    )
+
+
+def _pending_unit(
+    unit: conversation.MaterializedConversationUnit, locale: str
+) -> PendingRequestFrame:
+    facts = unit.facts
+    if unit.employees:
+        ids = tuple(item.employee_id for item in unit.employees)
+        facts = tuple(
+            fact
+            for fact in facts
+            if fact.kind != "entity" and fact.field not in {"Employee_ID", "Name"}
+        ) + (
+            SemanticFact(
+                kind="filter",
+                field="Employee_ID",
+                operator="eq" if len(ids) == 1 else "in",
+                values=ids,
+                evidence_text=" ".join(ids),
+                origin="trusted_state",
+                strength="strong",
+            ),
+        )
+    return PendingRequestFrame(
+        original_question=unit.source_text,
+        reply_locale=locale,
+        facts=facts,
+        employees=unit.employees,
+        view=unit.view,
+        unit_id=unit.unit_id,
+        relation=unit.relation,
+        explain_previous=unit.explain_previous,
+        prior_result=unit.prior_result,
+    )
+
+
+def _materialized_pending_unit(
+    saved: PendingRequestFrame,
+) -> conversation.MaterializedConversationUnit:
+    return conversation.MaterializedConversationUnit(
+        unit_id=saved.unit_id,
+        route="attendance",
+        relation=saved.relation,
+        source_text=saved.original_question,
+        facts=saved.facts,
+        employees=saved.employees,
+        view=saved.view,
+        explain_previous=saved.explain_previous,
+        prior_result=saved.prior_result,
+    )
+
+
+def _prepare_turn(
+    units: tuple[PendingRequestFrame, ...],
+    *,
+    response: str | None = None,
+    response_index: int = 0,
+    access_context: AccessContext | None = None,
+) -> TurnPreparationResult:
+    if (
+        not units
+        or len(units)
+        > min(
+            settings.conversation_unit_limit, settings.conversation_compiled_plan_limit
+        )
+        or any(
+            len(unit.employees) > settings.conversation_employee_binding_limit
+            for unit in units
+        )
+    ):
+        locale = units[0].reply_locale if units else "en"
+        return TurnPreparationResult(
+            None, (TurnBlocker(0, _format_conversation_help(locale), None),), units
+        )
+    if any(unit.employees for unit in units):
+        identities = {
+            (item.employee_id.casefold(), _normalize_name(item.name))
+            for item in load_employee_directory()
+        }
+        if any(
+            (item.employee_id.casefold(), _normalize_name(item.name)) not in identities
+            for unit in units
+            for item in unit.employees
+        ):
+            return TurnPreparationResult(
+                None,
+                (
+                    TurnBlocker(
+                        0, _format_conversation_help(units[0].reply_locale), None
+                    ),
+                ),
+                units,
+            )
+    requests = []
+    retained = []
+    blockers = []
+    for index, saved in enumerate(units):
+        if saved.clarification is not None and (
+            response is None or index != response_index
+        ):
+            retained.append(saved)
+            blockers.append(TurnBlocker(index, saved.clarification_text, saved))
+            continue
+        unit_state = ConversationState()
+        if saved.clarification is not None:
+            _write_pending_request(unit_state, saved)
+        prepared = _answer_question_with_state(
+            response if saved.clarification is not None else saved.original_question,
+            [],
+            unit_state,
+            access_context=access_context,
+            contextual_unit=_materialized_pending_unit(saved),
+            preparation_only=True,
+        )
+        if isinstance(prepared, PreparedContextRequest):
+            if len(prepared.employees) > settings.conversation_employee_binding_limit:
+                return TurnPreparationResult(
+                    None,
+                    (
+                        TurnBlocker(
+                            index, _format_conversation_help(saved.reply_locale), None
+                        ),
+                    ),
+                    units,
+                )
+            requests.append(prepared)
+            retained.append(
+                saved.model_copy(
+                    update={
+                        "facts": prepared.facts,
+                        "employees": prepared.employees,
+                        "clarification": None,
+                        "pending_candidates": (),
+                        "pending_constraint": None,
+                        "pending_interpretations": (),
+                        "clarification_text": "",
+                    }
+                )
+            )
+        else:
+            text, _, paused = prepared
+            pending = paused.pending_request
+            if pending is not None:
+                pending = pending.model_copy(update={"clarification_text": text})
+            retained.append(pending or saved)
+            blockers.append(TurnBlocker(index, text, pending))
+    return TurnPreparationResult(
+        None if blockers else PreparedTurn(tuple(requests)),
+        tuple(blockers),
+        tuple(retained),
+    )
+
+
+def _answer_compound_turn(
+    question: str,
+    units: tuple[PendingRequestFrame, ...],
+    state: ConversationState,
+    *,
+    locale: str,
+    response: str | None = None,
+    response_index: int = 0,
+    access_context: AccessContext | None = None,
+):
+    prepared = _prepare_turn(
+        units,
+        response=response,
+        response_index=response_index,
+        access_context=access_context,
+    )
+    if prepared.blockers:
+        fatal = next((item for item in prepared.blockers if item.pending is None), None)
+        if fatal is not None:
+            return fatal.text, [], state
+        blocker = prepared.blockers[0]
+        updated = state.model_copy(deep=True)
+        _write_pending_request(
+            updated,
+            PendingRequestFrame(
+                original_question=question,
+                reply_locale=locale,
+                clarification=blocker.pending.clarification,
+                compound_units=prepared.units,
+                compound_index=blocker.unit_index,
+            ),
+        )
+        return blocker.text, [], updated
+    execution = _execute_prepared_turn(prepared.turn)
+    texts = []
+    chunks = []
+    frames = []
+    warnings = []
+    for saved, result in zip(prepared.units, execution.results):
+        aggregation = result.aggregation
+        if aggregation is not None:
+            warning = _coverage_warning(aggregation, locale=locale)
+            if warning and warning not in warnings:
+                warnings.append(warning)
+            aggregation = {
+                key: value for key, value in aggregation.items() if key != "coverage"
+            }
+        text, evidence = _answer_from_context(
+            saved.original_question,
+            [],
+            result.chunks,
+            result.plan,
+            aggregation,
+            result.matched_count,
+            locale=locale,
+        )
+        texts.append(_material_correction_note(saved.original_question) + text)
+        chunks.extend(evidence)
+        frames.append(
+            AttendanceUnitFrame(
+                unit_id=saved.unit_id,
+                source_text=saved.original_question,
+                facts=result.facts,
+                employees=saved.employees,
+                view=saved.view,
+                result=_snapshot_successful_result(result),
+            )
+        )
+    updated = state.model_copy(deep=True)
+    _clear_pending_state(updated)
+    updated.selected_employees = list(
+        {
+            item.employee_id: EmployeeCandidate(
+                employee_id=item.employee_id, name=item.name
+            )
+            for saved in prepared.units
+            for item in saved.employees
+        }.values()
+    )
+    _store_successful_turn(
+        updated,
+        ConversationTurnFrame(
+            original_question=question,
+            reply_locale=locale,
+            units=tuple(frames),
+        ),
+    )
+    return "\n\n".join(texts + warnings), chunks, updated
+
+
 def answer_question_with_state(
     question: str,
     history: list[dict] | None,
@@ -5167,10 +5943,48 @@ def answer_question_with_state(
     *,
     access_context: AccessContext | None = None,
 ) -> tuple[str, list[Result], ConversationState]:
+    original = state.model_copy(deep=True) if state is not None else ConversationState()
+    trace = []
+    parent_trace = _EVALUATION_TRACE_SINK.get()
+    token = _EVALUATION_TRACE_SINK.set(trace)
+    try:
+        result = _answer_question_with_state(
+            question, history, state, access_context=access_context
+        )
+    except conversation.ConversationDecisionValidationError:
+        return (
+            _format_conversation_help(analyze_question_surface(question).reply_locale),
+            [],
+            original,
+        )
+    except Exception:
+        locale = analyze_question_surface(question).reply_locale
+        return (
+            "تعذر إكمال طلب الحضور. يرجى المحاولة مرة أخرى."
+            if locale == "ar"
+            else "I could not complete the attendance request. Please try again.",
+            [],
+            original,
+        )
+    finally:
+        _EVALUATION_TRACE_SINK.reset(token)
+    if parent_trace is not None:
+        parent_trace.extend(trace)
+    return result
+
+
+def _answer_question_with_state(
+    question: str,
+    history: list[dict] | None,
+    state: ConversationState | None,
+    *,
+    access_context: AccessContext | None = None,
+    contextual_unit: conversation.MaterializedConversationUnit | None = None,
+    preparation_only: bool = False,
+) -> tuple[str, list[Result], ConversationState] | PreparedContextRequest:
     history = history or []
     state = state.model_copy(deep=True) if state is not None else ConversationState()
     _promote_legacy_pending_request(state)
-    contextual_unit: conversation.MaterializedConversationUnit | None = None
     if len(question) > settings.conversation_max_input_chars:
         locale = "ar" if re.search(r"[\u0600-\u06ff]", question[:256]) else "en"
         return _format_conversation_help(locale), [], state
@@ -5195,10 +6009,44 @@ def answer_question_with_state(
         return f"I could not safely interpret that request: {exc}", [], state
 
     if (
-        state.pending_request is None or _is_complete_new_attendance_question(question)
-    ) and not any(
-        not _EMPLOYEE_ID_PATTERN.fullmatch(match.group(0))
-        for match in _EMPLOYEE_ID_LIKE_PATTERN.finditer(question)
+        not preparation_only
+        and state.pending_request is not None
+        and state.pending_request.conversation_employee_pending
+    ):
+        if not _is_complete_new_attendance_question(question):
+            return _resume_conversation_employees(
+                question, state, access_context=access_context
+            )
+        _clear_pending_state(state)
+
+    if (
+        not preparation_only
+        and state.pending_request is not None
+        and state.pending_request.compound_units
+    ):
+        if not _is_complete_new_attendance_question(question):
+            pending = state.pending_request
+            return _answer_compound_turn(
+                pending.original_question,
+                pending.compound_units,
+                state,
+                locale=pending.reply_locale,
+                response=question,
+                response_index=pending.compound_index,
+                access_context=access_context,
+            )
+        _clear_pending_state(state)
+
+    if (
+        contextual_unit is None
+        and (
+            state.pending_request is None
+            or _is_complete_new_attendance_question(question)
+        )
+        and not any(
+            not _EMPLOYEE_ID_PATTERN.fullmatch(match.group(0))
+            for match in _EMPLOYEE_ID_LIKE_PATTERN.finditer(question)
+        )
     ):
         conversation_facts = merge_semantic_facts(
             detect_semantic_facts(
@@ -5243,6 +6091,16 @@ def answer_question_with_state(
                             else None
                         ),
                     )
+                    if blocker_fact is not None:
+                        _write_pending_request(
+                            state,
+                            state.pending_request.model_copy(
+                                update={
+                                    "conversation_employee_pending": True,
+                                    "resolved_mentions": (),
+                                }
+                            ),
+                        )
                 return (
                     _format_employee_clarification(blocker, locale=reply_locale),
                     [],
@@ -5299,6 +6157,26 @@ def answer_question_with_state(
                             reference_text=reference_text,
                             reference_span=reference_span,
                         )
+                        request = validated.request
+                        _write_pending_request(
+                            state,
+                            state.pending_request.model_copy(
+                                update={
+                                    "conversation_employee_pending": True,
+                                    "resolved_mentions": (),
+                                    "conversation_decision": PendingConversation(
+                                        context=request.context,
+                                        decision=validated.decision,
+                                        unit_ids=validated.unit_ids,
+                                        facts=request.facts,
+                                        employees=request.employees,
+                                        prior_units=request.prior_units,
+                                        active_choices=request.active_choices,
+                                        views=request.views,
+                                    ),
+                                }
+                            ),
+                        )
                         return (
                             _format_employee_clarification(
                                 resolution, locale=reply_locale
@@ -5310,8 +6188,18 @@ def answer_question_with_state(
                 materialized = conversation.materialize_conversation_units(
                     validated, resolved_mentions=resolved_mentions
                 )
-                if len(materialized) != 1 or materialized[0].route != "attendance":
+                if any(unit.route != "attendance" for unit in materialized):
                     return _format_conversation_help(reply_locale), [], state
+                if len(materialized) > 1:
+                    return _answer_compound_turn(
+                        question,
+                        tuple(
+                            _pending_unit(unit, reply_locale) for unit in materialized
+                        ),
+                        state,
+                        locale=reply_locale,
+                        access_context=access_context,
+                    )
                 contextual_unit = materialized[0]
             except conversation.ConversationDecisionValidationError:
                 return _format_conversation_help(reply_locale), [], state
@@ -5489,8 +6377,16 @@ def answer_question_with_state(
             )
         except conversation.ConversationDecisionValidationError:
             return _format_conversation_help(reply_locale), [], state
-        if len(materialized) != 1 or materialized[0].route != "attendance":
+        if any(unit.route != "attendance" for unit in materialized):
             return _format_conversation_help(reply_locale), [], state
+        if len(materialized) > 1:
+            return _answer_compound_turn(
+                effective_question,
+                tuple(_pending_unit(unit, reply_locale) for unit in materialized),
+                state,
+                locale=reply_locale,
+                access_context=access_context,
+            )
         contextual_unit = materialized[0]
         prepared_facts = contextual_unit.facts
         request_view = contextual_unit.view
@@ -5882,8 +6778,16 @@ def answer_question_with_state(
                 )
             except conversation.ConversationDecisionValidationError:
                 return _format_conversation_help(reply_locale), [], state
-            if len(materialized) != 1 or materialized[0].route != "attendance":
+            if any(unit.route != "attendance" for unit in materialized):
                 return _format_conversation_help(reply_locale), [], state
+            if len(materialized) > 1:
+                return _answer_compound_turn(
+                    effective_question,
+                    tuple(_pending_unit(unit, reply_locale) for unit in materialized),
+                    state,
+                    locale=reply_locale,
+                    access_context=access_context,
+                )
             contextual_unit = materialized[0]
             request_view = contextual_unit.view
             prepared_facts = tuple(
@@ -5905,7 +6809,8 @@ def answer_question_with_state(
             ]
 
     try:
-        result = _fetch_context_result(
+        fetch = _prepare_context_request if preparation_only else _fetch_context_result
+        result = fetch(
             effective_question,
             history,
             prepared_proposal=prepared_proposal,
@@ -5914,6 +6819,8 @@ def answer_question_with_state(
             request_view=request_view,
             access_context=access_context,
         )
+        if preparation_only:
+            return result
         chunks = result.chunks
         plan = result.plan
         aggregation = result.aggregation

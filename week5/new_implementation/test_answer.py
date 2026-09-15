@@ -686,14 +686,13 @@ class AccessScopeTests(unittest.TestCase):
 
         self.assertTrue(pending.unrelated_refusal_given)
 
-    def test_mixed_clarification_writes_one_refusal_then_resumes_without_partial_answer(
-        self,
-    ):
+    def test_mixed_clarification_resumes_real_compound_execution_once(self):
         from week5.new_implementation import conversation_understanding as c
 
-        message = "count attendance records; what is the weather?"
-        attendance_start = 0
-        attendance_end = len("count attendance records")
+        message = "count attendance records; attendance; what is the weather?"
+        first_end = len("count attendance records")
+        second_start = first_end + 2
+        second_end = second_start + len("attendance")
 
         def decision(request):
             payload = c.ConversationDecision.model_validate(
@@ -703,65 +702,67 @@ class AccessScopeTests(unittest.TestCase):
                         {
                             "route": "attendance",
                             "relation": "new",
-                            "source_span": (attendance_start, attendance_end),
+                            "source_span": (0, first_end),
                             "fact_ids": tuple(
                                 key
                                 for key, fact in request.facts
                                 if fact.evidence_span
-                                and attendance_start
-                                <= fact.evidence_span[0]
-                                < attendance_end
+                                and fact.evidence_span[0] < first_end
                             ),
                         },
                         {
+                            "route": "attendance",
+                            "relation": "new",
+                            "source_span": (second_start, second_end),
+                        },
+                        {
                             "route": "unrelated",
-                            "source_span": (attendance_end + 2, len(message)),
+                            "source_span": (second_end + 2, len(message)),
                         },
                     ],
                 }
             )
             validated = c.validate_conversation_decision(payload, request.context)
-            return c.ValidatedConversation(request, validated, ("attendance", "other"))
-
-        pending_unit = answer.PendingRequestFrame(
-            original_question="count attendance records", reply_locale="en"
-        )
-        paused = answer.ConversationState(
-            pending_request=answer.PendingRequestFrame(
-                original_question=message,
-                reply_locale="en",
-                compound_units=(pending_unit,),
-                clarification_text="Which period should I use?",
+            return c.ValidatedConversation(
+                request, validated, ("first", "second", "other")
             )
-        )
-        completed = answer.ConversationState()
+
+        records = {
+            "documents": ["record"],
+            "metadatas": [
+                {
+                    "domain": "attendance",
+                    "chunk_type": "attendance_record",
+                    "Date": "2026-09-01",
+                }
+            ],
+        }
         with (
             patch.object(c, "request_conversation_decision", side_effect=decision),
-            patch.object(
-                answer,
-                "_answer_compound_turn",
-                side_effect=(
-                    ("Which period should I use?", [], paused),
-                    ("2 attendance records.", [], completed),
-                ),
-            ) as compound,
+            patch.object(answer, "load_employee_directory", return_value=[]),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_postgres_enabled", return_value=False),
+            patch.object(answer.collection, "get", return_value=records) as retrieval,
         ):
             first_text, first_chunks, pending_state = answer.answer_question_with_state(
                 message, [], None
             )
+            retrieval.assert_not_called()
             resumed_text, resumed_chunks, _state = answer.answer_question_with_state(
-                "September", [], pending_state
+                "yes", [], pending_state
             )
 
         refusal = answer._unrelated_refusal("en")
-        self.assertIn(refusal, first_text)
-        self.assertNotIn("2 attendance records.", first_text)
+        self.assertEqual(first_text.count(refusal), 1)
         self.assertEqual(first_chunks, [])
+        self.assertIsNotNone(pending_state.pending_clarification)
+        self.assertIsNotNone(pending_state.pending_request)
         self.assertTrue(pending_state.pending_request.unrelated_refusal_given)
-        self.assertEqual(resumed_text, "2 attendance records.")
+        self.assertIn("attendance records", resumed_text)
         self.assertNotIn(refusal, resumed_text)
-        self.assertEqual(resumed_chunks, [])
-        self.assertEqual(compound.call_count, 2)
+        self.assertEqual(resumed_text.count(refusal), 0)
+        self.assertTrue(resumed_chunks)
+        self.assertGreater(retrieval.call_count, 0)
 
     def test_invalid_over_comparison_stops_before_planning(self):
         with patch.object(answer, "propose_query") as planner:

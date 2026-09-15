@@ -93,7 +93,7 @@ try:
         CoverageSnapshot,
         ResultSnapshot,
         AttendanceUnitFrame as BaseAttendanceUnitFrame,
-        ConversationTurnFrame,
+        ConversationTurnFrame as BaseConversationTurnFrame,
         PendingRequestFrame as BasePendingRequestFrame,
         PendingConstraintSnapshot,
         ResolvedPendingMention,
@@ -184,7 +184,7 @@ except ImportError:  # Running answer.py directly from its directory.
         CoverageSnapshot,
         ResultSnapshot,
         AttendanceUnitFrame as BaseAttendanceUnitFrame,
-        ConversationTurnFrame,
+        ConversationTurnFrame as BaseConversationTurnFrame,
         PendingRequestFrame as BasePendingRequestFrame,
         PendingConstraintSnapshot,
         ResolvedPendingMention,
@@ -341,6 +341,12 @@ class AttendanceUnitFrame(BaseAttendanceUnitFrame):
     view: MultiEmployeeDateView | None = None
 
 
+class ConversationTurnFrame(BaseConversationTurnFrame):
+    """Task-5 turn schema that serializes the enriched attendance units."""
+
+    units: tuple[AttendanceUnitFrame, ...] = Field(min_length=1)
+
+
 class PendingRequestFrame(BasePendingRequestFrame):
     """Authoritative Task-5 resumable request, including effective unit scope."""
 
@@ -361,6 +367,7 @@ class PendingRequestFrame(BasePendingRequestFrame):
     ) = None
     explain_previous: bool = False
     prior_result: ResultSnapshot | None = None
+    context_units: tuple[AttendanceUnitFrame, ...] = ()
 
 
 class ContextFetchResult(NamedTuple):
@@ -3485,7 +3492,6 @@ def _fetch_context_result(
     *,
     access_context: AccessContext | None = None,
 ) -> ContextFetchResult:
-    _ = request_view
     trusted_access = _require_attendance_access(access_context)
     _require_supported_attendance_question(question)
     _numeric_comparison_value(question)
@@ -4000,7 +4006,11 @@ def _fetch_context_result(
         raise RuntimeError(
             "Plan revalidation reported ready without an executable plan."
         )
-    plan = revalidated.executable_plan
+    plan = ExecutableQueryPlan.model_validate(revalidated.executable_plan.model_dump())
+    # The Task-5 view is trusted conversational metadata, not executable query
+    # input. Carry it across the existing execution seam without changing the
+    # compiler-owned exact plan type or introducing Task-7 rendering behavior.
+    object.__setattr__(plan, "request_view", request_view)
 
     backend = _retrieval_backend(plan.mode)
 
@@ -4117,7 +4127,7 @@ def _fetch_context_result(
             and employee_resolution.outcome == "unique"
             else []
         ),
-        facts=initial_facts,
+        facts=facts,
     )
     trace_sink = _EVALUATION_TRACE_SINK.get()
     if trace_sink is not None:
@@ -4654,6 +4664,7 @@ def _store_employee_clarification(
     reference_span: tuple[int, int] | None = None,
     employees: Sequence[EmployeeCandidate] = (),
     contextual_unit: conversation.MaterializedConversationUnit | None = None,
+    context_units: Sequence[AttendanceUnitFrame] = (),
 ) -> None:
     pending = EmployeeClarification(
         original_question=question,
@@ -4708,6 +4719,7 @@ def _store_employee_clarification(
             prior_result=(
                 contextual_unit.prior_result if contextual_unit is not None else None
             ),
+            context_units=tuple(context_units),
         ),
     )
 
@@ -5453,10 +5465,30 @@ def answer_question_with_state(
             validated
         )
         if mention_blocker is not None:
+            resolution, reference_text, reference_span = mention_blocker
+            if resolution.outcome != "none" and resolution.candidates:
+                _store_employee_clarification(
+                    state,
+                    effective_question,
+                    None,
+                    pending_context.facts,
+                    resolution,
+                    reference_text=reference_text,
+                    reference_span=reference_span,
+                    context_units=(base,),
+                )
+                return (
+                    _format_employee_clarification(resolution, locale=reply_locale),
+                    [],
+                    state,
+                )
             return _format_conversation_help(reply_locale), [], state
-        materialized = conversation.materialize_conversation_units(
-            validated, resolved_mentions=resolved_mentions
-        )
+        try:
+            materialized = conversation.materialize_conversation_units(
+                validated, resolved_mentions=resolved_mentions
+            )
+        except conversation.ConversationDecisionValidationError:
+            return _format_conversation_help(reply_locale), [], state
         if len(materialized) != 1 or materialized[0].route != "attendance":
             return _format_conversation_help(reply_locale), [], state
         contextual_unit = materialized[0]
@@ -5794,7 +5826,7 @@ def answer_question_with_state(
         if (
             pending_employee is not None
             and pending_employee.reference_span is not None
-            and state.recent_frames
+            and (state.recent_frames or pending_request.context_units)
             and conversation.needs_conversation_decision(
                 effective_question, pending_request.facts
             )
@@ -5814,11 +5846,20 @@ def answer_question_with_state(
                     )
                 }.values()
             )
+            resume_frames = tuple(state.recent_frames)
+            if pending_request.context_units:
+                resume_frames = (
+                    ConversationTurnFrame(
+                        original_question=pending_request.original_question,
+                        reply_locale=pending_request.reply_locale,
+                        units=pending_request.context_units,
+                    ),
+                )
             request = conversation.build_conversation_request(
                 effective_question,
                 pending_request.facts,
                 confirmed_referents,
-                tuple(state.recent_frames),
+                resume_frames,
                 tuple(selected_ids),
                 employee_sources=(
                     conversation.ConversationEmployeeSource(
@@ -5835,9 +5876,12 @@ def answer_question_with_state(
             )
             if mention_blocker is not None:
                 return _format_conversation_help(reply_locale), [], state
-            materialized = conversation.materialize_conversation_units(
-                validated, resolved_mentions=resolved_mentions
-            )
+            try:
+                materialized = conversation.materialize_conversation_units(
+                    validated, resolved_mentions=resolved_mentions
+                )
+            except conversation.ConversationDecisionValidationError:
+                return _format_conversation_help(reply_locale), [], state
             if len(materialized) != 1 or materialized[0].route != "attendance":
                 return _format_conversation_help(reply_locale), [], state
             contextual_unit = materialized[0]

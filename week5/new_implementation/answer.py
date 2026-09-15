@@ -52,8 +52,11 @@ try:
     from .semantic_resolution import (
         EmployeeReference,
         ResolutionContext,
+        catalog_clarification_matches,
+        catalog_constraint_references,
         detect_semantic_facts,
         evidence_occurs,
+        grounded_catalog_candidates,
         merge_semantic_facts,
     )
     from .plan_compiler import (
@@ -111,6 +114,7 @@ try:
         SurfaceCandidate,
         analyze_question_surface,
         automatically_accepted_candidates,
+        has_unregistered_arabic_meaning_modifier,
         is_conversation_control_reference,
         normalize_for_matching,
     )
@@ -148,8 +152,11 @@ except ImportError:  # Running answer.py directly from its directory.
     from semantic_resolution import (
         EmployeeReference,
         ResolutionContext,
+        catalog_clarification_matches,
+        catalog_constraint_references,
         detect_semantic_facts,
         evidence_occurs,
+        grounded_catalog_candidates,
         merge_semantic_facts,
     )
     from plan_compiler import (
@@ -207,6 +214,7 @@ except ImportError:  # Running answer.py directly from its directory.
         SurfaceCandidate,
         analyze_question_surface,
         automatically_accepted_candidates,
+        has_unregistered_arabic_meaning_modifier,
         is_conversation_control_reference,
         normalize_for_matching,
     )
@@ -264,6 +272,10 @@ def _require_supported_attendance_question(question: str):
         raise PlanValidationError("Please enter an attendance question using words.")
     if _UNSUPPORTED_DOMAIN_PATTERN.search(question):
         raise DomainAccessDeniedError(ACCESS_DENIED_MESSAGE)
+    if has_unregistered_arabic_meaning_modifier(question):
+        raise PlanValidationError(
+            "An Arabic meaning modifier is not safely registered."
+        )
 
 
 def _access_denied_reply(locale: str) -> str:
@@ -1172,10 +1184,7 @@ def resolve_employee_reference(
         transliterated = _best_scored_candidates(
             [
                 (
-                    max(
-                        _similarity(transliterated_reference, name),
-                        _similarity(transliterated_reference, name.split()[0]),
-                    ),
+                    _similarity(transliterated_reference, name.split()[0]),
                     candidate,
                 )
                 for name, candidate in transliterated_names
@@ -1205,15 +1214,32 @@ def resolve_employee_reference(
             has_more_candidates=len(transliterated) > limit,
         )
 
+    full_name_candidates = []
+    if len(normalized_reference.split()) > 1:
+        full_name_candidates = _best_scored_candidates(
+            [
+                (
+                    _similarity(normalized_reference, _normalize_name(candidate.name)),
+                    candidate,
+                )
+                for candidate in ordered
+            ]
+        )
+    if full_name_candidates:
+        return EmployeeResolution(
+            outcome=("ambiguous" if len(full_name_candidates) > 1 else "confirmation"),
+            candidates=full_name_candidates[:limit],
+            reference=reference,
+            match_method="fuzzy",
+            has_more_candidates=len(full_name_candidates) > limit,
+        )
+
     first_token_candidates = _best_scored_candidates(
         [
             (
-                max(
-                    _similarity(normalized_reference, _normalize_name(candidate.name)),
-                    _similarity(
-                        normalized_reference,
-                        _normalize_name(candidate.name).split()[0],
-                    ),
+                _similarity(
+                    normalized_reference,
+                    _normalize_name(candidate.name).split()[0],
                 ),
                 candidate,
             )
@@ -1475,9 +1501,18 @@ def load_attendance_catalog(
                         f"ORDER BY value LIMIT %s",
                         params,
                     )
-                    catalog[field].update(
-                        str(row["value"]) for row in cursor.fetchall()
-                    )
+                    rows = cursor.fetchall()
+                    if field_references and not rows:
+                        scan_limit = min(max(limit * 20, 50), 200)
+                        cursor.execute(
+                            f"SELECT DISTINCT {expression} AS value "
+                            f"FROM {POSTGRES_ATTENDANCE_TABLE} "
+                            f"WHERE {expression} IS NOT NULL "
+                            f"ORDER BY value LIMIT %s",
+                            (scan_limit,),
+                        )
+                        rows = cursor.fetchall()
+                    catalog[field].update(str(row["value"]) for row in rows)
     else:
         stored = collection.get(
             where=_chroma_domain_where(
@@ -1510,6 +1545,9 @@ def load_attendance_catalog_candidates(
         )
     }
     filters_by_field: dict[str, list[str]] = {}
+    for field, reference in catalog_constraint_references(question):
+        fields.add(field)
+        filters_by_field.setdefault(field, []).append(reference)
     for proposed in proposed_filters:
         definition = FIELD_DEFINITIONS.get(proposed.field)
         if (
@@ -1537,15 +1575,15 @@ def load_attendance_catalog_candidates(
         values = catalog.get(field, [])
         references = filters_by_field.get(field, [])
         if references:
-            matching = [
-                value
-                for value in values
-                if any(
-                    reference.casefold() in value.casefold()
-                    or value.casefold() in reference.casefold()
+            matching = list(
+                dict.fromkeys(
+                    candidate
                     for reference in references
+                    for candidate in grounded_catalog_candidates(
+                        field, reference, values
+                    )
                 )
-            ]
+            )
         else:
             matching = values
         bounded[field] = tuple(matching[: settings.constraint_candidate_limit])
@@ -3604,6 +3642,27 @@ def _facts_from_question_surface(question: str) -> tuple[SemanticFact, ...]:
                     kind="predicate", concept_name=candidate.target_name, **common
                 )
             )
+        elif candidate.target_kind == "calculation":
+            numeric_fields = tuple(
+                field
+                for field, definition in FIELD_DEFINITIONS.items()
+                if definition.planner_visible
+                and definition.storage_type == "number"
+                and definition.aggregatable
+                and any(
+                    evidence_occurs(question, phrase)
+                    for phrase in definition.natural_names
+                )
+            )
+            if len(numeric_fields) == 1:
+                facts.append(
+                    SemanticFact(
+                        kind="calculation",
+                        field=numeric_fields[0],
+                        concept_name=candidate.target_name,
+                        **common,
+                    )
+                )
     return merge_semantic_facts(tuple(facts))
 
 
@@ -4073,6 +4132,53 @@ def _prepare_context_request(
     detected_facts = _drop_detected_facts_overridden_by_trusted(
         prepared_facts, detected_facts
     )
+    catalog_matches = catalog_clarification_matches(question, pre_context)
+    if len(catalog_matches) == 1:
+        match = catalog_matches[0]
+        proposal_facts = tuple(
+            fact
+            for fact in merge_semantic_facts(prepared_facts, detected_facts)
+            if not (
+                fact.kind == "unsupported"
+                and fact.concept_name == "unsupported_constraint"
+            )
+        )
+        proposal_facts = _complete_registered_short_form(question, proposal_facts)
+        proposal = propose_query(
+            question,
+            history,
+            trusted_employees=default_employees,
+            semantic_facts=proposal_facts,
+            candidate_catalog=pre_catalog,
+            event_logger=event_logger,
+            request_id=request_id,
+        )
+        if proposal.status == "ready":
+            proposal = proposal.model_copy(deep=True)
+            proposal.filters.append(
+                ProposedFilter(
+                    field=match.field,
+                    operator="eq",
+                    value=match.reference,
+                    evidence_text=match.reference,
+                )
+            )
+            raise ConstraintClarificationRequired(
+                proposal,
+                proposal_facts,
+                PendingConstraintData(
+                    field=match.field,
+                    reference=match.reference,
+                    candidates=[
+                        {
+                            "field": match.field,
+                            "value": value,
+                            "label": value,
+                        }
+                        for value in match.candidates
+                    ],
+                ),
+            )
     if any(
         fact.kind == "unsupported" and fact.strength == "strong"
         for fact in detected_facts
@@ -5137,7 +5243,20 @@ def _select_pending_employees(
     normalized = _normalize_name(response)
     if len(candidates) == 1 and normalized in {"yes", "y", "نعم", "اجل", "أجل"}:
         return candidates
-    if normalized in {"both", "all", "كلاهما", "كليهما", "الجميع", "معا"}:
+    if normalized in {
+        "both",
+        "all",
+        "كلاهما",
+        "كليهما",
+        "لكلاهما",
+        "لكليهما",
+        "وكلاهما",
+        "وكليهما",
+        "ولكلاهما",
+        "ولكليهما",
+        "الجميع",
+        "معا",
+    }:
         return candidates if allow_multiple else []
 
     if normalized.isdigit():
@@ -5278,9 +5397,17 @@ def _upsert_referents(
         retained = [item for item in retained if item.employee_id.casefold() != key]
         retained.append(referent)
     state.referents = retained[-bounded_limit:]
-    state.active_referent_ids = [item.employee_id for item in referents][
-        -settings.conversation_employee_binding_limit :
-    ]
+    retained_ids = {item.employee_id.casefold() for item in state.referents}
+    active: list[str] = []
+    for referent in referents:
+        active = [
+            employee_id
+            for employee_id in active
+            if employee_id.casefold() != referent.employee_id.casefold()
+        ]
+        if referent.employee_id.casefold() in retained_ids:
+            active.append(referent.employee_id)
+    state.active_referent_ids = active[-settings.conversation_employee_binding_limit :]
 
 
 def _revalidate_referents(
@@ -5300,6 +5427,34 @@ def _revalidate_referents(
         for employee_id in state.active_referent_ids
         if employee_id.casefold() in valid_ids
     ]
+    refreshed_frames = []
+    for frame in state.recent_frames:
+        refreshed_units = []
+        for unit in frame.units:
+            refreshed = [
+                current.get(employee.employee_id.casefold())
+                for employee in unit.employees
+            ]
+            if any(employee is None for employee in refreshed):
+                continue
+            refreshed_units.append(
+                unit.model_copy(
+                    update={
+                        "employees": tuple(
+                            EmployeeReferent(
+                                employee_id=employee.employee_id,
+                                name=employee.name,
+                            )
+                            for employee in refreshed
+                        )
+                    }
+                )
+            )
+        if refreshed_units:
+            refreshed_frames.append(
+                frame.model_copy(update={"units": tuple(refreshed_units)})
+            )
+    state.recent_frames = refreshed_frames
 
 
 def _store_successful_turn(
@@ -5364,6 +5519,7 @@ def _store_employee_clarification(
     employees: Sequence[EmployeeCandidate] = (),
     contextual_unit: conversation.MaterializedConversationUnit | None = None,
     context_units: Sequence[AttendanceUnitFrame] = (),
+    resolved_mentions: Sequence[ResolvedPendingMention] | None = None,
 ) -> None:
     pending = EmployeeClarification(
         original_question=question,
@@ -5392,15 +5548,19 @@ def _store_employee_clarification(
             facts=facts,
             prepared_proposal=proposal,
             clarification=pending,
-            resolved_mentions=tuple(
-                ResolvedPendingMention(
-                    source_text=reference_text or item.name,
-                    source_span=reference_span,
-                    referent=EmployeeReferent(
-                        employee_id=item.employee_id, name=item.name
-                    ),
+            resolved_mentions=(
+                tuple(resolved_mentions)
+                if resolved_mentions is not None
+                else tuple(
+                    ResolvedPendingMention(
+                        source_text=reference_text or item.name,
+                        source_span=reference_span,
+                        referent=EmployeeReferent(
+                            employee_id=item.employee_id, name=item.name
+                        ),
+                    )
+                    for item in resolved_employees
                 )
-                for item in resolved_employees
             ),
             pending_candidates=pending.options,
             employees=tuple(
@@ -5540,6 +5700,7 @@ def _store_context_clarification(
     *,
     locale: str,
 ) -> ContextChoiceClarification:
+    relation, view = _context_choice_operation(question, facts)
     pending = ContextChoiceClarification(
         original_question=question,
         reply_locale=locale,
@@ -5563,9 +5724,181 @@ def _store_context_clarification(
             reply_locale=locale,
             facts=facts,
             clarification=pending,
+            relation=relation,
+            view=view,
         ),
     )
     return pending
+
+
+def _context_choice_operation(
+    question: str, facts: tuple[SemanticFact, ...]
+) -> tuple[str, MultiEmployeeDateView | None]:
+    """Preserve a bounded operation when only the prior-result referent is ambiguous."""
+    normalized = normalize_for_matching(question)
+    if re.search(r"\b(?:explain|why)\b|(?:اشرح|لماذا)", normalized, re.I):
+        return "explain_previous", None
+    if re.search(
+        r"\b(?:separately|per employee|for each employee)\b|(?:لكل موظف|بشكل منفصل)",
+        normalized,
+        re.I,
+    ):
+        return "change_view", "per_employee"
+    if re.search(
+        r"\b(?:intersection|common dates?)\b|(?:تقاطع|مشتركة)", normalized, re.I
+    ):
+        return "change_view", "intersection_dates"
+    if re.search(r"\b(?:union|combined dates?)\b|(?:اتحاد|مجتمعة)", normalized, re.I):
+        return "change_view", "union_dates"
+    result_facts = tuple(fact for fact in facts if fact.kind in _RESULT_FACT_KINDS)
+    scope_facts = tuple(fact for fact in facts if fact.kind not in _RESULT_FACT_KINDS)
+    if result_facts and not scope_facts:
+        return "replace_result", None
+    if scope_facts:
+        if re.search(
+            r"\b(?:add|also|include|including|with)\b|(?:اضف|ايضا|مع)", normalized, re.I
+        ):
+            return "add_constraints", None
+        return "modify_scope", None
+    return "repeat", None
+
+
+def _materialize_context_choice(
+    pending: PendingRequestFrame, base: AttendanceUnitFrame
+) -> conversation.MaterializedConversationUnit:
+    """Resume a finite displayed choice without another interpretation call."""
+    relation = pending.relation or "repeat"
+    selected_facts = pending.facts
+    inherited = tuple(conversation._trusted_fact(fact) for fact in base.facts)
+    facts = inherited
+    view = base.view
+    if relation == "replace_result":
+        facts = (
+            tuple(fact for fact in inherited if fact.kind not in _RESULT_FACT_KINDS)
+            + selected_facts
+        )
+    elif relation == "add_constraints":
+        if any(fact.kind in _RESULT_FACT_KINDS for fact in selected_facts):
+            raise conversation.ConversationDecisionValidationError(
+                "saved added constraints contain result facts"
+            )
+        facts = inherited + selected_facts
+    elif relation == "modify_scope":
+        if any(fact.kind in _RESULT_FACT_KINDS for fact in selected_facts):
+            raise conversation.ConversationDecisionValidationError(
+                "saved scope change contains result facts"
+            )
+        changed_fields = {
+            fact.field for fact in selected_facts if fact.field is not None
+        }
+        facts = (
+            tuple(fact for fact in inherited if fact.field not in changed_fields)
+            + selected_facts
+        )
+    elif relation == "change_view":
+        if pending.view is None:
+            raise conversation.ConversationDecisionValidationError(
+                "saved view change has no view"
+            )
+        view = pending.view
+    elif relation not in {"repeat", "explain_previous"}:
+        raise conversation.ConversationDecisionValidationError(
+            "saved context operation is unsupported"
+        )
+    return conversation.MaterializedConversationUnit(
+        unit_id=uuid.uuid4().hex,
+        route="attendance",
+        relation=relation,
+        source_text=pending.original_question,
+        facts=facts,
+        employees=base.employees,
+        view=view,
+        explain_previous=relation == "explain_previous",
+        prior_result=base.result,
+    )
+
+
+def _fact_span_in_question(question: str, fact: SemanticFact) -> tuple[int, int] | None:
+    if fact.evidence_span is not None:
+        return fact.evidence_span
+    matches = tuple(
+        match.span()
+        for match in re.finditer(re.escape(fact.evidence_text), question, re.I)
+    )
+    return matches[0] if len(matches) == 1 else None
+
+
+def _context_unit_with_employees(
+    unit: conversation.MaterializedConversationUnit,
+    employees: tuple[EmployeeReferent, ...],
+) -> conversation.MaterializedConversationUnit:
+    return conversation.MaterializedConversationUnit(
+        unit_id=unit.unit_id,
+        route=unit.route,
+        relation=unit.relation,
+        source_text=unit.source_text,
+        facts=tuple(
+            fact
+            for fact in unit.facts
+            if not (
+                fact.kind == "entity"
+                or (fact.kind == "filter" and fact.field in {"Employee_ID", "Name"})
+            )
+        ),
+        employees=employees,
+        view=unit.view,
+        explain_previous=unit.explain_previous,
+        prior_result=unit.prior_result,
+    )
+
+
+def _materialize_repeated_context_segments(
+    pending: PendingRequestFrame, base: AttendanceUnitFrame
+) -> tuple[conversation.MaterializedConversationUnit, ...]:
+    spans = tuple(
+        match.span()
+        for match in re.finditer(r"[^;؛]+", pending.original_question)
+        if match.group(0).strip()
+    )
+    if len(spans) < 2:
+        return ()
+    units = []
+    for start, end in spans:
+        raw_segment = pending.original_question[start:end]
+        segment = raw_segment.strip()
+        leading = len(raw_segment) - len(raw_segment.lstrip())
+        segment_start = start + leading
+        segment_end = segment_start + len(segment)
+        segment_facts = tuple(
+            fact.model_copy(update={"evidence_span": fact_span})
+            for fact in pending.facts
+            if (fact_span := _fact_span_in_question(pending.original_question, fact))
+            is not None
+            and segment_start <= fact_span[0]
+            and fact_span[1] <= segment_end
+        )
+        normalized = normalize_for_matching(segment)
+        explicit_control = bool(
+            re.search(
+                r"\b(?:again|repeat|same|explain|why|separately|intersection|union)\b"
+                r"|(?:كرر|مرة اخرى|اشرح|لماذا|منفصل|تقاطع|اتحاد)",
+                normalized,
+                re.I,
+            )
+        )
+        if not segment_facts and not explicit_control:
+            return ()
+        relation, view = _context_choice_operation(segment, segment_facts)
+        segment_pending = pending.model_copy(
+            update={
+                "original_question": segment,
+                "facts": segment_facts,
+                "relation": relation,
+                "view": view,
+            }
+        )
+        units.append(_materialize_context_choice(segment_pending, base))
+    return tuple(units)
 
 
 _ARABIC_CORRECTION_LABELS = {
@@ -6646,6 +6979,11 @@ def _answer_question_with_state(
                         validated.decision.reason == "ambiguous_reference"
                         and len(validated.request.prior_units) > 1
                     ):
+                        state.referents = list(request_state.referents)
+                        state.active_referent_ids = list(
+                            request_state.active_referent_ids
+                        )
+                        state.recent_frames = list(request_state.recent_frames)
                         pending = _store_context_clarification(
                             state,
                             question,
@@ -6746,6 +7084,9 @@ def _answer_question_with_state(
                             )
                     return "\n\n".join(replies), attendance_chunks, attendance_state
                 contextual_unit = materialized[0]
+                # A validated replacement owns this turn. Do not let stale legacy
+                # clarification mirrors re-gate or recursively reinterpret it.
+                _clear_pending_state(state)
             except conversation.ConversationDecisionValidationError:
                 return _format_conversation_help(reply_locale), [], state
 
@@ -6864,50 +7205,38 @@ def _answer_question_with_state(
             _clear_pending_state(state)
             return _format_conversation_help(reply_locale), [], state
         effective_question = pending_context.original_question
-        request_referents = tuple(
-            EmployeeReferent(employee_id=item.employee_id, name=item.name)
-            for item in current_directory
-            if any(
-                item.employee_id.casefold() == saved.employee_id.casefold()
-                for saved in state.referents
+        pending_entities = []
+        for fact in pending_context.facts:
+            if fact.kind != "entity":
+                continue
+            evidence_span = _fact_span_in_question(effective_question, fact)
+            if evidence_span is not None:
+                pending_entities.append(
+                    fact.model_copy(update={"evidence_span": evidence_span})
+                )
+        pending_entities = tuple(pending_entities)
+        unique_context_employees: tuple[EmployeeReferent, ...] = ()
+        if len(pending_entities) == 1:
+            entity = pending_entities[0]
+            resolution = resolve_employee_reference(
+                entity.evidence_text, current_directory
             )
-        )
-        narrowed_frame = ConversationTurnFrame(
-            original_question=base.source_text,
-            reply_locale=pending_context.reply_locale,
-            units=(base,),
-        )
-        request = conversation.build_conversation_request(
-            effective_question,
-            pending_context.facts,
-            request_referents,
-            (narrowed_frame,),
-            tuple(state.active_referent_ids),
-            employee_sources=_conversation_employee_sources(
-                effective_question,
-                pending_context.facts,
-                (),
-                request_referents,
-                tuple(state.active_referent_ids),
-            ),
-        )
-        validated = conversation.request_conversation_decision(request)
-        if validated is None or validated.decision.status != "resolved":
-            return _format_conversation_help(reply_locale), [], state
-        resolved_mentions, mention_blocker = _resolve_conversation_employee_mentions(
-            validated
-        )
-        if mention_blocker is not None:
-            resolution, reference_text, reference_span = mention_blocker
-            if resolution.outcome != "none" and resolution.candidates:
+            if resolution.outcome in {"confirmation", "ambiguous"}:
+                try:
+                    contextual_template = _materialize_context_choice(
+                        pending_request, base
+                    )
+                except conversation.ConversationDecisionValidationError:
+                    return _format_conversation_help(reply_locale), [], state
                 _store_employee_clarification(
                     state,
                     effective_question,
                     None,
-                    pending_context.facts,
+                    contextual_template.facts,
                     resolution,
-                    reference_text=reference_text,
-                    reference_span=reference_span,
+                    reference_text=entity.evidence_text,
+                    reference_span=entity.evidence_span,
+                    contextual_unit=contextual_template,
                     context_units=(base,),
                 )
                 return (
@@ -6915,24 +7244,41 @@ def _answer_question_with_state(
                     [],
                     state,
                 )
-            return _format_conversation_help(reply_locale), [], state
-        try:
-            materialized = conversation.materialize_conversation_units(
-                validated, resolved_mentions=resolved_mentions
-            )
-        except conversation.ConversationDecisionValidationError:
-            return _format_conversation_help(reply_locale), [], state
-        if any(unit.route != "attendance" for unit in materialized):
-            return _format_conversation_help(reply_locale), [], state
-        if len(materialized) > 1:
+            if resolution.outcome == "unique":
+                unique_context_employees = tuple(
+                    EmployeeReferent(
+                        employee_id=candidate.employee_id, name=candidate.name
+                    )
+                    for candidate in resolution.candidates
+                )
+        repeated_units = _materialize_repeated_context_segments(pending_request, base)
+        if repeated_units:
+            if unique_context_employees:
+                repeated_units = tuple(
+                    _context_unit_with_employees(unit, unique_context_employees)
+                    if any(
+                        fact.kind == "entity" and fact.origin == "question"
+                        for fact in unit.facts
+                    )
+                    else unit
+                    for unit in repeated_units
+                )
+            _clear_pending_state(state)
             return _answer_compound_turn(
                 effective_question,
-                tuple(_pending_unit(unit, reply_locale) for unit in materialized),
+                tuple(_pending_unit(unit, reply_locale) for unit in repeated_units),
                 state,
                 locale=reply_locale,
                 access_context=access_context,
             )
-        contextual_unit = materialized[0]
+        try:
+            contextual_unit = _materialize_context_choice(pending_request, base)
+        except conversation.ConversationDecisionValidationError:
+            return _format_conversation_help(reply_locale), [], state
+        if unique_context_employees:
+            contextual_unit = _context_unit_with_employees(
+                contextual_unit, unique_context_employees
+            )
         prepared_facts = contextual_unit.facts
         request_view = contextual_unit.view
         employees_for_request = [
@@ -7233,6 +7579,28 @@ def _answer_question_with_state(
                 resolved_employees=selected,
                 reference_text=malformed_reference,
                 reference_span=malformed_span,
+                resolved_mentions=(
+                    pending_request.resolved_mentions
+                    + tuple(
+                        ResolvedPendingMention(
+                            source_text=(
+                                pending_employee.reference_text or candidate.name
+                                if pending_employee is not None
+                                else candidate.name
+                            ),
+                            source_span=(
+                                pending_employee.reference_span
+                                if pending_employee is not None
+                                else None
+                            ),
+                            referent=EmployeeReferent(
+                                employee_id=candidate.employee_id,
+                                name=candidate.name,
+                            ),
+                        )
+                        for candidate in current_selection
+                    )
+                ),
             )
             return (
                 _format_employee_clarification(
@@ -7268,6 +7636,10 @@ def _answer_question_with_state(
             pending_employee is not None
             and pending_employee.reference_span is not None
             and (state.recent_frames or pending_request.context_units)
+            and not (
+                pending_request.unit_id is not None
+                and pending_request.relation is not None
+            )
             and conversation.needs_conversation_decision(
                 effective_question, pending_request.facts
             )

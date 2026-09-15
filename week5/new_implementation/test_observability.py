@@ -92,6 +92,35 @@ class ObservabilityTests(unittest.TestCase):
 
         self.assertEqual(payload["match_method_counts"], {"exact": 2, "fuzzy": 1})
 
+    def test_retrieval_events_drop_result_counts_but_keep_structural_fields(self):
+        logger = EventLogger(sink=lambda _rendered: None, json_format=True)
+
+        payload = logger.emit(
+            "retrieval_complete",
+            stage="structured_retrieval",
+            state="success",
+            backend="postgres",
+            mode="exact",
+            operation="count",
+            count=42,
+            matched_count=43,
+            result_count=44,
+            aggregate_count=45,
+            value=46,
+        )
+
+        self.assertEqual(
+            payload,
+            {
+                "event": "retrieval_complete",
+                "stage": "structured_retrieval",
+                "state": "success",
+                "backend": "postgres",
+                "mode": "exact",
+                "operation": "count",
+            },
+        )
+
     def test_redaction_cannot_be_disabled_for_event_emission(self):
         events = []
         logger = EventLogger(sink=events.append, json_format=True, redact_pii=False)

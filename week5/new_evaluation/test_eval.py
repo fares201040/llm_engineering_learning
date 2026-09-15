@@ -6,6 +6,8 @@ import sys
 import unittest
 from unittest.mock import patch
 
+from pydantic import ValidationError
+
 from week5.new_implementation.answer import EmployeeCandidate, FilterCondition, Result
 from week5.new_evaluation import eval as evaluation
 from week5.new_evaluation import test as evaluation_cases
@@ -1588,6 +1590,45 @@ class BaselineCapabilityParityTests(unittest.TestCase):
 
 
 class EvaluationWiringTests(unittest.TestCase):
+    def test_turn_expectations_require_strict_supported_types(self):
+        invalid_turns = (
+            {"user": 1},
+            {"user": "1", "expected_employee_ids": "A10001"},
+            {"user": "1", "expected_pending_ids": [10001]},
+            {"user": "1", "expected_answer_facts": "worked"},
+        )
+
+        for turn in invalid_turns:
+            with self.subTest(turn=turn):
+                with self.assertRaises(ValidationError):
+                    TestQuestion(
+                        question="Synthetic ambiguous employee",
+                        keywords=[],
+                        reference_answer="Clarify, then execute.",
+                        category="employee_ambiguity",
+                        expected_clarification_ids=["A10001"],
+                        turns=[turn],
+                    )
+
+    def test_turn_expectations_reject_unsupported_behavioral_keys(self):
+        unsupported_expectations = (
+            "expected_provider_calls",
+            "expected_partial_results",
+            "expected_atomicity",
+        )
+
+        for unsupported_key in unsupported_expectations:
+            with self.subTest(unsupported_key=unsupported_key):
+                with self.assertRaises(ValidationError):
+                    TestQuestion(
+                        question="Synthetic ambiguous employee",
+                        keywords=[],
+                        reference_answer="Clarify, then execute.",
+                        category="employee_ambiguity",
+                        expected_clarification_ids=["A10001"],
+                        turns=[{"user": "1", unsupported_key: True}],
+                    )
+
     def test_semantic_rejection_cannot_pass_via_legacy_message_substring(self):
         from week5.new_implementation.plan_compiler import PlanViolation
 
@@ -2173,12 +2214,12 @@ class AttendanceCorpusTests(unittest.TestCase):
                 *(
                     employee_id
                     for turn in test.turns
-                    for employee_id in turn.get("expected_employee_ids", [])
+                    for employee_id in (turn.expected_employee_ids or [])
                 ),
                 *(
                     employee_id
                     for turn in test.turns
-                    for employee_id in turn.get("expected_pending_ids", [])
+                    for employee_id in (turn.expected_pending_ids or [])
                 ),
             }
             self.assertTrue(

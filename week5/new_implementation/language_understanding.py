@@ -370,6 +370,54 @@ class PendingRequestFrame(_StrictFrozenModel):
             raise ValueError("pending request question must not be blank")
         return value
 
+    @model_validator(mode="after")
+    def _duplicated_choices_match_displayed_clarification(self):
+        clarification = self.clarification
+        if self.pending_candidates and clarification is not None:
+            if not isinstance(clarification, EmployeeClarification) or (
+                self.pending_candidates != clarification.options
+            ):
+                raise ValueError(
+                    "pending employee choices must match the displayed clarification"
+                )
+
+        if self.pending_constraint is not None and clarification is not None:
+            if not isinstance(clarification, CatalogClarification):
+                raise ValueError(
+                    "pending catalog choices must match the displayed clarification"
+                )
+            displayed_catalog = tuple(
+                (option.field, option.value, option.display_value)
+                for option in clarification.options
+            )
+            resumable_catalog = tuple(
+                (candidate.field, candidate.value, candidate.label or candidate.value)
+                for candidate in self.pending_constraint.candidates
+            )
+            if displayed_catalog != resumable_catalog:
+                raise ValueError(
+                    "pending catalog choices must match the displayed clarification"
+                )
+
+        if self.pending_interpretations and clarification is not None:
+            if not isinstance(clarification, MeaningClarification):
+                raise ValueError(
+                    "pending interpretation choices must match the displayed clarification"
+                )
+            displayed_interpretations = tuple(
+                option.target_name
+                for option in clarification.options
+                if option.target_kind == "interpretation"
+            )
+            if (
+                len(displayed_interpretations) != len(clarification.options)
+                or displayed_interpretations != self.pending_interpretations
+            ):
+                raise ValueError(
+                    "pending interpretation choices must match the displayed clarification"
+                )
+        return self
+
 
 class InputUnderstanding(_StrictFrozenModel):
     status: UnderstandingStatus
@@ -467,6 +515,12 @@ LOCALIZED_ALIAS_DEFINITIONS: tuple[LocalizedAliasDefinition, ...] = (
         target_kind="interpretation",
         target_name="absent_days",
         phrases=("أيام الغياب",),
+    ),
+    LocalizedAliasDefinition(
+        locale="ar",
+        target_kind="interpretation",
+        target_name="attendance_records",
+        phrases=("سجلات الحضور", "سجلات الدوام", "السجلات"),
     ),
     LocalizedAliasDefinition(
         locale="ar",
@@ -885,11 +939,62 @@ _ARABIC_CONTINUATION_TOKENS = frozenset(
         "بعد",
         "عن",
         "مع",
+        "حيث",
         "حتي",
         "للموظف",
         "للموظفة",
     }
 )
+
+_ARABIC_MEANING_REVERSAL_PREFIXES = frozenset(
+    {
+        "بدون",
+        "دون",
+        "لا",
+        "استبعد",
+        "استبعاد",
+        "باستثناء",
+        "عدا",
+    }
+)
+
+_MEANING_REVERSAL_PREFIXES = _ARABIC_MEANING_REVERSAL_PREFIXES | frozenset(
+    {"without", "exclude", "excluding", "omit", "remove", "not", "no"}
+)
+
+_MEANING_CLAUSE_COORDINATORS = frozenset(
+    {
+        "but",
+        "however",
+        "then",
+        "yet",
+        "instead",
+        "and",
+        "or",
+        "لكن",
+        "ثم",
+        "بل",
+        "و",
+    }
+)
+_MEANING_CLAUSE_PUNCTUATION = re.compile(r"[،,.!?؟:;]+")
+
+
+def _has_meaning_reversal_prefix(
+    surface: QuestionSurface, candidate: SurfaceCandidate
+) -> bool:
+    prefix = surface.original_text[: candidate.evidence_span[0]]
+    current_clause = _MEANING_CLAUSE_PUNCTUATION.split(prefix)[-1]
+    clause_tokens = normalize_for_matching(current_clause).split()
+    last_coordinator = max(
+        (
+            index
+            for index, token in enumerate(clause_tokens)
+            if token in _MEANING_CLAUSE_COORDINATORS
+        ),
+        default=-1,
+    )
+    return bool(set(clause_tokens[last_coordinator + 1 :]) & _MEANING_REVERSAL_PREFIXES)
 
 
 def _has_unregistered_arabic_residual(
@@ -901,6 +1006,8 @@ def _has_unregistered_arabic_residual(
         or not _ARABIC_ALPHA.search(candidate.evidence_text)
     ):
         return False
+    if _has_meaning_reversal_prefix(surface, candidate):
+        return True
     suffix = surface.original_text[candidate.evidence_span[1] :].lstrip()
     if not suffix or suffix[0] in "،,.!?؟:;":
         return False
@@ -908,3 +1015,42 @@ def _has_unregistered_arabic_residual(
     if next_word is None:
         return False
     return normalize_for_matching(next_word.group(0)) not in _ARABIC_CONTINUATION_TOKENS
+
+
+def has_unregistered_arabic_meaning_modifier(question: str) -> bool:
+    """Detect a bounded prefix that reverses a registered attendance meaning."""
+    surface = analyze_question_surface(question)
+    for candidate in surface.candidates:
+        if candidate.method not in {
+            "exact",
+            "localized_alias",
+            "fuzzy",
+        } or candidate.target_kind not in {"predicate", "interpretation"}:
+            continue
+        if _has_meaning_reversal_prefix(surface, candidate):
+            if any(
+                other.candidate_id != candidate.candidate_id
+                and other.method in {"exact", "localized_alias"}
+                and other.target_kind in {"predicate", "interpretation"}
+                and other.evidence_span[0] < candidate.evidence_span[0]
+                and candidate.evidence_span[1] <= other.evidence_span[1]
+                for other in surface.candidates
+            ):
+                continue
+            if any(
+                field.target_kind == "field"
+                and field.method in {"exact", "localized_alias"}
+                and field.evidence_span[1] <= candidate.evidence_span[0]
+                and re.fullmatch(
+                    r"\s*(?:(?:is|are|was|were|does|do)\s+)?"
+                    r"(?:not|no)(?:\s+(?:in|contain|contains|start with|end with))?\s*",
+                    surface.original_text[
+                        field.evidence_span[1] : candidate.evidence_span[0]
+                    ],
+                    re.I,
+                )
+                for field in surface.candidates
+            ):
+                continue
+            return True
+    return False

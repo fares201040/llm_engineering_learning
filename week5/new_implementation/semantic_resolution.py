@@ -3,7 +3,8 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
+from difflib import SequenceMatcher
 import re
 import unicodedata
 from typing import Literal
@@ -195,16 +196,22 @@ class FieldResolver(ABC):
         categorical_clauses=None,
     ) -> tuple[SemanticFact, ...]:
         definition = FIELD_DEFINITIONS[field]
+        field_occurrences = tuple(
+            (start, end)
+            for phrase in sorted(definition.natural_names, key=len, reverse=True)
+            for form in _token_forms(phrase)
+            for start, end in _raw_phrase_spans(question, form)
+        )
         field_facts = tuple(
             SemanticFact(
                 kind="field",
                 field=field,
-                evidence_text=phrase,
+                evidence_text=question[start:end],
+                evidence_span=(start, end),
                 origin="question",
                 strength="strong",
             )
-            for phrase in sorted(definition.natural_names, key=len, reverse=True)
-            if evidence_occurs(question, phrase)
+            for start, end in dict.fromkeys(field_occurrences)
         )[:1]
         if not field_facts and definition.resolution_kind not in {
             "catalog",
@@ -1157,6 +1164,34 @@ class EntityResolver(FieldResolver):
                 name_end -= 1
             syntax_spans.append((start, name_end))
         for match in re.finditer(
+            r"(?:\b(?:what|how)\s+about|(?:ماذا|ما)\s+عن)\s+"
+            r"(?P<name>[^\W\d_][\w'-]*(?:\s+[^\W\d_][\w'-]*)*?)"
+            r"(?=\s+(?:in|on|during|where|with|for|and)\b|[،,?.!؟]|$)",
+            question,
+            re.I,
+        ):
+            start, end = match.span("name")
+            semantic_boundaries = [
+                boundary_start
+                for boundary_start, _ in (*protected_spans, *non_entity_field_spans)
+                if start < boundary_start < end
+            ]
+            name_end = min(semantic_boundaries, default=end)
+            grounded_name_ends = [
+                grounded_end
+                for employee in context.employees
+                for grounded_start, grounded_end in _raw_phrase_spans(
+                    question, employee.name
+                )
+                if grounded_start == start and grounded_end <= name_end
+            ]
+            if grounded_name_ends:
+                name_end = max(grounded_name_ends)
+            while name_end > start and question[name_end - 1].isspace():
+                name_end -= 1
+            if name_end > start:
+                syntax_spans.append((start, name_end))
+        for match in re.finditer(
             r"\bemployee\s+(?P<name>[^\W\d_][\w'-]*(?:\s+[^\W\d_][\w'-]*)*?)"
             r"\s+(?=(?:attendance|records?)\b)",
             question,
@@ -1744,6 +1779,48 @@ def _catalog_outcome(
         return ResolutionOutcome("ambiguous", candidates=partial)
     if len(partial) > 1:
         return ResolutionOutcome("ambiguous", candidates=partial)
+    semantic_noise = {
+        "and",
+        "of",
+        "the",
+        "team",
+        "teams",
+        "department",
+        "departments",
+        "dept",
+        "group",
+        "قسم",
+        "القسم",
+        "فريق",
+    }
+    query_tokens = tuple(token for token in key.split() if token not in semantic_noise)
+
+    def acronym(tokens: tuple[str, ...]) -> str:
+        return "".join(
+            token[0] for token in tokens if token not in {"and", "of", "the"} and token
+        )
+
+    compact_query = "".join(query_tokens)
+    scored = []
+    for value in values:
+        normalized = normalize_semantic_text(value)
+        value_tokens = tuple(normalized.split())
+        score = 0.0
+        if query_tokens:
+            overlap = set(query_tokens) & set(value_tokens)
+            if overlap:
+                score = max(score, len(overlap) / len(set(query_tokens)))
+            score = max(
+                score, SequenceMatcher(None, " ".join(query_tokens), normalized).ratio()
+            )
+        if 2 <= len(compact_query) <= 8 and compact_query == acronym(value_tokens):
+            score = 1.0
+        if score >= 0.82:
+            scored.append((score, value))
+    if scored:
+        best = max(score for score, _value in scored)
+        candidates = tuple(value for score, value in scored if best - score <= 0.05)
+        return ResolutionOutcome("ambiguous", candidates=candidates)
     return ResolutionOutcome("unknown")
 
 
@@ -1762,6 +1839,72 @@ class CatalogValueResolver(FieldResolver):
         if len(set(aliases)) == 1:
             return ResolutionOutcome("resolved", tuple(dict.fromkeys(aliases)))
         return _catalog_outcome(field, raw_value, context)
+
+
+@dataclass(frozen=True)
+class CatalogClarificationMatch:
+    field: str
+    reference: str
+    evidence_span: tuple[int, int]
+    candidates: tuple[str, ...]
+
+
+def catalog_clarification_matches(
+    question: str, context: ResolutionContext
+) -> tuple[CatalogClarificationMatch, ...]:
+    """Return only finite live-catalog candidates for unresolved typed clauses."""
+    registry = ResolverRegistry.default()
+    matches = []
+    for clause in _parse_constraint_clauses(question, context, include_typed=True):
+        if clause.violation != "unsupported_constraint":
+            continue
+        definition = FIELD_DEFINITIONS[clause.field]
+        if definition.resolution_kind != "catalog" or clause.operator not in {
+            "eq",
+            "in",
+        }:
+            continue
+        reference = question[slice(*clause.operand_span)].strip()
+        outcome = registry.canonicalize(
+            clause.field, reference, reference, context, operator="eq"
+        )
+        if outcome.status != "ambiguous" or not outcome.candidates:
+            continue
+        matches.append(
+            CatalogClarificationMatch(
+                field=clause.field,
+                reference=reference,
+                evidence_span=clause.operand_span,
+                candidates=outcome.candidates,
+            )
+        )
+    return tuple(matches)
+
+
+def catalog_constraint_references(question: str) -> tuple[tuple[str, str], ...]:
+    """Extract typed catalog operands without treating them as canonical values."""
+    empty_context = ResolutionContext(catalog={})
+    references = []
+    for clause in _parse_constraint_clauses(
+        question, empty_context, include_typed=True
+    ):
+        if FIELD_DEFINITIONS[clause.field].resolution_kind != "catalog":
+            continue
+        reference = question[slice(*clause.operand_span)].strip()
+        if reference:
+            references.append((clause.field, reference))
+    return tuple(dict.fromkeys(references))
+
+
+def grounded_catalog_candidates(
+    field: str, reference: str, values: Sequence[str]
+) -> tuple[str, ...]:
+    """Rank only supplied allowed values; never turn similarity into execution."""
+    context = ResolutionContext(catalog={field: tuple(values)})
+    outcome = ResolverRegistry.default().canonicalize(
+        field, reference, reference, context, operator="eq"
+    )
+    return outcome.values if outcome.status == "resolved" else outcome.candidates
 
 
 class FreeTextResolver(FieldResolver):

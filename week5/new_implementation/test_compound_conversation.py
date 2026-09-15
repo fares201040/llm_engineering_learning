@@ -630,6 +630,119 @@ class CompoundTurnTests(unittest.TestCase):
             [u.result.scalar_value for u in resumed.recent_frames[-1].units], [3, 3]
         )
 
+    def test_context_choice_resumes_heterogeneous_compound_without_second_provider(
+        self,
+    ):
+        fact = answer.SemanticFact(
+            kind="measure",
+            concept_name="attendance_records",
+            evidence_text="records",
+            origin="question",
+            strength="strong",
+        )
+        state = answer.ConversationState(
+            recent_frames=[
+                answer.ConversationTurnFrame(
+                    original_question="previous requests",
+                    reply_locale="en",
+                    units=tuple(
+                        answer.AttendanceUnitFrame(
+                            unit_id=f"prior-{i}",
+                            source_text="count attendance records",
+                            facts=(fact,),
+                            result=answer.ResultSnapshot(),
+                        )
+                        for i in (1, 2)
+                    ),
+                )
+            ]
+        )
+        c = answer.conversation
+
+        def decide(request):
+            return c.ValidatedConversation(
+                request,
+                c.ConversationDecision.model_validate(
+                    {"status": "ambiguous", "reason": "ambiguous_reference"}
+                ),
+                (),
+            )
+
+        self.provider.side_effect = decide
+        _, _, pending = answer.answer_question_with_state(
+            "explain that; repeat it", [], state
+        )
+        text, _, resumed = answer.answer_question_with_state("1", [], pending)
+
+        self.assertTrue(text)
+        self.assertEqual(self.provider.call_count, 1)
+        self.assertIsNone(resumed.pending_request)
+        self.assertEqual(len(resumed.recent_frames[-1].units), 2)
+
+    def test_context_choice_preserves_repeat_and_exact_id_employee_change(self):
+        fact = answer.SemanticFact(
+            kind="measure",
+            concept_name="attendance_records",
+            evidence_text="records",
+            origin="question",
+            strength="strong",
+        )
+        prior = tuple(
+            answer.EmployeeReferent(employee_id=f"A1000{i}", name=name)
+            for i, name in ((1, "Morgan River"), (2, "Sam North"))
+        )
+        state = answer.ConversationState(
+            referents=list(prior),
+            active_referent_ids=[item.employee_id for item in prior],
+            recent_frames=[
+                answer.ConversationTurnFrame(
+                    original_question="previous requests",
+                    reply_locale="en",
+                    units=tuple(
+                        answer.AttendanceUnitFrame(
+                            unit_id=f"prior-{i}",
+                            source_text="count attendance records",
+                            facts=(fact,),
+                            employees=(employee,),
+                            result=answer.ResultSnapshot(),
+                        )
+                        for i, employee in enumerate(prior, start=1)
+                    ),
+                )
+            ],
+        )
+        directory = [
+            answer.EmployeeCandidate(**employee.model_dump()) for employee in prior
+        ] + [answer.EmployeeCandidate(employee_id="A10003", name="Taylor East")]
+
+        def decide(request):
+            c = answer.conversation
+            return c.ValidatedConversation(
+                request,
+                c.ConversationDecision.model_validate(
+                    {"status": "ambiguous", "reason": "ambiguous_reference"}
+                ),
+                (),
+            )
+
+        self.provider.side_effect = decide
+        answer.load_employee_directory.return_value = directory
+        _, _, pending = answer.answer_question_with_state(
+            "repeat it; what about A10003", [], state
+        )
+        text, _, resumed = answer.answer_question_with_state("2", [], pending)
+
+        self.assertTrue(text)
+        self.assertEqual(self.provider.call_count, 1)
+        self.assertIsNone(resumed.pending_request)
+        units = resumed.recent_frames[-1].units
+        self.assertEqual(len(units), 2)
+        self.assertEqual(units[0].employees, (prior[1],))
+        self.assertEqual(
+            units[1].employees,
+            (answer.EmployeeReferent(employee_id="A10003", name="Taylor East"),),
+        )
+
     def test_render_failure_withholds_all_results_state_and_trace(self):
         original = answer._answer_from_context
         rendered = []

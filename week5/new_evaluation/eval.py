@@ -516,31 +516,29 @@ def evaluate_behavior(test: TestQuestion) -> BehaviorEval:
         )
         multi_turn_ok = True
         for turn in test.turns:
-            text, _chunks, state = answer_question_with_state(
-                str(turn["user"]), [], state
-            )
+            text, _chunks, state = answer_question_with_state(turn.user, [], state)
             selected_ids = [
                 candidate.employee_id for candidate in state.selected_employees
             ]
             pending_ids = [
                 candidate.employee_id for candidate in state.pending_candidates
             ]
-            if "expected_employee_ids" in turn:
+            if turn.expected_employee_ids is not None:
                 multi_turn_ok = (
                     multi_turn_ok
-                    and selected_ids == turn["expected_employee_ids"]
+                    and selected_ids == turn.expected_employee_ids
                     and not pending_ids
                     and state.pending_question is None
                     and state.pending_proposal is None
                     and state.pending_constraint is None
                 )
-            if "expected_pending_ids" in turn:
+            if turn.expected_pending_ids is not None:
                 multi_turn_ok = (
-                    multi_turn_ok and pending_ids == turn["expected_pending_ids"]
+                    multi_turn_ok and pending_ids == turn.expected_pending_ids
                 )
             multi_turn_ok = multi_turn_ok and all(
                 str(fact).casefold() in text.casefold()
-                for fact in turn.get("expected_answer_facts", [])
+                for fact in turn.expected_answer_facts
             )
         return BehaviorEval(
             plan_ok=True,

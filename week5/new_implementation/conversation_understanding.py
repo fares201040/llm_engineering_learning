@@ -314,9 +314,7 @@ class ConversationDecisionContext(_StrictFrozenModel):
 
     @model_validator(mode="after")
     def _strong_facts_are_known_choices(self):
-        if self.fact_choice_ids and not set(self.strong_fact_ids) <= set(
-            self.fact_choice_ids
-        ):
+        if not set(self.strong_fact_ids) <= set(self.fact_choice_ids):
             raise ValueError("strong fact identifiers must be known fact choices")
         spans = [item.source_span for item in self.employee_span_choices]
         if len(spans) != len(set(spans)):
@@ -534,12 +532,14 @@ def conversation_preflight_route(
 ) -> Literal["protected", "social", "unrelated"] | None:
     normalized = normalize_for_matching(message)
     if re.search(
-        r"\b(?:payroll|salar(?:y|ies)|loans?|repayments?|benefits?|raw_source_rows)\b|\bprivate\s+raw\b"
-        r"|\b(?:ignore|disregard)\s+(?:previous|prior|all)\s+instructions?\b"
-        r"|\b(?:reveal|show|print)\s+(?:your\s+)?(?:hidden\s+)?system\s+prompt\b"
+        r"\b(?:payroll|salar(?:y|ies)|compensation|bonuses?|loans?|repayments?|benefits?|raw_source_rows)\b|\bprivate\s+raw\b"
+        r"|\b(?:ignore|disregard|forget)\s+(?:(?:previous|prior|all)\s+)*(?:instructions?|rules?)\b"
+        r"|\boverride\s+(?:(?:your|the|all)\s+)?(?:instructions?|rules?)\b"
+        r"|\b(?:reveal|show|print|give(?:\s+me)?|tell(?:\s+me)?)\s+(?:your\s+)?(?:hidden\s+)?system\s+prompt\b"
         r"|(?:تجاهل|تجاهلي)\s+(?:التعليمات|التوجيهات)\s+(?:السابقة|الماضية)"
+        r"|(?:انس|انسي|تجاوز)\s+(?:كل\s+)?(?:التعليمات|التوجيهات)(?:\s+(?:السابقة|الماضية))?"
         r"|(?:اكشف|اظهر|اعرض|اطبع)\s+(?:موجه\s+النظام|تعليمات\s+النظام|الموجه\s+السري|الموجه\s+المخفي)"
-        r"|(?:رواتب|راتب|قروض|قرض|سداد|مزايا|المصدر الخام)",
+        r"|(?:رواتب|راتب|تعويضات|مكافات|مكافاه|قروض|قرض|سداد|مزايا|المصدر الخام)",
         normalized,
         re.I,
     ):
@@ -550,7 +550,9 @@ def conversation_preflight_route(
     ) or (normalized and set(normalized.split()) <= _SOCIAL_TOKENS):
         return "social"
     if re.search(
-        r"\b(?:weather|recipe|recipes|poem|story|song|joke)\b|(?:الطقس|وصفة طبخ|قصيدة|قصة|اغنية|نكتة)",
+        r"\b(?:weather|recipe|recipes|poem|story|song|joke|capital|president|stock\s+market)\b"
+        r"|\b\d+\s+(?:plus|minus|times|divided\s+by)\s+\d+\b"
+        r"|(?:الطقس|وصفة طبخ|قصيدة|قصة|اغنية|نكتة|عاصمة|رئيس\s+فرنسا|سوق\s+الاسهم)",
         normalized,
     ) and not re.search(
         r"\b(?:attendance|employee|records?|days?|hours?|worked|overtime)\b|(?:حضور|موظف|سجلات|ايام|ساعات|عمل)",
@@ -580,6 +582,8 @@ def needs_conversation_decision(message: str, facts: tuple[SemanticFact, ...]) -
             )
         for start, end in spans:
             remaining[start:end] = " " * (end - start)
+            if fact.kind == "unsupported":
+                contextual_text[start:end] = " " * (end - start)
         if fact.kind == "projection" and fact.strength == "strong":
             projections.extend(
                 match.span()

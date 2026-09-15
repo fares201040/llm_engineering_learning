@@ -886,6 +886,21 @@ class BaselineOrderingGrammarTests(unittest.TestCase):
             filters[0].evidence_span, (question.rindex("Highest"), len(question) - 1)
         )
 
+    def test_plural_tolerant_field_fact_retains_exact_question_source(self):
+        question = "Count records by department and then by status"
+        facts = detect_semantic_facts(question, ResolutionContext({}))
+
+        department = next(
+            fact
+            for fact in facts
+            if fact.kind == "field" and fact.field == "Department"
+        )
+        self.assertEqual(department.evidence_text, "department")
+        self.assertEqual(
+            department.evidence_span,
+            (question.index("department"), question.index("department") + 10),
+        )
+
     def test_bound_value_occurrence_does_not_hide_independent_ranking(self):
         facts = detect_semantic_facts(
             "Which department has the highest total overtime where Position equal to Highest?",
@@ -1208,6 +1223,31 @@ class TemporalCompositionDetectorTests(unittest.TestCase):
                 self.assertEqual(
                     [f.evidence_text for f in facts if f.kind == "entity"],
                     ["morgan river"],
+                )
+
+    def test_contextual_name_boundary_stops_before_registered_result_vocabulary(self):
+        for question, expected_name in (
+            ("what about Taylor East worked days?", "Taylor East"),
+            ("what about Taylor East attendance records?", "Taylor East"),
+            ("ماذا عن أحمد علي أيام الغياب؟", "أحمد علي"),
+        ):
+            with self.subTest(question=question):
+                facts = detect_semantic_facts(
+                    question,
+                    ResolutionContext(
+                        {},
+                        employees=(
+                            EmployeeReference(employee_id="A10003", name=expected_name),
+                        ),
+                    ),
+                )
+                entities = [fact for fact in facts if fact.kind == "entity"]
+                self.assertEqual(
+                    [fact.evidence_text for fact in entities], [expected_name]
+                )
+                self.assertEqual(
+                    [question[slice(*fact.evidence_span)] for fact in entities],
+                    [expected_name],
                 )
 
 
@@ -1719,6 +1759,41 @@ class SemanticResolutionTests(unittest.TestCase):
 
         self.assertEqual(result.status, "ambiguous")
         self.assertEqual(result.candidates, ("Night A", "Night B"))
+
+    def test_catalog_typo_acronym_and_related_tokens_only_offer_candidates(self):
+        from week5.new_implementation.semantic_resolution import (
+            catalog_clarification_matches,
+        )
+
+        registry = ResolverRegistry.default()
+        context = ResolutionContext(
+            catalog={
+                "Department": (
+                    "Engineering",
+                    "Human Resources",
+                    "Engineering Operations",
+                )
+            }
+        )
+
+        typo = registry.canonicalize("Department", "Enginering", "Enginering", context)
+        acronym = registry.canonicalize("Department", "HR", "HR", context)
+        related = registry.canonicalize(
+            "Department", "engineering team", "engineering team", context
+        )
+
+        self.assertEqual(typo.status, "ambiguous")
+        self.assertIn("Engineering", typo.candidates)
+        self.assertEqual(acronym.status, "ambiguous")
+        self.assertEqual(acronym.candidates, ("Human Resources",))
+        self.assertEqual(related.status, "resolved")
+        self.assertEqual(related.values, ("Engineering",))
+        matches = catalog_clarification_matches(
+            "Count records where department is Enginering", context
+        )
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].field, "Department")
+        self.assertIn("Engineering", matches[0].candidates)
 
     def test_every_field_resolution_kind_has_one_implementation(self):
         registry = ResolverRegistry.default()

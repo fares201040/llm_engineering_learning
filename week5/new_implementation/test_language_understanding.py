@@ -9,6 +9,8 @@ from week5.new_implementation.attendance_schema import (
     RESULT_INTENT_DEFINITIONS,
 )
 from week5.new_implementation.language_understanding import (
+    CatalogClarification,
+    CatalogOption,
     ContextChoiceClarification,
     ContextChoiceOption,
     EmployeeClarification,
@@ -19,16 +21,99 @@ from week5.new_implementation.language_understanding import (
     MeaningClarification,
     MeaningOption,
     MissingIntentClarification,
+    PendingConstraintSnapshot,
+    PendingRequestFrame,
     QuestionSurface,
     SurfaceCandidate,
     analyze_question_surface,
     automatically_accepted_candidates,
+    has_unregistered_arabic_meaning_modifier,
     is_conversation_control_reference,
     validate_localized_alias_registry,
 )
 
 
 class TolerantInputContractTests(unittest.TestCase):
+    def test_pending_request_rejects_employee_choices_not_shown_in_clarification(
+        self,
+    ):
+        shown = EmployeeOption(employee_id="A10001", name="Shown Person")
+        hidden = EmployeeOption(employee_id="A10002", name="Hidden Person")
+        clarification = EmployeeClarification(
+            original_question="worked days for person",
+            reply_locale="en",
+            options=(shown,),
+            confirmation_required=False,
+        )
+
+        with self.assertRaisesRegex(ValidationError, "employee choices"):
+            PendingRequestFrame(
+                original_question=clarification.original_question,
+                reply_locale="en",
+                clarification=clarification,
+                pending_candidates=(hidden,),
+            )
+
+    def test_pending_request_rejects_catalog_choices_not_shown_in_clarification(
+        self,
+    ):
+        clarification = CatalogClarification(
+            original_question="worked days in Op",
+            reply_locale="en",
+            options=(
+                CatalogOption(
+                    option_id="1",
+                    display_value="Operations",
+                    field="Department",
+                    value="Operations",
+                ),
+            ),
+        )
+
+        with self.assertRaisesRegex(ValidationError, "catalog choices"):
+            PendingRequestFrame(
+                original_question=clarification.original_question,
+                reply_locale="en",
+                clarification=clarification,
+                pending_constraint=PendingConstraintSnapshot.model_validate(
+                    {
+                        "field": "Department",
+                        "reference": "Op",
+                        "candidates": (
+                            {
+                                "field": "Department",
+                                "value": "Office",
+                                "label": "Office",
+                            },
+                        ),
+                    }
+                ),
+            )
+
+    def test_pending_request_rejects_interpretations_not_shown_in_clarification(
+        self,
+    ):
+        clarification = MeaningClarification(
+            original_question="attendance for person",
+            reply_locale="en",
+            options=(
+                MeaningOption(
+                    option_id="worked_days",
+                    label="Worked days",
+                    target_kind="interpretation",
+                    target_name="worked_days",
+                ),
+            ),
+        )
+
+        with self.assertRaisesRegex(ValidationError, "interpretation choices"):
+            PendingRequestFrame(
+                original_question=clarification.original_question,
+                reply_locale="en",
+                clarification=clarification,
+                pending_interpretations=("scheduled_working_days",),
+            )
+
     def test_context_choice_clarification_is_finite_and_strict(self):
         options = (
             ContextChoiceOption(option_id="context:0", label="Previous result"),
@@ -296,6 +381,66 @@ class QuestionSurfaceAnalysisTests(unittest.TestCase):
             )
         )
         self.assertEqual(surface.original_text, question)
+
+    def test_arabic_exclusion_prefix_never_accepts_positive_absence_meaning(self):
+        for question in (
+            "بدون أيام الغياب",
+            "لا أيام الغياب",
+            "استبعد أيام الغياب",
+            "لا أريد أيام الغياب",
+            "لا تعرض أيام الغياب",
+            "بدون عرض أيام الغياب",
+            "استبعد لي أيام الغياب",
+            "لا أريد أن تعرض لي أي أيام الغياب",
+        ):
+            with self.subTest(question=question):
+                accepted = automatically_accepted_candidates(
+                    analyze_question_surface(question)
+                )
+                self.assertFalse(
+                    [
+                        candidate
+                        for candidate in accepted
+                        if candidate.target_name in {"absent", "absent_days"}
+                    ]
+                )
+
+    def test_long_reversal_prefixes_are_detected_within_current_clause(self):
+        for question in (
+            "لا أريد أن تعرض لي أي أيام الغياب",
+            "I do not want you to show me any absent days",
+        ):
+            with self.subTest(question=question):
+                self.assertTrue(has_unregistered_arabic_meaning_modifier(question))
+
+    def test_meaning_reversal_does_not_cross_a_fresh_clause_boundary(self):
+        for question in (
+            "Do not show late days, show absent days",
+            "Do not show late days but show absent days",
+            "لا تعرض أيام التأخير، اعرض أيام الغياب",
+            "لا تعرض أيام التأخير ثم اعرض أيام الغياب",
+        ):
+            with self.subTest(question=question):
+                self.assertFalse(has_unregistered_arabic_meaning_modifier(question))
+                accepted = automatically_accepted_candidates(
+                    analyze_question_surface(question)
+                )
+                self.assertTrue(
+                    [
+                        candidate
+                        for candidate in accepted
+                        if candidate.target_name in {"absent", "absent_days"}
+                    ]
+                )
+
+    def test_registered_negative_predicates_and_operators_are_not_modifiers(self):
+        for question in (
+            "How many days did not work?",
+            "Count records where Status does not contain Authorized",
+            "Count records where Department is not Engineering and Status is Authorized",
+        ):
+            with self.subTest(question=question):
+                self.assertFalse(has_unregistered_arabic_meaning_modifier(question))
 
     def test_longer_arabic_meaning_suppresses_conflicting_nested_alias(self):
         surface = analyze_question_surface("كم عدد أيام العمل المجدولة؟")

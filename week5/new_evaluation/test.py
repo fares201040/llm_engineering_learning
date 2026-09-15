@@ -1,10 +1,22 @@
 import json
 from pathlib import Path
 from typing import Literal
-from pydantic import BaseModel, Field
+
+from pydantic import BaseModel, ConfigDict, Field
 
 TEST_FILE = str(Path(__file__).parent / "tests.jsonl")
 ExpectedErrorType = Literal["DomainAccessDeniedError", "PlanValidationError"]
+
+
+class TurnExpectation(BaseModel):
+    """Strict expectations the evaluator measures after a follow-up turn."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    user: str = Field(min_length=1)
+    expected_employee_ids: list[str] | None = None
+    expected_pending_ids: list[str] | None = None
+    expected_answer_facts: list[str] = Field(default_factory=list)
 
 
 class TestQuestion(BaseModel):
@@ -29,7 +41,7 @@ class TestQuestion(BaseModel):
     expected_violation_codes: list[str] = Field(default_factory=list)
     expected_answer_contract: dict | None = None
     expected_unsupported_capabilities: list[str] = Field(default_factory=list)
-    turns: list[dict] = Field(default_factory=list)
+    turns: list[TurnExpectation] = Field(default_factory=list)
     expected_error: str | None = None
     expected_exception_type: ExpectedErrorType | None = None
 

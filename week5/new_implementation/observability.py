@@ -29,7 +29,6 @@ _SAFE_KEYS = frozenset(
         "predicate_count",
         "parameter_count",
         "fact_count",
-        "count",
         "violation_count",
         "duration_seconds",
         "fingerprint",
@@ -50,7 +49,6 @@ _SAFE_INT_KEYS = frozenset(
         "predicate_count",
         "parameter_count",
         "fact_count",
-        "count",
         "violation_count",
     }
 )

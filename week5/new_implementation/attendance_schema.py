@@ -762,11 +762,18 @@ _FIELD_NATURAL_NAMES = {
         "organization units",
         "organizational unit",
         "organizational units",
+        "الوحدة التنظيمية",
     ),
-    "Country": ("country", "countries"),
-    "Work_Location": ("work location", "work locations", "location", "locations"),
-    "Department": ("department", "departments"),
-    "Position": ("position", "positions"),
+    "Country": ("country", "countries", "الدولة", "البلد"),
+    "Work_Location": (
+        "work location",
+        "work locations",
+        "location",
+        "locations",
+        "موقع العمل",
+    ),
+    "Department": ("department", "departments", "dept", "القسم", "قسم"),
+    "Position": ("position", "positions", "المنصب", "المسمى الوظيفي"),
     "Job": ("job", "jobs"),
     "Grade": ("grade", "grades"),
     "Day_Type": (
@@ -774,8 +781,8 @@ _FIELD_NATURAL_NAMES = {
         "day types",
     ),
     "Holiday_Type": ("holiday", "holidays", "holiday type", "holiday types"),
-    "Shift": ("shift", "shifts"),
-    "Status": ("status",),
+    "Shift": ("shift", "shifts", "الوردية", "وردية"),
+    "Status": ("status", "الحالة"),
     "Exception": ("exception", "exceptions"),
     "Total_Worked_Hrs": (
         "worked hour",
@@ -788,6 +795,8 @@ _FIELD_NATURAL_NAMES = {
         "total worked hrs",
         "total worked hour",
         "total worked hours",
+        "ساعات العمل",
+        "ساعات العمل الفعلية",
     ),
     "Lateness_Hrs": (
         "late",
@@ -802,7 +811,7 @@ _FIELD_NATURAL_NAMES = {
     "Early_Out_Hrs": ("early out", "early-out"),
     "Overbreak_Hrs": ("over break", "over-break", "overbreak"),
     "Regular_Units": ("regular unit", "regular units"),
-    "Total_OT": ("overtime", "total ot"),
+    "Total_OT": ("overtime", "total ot", "ساعات العمل الإضافي"),
     "OT_Authorized": (
         "authorized overtime",
         "overtime authorized",
@@ -817,6 +826,21 @@ _FIELD_NATURAL_NAMES = {
     ),
     "Leave_Type": ("leave", "leave type", "leave types"),
     "Leave_Hrs": ("leave", "leave hour", "leave hours"),
+}
+
+_FIELD_VALUE_ALIASES = {
+    "Department": (
+        ValueAliasDefinition(
+            natural_name="engineering team", canonical_value="Engineering"
+        ),
+        ValueAliasDefinition(
+            natural_name="فريق الهندسة", canonical_value="Engineering"
+        ),
+        ValueAliasDefinition(natural_name="الهندسة", canonical_value="Engineering"),
+        ValueAliasDefinition(
+            natural_name="الموارد البشرية", canonical_value="Human Resources"
+        ),
+    ),
 }
 
 _FIELD_OUTPUT_UNITS: dict[str, AnswerUnit] = {
@@ -920,6 +944,7 @@ for _field, _definition in tuple(_FIELD_DEFINITIONS.items()):
                 )
             )
         ),
+        value_aliases=_FIELD_VALUE_ALIASES.get(_field, _definition.value_aliases),
         resolution_kind=_resolution_kind(_field, _definition),
         aggregatable=(
             _definition.storage_type == "number" or _field in {"Date", "Employee_ID"}
@@ -1153,7 +1178,8 @@ class FilterOperatorDefinition:
 FILTER_OPERATOR_DEFINITIONS = MappingProxyType(
     {
         "eq": FilterOperatorDefinition(
-            r"(?:=|:|is(?: exactly)?|exactly|equals?(?: to)?|has(?: the)? value)", "ne"
+            r"(?:=|:|is(?: exactly)?|exactly|equals?(?: to)?|has(?: the)? value|هو|هي|يساوي)",
+            "ne",
         ),
         "ne": FilterOperatorDefinition(r"(?:!=|<>|is not)", "eq"),
         "in": FilterOperatorDefinition(r"(?:is )?in"),

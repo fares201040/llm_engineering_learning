@@ -119,7 +119,7 @@ class ApdcEvaluationDashboardTests(unittest.TestCase):
         self.assertIn("0 completed, 1 failed", summary)
         self.assertNotIn("password", summary.lower())
         self.assertTrue(category_rows.empty)
-        self.assertEqual(details.loc[0, "Status"], "Failed (RuntimeError)")
+        self.assertEqual(details.loc[0, "Status"], "Failed (evaluation_error)")
         self.assertNotIn("password", details.to_string().lower())
         self.assertEqual(details.loc[0, "Question"], "Private question")
 
@@ -163,6 +163,71 @@ class ApdcEvaluationDashboardTests(unittest.TestCase):
         self.assertIn("3,964 records", rendered)
         self.assertIn("568 employees", rendered)
         self.assertIn("2026-09-01 through 2026-09-07", rendered)
+
+    def test_synthetic_local_cases_enforce_calls_atomicity_and_question_visibility(
+        self,
+    ):
+        dashboard = self.dashboard()
+
+        def runner(case):
+            if case.category == "synthetic_fast_path":
+                return dashboard.SyntheticObservation(
+                    conversation_calls=0,
+                    retrieval_calls=0,
+                    published_results=0,
+                )
+            if case.category == "synthetic_context_resume":
+                return dashboard.SyntheticObservation(
+                    conversation_calls=1,
+                    retrieval_calls=1,
+                    published_results=1,
+                )
+            return dashboard.SyntheticObservation(
+                conversation_calls=1,
+                retrieval_calls=0,
+                published_results=0,
+            )
+
+        details = dashboard.run_synthetic_conversation_evaluation(runner)
+
+        self.assertEqual(
+            details.columns.tolist(),
+            [
+                "Case",
+                "Category",
+                "Question",
+                "Conversation calls",
+                "Retrieval calls",
+                "Published results",
+                "Atomic",
+            ],
+        )
+        self.assertTrue(details["Atomic"].all())
+        self.assertEqual(
+            details["Question"].tolist(),
+            [
+                "hello",
+                "synthetic attendance request",
+                "invalid synthetic provider decision",
+            ],
+        )
+
+    def test_synthetic_local_cases_reject_partial_provider_failures(self):
+        dashboard = self.dashboard()
+
+        def runner(case):
+            return dashboard.SyntheticObservation(
+                conversation_calls=case.expected_conversation_calls,
+                retrieval_calls=case.expected_retrieval_calls,
+                published_results=case.expected_published_results,
+                partial_results=(
+                    1 if case.category == "synthetic_invalid_provider" else 0
+                ),
+            )
+
+        details = dashboard.run_synthetic_conversation_evaluation(runner)
+
+        self.assertFalse(details.loc[2, "Atomic"])
 
 
 if __name__ == "__main__":

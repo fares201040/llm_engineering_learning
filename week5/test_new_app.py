@@ -147,13 +147,13 @@ class SessionStateTests(unittest.TestCase):
                 "answer_question_with_state",
                 side_effect=RuntimeError("database password must not leak"),
             ),
-            patch.object(new_app.logger, "exception") as log_exception,
+            patch.object(new_app.logger, "error") as log_error,
         ):
             updated_history, context, state = new_app.chat_with_state(
                 history, answer.ConversationState()
             )
 
-        log_exception.assert_called_once()
+        log_error.assert_called_once_with("APDC attendance answer failed safely")
         self.assertIn("try again", updated_history[-1]["content"].lower())
         self.assertNotIn("password", updated_history[-1]["content"].lower())
         self.assertIn("Relevant Context", context)

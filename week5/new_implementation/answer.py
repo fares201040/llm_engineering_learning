@@ -4894,7 +4894,6 @@ def _answer_from_context(
     *,
     locale: str | None = None,
 ) -> tuple[str, list[Result]]:
-    started = perf_counter()
     reply_locale = locale or analyze_question_surface(question).reply_locale
 
     if aggregation is not None and "multi_employee_date_views" in aggregation:
@@ -4949,11 +4948,7 @@ def _answer_from_context(
             locale=reply_locale,
         )
         if deterministic_answer is not None:
-            logger.info(
-                "RAG deterministic aggregation operation=%s value=%s",
-                aggregation.get("operation"),
-                aggregation.get("value"),
-            )
+            logger.info("RAG deterministic aggregation completed")
             return deterministic_answer, chunks
 
     if (
@@ -4991,12 +4986,7 @@ def _answer_from_context(
         timeout=settings.final_answer_timeout_seconds,
     )
 
-    logger.info(
-        "RAG answer complete total_seconds=%.2f matched=%s evidence_records=%s",
-        perf_counter() - started,
-        matched_count,
-        len(answer_evidence),
-    )
+    logger.info("RAG answer completed")
 
     return (
         response.choices[0].message.content,

@@ -1,6 +1,9 @@
 import json
 import unittest
+from dataclasses import dataclass
 from unittest.mock import patch
+
+from pydantic import BaseModel
 
 from week5.new_implementation import answer
 from week5.new_implementation.observability import EventLogger, redact
@@ -75,6 +78,38 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(payload["state"], "success")
         self.assertGreaterEqual(payload["duration_seconds"], 0)
 
+    def test_allowlisted_match_method_counts_remain_structural(self):
+        payload = redact(
+            {
+                "event": "input_surface_analyzed",
+                "match_method_counts": {
+                    "exact": 2,
+                    "fuzzy": 1,
+                    "private_method": 99,
+                },
+            }
+        )
+
+        self.assertEqual(payload["match_method_counts"], {"exact": 2, "fuzzy": 1})
+
+    def test_redaction_cannot_be_disabled_for_event_emission(self):
+        events = []
+        logger = EventLogger(sink=events.append, json_format=True, redact_pii=False)
+
+        logger.emit(
+            "input_surface_analyzed",
+            question="private question A11017",
+            evidence_text="private evidence",
+        )
+
+        self.assertNotIn("private question", events[-1])
+        self.assertNotIn("A11017", events[-1])
+
+    def test_request_ids_must_use_an_opaque_telemetry_format(self):
+        payload = redact({"event": "stage_complete", "request_id": "A11017"})
+
+        self.assertNotIn("request_id", payload)
+
     def test_semantic_and_sql_sensitive_payloads_are_redacted(self):
         payload = redact(
             {
@@ -94,3 +129,78 @@ class ObservabilityTests(unittest.TestCase):
         self.assertNotIn("Secret Department", rendered)
         self.assertNotIn("SELECT", rendered)
         self.assertNotIn("A11017", rendered)
+
+    def test_redaction_recurses_through_structured_provider_and_plan_payloads(self):
+        @dataclass(frozen=True)
+        class PlanPayload:
+            query: str
+            employee_id: str
+
+        class ProviderPayload(BaseModel):
+            question: str
+            choices: list[str]
+
+        private_text = "Private employee A11017 and database password"
+        payload = redact(
+            {
+                "event": "stage_complete",
+                "state": "failure",
+                "request_id": ["PrivateA11017"],
+                "nested": {"question": private_text, "unexpected": private_text},
+                "tuple_payload": (private_text,),
+                "set_payload": {private_text},
+                "provider": ProviderPayload(
+                    question=private_text, choices=[private_text]
+                ),
+                "plan": PlanPayload(query=private_text, employee_id="A11017"),
+                "exception": RuntimeError(private_text),
+            }
+        )
+
+        rendered = str(payload)
+        self.assertEqual(payload["event"], "stage_complete")
+        self.assertEqual(payload["state"], "failure")
+        self.assertNotIn("Private employee", rendered)
+        self.assertNotIn("A11017", rendered)
+        self.assertNotIn("password", rendered)
+        self.assertNotIn("unexpected", rendered)
+
+    def test_stage_failure_emits_only_a_controlled_failure_code(self):
+        events = []
+        logger = EventLogger(sink=events.append, json_format=True)
+
+        with self.assertRaisesRegex(RuntimeError, "private provider payload"):
+            with logger.stage(
+                "provider", provider_response={"content": "private provider payload"}
+            ):
+                raise RuntimeError("private provider payload")
+
+        payload = json.loads(events[-1])
+        self.assertEqual(payload["failure_code"], "internal_error")
+        self.assertNotIn("error_type", payload)
+        self.assertNotIn("private provider payload", events[-1])
+
+    def test_answer_diagnostics_do_not_log_aggregate_values(self):
+        plan = answer.QueryPlan(
+            mode="exact",
+            search_query="count attendance",
+            aggregation="count",
+            answer_contract=answer.AnswerContract(
+                shape="scalar",
+                unit="records",
+                subject_field=None,
+                grain=[],
+            ),
+        )
+        with patch.object(answer.logger, "info") as log_info:
+            answer._answer_from_context(
+                "count attendance",
+                [],
+                [],
+                plan,
+                {"operation": "count", "value": 42},
+                42,
+            )
+
+        rendered_calls = repr(log_info.call_args_list)
+        self.assertNotIn("42", rendered_calls)

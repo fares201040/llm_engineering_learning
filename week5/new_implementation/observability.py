@@ -1,50 +1,323 @@
-"""Structured, privacy-safe APDC stage events."""
-
+from collections.abc import Mapping
 from contextlib import contextmanager
-from time import perf_counter
+from dataclasses import asdict, is_dataclass
 import json
 import logging
+import math
 import re
+from time import perf_counter
 
 
-_SENSITIVE_KEYS = {
-    "query",
-    "question",
-    "name",
-    "employee_id",
-    "dsn",
-    "search_query",
-    "evidence_text",
-    "catalog_value",
-    "params",
-    "sql",
+_SAFE_KEYS = frozenset(
+    {
+        "event",
+        "stage",
+        "state",
+        "status",
+        "mode",
+        "operation",
+        "purpose",
+        "backend",
+        "locale",
+        "request_id",
+        "clarification_kind",
+        "candidate_count",
+        "correction_count",
+        "selection_count",
+        "need_count",
+        "filter_count",
+        "predicate_count",
+        "parameter_count",
+        "fact_count",
+        "count",
+        "violation_count",
+        "duration_seconds",
+        "fingerprint",
+        "failure_code",
+        "violation_codes",
+        "unsupported_capabilities",
+        "fact_kinds",
+        "match_method_counts",
+    }
+)
+_SAFE_INT_KEYS = frozenset(
+    {
+        "candidate_count",
+        "correction_count",
+        "selection_count",
+        "need_count",
+        "filter_count",
+        "predicate_count",
+        "parameter_count",
+        "fact_count",
+        "count",
+        "violation_count",
+    }
+)
+_SAFE_STRING_KEYS = frozenset(
+    {
+        "event",
+        "stage",
+        "state",
+        "status",
+        "mode",
+        "operation",
+        "purpose",
+        "backend",
+        "locale",
+        "request_id",
+        "clarification_kind",
+        "failure_code",
+        "fingerprint",
+    }
+)
+_SAFE_LIST_KEYS = frozenset(
+    {"violation_codes", "unsupported_capabilities", "fact_kinds"}
+)
+_CONTROLLED_CODES = frozenset(
+    {
+        "invalid_schema",
+        "ungrounded_constraint",
+        "uncovered_fact",
+        "contradiction",
+        "answer_contract_mismatch",
+        "unsupported_capability",
+        "ambiguous_value",
+        "nested_boolean_filters",
+        "having_filter",
+        "window_calculation",
+        "cross_period_comparison",
+        "multi_stage_aggregation",
+        "unsupported_calculation",
+        "narrative_explanation",
+        "percentage_population",
+        "grouped_percentage",
+        "unsupported_constraint",
+        "access_denied",
+        "plan_validation",
+        "semantic_validation",
+        "planning_decision",
+        "conversation_validation",
+        "provider_timeout",
+        "schema_validation",
+        "validation_error",
+        "type_error",
+        "missing_value",
+        "internal_error",
+    }
+)
+_CONTROLLED_EVENTS = frozenset(
+    {
+        "planning_draft_built",
+        "planner_decision_rejected",
+        "planner_decision_received",
+        "postgres_query_compiled",
+        "input_surface_analyzed",
+        "input_clarification_required",
+        "semantic_facts_detected",
+        "planner_proposal_assembled",
+        "proposal_rejected",
+        "executable_plan_compiled",
+        "query_compiled",
+        "retrieval_complete",
+        "stage_complete",
+    }
+)
+_CONTROLLED_STAGES = frozenset(
+    {
+        "planning",
+        "postgres_compilation",
+        "input_understanding",
+        "semantic_detection",
+        "semantic_validation",
+        "structured_retrieval",
+        "semantic_search",
+        "provider",
+    }
+)
+_CONTROLLED_STATES = frozenset({"success", "rejected", "paused", "failure"})
+_CONTROLLED_STATUSES = frozenset({"ready", "ambiguous", "unsupported"})
+_CONTROLLED_MODES = frozenset({"exact", "semantic", "hybrid"})
+_CONTROLLED_OPERATIONS = frozenset(
+    {"none", "count", "distinct_count", "sum", "average", "min", "max", "percentage"}
+)
+_CONTROLLED_PURPOSES = frozenset(
+    {"sample", "count", "aggregation", "coverage", "profile"}
+)
+_CONTROLLED_BACKENDS = frozenset({"postgres", "postgres+pgvector", "chroma"})
+_CONTROLLED_CLARIFICATIONS = frozenset(
+    {
+        "employee_selection",
+        "semantic_interpretation",
+        "missing_intent",
+        "context_choice",
+        "constraint_value",
+    }
+)
+_CONTROLLED_FACT_KINDS = frozenset(
+    {
+        "entity",
+        "filter",
+        "measure",
+        "predicate",
+        "projection",
+        "result_intent",
+        "semantic_intent",
+        "temporal",
+        "numeric",
+        "unsupported",
+    }
+)
+_CONTROLLED_MATCH_METHODS = frozenset(
+    {
+        "exact",
+        "localized_alias",
+        "reordered_tokens",
+        "transliteration",
+        "edit_distance",
+        "fuzzy",
+    }
+)
+_OPAQUE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+_REQUEST_ID = re.compile(r"^(?:request-[A-Za-z0-9._:-]{1,64}|[0-9a-f]{32})$")
+_FAILURE_CODES_BY_TYPE = {
+    "DomainAccessDeniedError": "access_denied",
+    "PlanValidationError": "plan_validation",
+    "SemanticPlanValidationError": "semantic_validation",
+    "PlanningDecisionError": "planning_decision",
+    "ConversationDecisionValidationError": "conversation_validation",
+    "TimeoutError": "provider_timeout",
+    "ValidationError": "schema_validation",
+    "ValueError": "validation_error",
+    "TypeError": "type_error",
+    "KeyError": "missing_value",
+    "RuntimeError": "internal_error",
 }
 
 
-def redact(value):
-    if isinstance(value, dict):
+def _failure_code(error: BaseException) -> str:
+    for error_type in type(error).__mro__:
+        code = _FAILURE_CODES_BY_TYPE.get(error_type.__name__)
+        if code is not None:
+            return code
+    return "internal_error"
+
+
+def _safe_string(value: str, key: str):
+    if key == "locale":
+        return value if value in {"en", "ar"} else None
+    if key == "event":
+        return value if value in _CONTROLLED_EVENTS else None
+    if key == "stage":
+        return value if value in _CONTROLLED_STAGES else None
+    if key == "state":
+        return value if value in _CONTROLLED_STATES else None
+    if key == "status":
+        return value if value in _CONTROLLED_STATUSES else None
+    if key == "mode":
+        return value if value in _CONTROLLED_MODES else None
+    if key == "operation":
+        return value if value in _CONTROLLED_OPERATIONS else None
+    if key == "purpose":
+        return value if value in _CONTROLLED_PURPOSES else None
+    if key == "backend":
+        return value if value in _CONTROLLED_BACKENDS else None
+    if key == "clarification_kind":
+        return value if value in _CONTROLLED_CLARIFICATIONS else None
+    if key == "failure_code":
+        return value if value in _CONTROLLED_CODES else None
+    if key == "request_id":
+        return value if _REQUEST_ID.fullmatch(value) else None
+    if key == "fingerprint":
+        return value if _OPAQUE_IDENTIFIER.fullmatch(value) else None
+    return None
+
+
+def _sanitize(value, *, key: str | None = None):
+    if isinstance(value, BaseException):
+        return {"failure_code": _failure_code(value)}
+    if hasattr(value, "model_dump") and callable(value.model_dump):
+        try:
+            value = value.model_dump(mode="python")
+        except Exception:
+            return "[REDACTED]"
+    elif is_dataclass(value) and not isinstance(value, type):
+        try:
+            value = asdict(value)
+        except Exception:
+            return "[REDACTED]"
+    elif key == "match_method_counts" and isinstance(value, Mapping):
         return {
-            key: "[REDACTED]" if key.casefold() in _SENSITIVE_KEYS else redact(item)
-            for key, item in value.items()
+            item_key: int(item_value)
+            for item_key, item_value in value.items()
+            if isinstance(item_key, str)
+            and item_key in _CONTROLLED_MATCH_METHODS
+            and isinstance(item_value, int)
+            and not isinstance(item_value, bool)
+            and item_value >= 0
         }
-    if isinstance(value, list):
-        return [redact(item) for item in value]
+    elif isinstance(value, Mapping):
+        sanitized = {}
+        for raw_key, item in value.items():
+            if not isinstance(raw_key, str):
+                continue
+            normalized_key = raw_key.casefold()
+            if normalized_key not in _SAFE_KEYS:
+                continue
+            clean = _sanitize(item, key=normalized_key)
+            if clean is not None:
+                sanitized[normalized_key] = clean
+        return sanitized
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        items = value
+        if isinstance(value, (set, frozenset)):
+            items = sorted(value, key=repr)
+        if key in _SAFE_LIST_KEYS:
+            allowed = {
+                "violation_codes": _CONTROLLED_CODES,
+                "unsupported_capabilities": _CONTROLLED_CODES,
+                "fact_kinds": _CONTROLLED_FACT_KINDS,
+            }[key]
+            return [item for item in items if isinstance(item, str) and item in allowed]
+        return None
+    elif hasattr(value, "__dict__") and not isinstance(value, type):
+        try:
+            return _sanitize(vars(value), key=key)
+        except Exception:
+            return "[REDACTED]"
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value if key in _SAFE_KEYS else None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value if key in _SAFE_INT_KEYS and value >= 0 else None
+    if isinstance(value, float):
+        return (
+            value
+            if key == "duration_seconds" and math.isfinite(value) and value >= 0
+            else None
+        )
     if isinstance(value, str):
-        value = re.sub(r"\b[A-Za-z]\d{5}\b", "[EMPLOYEE_ID]", value)
-        value = re.sub(r"postgres(?:ql)?://\S+", "[DSN]", value)
-    return value
+        if key in _SAFE_STRING_KEYS:
+            return _safe_string(value, key)
+        return None
+    return None
+
+
+def redact(value):
+    """Return only controlled telemetry fields and recursively safe values."""
+    clean = _sanitize(value)
+    return clean if clean is not None else "[REDACTED]"
 
 
 class EventLogger:
     def __init__(self, sink=None, *, json_format=False, redact_pii=True):
+        del redact_pii
         self.sink = sink or logging.getLogger("attendance.events").info
         self.json_format = json_format
-        self.redact_pii = redact_pii
 
     def emit(self, event, **fields):
-        payload = {"event": event, **fields}
-        if self.redact_pii:
-            payload = redact(payload)
+        payload = redact({"event": event, **fields})
         rendered = (
             json.dumps(payload, sort_keys=True, default=str)
             if self.json_format
@@ -64,7 +337,7 @@ class EventLogger:
                 stage=stage,
                 state="failure",
                 duration_seconds=perf_counter() - started,
-                error_type=type(exc).__name__,
+                failure_code=_failure_code(exc),
                 **fields,
             )
             raise

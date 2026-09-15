@@ -59,7 +59,7 @@ def chat_with_state(history, state):
             access_context=LOCAL_DEMO_ACCESS,
         )
     except Exception:
-        logger.exception("APDC attendance answer failed")
+        logger.error("APDC attendance answer failed safely")
         answer = "I couldn't complete that request safely. Please try again."
         context = []
         updated_state = state or ConversationState()

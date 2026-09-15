@@ -1935,6 +1935,32 @@ class EmployeeResolutionTests(unittest.TestCase):
             candidates,
         )
 
+    def test_arabic_multiple_employee_controls_are_confirmed_only_when_requested(self):
+        candidates = [
+            answer.EmployeeCandidate(employee_id="A10001", name="Faris Ahmed"),
+            answer.EmployeeCandidate(employee_id="A10002", name="Faris North"),
+        ]
+
+        self.assertTrue(
+            answer._question_allows_multiple_employee_selection("أيام الغياب لكلاهما")
+        )
+        self.assertEqual(
+            answer._select_pending_employees("كلاهما", candidates, allow_multiple=True),
+            candidates,
+        )
+
+    def test_arabic_catalog_choice_uses_presentation_normalization(self):
+        pending = answer.PendingConstraintData(
+            field="Department",
+            reference="القسم",
+            candidates=[{"field": "Department", "value": "القسم", "label": "القسم"}],
+        )
+
+        self.assertEqual(
+            answer._select_pending_constraint_values("القِسْم", pending),
+            ["القسم"],
+        )
+
     def test_unresolved_employee_pauses_before_catalog_planning_and_retrieval(self):
         employees = [
             answer.EmployeeCandidate(employee_id="A10001", name="Faris Ahmed"),
@@ -3215,6 +3241,33 @@ class SurfaceCorrectionRuntimeTests(unittest.TestCase):
         self.assertEqual(facts[0].evidence_span, (0, 5))
         self.assertEqual(facts[0].origin, "user_clarification")
 
+    def test_arabic_correction_note_localizes_the_interpreted_meaning(self):
+        from week5.new_implementation.language_understanding import QuestionSurface
+
+        candidate = answer.SurfaceCandidate(
+            candidate_id="interpretation:worked_days:0",
+            target_kind="interpretation",
+            target_name="worked_days",
+            evidence_text="ايام العمل الفعليه",
+            evidence_span=(0, len("ايام العمل الفعليه")),
+            method="fuzzy",
+            score=0.96,
+        )
+        surface = QuestionSurface(
+            original_text="ايام العمل الفعليه",
+            reply_locale="ar",
+            candidates=(candidate,),
+        )
+        with patch.object(answer, "analyze_question_surface", return_value=surface):
+            with patch.object(
+                answer, "automatically_accepted_candidates", return_value=(candidate,)
+            ):
+                text = answer._material_correction_note(surface.original_text)
+
+        self.assertIn("فهمت", text)
+        self.assertIn("أيام العمل الفعلية", text)
+        self.assertNotIn("worked_days", text)
+
     def test_high_confidence_typo_executes_and_discloses_material_correction(self):
         with (
             patch.object(
@@ -3498,6 +3551,60 @@ class CoverageMetadataTests(unittest.TestCase):
 
 
 class DeterministicAggregationAnswerTests(unittest.TestCase):
+    def test_arabic_interpretation_choices_do_not_expose_english_descriptions(self):
+        text = answer._format_interpretation_clarification(
+            ["worked_days", "scheduled_working_days"], locale="ar"
+        )
+
+        self.assertIn("أيام", text)
+        self.assertNotRegex(
+            text,
+            r"\b(?:worked|scheduled|Distinct|dates|working|classified)\b",
+        )
+
+    def test_arabic_interpretation_choice_accepts_the_displayed_label(self):
+        self.assertEqual(
+            answer._select_pending_interpretation(
+                "أيام العمل الفعلية", ["worked_days"]
+            ),
+            "worked_days",
+        )
+
+    def test_arabic_surface_choice_uses_presentation_normalization(self):
+        option = answer.MeaningOption(
+            option_id="interpretation:worked_days",
+            label="أيام العمل الفعلية",
+            target_kind="interpretation",
+            target_name="worked_days",
+        )
+        pending = answer.MeaningClarification(
+            original_question="ما معنى الحضور؟",
+            reply_locale="ar",
+            options=(option,),
+        )
+
+        self.assertEqual(
+            answer._select_surface_meaning("أَيَّامُ العمل الفعلية", pending),
+            option,
+        )
+
+    def test_arabic_coverage_warning_formats_months_in_arabic(self):
+        text = answer._coverage_warning(
+            {
+                "coverage": {
+                    "available_start": "2026-09-01",
+                    "available_end": "2026-09-07",
+                    "requested_start": "2026-09-01",
+                    "requested_end": "2026-09-30",
+                    "complete": False,
+                }
+            },
+            locale="ar",
+        )
+
+        self.assertIn("سبتمبر", text)
+        self.assertNotIn("September", text)
+
     def test_arabic_projection_localizes_the_truncation_footer(self):
         plan = answer.QueryPlan(
             mode="exact",

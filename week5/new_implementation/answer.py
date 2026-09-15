@@ -3034,9 +3034,34 @@ def attach_coverage_metadata(
     return enriched
 
 
-def _human_date_range(start_text: str, end_text: str):
+_ARABIC_MONTH_NAMES = {
+    1: "يناير",
+    2: "فبراير",
+    3: "مارس",
+    4: "أبريل",
+    5: "مايو",
+    6: "يونيو",
+    7: "يوليو",
+    8: "أغسطس",
+    9: "سبتمبر",
+    10: "أكتوبر",
+    11: "نوفمبر",
+    12: "ديسمبر",
+}
+
+
+def _human_date_range(start_text: str, end_text: str, *, locale: str = "en"):
     start = date.fromisoformat(start_text)
     end = date.fromisoformat(end_text)
+    if locale == "ar":
+        start_month = _ARABIC_MONTH_NAMES[start.month]
+        end_month = _ARABIC_MONTH_NAMES[end.month]
+        if start.year == end.year and start.month == end.month:
+            return f"{start_month} {start.day}-{end.day}، {start.year}"
+        return (
+            f"{start_month} {start.day}، {start.year} إلى "
+            f"{end_month} {end.day}، {end.year}"
+        )
     if start.year == end.year and start.month == end.month:
         return f"{start.strftime('%B')} {start.day}-{end.day}, {start.year}"
     return (
@@ -3049,11 +3074,14 @@ def _coverage_warning(aggregation: dict, *, locale: str = "en"):
     coverage = aggregation.get("coverage")
     if not coverage or coverage.get("complete"):
         return ""
+    if locale == "ar":
+        available = _human_date_range(
+            coverage["available_start"], coverage["available_end"], locale="ar"
+        )
+        return f" تغطي بيانات الحضور المتاحة الفترة {available}، وليس كامل الفترة المطلوبة."
     available = _human_date_range(
         coverage["available_start"], coverage["available_end"]
     )
-    if locale == "ar":
-        return f" تغطي بيانات الحضور المتاحة الفترة {available}، وليس كامل الفترة المطلوبة."
     return (
         f" The available attendance data covers {available}, "
         "not the full requested period."
@@ -3641,6 +3669,11 @@ def _material_correction_note(question: str) -> str:
     correction = max(corrections, key=lambda item: item.score)
     meaning = correction.target_name.replace("_", " ")
     if surface.reply_locale == "ar":
+        meaning = (
+            _interpretation_label(correction.target_name, locale="ar")
+            if correction.target_kind == "interpretation"
+            else _ARABIC_CORRECTION_LABELS.get(correction.target_name, meaning)
+        )
         return f"فهمت «{correction.evidence_text}» بمعنى «{meaning}».\n"
     return f"I understood “{correction.evidence_text}” as “{meaning}.”\n"
 
@@ -5084,7 +5117,7 @@ def _select_pending_employees(
     normalized = _normalize_name(response)
     if len(candidates) == 1 and normalized in {"yes", "y", "نعم", "اجل", "أجل"}:
         return candidates
-    if normalized in {"both", "all"}:
+    if normalized in {"both", "all", "كلاهما", "كليهما", "الجميع", "معا"}:
         return candidates if allow_multiple else []
 
     if normalized.isdigit():
@@ -5109,7 +5142,11 @@ def _select_pending_employees(
 
 
 def _question_allows_multiple_employee_selection(question: str) -> bool:
-    return bool(re.search(r"\b(?:all|both)\b", question, re.IGNORECASE))
+    normalized = normalize_for_matching(question)
+    return bool(
+        re.search(r"\b(?:all|both)\b", normalized, re.IGNORECASE)
+        or re.search(r"(?:كلاهما|كليهما|الجميع|معا)", normalized)
+    )
 
 
 def _is_complete_new_attendance_question(question: str) -> bool:
@@ -5376,15 +5413,16 @@ def _store_interpretation_clarification(
     employees: Sequence[EmployeeCandidate] = (),
     contextual_unit: conversation.MaterializedConversationUnit | None = None,
 ) -> None:
+    reply_locale = analyze_question_surface(question).reply_locale
     pending = MeaningClarification(
         original_question=question,
-        reply_locale=analyze_question_surface(question).reply_locale,
+        reply_locale=reply_locale,
         facts=facts,
         prepared_proposal=proposal,
         options=tuple(
             MeaningOption(
                 option_id=name,
-                label=_interpretation_label(name),
+                label=_interpretation_label(name, locale=reply_locale),
                 target_kind="interpretation",
                 target_name=name,
             )
@@ -5510,16 +5548,54 @@ def _store_context_clarification(
     return pending
 
 
-def _interpretation_label(name: InterpretationName):
+_ARABIC_CORRECTION_LABELS = {
+    "worked": "العمل الفعلي",
+    "absent": "الغياب",
+    "authorized": "الحضور المعتمد",
+    "employee_profile": "ملف الموظف",
+}
+
+_ARABIC_INTERPRETATION_LABELS = {
+    "worked_days": "أيام العمل الفعلية",
+    "scheduled_working_days": "أيام العمل المجدولة",
+    "scheduled_non_attended_days": "أيام العمل المجدولة غير المحضورة",
+    "absent_days": "أيام الغياب",
+    "attendance_records": "سجلات الحضور",
+    "authorized_records": "سجلات الحضور المعتمدة",
+    "employees": "الموظفون",
+}
+
+_ARABIC_INTERPRETATION_DESCRIPTIONS = {
+    "worked_days": "التواريخ المميزة التي تم فيها العمل الفعلي.",
+    "scheduled_working_days": "التواريخ المميزة المصنفة كأيام عمل مجدولة.",
+    "scheduled_non_attended_days": "أيام العمل المجدولة التي لم تسجل ساعات عمل فعلية.",
+    "absent_days": "التواريخ المميزة التي تحمل استثناء الغياب الصريح.",
+    "attendance_records": "سجلات الحضور اليومية المطابقة.",
+    "authorized_records": "سجلات الحضور المطابقة ذات الحالة المعتمدة.",
+    "employees": "الموظفون المميزون في سجلات الحضور المطابقة.",
+}
+
+
+def _interpretation_label(name: InterpretationName, *, locale: str = "en"):
+    if locale == "ar":
+        return _ARABIC_INTERPRETATION_LABELS.get(name, name.replace("_", " "))
     return name.replace("_", " ")
+
+
+def _interpretation_description(name: InterpretationName, *, locale: str = "en"):
+    if locale == "ar":
+        return _ARABIC_INTERPRETATION_DESCRIPTIONS.get(
+            name, "معنى حضور مسجل في النظام."
+        )
+    return INTERPRETATION_PRESETS[name].description
 
 
 def _format_interpretation_clarification(
     candidates: list[InterpretationName], *, locale: str = "en"
 ):
     choices = "\n".join(
-        f"{index}. {_interpretation_label(name)} — "
-        f"{INTERPRETATION_PRESETS[name].description}"
+        f"{index}. {_interpretation_label(name, locale=locale)} — "
+        f"{_interpretation_description(name, locale=locale)}"
         for index, name in enumerate(candidates, start=1)
     )
     if locale == "ar":
@@ -5587,7 +5663,7 @@ def _select_context_choice(
 def _select_surface_meaning(
     response: str, pending: MeaningClarification
 ) -> MeaningOption | None:
-    normalized = " ".join(response.casefold().replace("_", " ").split())
+    normalized = normalize_for_matching(response.replace("_", " "))
     if len(pending.options) == 1 and normalized in {"yes", "y", "نعم", "أجل", "اجل"}:
         return pending.options[0]
     if normalized.isdigit():
@@ -5601,8 +5677,8 @@ def _select_surface_meaning(
             for option in pending.options
             if normalized
             in {
-                option.label.casefold(),
-                option.target_name.replace("_", " ").casefold(),
+                normalize_for_matching(option.label),
+                normalize_for_matching(option.target_name.replace("_", " ")),
             }
         ),
         None,
@@ -5612,14 +5688,17 @@ def _select_surface_meaning(
 def _select_pending_interpretation(
     response: str, candidates: list[InterpretationName]
 ) -> InterpretationName | None:
-    normalized = " ".join(response.casefold().replace("_", " ").split())
+    normalized = normalize_for_matching(response.replace("_", " "))
     if normalized.isdigit():
         index = int(normalized) - 1
         if 0 <= index < len(candidates):
             return candidates[index]
         return None
     for name in candidates:
-        if normalized == _interpretation_label(name):
+        if normalized in {
+            normalize_for_matching(_interpretation_label(name)),
+            normalize_for_matching(_interpretation_label(name, locale="ar")),
+        }:
             return name
     return None
 
@@ -5643,7 +5722,7 @@ def _format_constraint_clarification(
 
 
 def _select_pending_constraint_values(response: str, pending: PendingConstraintData):
-    normalized = response.strip().casefold()
+    normalized = normalize_for_matching(response)
     if normalized in {"both", "all"}:
         return [candidate.value for candidate in pending.candidates]
     if normalized.isdigit():
@@ -5656,8 +5735,8 @@ def _select_pending_constraint_values(response: str, pending: PendingConstraintD
         for candidate in pending.candidates
         if normalized
         in {
-            candidate.value.casefold(),
-            (candidate.label or candidate.value).casefold(),
+            normalize_for_matching(candidate.value),
+            normalize_for_matching(candidate.label or candidate.value),
         }
     ]
 

@@ -482,9 +482,28 @@ ConversationUnitDraft = ConversationUnitDecision
 _CONTEXTUAL_LANGUAGE = re.compile(
     r"\b(?:again|same|him|her|them|they|both|former|latter|separately|together|explain|why)\b"
     r"|\b(?:what|how)\s+about\b|^(?:and|also|then)\b"
-    r"|(?:مرة أخرى|مجددا|نفسه|نفسها|كلاهما|كليهما|بشكل منفصل|اشرح|لماذا)"
+    r"|(?:مرة أخرى|مجددا|نفسه|نفسها|كلاهما|كليهما|الجميع|السابق|السابقة|الأول|الأولى|الثاني|الثانية|الأخير|الأخيرة|هذا|هذه|بشكل منفصل|اشرح|لماذا)"
     r"|\b(?:له|لها|لهم|هو|هي|هم|معا)\b",
     re.I,
+)
+
+_SOCIAL_TOKENS = frozenset(
+    {
+        "hi",
+        "hello",
+        "hey",
+        "thanks",
+        "thank",
+        "you",
+        "good",
+        "morning",
+        "evening",
+        "مرحبا",
+        "اهلا",
+        "شكرا",
+        "السلام",
+        "عليكم",
+    }
 )
 
 
@@ -496,6 +515,8 @@ def conversation_preflight_route(
         r"\b(?:payroll|salar(?:y|ies)|loans?|repayments?|benefits?|raw_source_rows)\b|\bprivate\s+raw\b"
         r"|\b(?:ignore|disregard)\s+(?:previous|prior|all)\s+instructions?\b"
         r"|\b(?:reveal|show|print)\s+(?:your\s+)?(?:hidden\s+)?system\s+prompt\b"
+        r"|(?:تجاهل|تجاهلي)\s+(?:التعليمات|التوجيهات)\s+(?:السابقة|الماضية)"
+        r"|(?:اكشف|اظهر|اعرض|اطبع)\s+(?:موجه\s+النظام|تعليمات\s+النظام|الموجه\s+السري|الموجه\s+المخفي)"
         r"|(?:رواتب|راتب|قروض|قرض|سداد|مزايا|المصدر الخام)",
         normalized,
         re.I,
@@ -504,7 +525,7 @@ def conversation_preflight_route(
     if re.fullmatch(
         r"(?:hi|hello|hey|thanks|thank you|good morning|good evening|مرحبا|اهلا|شكرا|السلام عليكم)",
         normalized,
-    ):
+    ) or (normalized and set(normalized.split()) <= _SOCIAL_TOKENS):
         return "social"
     if re.search(
         r"\b(?:weather|recipe|recipes|poem|story|song|joke)\b|(?:الطقس|وصفة طبخ|قصيدة|قصة|اغنية|نكتة)",

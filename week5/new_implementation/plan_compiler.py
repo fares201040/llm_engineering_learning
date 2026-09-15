@@ -22,6 +22,7 @@ try:
         FilterOperator,
         PlannerProposal,
         QueryPlan,
+        MultiEmployeeDateView,
     )
     from .semantic_resolution import (
         ResolutionContext,
@@ -46,6 +47,7 @@ except ImportError:  # Direct execution from week5/new_implementation.
         FilterOperator,
         PlannerProposal,
         QueryPlan,
+        MultiEmployeeDateView,
     )
     from semantic_resolution import (
         ResolutionContext,
@@ -125,6 +127,20 @@ class PlanCompilationResult:
     @property
     def ready(self) -> bool:
         return self.executable_plan is not None and not self.violations
+
+
+@dataclass(frozen=True)
+class CompiledMultiEmployeeDateViews:
+    """Compiler-owned primitives for verified multi-employee date reductions."""
+
+    employee_ids: tuple[str, ...]
+    views: tuple[
+        Literal["per_employee", "employee_days", "union_dates", "intersection_dates"],
+        ...,
+    ]
+    per_employee: ExecutableQueryPlan | None = None
+    union_dates: ExecutableQueryPlan | None = None
+    intersection_dates: ExecutableQueryPlan | None = None
 
 
 class PlanInvariant(ABC):
@@ -1140,4 +1156,96 @@ def revalidate_executable_plan(
     )
     return PlanCompilationResult(
         candidate if not violations else None, provenance, violations
+    )
+
+
+def compile_multi_employee_date_views(
+    plan: ExecutableQueryPlan,
+    *,
+    context: CompilationContext,
+    provenance: tuple[ConstraintProvenance, ...],
+    employee_ids: tuple[str, ...],
+    view: MultiEmployeeDateView | None = None,
+) -> CompiledMultiEmployeeDateViews:
+    """Derive only the verified primitives needed for date-set views.
+
+    This deliberately accepts an already executable plan and revalidates it before
+    adding compiler-owned grouping.  The caller never supplies aggregation SQL or
+    a set-intersection expression.
+    """
+    if type(plan) is not ExecutableQueryPlan:
+        raise TypeError("Multi-employee date views require ExecutableQueryPlan.")
+    normalized_ids = tuple(employee_ids)
+    if len(normalized_ids) < 2 or len(set(normalized_ids)) != len(normalized_ids):
+        raise ValueError("Multi-employee date views require distinct employee IDs.")
+    employee_filter = next(
+        (
+            item
+            for item in plan.filters
+            if item.field == "Employee_ID"
+            and item.operator == "in"
+            and tuple(item.value) == normalized_ids
+        ),
+        None,
+    )
+    if employee_filter is None:
+        raise ValueError("Date views require the verified employee scope filter.")
+    if provenance:
+        checked = revalidate_executable_plan(plan, context, provenance)
+        if not checked.ready or checked.executable_plan is None:
+            raise ValueError("Date views require a revalidated executable plan.")
+    else:
+        try:
+            ExecutableQueryPlan.model_validate(plan.model_dump())
+        except ValidationError as exc:
+            raise ValueError(
+                "Date views require a revalidated executable plan."
+            ) from exc
+    if (
+        plan.mode != "exact"
+        or plan.aggregation != "distinct_count"
+        or plan.aggregation_field != "Date"
+    ):
+        raise ValueError("Date views require a verified distinct-date exact plan.")
+
+    selected = (
+        ("per_employee", "employee_days", "union_dates", "intersection_dates")
+        if view in (None, "all_views")
+        else (view,)
+    )
+    per_employee = None
+    union_dates = None
+    intersection_dates = None
+    if "per_employee" in selected or "employee_days" in selected:
+        per_employee = plan.model_copy(
+            update={
+                "group_by": ["Employee_ID"],
+                "answer_contract": derive_expected_answer_contract(
+                    plan.model_copy(update={"group_by": ["Employee_ID"]})
+                ),
+            }
+        )
+    if "union_dates" in selected:
+        union_dates = plan.model_copy(update={"group_by": []})
+    if "intersection_dates" in selected:
+        intersection_dates = plan.model_copy(
+            update={
+                "group_by": ["Date"],
+                "aggregation_field": "Employee_ID",
+                "answer_contract": derive_expected_answer_contract(
+                    plan.model_copy(
+                        update={
+                            "group_by": ["Date"],
+                            "aggregation_field": "Employee_ID",
+                        }
+                    )
+                ),
+            }
+        )
+    return CompiledMultiEmployeeDateViews(
+        employee_ids=normalized_ids,
+        views=selected,
+        per_employee=per_employee,
+        union_dates=union_dates,
+        intersection_dates=intersection_dates,
     )

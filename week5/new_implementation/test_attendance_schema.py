@@ -6,6 +6,22 @@ from pydantic import ValidationError
 
 
 class SemanticSchemaContractTests(unittest.TestCase):
+    def test_multi_employee_date_result_is_strict_and_frozen(self):
+        schema = importlib.import_module("week5.new_implementation.attendance_schema")
+
+        result = schema.MultiEmployeeDateViewsResult(
+            views=("per_employee",),
+            per_employee=[
+                schema.MultiEmployeeDateEmployeeResult(
+                    employee_id="A10001", name="A", dates=0
+                )
+            ],
+        )
+
+        self.assertEqual(result.per_employee[0].dates, 0)
+        with self.assertRaises(ValidationError):
+            schema.MultiEmployeeDateViewsResult(views=("unknown",))
+
     def test_multi_employee_date_views_are_separate_from_answer_units(self):
         schema = importlib.import_module("week5.new_implementation.attendance_schema")
 

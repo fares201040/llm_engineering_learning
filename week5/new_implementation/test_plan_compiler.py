@@ -27,6 +27,51 @@ from week5.new_implementation.semantic_resolution import (
 
 
 class ExecutableChoiceCoverageTests(unittest.TestCase):
+    def test_multi_employee_date_views_compile_revalidated_primitives(self):
+        from dataclasses import FrozenInstanceError
+        from week5.new_implementation.plan_compiler import (
+            compile_multi_employee_date_views,
+        )
+
+        plan = self._date_plan(["A10001", "A10002"])
+        context = CompilationContext("worked days", (), ResolutionContext({}))
+        compiled = compile_multi_employee_date_views(
+            plan,
+            context=context,
+            provenance=(),
+            employee_ids=("A10001", "A10002"),
+        )
+
+        self.assertEqual(
+            compiled.views,
+            ("per_employee", "employee_days", "union_dates", "intersection_dates"),
+        )
+        self.assertEqual(compiled.per_employee.group_by, ["Employee_ID"])
+        self.assertEqual(compiled.per_employee.aggregation, "distinct_count")
+        self.assertEqual(compiled.union_dates.group_by, [])
+        self.assertEqual(compiled.intersection_dates.group_by, ["Date"])
+        self.assertEqual(compiled.intersection_dates.aggregation_field, "Employee_ID")
+        with self.assertRaises(FrozenInstanceError):
+            compiled.employee_ids = ()
+
+    @staticmethod
+    def _date_plan(employee_ids):
+        from week5.new_implementation.attendance_schema import (
+            ExecutableQueryPlan,
+            FilterCondition,
+        )
+
+        return ExecutableQueryPlan(
+            mode="exact",
+            search_query="worked days",
+            filters=[
+                FilterCondition(field="Employee_ID", operator="in", value=employee_ids)
+            ],
+            aggregation="distinct_count",
+            aggregation_field="Date",
+            answer_contract=AnswerContract(shape="scalar", unit="dates"),
+        )
+
     def test_profile_projection_change_is_rejected_during_revalidation(self):
         question = "who is Faris"
         resolution = ResolutionContext({})

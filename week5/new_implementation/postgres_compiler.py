@@ -309,6 +309,48 @@ def compile_aggregation_queries(
     return (_query(sql, where.params, "aggregation"),)
 
 
+def compile_multi_employee_date_query(
+    plan: ExecutableQueryPlan,
+    *,
+    execution_group_limit: int,
+    table_name: str = "attendance_records",
+) -> CompiledPostgresQuery:
+    """Compile a bounded grouped date primitive for a verified composite view."""
+    plan = _require_executable(plan)
+    if not isinstance(execution_group_limit, int) or isinstance(
+        execution_group_limit, bool
+    ):
+        raise ValueError("Execution group limit must be a positive integer.")
+    if execution_group_limit < 1:
+        raise ValueError("Execution group limit must be a positive integer.")
+    group_by = effective_grouping_fields(plan.group_by)
+    if (
+        plan.aggregation != "distinct_count"
+        or plan.aggregation_field not in {"Date", "Employee_ID"}
+        or not group_by
+    ):
+        raise ValueError(
+            "Multi-employee date compilation requires a grouped distinct count."
+        )
+    if any(field not in {"Date", "Employee_ID"} for field in group_by):
+        raise ValueError(
+            "Multi-employee date grouping supports Date and Employee_ID only."
+        )
+    table = _require_table_name(table_name)
+    where = compile_where(plan.filters)
+    expression = POSTGRES_FIELD_MAP[plan.aggregation_field]
+    columns = [POSTGRES_FIELD_MAP[field] for field in group_by]
+    groups = ", ".join(
+        f"{column} AS group_{index}" for index, column in enumerate(columns)
+    )
+    sql = (
+        f"SELECT {groups}, COUNT(DISTINCT {expression}) AS value FROM {table} "
+        f"WHERE {where.sql} GROUP BY {', '.join(columns)} "
+        "ORDER BY " + ", ".join(columns) + " LIMIT %s"
+    )
+    return _query(sql, (*where.params, execution_group_limit + 1), "aggregation")
+
+
 def compile_coverage_query(
     table_name: str = "attendance_records",
 ) -> CompiledPostgresQuery:

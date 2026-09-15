@@ -17,6 +17,43 @@ from week5.new_implementation.postgres_compiler import (
 
 
 class PostgresCompilerTests(unittest.TestCase):
+    def test_multi_employee_group_query_uses_bound_execution_limit(self):
+        from week5.new_implementation.postgres_compiler import (
+            compile_multi_employee_date_query,
+        )
+
+        plan = ExecutableQueryPlan(
+            mode="exact",
+            search_query="dates",
+            filters=[
+                FilterCondition(
+                    field="Employee_ID", operator="in", value=["A10001", "A10002"]
+                )
+            ],
+            aggregation="distinct_count",
+            aggregation_field="Date",
+            group_by=["Date"],
+            answer_contract=AnswerContract(
+                shape="grouped", unit="dates", grain=["Date"]
+            ),
+        )
+        query = compile_multi_employee_date_query(plan, execution_group_limit=17)
+
+        self.assertIn("GROUP BY attendance_date", query.sql)
+        self.assertIn("LIMIT %s", query.sql)
+        self.assertNotIn("17", query.sql)
+        self.assertEqual(query.params[-1], 18)
+
+    def test_multi_employee_group_query_rejects_non_keyword_or_invalid_limit(self):
+        from week5.new_implementation.postgres_compiler import (
+            compile_multi_employee_date_query,
+        )
+
+        with self.assertRaises(TypeError):
+            compile_multi_employee_date_query(self._plan(), 2)
+        with self.assertRaises(ValueError):
+            compile_multi_employee_date_query(self._plan(), execution_group_limit=0)
+
     def test_profile_query_is_distinct_and_parameterized(self):
         plan = ExecutableQueryPlan(
             mode="exact",

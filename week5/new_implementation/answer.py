@@ -31,6 +31,8 @@ try:
         InterpretationName,
         MEASURE_DEFINITIONS,
         MultiEmployeeDateView,
+        MultiEmployeeDateEmployeeResult,
+        MultiEmployeeDateViewsResult,
         NUMERIC_FILTER_FIELDS,
         POSTGRES_FIELD_MAP,
         PlannerDecision,
@@ -64,6 +66,8 @@ try:
         PlanViolation,
         compile_proposal,
         revalidate_executable_plan,
+        CompiledMultiEmployeeDateViews,
+        compile_multi_employee_date_views,
     )
     from .postgres_compiler import (
         CompiledPostgresQuery,
@@ -73,6 +77,7 @@ try:
         compile_coverage_query,
         compile_profile_query,
         compile_sample_query,
+        compile_multi_employee_date_query,
     )
     from .chroma_client import create_chroma_client
     from .config import settings
@@ -122,6 +127,8 @@ except ImportError:  # Running answer.py directly from its directory.
         InterpretationName,
         MEASURE_DEFINITIONS,
         MultiEmployeeDateView,
+        MultiEmployeeDateEmployeeResult,
+        MultiEmployeeDateViewsResult,
         NUMERIC_FILTER_FIELDS,
         POSTGRES_FIELD_MAP,
         PlannerDecision,
@@ -155,6 +162,8 @@ except ImportError:  # Running answer.py directly from its directory.
         PlanViolation,
         compile_proposal,
         revalidate_executable_plan,
+        CompiledMultiEmployeeDateViews,
+        compile_multi_employee_date_views,
     )
     from postgres_compiler import (
         CompiledPostgresQuery,
@@ -164,6 +173,7 @@ except ImportError:  # Running answer.py directly from its directory.
         compile_coverage_query,
         compile_profile_query,
         compile_sample_query,
+        compile_multi_employee_date_query,
     )
     from chroma_client import create_chroma_client
     from config import settings
@@ -429,6 +439,13 @@ class PreparedPostgresQueries:
 
 
 @dataclass(frozen=True)
+class PreparedMultiEmployeeDateQueries:
+    per_employee: CompiledPostgresQuery | None = None
+    union_dates: CompiledPostgresQuery | None = None
+    intersection_dates: CompiledPostgresQuery | None = None
+
+
+@dataclass(frozen=True)
 class PreparedContextRequest:
     question: str
     plan: ExecutableQueryPlan
@@ -439,6 +456,8 @@ class PreparedContextRequest:
     request_id: str
     started: float
     postgres_queries: PreparedPostgresQueries | None = None
+    multi_employee_views: CompiledMultiEmployeeDateViews | None = None
+    multi_employee_queries: PreparedMultiEmployeeDateQueries | None = None
 
 
 @dataclass(frozen=True)
@@ -2063,6 +2082,122 @@ def _normalize_typed_filter_value(field: str, value):
 
 class PlanValidationError(ValueError):
     """The interpreted query cannot be executed safely."""
+
+
+def reduce_multi_employee_date_views(
+    compiled: CompiledMultiEmployeeDateViews,
+    *,
+    employee_names: Mapping[str, str],
+    per_employee_rows: Sequence[Mapping[str, object]],
+    union_value: object | None,
+    intersection_rows: Sequence[Mapping[str, object]],
+    execution_group_limit: int,
+) -> MultiEmployeeDateViewsResult:
+    """Reduce bounded backend primitives without changing their verified scope."""
+    if (
+        not isinstance(execution_group_limit, int)
+        or isinstance(execution_group_limit, bool)
+        or execution_group_limit < 1
+    ):
+        raise PlanValidationError(
+            "Derived attendance groups could not be safely completed."
+        )
+    if (
+        len(per_employee_rows) > execution_group_limit
+        or len(intersection_rows) > execution_group_limit
+    ):
+        raise PlanValidationError(
+            "Derived attendance groups could not be safely completed."
+        )
+    per_employee_values: dict[str, int] = {}
+    for row in per_employee_rows:
+        employee_id, value = row.get("group_0"), row.get("value")
+        if (
+            employee_id not in compiled.employee_ids
+            or not isinstance(value, (int, float))
+            or isinstance(value, bool)
+        ):
+            raise PlanValidationError(
+                "Derived attendance groups could not be safely completed."
+            )
+        numeric = int(value)
+        if numeric < 0 or numeric != value or employee_id in per_employee_values:
+            raise PlanValidationError(
+                "Derived attendance groups could not be safely completed."
+            )
+        per_employee_values[employee_id] = numeric
+    intersection_dates: set[str] = set()
+    for row in intersection_rows:
+        date_value, value = row.get("group_0"), row.get("value")
+        if (
+            not isinstance(date_value, str)
+            or not isinstance(value, (int, float))
+            or isinstance(value, bool)
+        ):
+            raise PlanValidationError(
+                "Derived attendance groups could not be safely completed."
+            )
+        if int(value) == value and int(value) == len(compiled.employee_ids):
+            intersection_dates.add(date_value)
+    rows = tuple(
+        MultiEmployeeDateEmployeeResult(
+            employee_id=employee_id,
+            name=employee_names.get(employee_id, employee_id),
+            dates=per_employee_values.get(employee_id, 0),
+        )
+        for employee_id in compiled.employee_ids
+    )
+    if union_value is not None and (
+        not isinstance(union_value, (int, float))
+        or isinstance(union_value, bool)
+        or int(union_value) != union_value
+        or union_value < 0
+    ):
+        raise PlanValidationError(
+            "Derived attendance groups could not be safely completed."
+        )
+    return MultiEmployeeDateViewsResult(
+        views=compiled.views,
+        per_employee=rows if "per_employee" in compiled.views else (),
+        employee_days=(
+            sum(item.dates for item in rows)
+            if "employee_days" in compiled.views
+            else None
+        ),
+        union_dates=(int(union_value) if "union_dates" in compiled.views else None),
+        intersection_dates=(
+            len(intersection_dates) if "intersection_dates" in compiled.views else None
+        ),
+    )
+
+
+def format_multi_employee_date_views(
+    result: MultiEmployeeDateViewsResult, *, locale: str = "en"
+) -> str:
+    """Render only reducer-owned values; this view never reaches narrative completion."""
+    if locale == "ar":
+        lines = []
+        if "per_employee" in result.views:
+            lines.append("التواريخ المميزة لكل موظف:")
+            lines.extend(f"{item.name}: {item.dates}" for item in result.per_employee)
+        if result.employee_days is not None:
+            lines.append(f"أيام الموظفين: {result.employee_days}")
+        if result.union_dates is not None:
+            lines.append(f"اتحاد التواريخ: {result.union_dates}")
+        if result.intersection_dates is not None:
+            lines.append(f"تقاطع التواريخ: {result.intersection_dates}")
+        return "\n".join(lines)
+    lines = []
+    if "per_employee" in result.views:
+        lines.append("Distinct dates by employee:")
+        lines.extend(f"{item.name}: {item.dates}" for item in result.per_employee)
+    if result.employee_days is not None:
+        lines.append(f"Employee-days: {result.employee_days}")
+    if result.union_dates is not None:
+        lines.append(f"Union of dates: {result.union_dates}")
+    if result.intersection_dates is not None:
+        lines.append(f"Intersection of dates: {result.intersection_dates}")
+    return "\n".join(lines)
 
 
 def format_plan_violations(violations: tuple[PlanViolation, ...]) -> str:
@@ -4133,10 +4268,62 @@ def _prepare_context_request(
             "Plan revalidation reported ready without an executable plan."
         )
     plan = ExecutableQueryPlan.model_validate(revalidated.executable_plan.model_dump())
-    # The Task-5 view is trusted conversational metadata, not executable query
-    # input. Carry it across the existing execution seam without changing the
-    # compiler-owned exact plan type or introducing Task-7 rendering behavior.
+    # The view remains trusted conversational metadata; Task 7 maps it only to
+    # compiler-owned primitives after this normal plan has been revalidated.
     object.__setattr__(plan, "request_view", request_view)
+
+    employee_scope = next(
+        (
+            tuple(condition.value)
+            for condition in plan.filters
+            if condition.field == "Employee_ID"
+            and condition.operator == "in"
+            and isinstance(condition.value, list)
+        ),
+        (),
+    )
+    multi_employee_views = None
+    multi_employee_queries = None
+    if (
+        len(employee_scope) >= 2
+        and plan.aggregation == "distinct_count"
+        and plan.aggregation_field == "Date"
+    ):
+        multi_employee_views = compile_multi_employee_date_views(
+            plan,
+            context=compilation_context,
+            provenance=tuple(provenance),
+            employee_ids=employee_scope,
+            view=request_view,
+        )
+        if _postgres_enabled():
+            multi_employee_queries = PreparedMultiEmployeeDateQueries(
+                per_employee=(
+                    compile_multi_employee_date_query(
+                        multi_employee_views.per_employee,
+                        execution_group_limit=settings.max_derived_group_rows,
+                        table_name=POSTGRES_ATTENDANCE_TABLE,
+                    )
+                    if multi_employee_views.per_employee is not None
+                    else None
+                ),
+                union_dates=(
+                    compile_aggregation_queries(
+                        multi_employee_views.union_dates, POSTGRES_ATTENDANCE_TABLE
+                    )[0]
+                    if multi_employee_views.union_dates is not None
+                    else None
+                ),
+                intersection_dates=(
+                    compile_multi_employee_date_query(
+                        multi_employee_views.intersection_dates,
+                        execution_group_limit=settings.max_derived_group_rows,
+                        table_name=POSTGRES_ATTENDANCE_TABLE,
+                    )
+                    if multi_employee_views.intersection_dates is not None
+                    else None
+                ),
+            )
 
     backend = _retrieval_backend(plan.mode)
 
@@ -4174,6 +4361,8 @@ def _prepare_context_request(
             if plan.mode == "exact" and _postgres_enabled()
             else None
         ),
+        multi_employee_views=multi_employee_views,
+        multi_employee_queries=multi_employee_queries,
     )
 
 
@@ -4190,6 +4379,123 @@ def _execute_prepared_context(
     started = prepared.started
     aggregation = None
     matched_count = None
+
+    if prepared.multi_employee_views is not None:
+        names = {item.employee_id: item.name for item in prepared.employees}
+        if prepared.multi_employee_queries is not None:
+            if resources is None or resources.connection is None:
+                psycopg, dict_row = _import_psycopg()
+                with psycopg.connect(POSTGRES_DSN, row_factory=dict_row) as connection:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+                        )
+                    per_rows = (
+                        _execute_rows_query(
+                            prepared.multi_employee_queries.per_employee, connection
+                        )
+                        if prepared.multi_employee_queries.per_employee
+                        else []
+                    )
+                    union_row = (
+                        _execute_scalar_query(
+                            prepared.multi_employee_queries.union_dates, connection
+                        )
+                        if prepared.multi_employee_queries.union_dates
+                        else None
+                    )
+                    intersection_rows = (
+                        _execute_rows_query(
+                            prepared.multi_employee_queries.intersection_dates,
+                            connection,
+                        )
+                        if prepared.multi_employee_queries.intersection_dates
+                        else []
+                    )
+            else:
+                connection = resources.connection
+                per_rows = (
+                    _execute_rows_query(
+                        prepared.multi_employee_queries.per_employee, connection
+                    )
+                    if prepared.multi_employee_queries.per_employee
+                    else []
+                )
+                union_row = (
+                    _execute_scalar_query(
+                        prepared.multi_employee_queries.union_dates, connection
+                    )
+                    if prepared.multi_employee_queries.union_dates
+                    else None
+                )
+                intersection_rows = (
+                    _execute_rows_query(
+                        prepared.multi_employee_queries.intersection_dates, connection
+                    )
+                    if prepared.multi_employee_queries.intersection_dates
+                    else []
+                )
+        else:
+            source = (
+                [
+                    chunk
+                    for chunk in resources.chroma_snapshot
+                    if _metadata_matches(chunk.metadata, plan.filters)
+                ]
+                if resources is not None and resources.chroma_snapshot is not None
+                else fetch_exact_chroma(plan.filters, domain=trusted_access.domain)
+            )
+            dates_by_employee: dict[str, set[str]] = {}
+            employees_by_date: dict[str, set[str]] = {}
+            for chunk in source:
+                employee_id = chunk.metadata.get("Employee_ID")
+                date_value = chunk.metadata.get("Date")
+                if (
+                    employee_id in prepared.multi_employee_views.employee_ids
+                    and isinstance(date_value, str)
+                ):
+                    dates_by_employee.setdefault(employee_id, set()).add(date_value)
+                    employees_by_date.setdefault(date_value, set()).add(employee_id)
+            if (
+                len(dates_by_employee) > settings.max_derived_group_rows
+                or len(employees_by_date) > settings.max_derived_group_rows
+            ):
+                raise PlanValidationError(
+                    "Derived attendance groups could not be safely completed."
+                )
+            per_rows = [
+                {"group_0": key, "value": len(value)}
+                for key, value in dates_by_employee.items()
+            ]
+            union_row = {"value": len(employees_by_date)}
+            intersection_rows = [
+                {"group_0": key, "value": len(value)}
+                for key, value in employees_by_date.items()
+            ]
+        reduced = reduce_multi_employee_date_views(
+            prepared.multi_employee_views,
+            employee_names=names,
+            per_employee_rows=per_rows,
+            union_value=(union_row or {}).get("value"),
+            intersection_rows=intersection_rows,
+            execution_group_limit=settings.max_derived_group_rows,
+        )
+        aggregation = attach_coverage_metadata(
+            plan,
+            {"multi_employee_date_views": reduced},
+            resources.coverage if resources is not None else None,
+        )
+        return ContextFetchResult(
+            chunks=[],
+            plan=plan,
+            aggregation=aggregation,
+            matched_count=None,
+            resolved_employees=[
+                EmployeeCandidate(employee_id=item.employee_id, name=item.name)
+                for item in prepared.employees
+            ],
+            facts=prepared.facts,
+        )
 
     if plan.mode == "exact":
         if prepared.postgres_queries is not None:
@@ -4516,6 +4822,15 @@ def _answer_from_context(
 ) -> tuple[str, list[Result]]:
     started = perf_counter()
     reply_locale = locale or analyze_question_surface(question).reply_locale
+
+    if aggregation is not None and "multi_employee_date_views" in aggregation:
+        return (
+            format_multi_employee_date_views(
+                aggregation["multi_employee_date_views"], locale=reply_locale
+            )
+            + _coverage_warning(aggregation, locale=reply_locale),
+            [],
+        )
 
     if plan.result_intent == "employee_profile":
         return _format_employee_profile(chunks, locale=reply_locale), chunks

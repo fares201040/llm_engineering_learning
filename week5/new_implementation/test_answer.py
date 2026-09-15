@@ -181,6 +181,79 @@ def _executable_plan(**values):
     return answer.ExecutableQueryPlan(**values)
 
 
+class MultiEmployeeDateViewReducerTests(unittest.TestCase):
+    def test_multi_employee_date_renderer_is_deterministic_in_both_locales(self):
+        result = answer.MultiEmployeeDateViewsResult(
+            views=(
+                "per_employee",
+                "employee_days",
+                "union_dates",
+                "intersection_dates",
+            ),
+            per_employee=(
+                answer.MultiEmployeeDateEmployeeResult(
+                    employee_id="A10001", name="A", dates=2
+                ),
+                answer.MultiEmployeeDateEmployeeResult(
+                    employee_id="A10002", name="B", dates=0
+                ),
+            ),
+            employee_days=2,
+            union_dates=2,
+            intersection_dates=0,
+        )
+
+        self.assertEqual(
+            answer.format_multi_employee_date_views(result, locale="en"),
+            "Distinct dates by employee:\nA: 2\nB: 0\nEmployee-days: 2\nUnion of dates: 2\nIntersection of dates: 0",
+        )
+        self.assertIn(
+            "لكل موظف", answer.format_multi_employee_date_views(result, locale="ar")
+        )
+
+    def test_reducer_deduplicates_fills_zero_rows_and_detects_overflow(self):
+        compiled = answer.CompiledMultiEmployeeDateViews(
+            employee_ids=("A10001", "A10002", "A10003"),
+            views=(
+                "per_employee",
+                "employee_days",
+                "union_dates",
+                "intersection_dates",
+            ),
+        )
+        result = answer.reduce_multi_employee_date_views(
+            compiled,
+            employee_names={"A10001": "A", "A10002": "B", "A10003": "C"},
+            per_employee_rows=[
+                {"group_0": "A10001", "value": 2},
+                {"group_0": "A10002", "value": 2},
+            ],
+            union_value=3,
+            intersection_rows=[
+                {"group_0": "2026-09-01", "value": 3},
+                {"group_0": "2026-09-02", "value": 2},
+                {"group_0": "2026-09-02", "value": 2},
+            ],
+            execution_group_limit=3,
+        )
+
+        self.assertEqual([item.dates for item in result.per_employee], [2, 2, 0])
+        self.assertEqual(result.employee_days, 4)
+        self.assertEqual(result.union_dates, 3)
+        self.assertEqual(result.intersection_dates, 1)
+        with self.assertRaises(answer.PlanValidationError):
+            answer.reduce_multi_employee_date_views(
+                compiled,
+                employee_names={},
+                per_employee_rows=[
+                    {"group_0": str(index), "value": 1} for index in range(4)
+                ],
+                union_value=0,
+                intersection_rows=[],
+                execution_group_limit=3,
+            )
+
+
 class RetrievalBoundaryTests(unittest.TestCase):
     def test_facade_exposes_only_gated_retrieval(self):
         from week5.new_implementation import retrieval

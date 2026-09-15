@@ -435,6 +435,27 @@ class PercentageCalculationResult(BaseModel):
     value: float | None
 
 
+class MultiEmployeeDateEmployeeResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    employee_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    dates: int = Field(ge=0)
+
+
+class MultiEmployeeDateViewsResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    views: tuple[
+        Literal["per_employee", "employee_days", "union_dates", "intersection_dates"],
+        ...,
+    ]
+    per_employee: tuple[MultiEmployeeDateEmployeeResult, ...] = ()
+    employee_days: int | None = Field(default=None, ge=0)
+    union_dates: int | None = Field(default=None, ge=0)
+    intersection_dates: int | None = Field(default=None, ge=0)
+
+
 @dataclass(frozen=True)
 class FieldDefinition:
     storage_type: Literal["text", "date", "time", "datetime", "number"]

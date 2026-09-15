@@ -1,9 +1,412 @@
 import unittest
+import json
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from pydantic import TypeAdapter, ValidationError
 
 
+class ConversationProviderTests(unittest.TestCase):
+    def test_oversized_typed_frame_is_rejected_before_provider_input(self):
+        from week5.new_implementation import conversation_understanding as c
+        from week5.new_implementation.language_understanding import ResultSnapshot
+
+        frame = c.ConversationTurnFrame(
+            original_question="records",
+            reply_locale="en",
+            units=tuple(
+                c.AttendanceUnitFrame(
+                    unit_id=str(index), source_text="records", result=ResultSnapshot()
+                )
+                for index in range(9)
+            ),
+        )
+        with self.assertRaises(c.ConversationDecisionValidationError):
+            c.build_conversation_request("again", frames=(frame,))
+
+    def test_adversarial_completions_never_allocate_unit_ids(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        fact = c.SemanticFact(
+            kind="measure",
+            concept_name="attendance_records",
+            evidence_text="records",
+            origin="question",
+            strength="strong",
+        )
+        request = c.build_conversation_request("records again", (fact,))
+        good = {
+            "route": "attendance",
+            "source_span": [0, 13],
+            "relation": "new",
+            "fact_ids": list(request.context.fact_choice_ids),
+        }
+        variants = [
+            good | {"fact_ids": ["invented"]},
+            good | {"fact_ids": []},
+            good | {"source_span": [0, 99]},
+            good | {"source_span": ["0", 13]},
+            good | {"source_span": [False, 13]},
+            good | {"field": "Salary"},
+            good | {"sql": "SELECT * FROM payroll"},
+            good | {"answer": "invented"},
+            good | {"filters": [{"field": "Employee_ID", "value": "A99999"}]},
+            good | {"answer_contract": {}},
+            good | {"route": "postgres"},
+            good | {"view_choice_id": "invented"},
+            good | {"relation": "modify_scope", "base_unit_choice_id": "invented"},
+            good
+            | {
+                "employee_mentions": [
+                    {
+                        "kind": "reference_choice",
+                        "source_span": [8, 13],
+                        "choice_id": "invented",
+                    }
+                ]
+            },
+            good
+            | {
+                "employee_mentions": [
+                    {"kind": "previous_unit", "source_span": [8, 13], "unit_index": 0}
+                ]
+            },
+        ]
+        payloads = [
+            (json.dumps({"status": "resolved", "units": [unit]}), "stop")
+            for unit in variants
+        ]
+        payloads += [
+            ("not json", "stop"),
+            (
+                json.dumps(
+                    {
+                        "status": "resolved",
+                        "units": [good, good | {"source_span": [8, 13]}],
+                    }
+                ),
+                "stop",
+            ),
+            (
+                json.dumps(
+                    {"status": "resolved", "units": [good | {"source_span": [0, 7]}]}
+                ),
+                "stop",
+            ),
+            (json.dumps({"status": "resolved", "units": [good]}), "length"),
+        ]
+        for index, (content, finish_reason) in enumerate(payloads):
+            response = SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason=finish_reason,
+                        message=SimpleNamespace(content=content),
+                    )
+                ]
+            )
+            with (
+                patch.object(c, "completion", return_value=response) as call,
+                patch.object(c.uuid, "uuid4") as allocate,
+            ):
+                self.assertIsNone(c.request_conversation_decision(request), index)
+            self.assertEqual(call.call_count, 1)
+            allocate.assert_not_called()
+
+    def test_view_choices_are_opaque_and_keep_server_owned_meanings(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        request = c.build_conversation_request("separately")
+        self.assertEqual(len(request.context.view_choice_ids), 5)
+        self.assertEqual(
+            set(dict(request.views).values()),
+            {
+                "all_views",
+                "per_employee",
+                "employee_days",
+                "union_dates",
+                "intersection_dates",
+            },
+        )
+        self.assertTrue(
+            set(request.context.view_choice_ids).isdisjoint(
+                dict(request.views).values()
+            )
+        )
+
+    def test_employee_binding_budget_is_enforced_before_unit_ids_exist(self):
+        from week5.new_implementation import conversation_understanding as c
+        import json
+
+        message = " ".join("person" for _ in range(21))
+        payload = {
+            "status": "resolved",
+            "units": [
+                {
+                    "route": "attendance",
+                    "source_span": [0, len(message)],
+                    "relation": "new",
+                    "employee_mentions": [
+                        {"kind": "resolve", "source_span": [i * 7, i * 7 + 6]}
+                        for i in range(21)
+                    ],
+                }
+            ],
+        }
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))
+            ]
+        )
+        with (
+            patch.object(c, "completion", return_value=response),
+            patch.object(c.uuid, "uuid4") as allocate,
+        ):
+            self.assertIsNone(
+                c.request_conversation_decision(
+                    c.ConversationDecisionContext(message=message, max_units=8)
+                )
+            )
+        allocate.assert_not_called()
+
+    def test_input_budget_stops_before_completion(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        context = c.ConversationDecisionContext(message="x" * 16001, max_units=8)
+        with patch.object(c, "completion") as call:
+            self.assertIsNone(c.request_conversation_decision(context))
+        call.assert_not_called()
+
+    def test_gateway_rejects_route_theft_using_server_bound_fact_occurrences(self):
+        from week5.new_implementation import conversation_understanding as c
+        import json
+
+        fact = c.SemanticFact(
+            kind="measure",
+            concept_name="attendance_records",
+            evidence_text="records",
+            origin="question",
+            strength="strong",
+        )
+        request = c.build_conversation_request("records and hello", (fact,))
+        payload = {
+            "status": "resolved",
+            "units": [
+                {"route": "social", "source_span": [0, 7]},
+                {
+                    "route": "attendance",
+                    "source_span": [12, 17],
+                    "relation": "new",
+                    "fact_ids": list(request.context.fact_choice_ids),
+                },
+            ],
+        }
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))
+            ]
+        )
+        with patch.object(c, "completion", return_value=response):
+            self.assertIsNone(c.request_conversation_decision(request))
+
+    def test_validated_units_get_server_ids_and_minimal_request_local_choices(self):
+        from week5.new_implementation import conversation_understanding as c
+        from week5.new_implementation.language_understanding import (
+            EmployeeReferent,
+            AttendanceUnitFrame,
+            ConversationTurnFrame,
+            ResultSnapshot,
+        )
+
+        self.assertTrue(
+            hasattr(c, "build_conversation_request"), "request builder missing"
+        )
+        employee = EmployeeReferent(employee_id="A10001", name="PRIVATE_NAME")
+        frame = ConversationTurnFrame(
+            original_question="PRIVATE_HISTORY",
+            reply_locale="en",
+            units=(
+                AttendanceUnitFrame(
+                    unit_id="PRIVATE_UNIT_ID",
+                    source_text="PRIVATE_SOURCE",
+                    employees=(employee,),
+                    result=ResultSnapshot(scalar_value="PRIVATE_RESULT"),
+                ),
+            ),
+        )
+        request = c.build_conversation_request(
+            "again", (), (employee,), (frame,), ("A10001",)
+        )
+        other = c.build_conversation_request(
+            "again", (), (employee,), (frame,), ("A10001",)
+        )
+        self.assertNotEqual(
+            request.context.prior_unit_choice_ids, other.context.prior_unit_choice_ids
+        )
+        payload = {
+            "status": "resolved",
+            "units": [
+                {
+                    "route": "attendance",
+                    "source_span": [0, 5],
+                    "relation": "repeat",
+                    "base_unit_choice_id": request.context.prior_unit_choice_ids[0],
+                }
+            ],
+        }
+        import json
+
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))
+            ]
+        )
+        with patch.object(c, "completion", return_value=response) as call:
+            result = c.request_conversation_decision(request)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result.unit_ids), 1)
+        self.assertNotIn(result.unit_ids[0], json.dumps(payload))
+        prompt = json.dumps(call.call_args.kwargs["messages"])
+        self.assertIn(request.context.prior_unit_choice_ids[0], prompt)
+        self.assertIn(request.context.employee_choice_ids[0], prompt)
+        for secret in (
+            "PRIVATE_NAME",
+            "PRIVATE_HISTORY",
+            "PRIVATE_SOURCE",
+            "PRIVATE_RESULT",
+            "PRIVATE_UNIT_ID",
+            "A10001",
+        ):
+            self.assertNotIn(secret, prompt)
+        self.assertEqual(call.call_count, 1)
+
+    def test_gateway_makes_one_attempt_and_never_retries_failure(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        self.assertTrue(hasattr(c, "request_conversation_decision"), "gateway missing")
+        context = c.ConversationDecisionContext(message="again", max_units=8)
+        with patch.object(
+            c, "completion", side_effect=TimeoutError("PRIVATE_PROVIDER")
+        ) as call:
+            result = c.request_conversation_decision(context)
+        self.assertIsNone(result)
+        self.assertEqual(call.call_count, 1)
+        self.assertEqual(call.call_args.kwargs["num_retries"], 0)
+        self.assertEqual(call.call_args.kwargs["timeout"], 8.0)
+        self.assertEqual(call.call_args.kwargs["max_tokens"], 1200)
+
+
 class ConversationContractTests(unittest.TestCase):
+    def test_employee_spans_are_ordered_and_cannot_cut_through_source_tokens(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        for spans in (((7, 10), (0, 6)), ((1, 6),)):
+            decision = c.ConversationDecision.model_validate(
+                {
+                    "status": "resolved",
+                    "units": [
+                        {
+                            "route": "attendance",
+                            "source_span": (0, 10),
+                            "relation": "new",
+                            "employee_mentions": [
+                                {"kind": "resolve", "source_span": span}
+                                for span in spans
+                            ],
+                        },
+                    ],
+                }
+            )
+            with self.assertRaises(c.ConversationDecisionValidationError):
+                c.validate_conversation_decision(
+                    decision,
+                    c.ConversationDecisionContext(message="Morgan Sam", max_units=8),
+                )
+
+    def test_previous_employee_reference_requires_an_attendance_target(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        decision = c.ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": [
+                    {"route": "social", "source_span": (0, 5)},
+                    {
+                        "route": "attendance",
+                        "source_span": (6, 10),
+                        "relation": "new",
+                        "employee_mentions": [
+                            {
+                                "kind": "previous_unit",
+                                "source_span": (6, 10),
+                                "unit_index": 0,
+                            }
+                        ],
+                    },
+                ],
+            }
+        )
+        with self.assertRaisesRegex(
+            c.ConversationDecisionValidationError, "attendance unit"
+        ):
+            c.validate_conversation_decision(
+                decision,
+                c.ConversationDecisionContext(message="hello them", max_units=8),
+            )
+
+    def test_fact_ids_cannot_cover_text_in_another_unit_or_route(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        self.assertTrue(
+            hasattr(c, "ConversationFactSource"), "fact source validation is missing"
+        )
+        context = c.ConversationDecisionContext(
+            message="count records and hello",
+            max_units=8,
+            fact_choice_ids=("f1",),
+            strong_fact_ids=("f1",),
+            fact_sources=(c.ConversationFactSource(fact_id="f1", source_span=(0, 13)),),
+        )
+        decision = c.ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": [
+                    {"route": "social", "source_span": (0, 13)},
+                    {
+                        "route": "attendance",
+                        "source_span": (18, 23),
+                        "relation": "new",
+                        "fact_ids": ("f1",),
+                    },
+                ],
+            }
+        )
+        with self.assertRaisesRegex(
+            c.ConversationDecisionValidationError, "fact source"
+        ):
+            c.validate_conversation_decision(decision, context)
+
+    def test_material_text_cannot_be_omitted(self):
+        from week5.new_implementation.conversation_understanding import (
+            ConversationDecision,
+            ConversationDecisionContext,
+            ConversationDecisionValidationError,
+            validate_conversation_decision,
+        )
+
+        decision = ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": [{"route": "social", "source_span": (0, 5)}],
+            }
+        )
+        with self.assertRaisesRegex(ConversationDecisionValidationError, "omitted"):
+            validate_conversation_decision(
+                decision,
+                ConversationDecisionContext(
+                    message="hello and count records", max_units=8
+                ),
+            )
+
     def _context(self, **replacements):
         from week5.new_implementation.conversation_understanding import (
             ConversationDecisionContext,
@@ -402,7 +805,7 @@ class ConversationContractTests(unittest.TestCase):
         )
         validate_conversation_decision(
             adapter.validate_python(shared_span),
-            self._context(),
+            self._context(message="worked days for Morgan"),
         )
 
     def test_context_validation_enforces_message_bounds_unit_budget_and_containment(

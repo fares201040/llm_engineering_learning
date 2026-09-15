@@ -17,6 +17,7 @@ from pydantic import BaseModel, Field, ValidationError
 from tenacity import retry, wait_exponential, stop_after_attempt
 
 try:
+    from . import conversation_understanding as conversation
     from .attendance_schema import (
         AccessContext,
         AnswerContract,
@@ -104,6 +105,7 @@ try:
         normalize_for_matching,
     )
 except ImportError:  # Running answer.py directly from its directory.
+    import conversation_understanding as conversation
     from attendance_schema import (
         AccessContext,
         AnswerContract,
@@ -712,10 +714,6 @@ def _planning_decision_prompt(
             "controlled capability identifier.",
             "BOUNDED NEEDS\n"
             + json.dumps(needs, ensure_ascii=False, separators=(",", ":")),
-            "RECENT CONVERSATION\n"
-            + json.dumps(
-                (history or [])[-4:], ensure_ascii=False, separators=(",", ":")
-            ),
             f"QUESTION\n{question}",
         )
     )
@@ -4130,18 +4128,13 @@ def make_rag_messages(
         )
 
     context = "\n\n---\n\n".join(context_parts)
-    recent_history = (history or [])[-6:]
 
-    return (
-        [
-            {
-                "role": "system",
-                "content": SYSTEM_PROMPT.format(context=context),
-            }
-        ]
-        + recent_history
-        + [{"role": "user", "content": question}]
-    )
+    return [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT.format(context=context),
+        }
+    ] + [{"role": "user", "content": question}]
 
 
 @_retry()
@@ -4804,6 +4797,36 @@ def _plan_for_selected_employees(
     return prepared
 
 
+def _conversation_employee_blocker(question: str, facts: tuple[SemanticFact, ...]):
+    """Resolve explicit mentions locally before asking about clause relationships."""
+    entities = [
+        fact
+        for fact in facts
+        if fact.kind == "entity"
+        and not is_conversation_control_reference(fact.evidence_text)
+    ]
+    references = [fact.evidence_text for fact in entities]
+    # A name-only tail has a deterministic coordinator boundary. Semantic clauses
+    # remain with the conversation gateway rather than becoming directory names.
+    named_spans = [
+        fact.evidence_span
+        for fact in entities
+        if fact.field == "Name" and fact.evidence_span
+    ]
+    if named_spans:
+        tail = question[min(span[0] for span in named_spans) :].strip(" .?!؟")
+        parts = re.split(r"\s+(?:and|و)\s+|[,،]", tail, flags=re.I)
+        if len(parts) > 1 and all(
+            re.fullmatch(r"[^\W\d_]+(?:\s+[^\W\d_]+)*", part.strip())
+            and not analyze_question_surface(part).candidates
+            for part in parts
+        ):
+            references = [part.strip() for part in parts]
+    if not references:
+        return [], None
+    return _resolve_employee_mentions(tuple(references), load_employee_directory())
+
+
 def answer_question_with_state(
     question: str,
     history: list[dict] | None,
@@ -4813,14 +4836,81 @@ def answer_question_with_state(
 ) -> tuple[str, list[Result], ConversationState]:
     history = history or []
     state = state.model_copy(deep=True) if state is not None else ConversationState()
+    if len(question) > settings.conversation_max_input_chars:
+        locale = "ar" if re.search(r"[\u0600-\u06ff]", question[:256]) else "en"
+        return _format_conversation_help(locale), [], state
     reply_locale = analyze_question_surface(question).reply_locale
     try:
         _require_attendance_access(access_context)
+        route = conversation.conversation_preflight_route(question)
+        if route == "protected":
+            return ACCESS_DENIED_MESSAGE, [], state
+        if route in {"social", "unrelated"}:
+            return (
+                "يمكنني مساعدتك في أسئلة الحضور."
+                if reply_locale == "ar"
+                else "I can help with attendance questions.",
+                [],
+                state,
+            )
         _require_supported_attendance_question(question)
     except DomainAccessDeniedError:
         return ACCESS_DENIED_MESSAGE, [], state
     except PlanValidationError as exc:
         return f"I could not safely interpret that request: {exc}", [], state
+
+    if (
+        state.pending_clarification is None
+        or _is_complete_new_attendance_question(question)
+    ) and not any(
+        not _EMPLOYEE_ID_PATTERN.fullmatch(match.group(0))
+        for match in _EMPLOYEE_ID_LIKE_PATTERN.finditer(question)
+    ):
+        conversation_facts = merge_semantic_facts(
+            detect_semantic_facts(
+                question,
+                ResolutionContext(catalog={}, reference_date=_current_local_date()),
+            ),
+            _facts_from_question_surface(question),
+        )
+        if conversation.needs_conversation_decision(question, conversation_facts):
+            selected, blocker = _conversation_employee_blocker(
+                question, conversation_facts
+            )
+            if blocker is not None:
+                if blocker.outcome != "none":
+                    _clear_pending_state(state)
+                    state.pending_question = question
+                    state.pending_facts = list(conversation_facts)
+                    state.pending_candidates = blocker.candidates
+                    _store_employee_clarification(
+                        state,
+                        question,
+                        None,
+                        conversation_facts,
+                        blocker,
+                        resolved_employees=selected,
+                    )
+                return (
+                    _format_employee_clarification(blocker, locale=reply_locale),
+                    [],
+                    state,
+                )
+            try:
+                request_state = state.model_copy(deep=True)
+                if request_state.referents:
+                    _revalidate_referents(request_state, load_employee_directory())
+                request = conversation.build_conversation_request(
+                    question,
+                    conversation_facts,
+                    tuple(request_state.referents),
+                    tuple(request_state.recent_frames),
+                    tuple(request_state.active_referent_ids),
+                )
+                conversation.request_conversation_decision(request)
+            except conversation.ConversationDecisionValidationError:
+                pass
+            return _format_conversation_help(reply_locale), [], state
 
     if state.pending_clarification is None:
         malformed = None
@@ -5410,6 +5500,14 @@ def answer_question_with_state(
         ),
     )
     return _material_correction_note(effective_question) + text, chunks, state
+
+
+def _format_conversation_help(locale: str) -> str:
+    return (
+        "يرجى توضيح سياق طلب الحضور وذكر الموظف والفترة والنتيجة المطلوبة، أو تقسيم الطلب."
+        if locale == "ar"
+        else "Please clarify the attendance context with the employee, period, and result you want, or split the request."
+    )
 
 
 def answer_question(

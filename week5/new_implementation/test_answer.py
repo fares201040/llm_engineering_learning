@@ -1224,7 +1224,14 @@ class EmployeeResolutionTests(unittest.TestCase):
             [morgan, sam_north],
         )
 
-        with patch.object(answer, "_fetch_context_result", side_effect=exception):
+        with (
+            patch.object(answer, "_fetch_context_result", side_effect=exception),
+            patch.object(
+                answer,
+                "load_employee_directory",
+                return_value=[morgan, sam_north, sam_south],
+            ),
+        ):
             _text, _chunks, state = answer.answer_question_with_state(
                 "worked days for Morgan River and Sam",
                 [],
@@ -1267,7 +1274,12 @@ class EmployeeResolutionTests(unittest.TestCase):
             None, (), blocker, resolved_employees=[morgan]
         )
 
-        with patch.object(answer, "_fetch_context_result", side_effect=exception):
+        with (
+            patch.object(answer, "_fetch_context_result", side_effect=exception),
+            patch.object(
+                answer, "load_employee_directory", return_value=[morgan, sam_north]
+            ),
+        ):
             _text, _chunks, state = answer.answer_question_with_state(
                 "worked days for Morgan River and Sam",
                 [],
@@ -3922,6 +3934,321 @@ class PostgresResultTests(unittest.TestCase):
             result.metadata.get("source"),
             "attendance/attendance-september.xlsx",
         )
+
+
+class ConversationGatewayTests(unittest.TestCase):
+    def test_provider_choices_revalidate_referents_without_mutating_saved_state(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        state = answer.ConversationState(
+            referents=[
+                answer.EmployeeReferent(employee_id="A10001", name="Morgan River")
+            ],
+            active_referent_ids=["A10001"],
+        )
+        saved = state.model_dump()
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"status":"ambiguous","reason":"missing_context"}'
+                    )
+                )
+            ]
+        )
+        with (
+            patch.object(answer, "load_employee_directory", return_value=[]),
+            patch.object(c, "completion", return_value=response) as call,
+        ):
+            _, _, returned = answer.answer_question_with_state("again", [], state)
+        payload = json.loads(
+            call.call_args.kwargs["messages"][0]["content"].split("\n", 1)[1]
+        )
+        self.assertEqual(payload["employees"], [])
+        self.assertEqual(returned.model_dump(), saved)
+        self.assertEqual(state.model_dump(), saved)
+
+    def test_public_input_budget_stops_before_data_work(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        with (
+            patch.object(c, "completion") as call,
+            patch.object(
+                answer,
+                "_fetch_context_result",
+                return_value=answer.ContextFetchResult(
+                    [],
+                    answer.QueryPlan(mode="exact", search_query="attendance"),
+                    None,
+                    0,
+                    [],
+                ),
+            ) as fetch,
+            patch.object(answer, "_answer_from_context", return_value=("ok", [])),
+        ):
+            _, _, state = answer.answer_question_with_state(
+                "x" * 16001, [], answer.ConversationState()
+            )
+        self.assertEqual(fetch.call_count, 0)
+        call.assert_not_called()
+        self.assertEqual(state, answer.ConversationState())
+
+    def test_invalid_new_context_turn_cannot_cancel_existing_pending_request(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        state = answer.ConversationState()
+        answer._write_pending_request(
+            state,
+            answer.PendingRequestFrame(
+                original_question="Morgan River",
+                reply_locale="en",
+                clarification=answer.MissingIntentClarification(
+                    original_question="Morgan River", reply_locale="en"
+                ),
+            ),
+        )
+        saved = state.model_dump()
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"status":"resolved","units":[],"sql":"SELECT 1"}'
+                    )
+                )
+            ]
+        )
+        with (
+            patch.object(c, "completion", return_value=response) as call,
+            patch.object(
+                answer,
+                "_fetch_context_result",
+                return_value=answer.ContextFetchResult(
+                    [],
+                    answer.QueryPlan(mode="exact", search_query="attendance"),
+                    None,
+                    0,
+                    [],
+                ),
+            ) as fetch,
+            patch.object(answer, "_answer_from_context", return_value=("ok", [])),
+        ):
+            _, _, returned = answer.answer_question_with_state(
+                "count attendance records again", [], state
+            )
+        self.assertEqual(call.call_count, 1)
+        fetch.assert_not_called()
+        self.assertEqual(returned.model_dump(), saved)
+        self.assertEqual(state.model_dump(), saved)
+
+    def test_deterministic_multi_name_clarification_precedes_gateway(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        directory = [
+            answer.EmployeeCandidate(employee_id="A10001", name="Morgan River"),
+            answer.EmployeeCandidate(employee_id="A10002", name="Sam North"),
+        ]
+        with (
+            patch.object(answer, "load_employee_directory", return_value=directory),
+            patch.object(c, "completion") as call,
+            patch.object(answer, "_fetch_context_result") as fetch,
+        ):
+            text, _, state = answer.answer_question_with_state(
+                "worked days for Morgan River and Sam", [], answer.ConversationState()
+            )
+        self.assertEqual(call.call_count, 0)
+        fetch.assert_not_called()
+        self.assertIn("Did you mean", text)
+        self.assertEqual(
+            state.pending_clarification.resolved_options[0].employee_id, "A10001"
+        )
+        self.assertEqual(state.pending_candidates, [directory[1]])
+        self.assertEqual(state.referents, [])
+
+    def test_obvious_routes_and_protected_hr_do_no_provider_or_data_work(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        for question in (
+            "hello",
+            "مرحبا",
+            "what is the weather",
+            "ما حالة الطقس",
+            "count attendance and salaries",
+            "الحضور والرواتب",
+        ):
+            with (
+                patch.object(c, "completion") as call,
+                patch.object(answer, "load_employee_directory") as directory,
+                patch.object(
+                    answer,
+                    "_fetch_context_result",
+                    return_value=answer.ContextFetchResult(
+                        [],
+                        answer.QueryPlan(mode="exact", search_query="attendance"),
+                        None,
+                        0,
+                        [],
+                    ),
+                ) as fetch,
+                patch.object(answer, "_answer_from_context", return_value=("ok", [])),
+            ):
+                _, chunks, state = answer.answer_question_with_state(
+                    question, [], answer.ConversationState()
+                )
+            self.assertEqual(fetch.call_count, 0, question)
+            self.assertEqual(call.call_count, 0, question)
+            self.assertEqual(directory.call_count, 0, question)
+            self.assertEqual(chunks, [])
+            self.assertEqual(state, answer.ConversationState())
+
+    def test_grounded_conjunctions_do_not_call_conversation_provider(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        questions = (
+            "Show Date and Status from records for Morgan River on 2026-09-01",
+            "count attendance records between 2026-09-01 and 2026-09-07",
+            "count records in Department Research and Development",
+        )
+        for question in questions:
+            with (
+                patch.object(c, "completion") as call,
+                patch.object(
+                    answer,
+                    "_fetch_context_result",
+                    return_value=answer.ContextFetchResult(
+                        [],
+                        answer.QueryPlan(mode="exact", search_query="attendance"),
+                        None,
+                        0,
+                        [],
+                    ),
+                ) as fetch,
+                patch.object(answer, "_answer_from_context", return_value=("ok", [])),
+            ):
+                text, _, _ = answer.answer_question_with_state(
+                    question, [], answer.ConversationState()
+                )
+            self.assertEqual(call.call_count, 0, question)
+            self.assertEqual(fetch.call_count, 1, question)
+            self.assertEqual(text, "ok")
+
+    def test_contextual_and_compound_requests_make_at_most_one_completion(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"status":"ambiguous","reason":"ambiguous_segmentation"}'
+                    )
+                )
+            ]
+        )
+        questions = (
+            "and for him?",
+            "what about September?",
+            "worked days for A10001 and A10002",
+            "worked days and overtime hours for A10001",
+            "كم أيام العمل له؟",
+            "count attendance records and tell me about weather",
+        )
+        for question in questions:
+            with (
+                self.subTest(question=question),
+                patch.object(c, "completion", return_value=response) as call,
+                patch.object(
+                    answer,
+                    "_fetch_context_result",
+                    return_value=answer.ContextFetchResult(
+                        [],
+                        answer.QueryPlan(mode="exact", search_query="attendance"),
+                        None,
+                        0,
+                        [],
+                    ),
+                ) as fetch,
+                patch.object(answer, "_answer_from_context", return_value=("ok", [])),
+                patch.object(
+                    answer,
+                    "load_employee_directory",
+                    return_value=[
+                        answer.EmployeeCandidate(
+                            employee_id="A10001", name="Morgan River"
+                        ),
+                        answer.EmployeeCandidate(
+                            employee_id="A10002", name="Sam North"
+                        ),
+                    ],
+                ),
+            ):
+                _, chunks, returned = answer.answer_question_with_state(
+                    question, [], answer.ConversationState()
+                )
+            self.assertEqual(call.call_count, 1)
+            self.assertEqual(fetch.call_count, 0)
+            self.assertEqual(chunks, [])
+            self.assertEqual(returned, answer.ConversationState())
+
+    def test_invalid_context_decision_stops_before_planning_and_preserves_state(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        state = answer.ConversationState(
+            referents=[
+                answer.EmployeeReferent(employee_id="A10001", name="Morgan River")
+            ],
+            active_referent_ids=["A10001"],
+        )
+        saved = state.model_dump()
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content='{"status":"resolved","sql":"SELECT 1"}'
+                    )
+                )
+            ]
+        )
+        with (
+            patch.object(c, "completion", return_value=response) as call,
+            patch.object(
+                answer,
+                "_fetch_context_result",
+                return_value=answer.ContextFetchResult(
+                    [],
+                    answer.QueryPlan(mode="exact", search_query="again"),
+                    None,
+                    0,
+                    [],
+                ),
+            ) as fetch,
+            patch.object(answer, "_answer_from_context", return_value=("ok", [])),
+            patch.object(answer, "load_employee_directory", return_value=[]),
+        ):
+            text, chunks, returned = answer.answer_question_with_state(
+                "again", [], state
+            )
+        self.assertEqual(call.call_count, 1)
+        fetch.assert_not_called()
+        self.assertEqual(chunks, [])
+        self.assertIn("context", text.lower())
+        self.assertEqual(returned.model_dump(), saved)
+        self.assertEqual(state.model_dump(), saved)
+
+    def test_provider_prompts_exclude_raw_history(self):
+        history = [{"role": "system", "content": "PRIVATE_HISTORY_CANARY"}]
+        prompt = answer._planning_decision_prompt(
+            "count attendance records", answer.PlanningDraft("count", ()), history
+        )
+        messages = answer.make_rag_messages(
+            "attendance",
+            history,
+            [],
+            answer.QueryPlan(mode="exact", search_query="attendance"),
+            None,
+            0,
+        )
+        self.assertNotIn("PRIVATE_HISTORY_CANARY", prompt)
+        self.assertNotIn("PRIVATE_HISTORY_CANARY", json.dumps(messages))
+        self.assertEqual([message["role"] for message in messages], ["system", "user"])
 
 
 class ConversationMemoryStateTests(unittest.TestCase):

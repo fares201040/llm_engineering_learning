@@ -1392,6 +1392,52 @@ class ConversationMaterializationTests(unittest.TestCase):
         self.assertEqual(unit.view, "per_employee")
         self.assertEqual(unit.facts[0].origin, "trusted_state")
 
+    def test_repeat_inherits_the_stored_complete_view(self):
+        from week5.new_implementation import answer
+        from week5.new_implementation import conversation_understanding as c
+        from week5.new_implementation.language_understanding import ResultSnapshot
+
+        fact = c.SemanticFact(
+            kind="measure",
+            concept_name="worked_days",
+            evidence_text="worked days",
+            origin="question",
+            strength="strong",
+        )
+        frame = c.ConversationTurnFrame(
+            original_question="worked days per employee",
+            reply_locale="en",
+            units=(
+                answer.AttendanceUnitFrame(
+                    unit_id="base",
+                    source_text="worked days per employee",
+                    facts=(fact,),
+                    view="per_employee",
+                    result=ResultSnapshot(),
+                ),
+            ),
+        )
+        request = c.build_conversation_request("again", frames=(frame,))
+        decision = c.ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "relation": "repeat",
+                        "source_span": (0, 5),
+                        "base_unit_choice_id": request.context.prior_unit_choice_ids[0],
+                    }
+                ],
+            }
+        )
+
+        unit = c.materialize_conversation_units(
+            c.ValidatedConversation(request, decision, ("repeat",))
+        )[0]
+
+        self.assertEqual(unit.view, "per_employee")
+
     def test_explain_previous_keeps_grounded_request_and_marks_explanation(self):
         from week5.new_implementation import conversation_understanding as c
         from week5.new_implementation.language_understanding import ResultSnapshot

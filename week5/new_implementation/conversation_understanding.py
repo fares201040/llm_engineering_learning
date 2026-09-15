@@ -726,7 +726,7 @@ def materialize_conversation_units(
                         if selected_employees
                         else base.employees
                     ),
-                    view=selected_view,
+                    view=getattr(base, "view", None),
                     prior_result=base.result,
                 )
             )
@@ -751,6 +751,7 @@ def materialize_conversation_units(
                     source_text=source_text,
                     facts=inherited + selected_facts,
                     employees=base.employees,
+                    view=getattr(base, "view", None),
                     prior_result=base.result,
                 )
             )
@@ -781,6 +782,7 @@ def materialize_conversation_units(
                         + selected_facts
                     ),
                     employees=base.employees,
+                    view=getattr(base, "view", None),
                     prior_result=base.result,
                 )
             )
@@ -808,6 +810,7 @@ def materialize_conversation_units(
                     source_text=source_text,
                     facts=tuple(_trusted_fact(fact) for fact in base.facts),
                     employees=base.employees,
+                    view=getattr(base, "view", None),
                     explain_previous=True,
                     prior_result=base.result,
                 )
@@ -825,6 +828,7 @@ def materialize_conversation_units(
                 source_text=source_text,
                 facts=tuple(_trusted_fact(fact) for fact in base.facts),
                 employees=base.employees,
+                view=getattr(base, "view", None),
                 prior_result=base.result,
             )
         )

@@ -20,7 +20,7 @@ try:
     from . import conversation_understanding as conversation
     from .attendance_schema import (
         AccessContext,
-        AnswerContract,
+        AnswerContract,  # noqa: F401 - retained for direct-script consumers
         BUSINESS_PREDICATE_DEFINITIONS,
         CoverageWindow,
         FIELD_DEFINITIONS,
@@ -28,13 +28,14 @@ try:
         INTERPRETATION_PRESETS,
         InterpretationName,
         MEASURE_DEFINITIONS,
+        MultiEmployeeDateView,
         NUMERIC_FILTER_FIELDS,
         POSTGRES_FIELD_MAP,
         PlannerDecision,
         PlannerProposal,
         ProposedFilter,
-        ProposedMeasureChoice,
-        ProposedPredicateChoice,
+        ProposedMeasureChoice,  # noqa: F401 - retained for direct-script consumers
+        ProposedPredicateChoice,  # noqa: F401 - retained for direct-script consumers
         FilterCondition,
         LOCAL_DEMO_ACCESS,
         QueryPlan,
@@ -91,9 +92,9 @@ try:
         EmployeeReferent,
         CoverageSnapshot,
         ResultSnapshot,
-        AttendanceUnitFrame,
+        AttendanceUnitFrame as BaseAttendanceUnitFrame,
         ConversationTurnFrame,
-        PendingRequestFrame,
+        PendingRequestFrame as BasePendingRequestFrame,
         PendingConstraintSnapshot,
         ResolvedPendingMention,
         MeaningClarification,
@@ -110,7 +111,7 @@ except ImportError:  # Running answer.py directly from its directory.
     import conversation_understanding as conversation
     from attendance_schema import (
         AccessContext,
-        AnswerContract,
+        AnswerContract,  # noqa: F401 - retained for direct-script consumers
         BUSINESS_PREDICATE_DEFINITIONS,
         CoverageWindow,
         FIELD_DEFINITIONS,
@@ -118,13 +119,14 @@ except ImportError:  # Running answer.py directly from its directory.
         INTERPRETATION_PRESETS,
         InterpretationName,
         MEASURE_DEFINITIONS,
+        MultiEmployeeDateView,
         NUMERIC_FILTER_FIELDS,
         POSTGRES_FIELD_MAP,
         PlannerDecision,
         PlannerProposal,
         ProposedFilter,
-        ProposedMeasureChoice,
-        ProposedPredicateChoice,
+        ProposedMeasureChoice,  # noqa: F401 - retained for direct-script consumers
+        ProposedPredicateChoice,  # noqa: F401 - retained for direct-script consumers
         FilterCondition,
         LOCAL_DEMO_ACCESS,
         QueryPlan,
@@ -181,9 +183,9 @@ except ImportError:  # Running answer.py directly from its directory.
         EmployeeReferent,
         CoverageSnapshot,
         ResultSnapshot,
-        AttendanceUnitFrame,
+        AttendanceUnitFrame as BaseAttendanceUnitFrame,
         ConversationTurnFrame,
-        PendingRequestFrame,
+        PendingRequestFrame as BasePendingRequestFrame,
         PendingConstraintSnapshot,
         ResolvedPendingMention,
         MeaningClarification,
@@ -333,12 +335,41 @@ class EmployeeCandidate(BaseModel):
     name: str
 
 
+class AttendanceUnitFrame(BaseAttendanceUnitFrame):
+    """Task-5 execution frame with the selected request-local view retained."""
+
+    view: MultiEmployeeDateView | None = None
+
+
+class PendingRequestFrame(BasePendingRequestFrame):
+    """Authoritative Task-5 resumable request, including effective unit scope."""
+
+    employees: tuple[EmployeeReferent, ...] = ()
+    view: MultiEmployeeDateView | None = None
+    unit_id: str | None = Field(default=None, min_length=1)
+    relation: (
+        Literal[
+            "new",
+            "repeat",
+            "modify_scope",
+            "replace_result",
+            "add_constraints",
+            "change_view",
+            "explain_previous",
+        ]
+        | None
+    ) = None
+    explain_previous: bool = False
+    prior_result: ResultSnapshot | None = None
+
+
 class ContextFetchResult(NamedTuple):
     chunks: list[Result]
     plan: ExecutableQueryPlan
     aggregation: dict | None
     matched_count: int | None
     resolved_employees: list[EmployeeCandidate]
+    facts: tuple[SemanticFact, ...] = ()
 
 
 _EVALUATION_TRACE_SINK: ContextVar[list[ContextFetchResult] | None] = ContextVar(
@@ -3138,6 +3169,32 @@ _RESULT_FACT_KINDS = frozenset(
 )
 
 
+def _drop_detected_facts_overridden_by_trusted(
+    authoritative: tuple[SemanticFact, ...],
+    detected: tuple[SemanticFact, ...],
+) -> tuple[SemanticFact, ...]:
+    authoritative_result_kinds = {
+        fact.kind
+        for fact in authoritative
+        if fact.origin in {"trusted_state", "user_clarification"}
+        and fact.kind in _RESULT_FACT_KINDS
+    }
+    authoritative_predicates = {
+        fact.concept_name
+        for fact in authoritative
+        if fact.origin in {"trusted_state", "user_clarification"}
+        and fact.kind == "predicate"
+    }
+    return tuple(
+        fact
+        for fact in detected
+        if fact.kind not in authoritative_result_kinds
+        and not (
+            fact.kind == "predicate" and fact.concept_name in authoritative_predicates
+        )
+    )
+
+
 def _facts_from_question_surface(question: str) -> tuple[SemanticFact, ...]:
     surface = analyze_question_surface(question)
     facts: list[SemanticFact] = []
@@ -3424,9 +3481,11 @@ def _fetch_context_result(
     prepared_facts: tuple[SemanticFact, ...] = (),
     default_employees: list[EmployeeCandidate] | None = None,
     request_id: str | None = None,
+    request_view: MultiEmployeeDateView | None = None,
     *,
     access_context: AccessContext | None = None,
 ) -> ContextFetchResult:
+    _ = request_view
     trusted_access = _require_attendance_access(access_context)
     _require_supported_attendance_question(question)
     _numeric_comparison_value(question)
@@ -3637,6 +3696,9 @@ def _fetch_context_result(
     detected_facts = merge_semantic_facts(
         detect_semantic_facts(question, pre_context), surface_facts
     )
+    detected_facts = _drop_detected_facts_overridden_by_trusted(
+        prepared_facts, detected_facts
+    )
     if any(
         fact.kind == "unsupported" and fact.strength == "strong"
         for fact in detected_facts
@@ -3742,7 +3804,7 @@ def _fetch_context_result(
         fact_kinds=sorted({fact.kind for fact in initial_facts}),
     )
     try:
-        proposal = prepared_proposal or propose_query(
+        proposal = propose_query(
             question,
             history,
             trusted_employees=default_employees,
@@ -3822,6 +3884,9 @@ def _fetch_context_result(
         reference_date=pre_context.reference_date,
     )
     refreshed_facts = detect_semantic_facts(question, resolution_context)
+    refreshed_facts = _drop_detected_facts_overridden_by_trusted(
+        initial_facts, refreshed_facts
+    )
     trusted_scope = any(
         fact.field == "Employee_ID"
         and fact.origin in {"trusted_state", "user_clarification"}
@@ -4052,6 +4117,7 @@ def _fetch_context_result(
             and employee_resolution.outcome == "unique"
             else []
         ),
+        facts=initial_facts,
     )
     trace_sink = _EVALUATION_TRACE_SINK.get()
     if trace_sink is not None:
@@ -4440,8 +4506,10 @@ def _write_pending_request(
     state.pending_interpretations = list(request.pending_interpretations)
 
 
-def _sync_pending_request(state: ConversationState) -> None:
-    """Mirror legacy pending fields into the one typed resumable request frame."""
+def _promote_legacy_pending_request(state: ConversationState) -> None:
+    """Promote old caller-constructed mirrors once; all resumes then use the frame."""
+    if state.pending_request is not None:
+        return
     if state.pending_question is None:
         state.pending_request = None
         return
@@ -4584,8 +4652,10 @@ def _store_employee_clarification(
     resolved_employees: Sequence[EmployeeCandidate] = (),
     reference_text: str | None = None,
     reference_span: tuple[int, int] | None = None,
+    employees: Sequence[EmployeeCandidate] = (),
+    contextual_unit: conversation.MaterializedConversationUnit | None = None,
 ) -> None:
-    state.pending_clarification = EmployeeClarification(
+    pending = EmployeeClarification(
         original_question=question,
         reply_locale=analyze_question_surface(question).reply_locale,
         facts=facts,
@@ -4604,7 +4674,42 @@ def _store_employee_clarification(
         allow_multiple=_question_allows_multiple_employee_selection(question),
         has_more_candidates=resolution.has_more_candidates,
     )
-    _sync_pending_request(state)
+    _write_pending_request(
+        state,
+        PendingRequestFrame(
+            original_question=question,
+            reply_locale=pending.reply_locale,
+            facts=facts,
+            prepared_proposal=proposal,
+            clarification=pending,
+            resolved_mentions=tuple(
+                ResolvedPendingMention(
+                    source_text=reference_text or item.name,
+                    source_span=reference_span,
+                    referent=EmployeeReferent(
+                        employee_id=item.employee_id, name=item.name
+                    ),
+                )
+                for item in resolved_employees
+            ),
+            pending_candidates=pending.options,
+            employees=tuple(
+                EmployeeReferent(employee_id=item.employee_id, name=item.name)
+                for item in employees
+            ),
+            view=contextual_unit.view if contextual_unit is not None else None,
+            unit_id=contextual_unit.unit_id if contextual_unit is not None else None,
+            relation=contextual_unit.relation if contextual_unit is not None else None,
+            explain_previous=(
+                contextual_unit.explain_previous
+                if contextual_unit is not None
+                else False
+            ),
+            prior_result=(
+                contextual_unit.prior_result if contextual_unit is not None else None
+            ),
+        ),
+    )
 
 
 def _store_interpretation_clarification(
@@ -4613,8 +4718,11 @@ def _store_interpretation_clarification(
     proposal: PlannerProposal,
     facts: tuple[SemanticFact, ...],
     candidates: list[InterpretationName],
+    *,
+    employees: Sequence[EmployeeCandidate] = (),
+    contextual_unit: conversation.MaterializedConversationUnit | None = None,
 ) -> None:
-    state.pending_clarification = MeaningClarification(
+    pending = MeaningClarification(
         original_question=question,
         reply_locale=analyze_question_surface(question).reply_locale,
         facts=facts,
@@ -4629,7 +4737,32 @@ def _store_interpretation_clarification(
             for name in candidates
         ),
     )
-    _sync_pending_request(state)
+    _write_pending_request(
+        state,
+        PendingRequestFrame(
+            original_question=question,
+            reply_locale=pending.reply_locale,
+            facts=facts,
+            prepared_proposal=proposal,
+            clarification=pending,
+            pending_interpretations=tuple(candidates),
+            employees=tuple(
+                EmployeeReferent(employee_id=item.employee_id, name=item.name)
+                for item in employees
+            ),
+            view=contextual_unit.view if contextual_unit is not None else None,
+            unit_id=contextual_unit.unit_id if contextual_unit is not None else None,
+            relation=contextual_unit.relation if contextual_unit is not None else None,
+            explain_previous=(
+                contextual_unit.explain_previous
+                if contextual_unit is not None
+                else False
+            ),
+            prior_result=(
+                contextual_unit.prior_result if contextual_unit is not None else None
+            ),
+        ),
+    )
 
 
 def _store_catalog_clarification(
@@ -4638,8 +4771,11 @@ def _store_catalog_clarification(
     proposal: PlannerProposal,
     facts: tuple[SemanticFact, ...],
     pending: PendingConstraintData,
+    *,
+    employees: Sequence[EmployeeCandidate] = (),
+    contextual_unit: conversation.MaterializedConversationUnit | None = None,
 ) -> None:
-    state.pending_clarification = CatalogClarification(
+    clarification = CatalogClarification(
         original_question=question,
         reply_locale=analyze_question_surface(question).reply_locale,
         facts=facts,
@@ -4654,7 +4790,34 @@ def _store_catalog_clarification(
             for index, candidate in enumerate(pending.candidates, start=1)
         ),
     )
-    _sync_pending_request(state)
+    _write_pending_request(
+        state,
+        PendingRequestFrame(
+            original_question=question,
+            reply_locale=clarification.reply_locale,
+            facts=facts,
+            prepared_proposal=proposal,
+            clarification=clarification,
+            pending_constraint=PendingConstraintSnapshot.model_validate(
+                pending.model_dump()
+            ),
+            employees=tuple(
+                EmployeeReferent(employee_id=item.employee_id, name=item.name)
+                for item in employees
+            ),
+            view=contextual_unit.view if contextual_unit is not None else None,
+            unit_id=contextual_unit.unit_id if contextual_unit is not None else None,
+            relation=contextual_unit.relation if contextual_unit is not None else None,
+            explain_previous=(
+                contextual_unit.explain_previous
+                if contextual_unit is not None
+                else False
+            ),
+            prior_result=(
+                contextual_unit.prior_result if contextual_unit is not None else None
+            ),
+        ),
+    )
 
 
 def _store_context_clarification(
@@ -4994,6 +5157,7 @@ def answer_question_with_state(
 ) -> tuple[str, list[Result], ConversationState]:
     history = history or []
     state = state.model_copy(deep=True) if state is not None else ConversationState()
+    _promote_legacy_pending_request(state)
     contextual_unit: conversation.MaterializedConversationUnit | None = None
     if len(question) > settings.conversation_max_input_chars:
         locale = "ar" if re.search(r"[\u0600-\u06ff]", question[:256]) else "en"
@@ -5019,8 +5183,7 @@ def answer_question_with_state(
         return f"I could not safely interpret that request: {exc}", [], state
 
     if (
-        state.pending_clarification is None
-        or _is_complete_new_attendance_question(question)
+        state.pending_request is None or _is_complete_new_attendance_question(question)
     ) and not any(
         not _EMPLOYEE_ID_PATTERN.fullmatch(match.group(0))
         for match in _EMPLOYEE_ID_LIKE_PATTERN.finditer(question)
@@ -5050,9 +5213,6 @@ def answer_question_with_state(
                         None,
                     )
                     _clear_pending_state(state)
-                    state.pending_question = question
-                    state.pending_facts = list(conversation_facts)
-                    state.pending_candidates = blocker.candidates
                     _store_employee_clarification(
                         state,
                         question,
@@ -5115,6 +5275,25 @@ def answer_question_with_state(
                     _resolve_conversation_employee_mentions(validated)
                 )
                 if mention_blocker is not None:
+                    resolution, reference_text, reference_span = mention_blocker
+                    if resolution.outcome != "none" and resolution.candidates:
+                        _store_employee_clarification(
+                            state,
+                            question,
+                            None,
+                            conversation_facts,
+                            resolution,
+                            resolved_employees=selected,
+                            reference_text=reference_text,
+                            reference_span=reference_span,
+                        )
+                        return (
+                            _format_employee_clarification(
+                                resolution, locale=reply_locale
+                            ),
+                            [],
+                            state,
+                        )
                     return _format_conversation_help(reply_locale), [], state
                 materialized = conversation.materialize_conversation_units(
                     validated, resolved_mentions=resolved_mentions
@@ -5125,7 +5304,7 @@ def answer_question_with_state(
             except conversation.ConversationDecisionValidationError:
                 return _format_conversation_help(reply_locale), [], state
 
-    if state.pending_clarification is None:
+    if state.pending_request is None:
         malformed = None
         if any(
             not _EMPLOYEE_ID_PATTERN.fullmatch(match.group(0))
@@ -5142,10 +5321,6 @@ def answer_question_with_state(
                     [],
                     state,
                 )
-            state.pending_question = question
-            state.pending_proposal = None
-            state.pending_facts = []
-            state.pending_candidates = malformed_resolution.candidates
             _store_employee_clarification(
                 state,
                 question,
@@ -5163,6 +5338,24 @@ def answer_question_with_state(
                 state,
             )
 
+    pending_request = state.pending_request
+    if (
+        contextual_unit is None
+        and pending_request is not None
+        and pending_request.unit_id is not None
+        and pending_request.relation is not None
+    ):
+        contextual_unit = conversation.MaterializedConversationUnit(
+            unit_id=pending_request.unit_id,
+            route="attendance",
+            relation=pending_request.relation,
+            source_text=pending_request.original_question,
+            facts=pending_request.facts,
+            employees=pending_request.employees,
+            view=pending_request.view,
+            explain_previous=pending_request.explain_previous,
+            prior_result=pending_request.prior_result,
+        )
     effective_question = (
         contextual_unit.source_text if contextual_unit is not None else question
     )
@@ -5176,12 +5369,26 @@ def answer_question_with_state(
             for item in contextual_unit.employees
         ]
         if contextual_unit is not None
-        else state.selected_employees
+        else (
+            [
+                EmployeeCandidate(employee_id=item.employee_id, name=item.name)
+                for item in pending_request.employees
+            ]
+            if pending_request is not None and pending_request.employees
+            else state.selected_employees
+        )
     )
-    if state.pending_clarification is not None:
-        reply_locale = state.pending_clarification.reply_locale
-    if isinstance(state.pending_clarification, ContextChoiceClarification):
-        pending_context = state.pending_clarification
+    request_view = (
+        contextual_unit.view
+        if contextual_unit is not None
+        else (pending_request.view if pending_request is not None else None)
+    )
+    if pending_request is not None and pending_request.clarification is not None:
+        reply_locale = pending_request.clarification.reply_locale
+    if pending_request is not None and isinstance(
+        pending_request.clarification, ContextChoiceClarification
+    ):
+        pending_context = pending_request.clarification
         selected_context = _select_context_choice(question, pending_context)
         if selected_context is None:
             if _is_complete_new_attendance_question(question):
@@ -5212,36 +5419,65 @@ def answer_question_with_state(
             _clear_pending_state(state)
             return _format_conversation_help(reply_locale), [], state
         effective_question = pending_context.original_question
-        prepared_facts = tuple(
-            fact.model_copy(
-                update={
-                    "origin": "trusted_state",
-                    "evidence_span": None,
-                    "consumed_span": None,
-                }
+        request_referents = tuple(
+            EmployeeReferent(employee_id=item.employee_id, name=item.name)
+            for item in current_directory
+            if any(
+                item.employee_id.casefold() == saved.employee_id.casefold()
+                for saved in state.referents
             )
-            for fact in base.facts
         )
+        narrowed_frame = ConversationTurnFrame(
+            original_question=base.source_text,
+            reply_locale=pending_context.reply_locale,
+            units=(base,),
+        )
+        request = conversation.build_conversation_request(
+            effective_question,
+            pending_context.facts,
+            request_referents,
+            (narrowed_frame,),
+            tuple(state.active_referent_ids),
+            employee_sources=_conversation_employee_sources(
+                effective_question,
+                pending_context.facts,
+                (),
+                request_referents,
+                tuple(state.active_referent_ids),
+            ),
+        )
+        validated = conversation.request_conversation_decision(request)
+        if validated is None or validated.decision.status != "resolved":
+            return _format_conversation_help(reply_locale), [], state
+        resolved_mentions, mention_blocker = _resolve_conversation_employee_mentions(
+            validated
+        )
+        if mention_blocker is not None:
+            return _format_conversation_help(reply_locale), [], state
+        materialized = conversation.materialize_conversation_units(
+            validated, resolved_mentions=resolved_mentions
+        )
+        if len(materialized) != 1 or materialized[0].route != "attendance":
+            return _format_conversation_help(reply_locale), [], state
+        contextual_unit = materialized[0]
+        prepared_facts = contextual_unit.facts
+        request_view = contextual_unit.view
         employees_for_request = [
-            item for item in selected_employees if item is not None
+            EmployeeCandidate(employee_id=item.employee_id, name=item.name)
+            for item in contextual_unit.employees
         ]
-        contextual_unit = conversation.MaterializedConversationUnit(
-            unit_id=uuid.uuid4().hex,
-            route="attendance",
-            relation="repeat",
-            source_text=effective_question,
-            facts=prepared_facts,
-            employees=tuple(base.employees),
-        )
         _clear_pending_state(state)
-    if isinstance(state.pending_clarification, MissingIntentClarification):
+    if pending_request is not None and isinstance(
+        pending_request.clarification, MissingIntentClarification
+    ):
         if _is_complete_new_attendance_question(question):
             _clear_pending_state(state)
     if (
-        isinstance(state.pending_clarification, MeaningClarification)
-        and not state.pending_interpretations
+        pending_request is not None
+        and isinstance(pending_request.clarification, MeaningClarification)
+        and not pending_request.pending_interpretations
     ):
-        pending_meaning = state.pending_clarification
+        pending_meaning = pending_request.clarification
         selected_meaning = _select_surface_meaning(question, pending_meaning)
         if selected_meaning is None:
             if _is_complete_new_attendance_question(question):
@@ -5251,21 +5487,16 @@ def answer_question_with_state(
                 )
             return _format_surface_meaning_clarification(pending_meaning), [], state
         effective_question = pending_meaning.original_question
-        prepared_proposal = pending_meaning.prepared_proposal
         prepared_facts = merge_semantic_facts(
-            pending_meaning.facts,
+            pending_request.facts,
             _facts_for_confirmed_meaning(
                 selected_meaning, pending_meaning.original_question
             ),
         )
         _clear_pending_state(state)
-    if (
-        state.pending_interpretations
-        and state.pending_proposal is not None
-        and state.pending_question
-    ):
+    if pending_request is not None and pending_request.pending_interpretations:
         selected_interpretation = _select_pending_interpretation(
-            question, state.pending_interpretations
+            question, list(pending_request.pending_interpretations)
         )
         if selected_interpretation is None:
             if _is_complete_new_attendance_question(question):
@@ -5275,66 +5506,48 @@ def answer_question_with_state(
                 )
             return (
                 _format_interpretation_clarification(
-                    state.pending_interpretations,
+                    list(pending_request.pending_interpretations),
                     locale=(
-                        state.pending_clarification.reply_locale
-                        if state.pending_clarification is not None
-                        else "en"
+                        pending_request.clarification.reply_locale
+                        if pending_request.clarification is not None
+                        else pending_request.reply_locale
                     ),
                 ),
                 [],
                 state,
             )
         definition = INTERPRETATION_PRESETS[selected_interpretation]
-        effective_question = state.pending_question
-        measure_definition = MEASURE_DEFINITIONS[definition.measure]
-        prepared_proposal = state.pending_proposal.model_copy(
-            deep=True,
-            update={
-                "status": "ready",
-                "measure": ProposedMeasureChoice(
-                    name=definition.measure, evidence_text=effective_question
-                ),
-                "business_predicates": [
-                    ProposedPredicateChoice(name=name, evidence_text=effective_question)
-                    for name in definition.business_predicates
-                ],
-                "answer_contract": AnswerContract(
-                    shape="scalar",
-                    unit=measure_definition.answer_unit,
-                    subject_field=measure_definition.aggregation_field,
-                    grain=(
-                        [measure_definition.aggregation_field]
-                        if measure_definition.aggregation_field
-                        else []
-                    ),
-                ),
-                "interpretation_candidates": [],
-            },
+        effective_question = pending_request.original_question
+        interpretation_scope = tuple(
+            fact
+            for fact in pending_request.facts
+            if fact.kind not in {"measure", "predicate"}
         )
-        prepared_facts = tuple(state.pending_facts) + (
-            SemanticFact(
-                kind="measure",
-                concept_name=definition.measure,
-                evidence_text=effective_question,
-                origin="question",
-                strength="strong",
-            ),
-            *(
+        prepared_facts = merge_semantic_facts(
+            interpretation_scope,
+            (
                 SemanticFact(
-                    kind="predicate",
-                    concept_name=name,
+                    kind="measure",
+                    concept_name=definition.measure,
                     evidence_text=effective_question,
-                    origin="question",
+                    origin="user_clarification",
                     strength="strong",
-                )
-                for name in definition.business_predicates
+                ),
+                *(
+                    SemanticFact(
+                        kind="predicate",
+                        concept_name=name,
+                        evidence_text=effective_question,
+                        origin="user_clarification",
+                        strength="strong",
+                    )
+                    for name in definition.business_predicates
+                ),
             ),
         )
-        state.pending_interpretations = []
 
-    if state.pending_constraint is not None and state.pending_proposal is not None:
-        pending = state.pending_constraint
+    if pending_request is not None and pending_request.pending_constraint is not None:
+        pending = pending_request.pending_constraint
         selected_values = _select_pending_constraint_values(question, pending)
         if not selected_values:
             if _is_complete_new_attendance_question(question):
@@ -5346,54 +5559,40 @@ def answer_question_with_state(
                 _format_constraint_clarification(
                     pending,
                     locale=(
-                        state.pending_clarification.reply_locale
-                        if state.pending_clarification is not None
-                        else "en"
+                        pending_request.clarification.reply_locale
+                        if pending_request.clarification is not None
+                        else pending_request.reply_locale
                     ),
                 ),
                 [],
                 state,
             )
-        effective_question = state.pending_question or question
-        prepared_proposal = state.pending_proposal.model_copy(deep=True)
-        prepared_proposal.filters = [
-            condition
-            for condition in prepared_proposal.filters
-            if condition.field != pending.field
-        ]
-        prepared_proposal.filters.append(
-            ProposedFilter(
-                field=pending.field,
-                operator="eq" if len(selected_values) == 1 else "in",
-                value=(
-                    selected_values[0] if len(selected_values) == 1 else selected_values
+        effective_question = pending_request.original_question
+        prepared_facts = merge_semantic_facts(
+            pending_request.facts,
+            (
+                SemanticFact(
+                    kind="filter",
+                    field=pending.field,
+                    operator="eq" if len(selected_values) == 1 else "in",
+                    values=tuple(selected_values),
+                    evidence_text=pending.reference,
+                    origin="user_clarification",
+                    strength="strong",
                 ),
-                evidence_text=pending.reference,
-            )
-        )
-        prepared_facts = tuple(state.pending_facts) + (
-            SemanticFact(
-                kind="filter",
-                field=pending.field,
-                operator="eq" if len(selected_values) == 1 else "in",
-                values=tuple(selected_values),
-                evidence_text=pending.reference,
-                origin="question",
-                strength="strong",
             ),
         )
-        state.pending_constraint = None
 
-    if (
-        prepared_proposal is None
-        and state.pending_question
-        and state.pending_candidates
-    ):
+    if pending_request is not None and pending_request.pending_candidates:
+        pending_candidates = [
+            EmployeeCandidate(employee_id=item.employee_id, name=item.name)
+            for item in pending_request.pending_candidates
+        ]
         selected_choice = _select_pending_employees(
             question,
-            state.pending_candidates,
+            pending_candidates,
             allow_multiple=_question_allows_multiple_employee_selection(
-                state.pending_question
+                pending_request.original_question
             ),
         )
         if not selected_choice:
@@ -5407,13 +5606,13 @@ def answer_question_with_state(
                 )
             resolution = EmployeeResolution(
                 outcome="ambiguous",
-                candidates=state.pending_candidates,
+                candidates=pending_candidates,
                 reference=question,
             )
             locale = (
-                state.pending_clarification.reply_locale
-                if state.pending_clarification is not None
-                else "en"
+                pending_request.clarification.reply_locale
+                if pending_request.clarification is not None
+                else pending_request.reply_locale
             )
             return _format_employee_clarification(resolution, locale=locale), [], state
 
@@ -5426,8 +5625,8 @@ def answer_question_with_state(
             for candidate in current_directory
         }
         pending_employee = (
-            state.pending_clarification
-            if isinstance(state.pending_clarification, EmployeeClarification)
+            pending_request.clarification
+            if isinstance(pending_request.clarification, EmployeeClarification)
             else None
         )
         prior_scope = (
@@ -5467,26 +5666,49 @@ def answer_question_with_state(
         ]
         if any(candidate is None for candidate in validated_choice):
             pending_ids = {
-                candidate.employee_id.casefold()
-                for candidate in state.pending_candidates
+                candidate.employee_id.casefold() for candidate in pending_candidates
             }
-            state.pending_candidates = [
+            available_candidates = [
                 candidate
                 for candidate in current_directory
                 if candidate.employee_id.casefold() in pending_ids
             ]
+            refreshed_clarification = (
+                pending_employee.model_copy(
+                    update={
+                        "options": tuple(
+                            EmployeeOption(employee_id=item.employee_id, name=item.name)
+                            for item in available_candidates
+                        )
+                    }
+                )
+                if pending_employee is not None and available_candidates
+                else pending_request.clarification
+            )
+            _write_pending_request(
+                state,
+                pending_request.model_copy(
+                    update={
+                        "clarification": refreshed_clarification,
+                        "pending_candidates": tuple(
+                            EmployeeOption(employee_id=item.employee_id, name=item.name)
+                            for item in available_candidates
+                        ),
+                    }
+                ),
+            )
             return (
                 "That employee choice is no longer available. Please choose again.\n"
                 + _format_employee_clarification(
                     EmployeeResolution(
                         outcome="ambiguous",
-                        candidates=state.pending_candidates,
+                        candidates=available_candidates,
                         reference=question,
                     ),
                     locale=(
-                        state.pending_clarification.reply_locale
-                        if state.pending_clarification is not None
-                        else "en"
+                        pending_request.clarification.reply_locale
+                        if pending_request.clarification is not None
+                        else pending_request.reply_locale
                     ),
                 ),
                 [],
@@ -5506,7 +5728,7 @@ def answer_question_with_state(
                 selected.append(candidate)
                 selected_ids_seen.add(employee_key)
         effective_question = _replace_confirmed_malformed_employee_id(
-            state.pending_question,
+            pending_request.original_question,
             current_selection,
             reference_text=(
                 pending_employee.reference_text
@@ -5529,12 +5751,6 @@ def answer_question_with_state(
                     [],
                     state,
                 )
-            state.pending_question = effective_question
-            state.pending_proposal = None
-            state.pending_facts = []
-            state.pending_candidates = malformed_resolution.candidates
-            state.pending_constraint = None
-            state.pending_interpretations = []
             _store_employee_clarification(
                 state,
                 effective_question,
@@ -5555,27 +5771,10 @@ def answer_question_with_state(
             )
         selected_ids = [candidate.employee_id for candidate in selected]
         selected_operator = "eq" if len(selected_ids) == 1 else "in"
-        selected_value = selected_ids[0] if len(selected_ids) == 1 else selected_ids
         selected_evidence = " ".join(selected_ids)
-        if state.pending_proposal is not None:
-            prepared_proposal = state.pending_proposal.model_copy(deep=True)
-            prepared_proposal.name_hint = None
-            prepared_proposal.filters = [
-                condition
-                for condition in prepared_proposal.filters
-                if condition.field not in {"Employee_ID", "Name"}
-            ]
-            prepared_proposal.filters.append(
-                ProposedFilter(
-                    field="Employee_ID",
-                    operator=selected_operator,
-                    value=selected_value,
-                    evidence_text=selected_evidence,
-                )
-            )
         prepared_facts = tuple(
             fact
-            for fact in state.pending_facts
+            for fact in pending_request.facts
             if not (
                 fact.kind == "entity"
                 or (fact.kind == "filter" and fact.field in {"Employee_ID", "Name"})
@@ -5597,7 +5796,7 @@ def answer_question_with_state(
             and pending_employee.reference_span is not None
             and state.recent_frames
             and conversation.needs_conversation_decision(
-                effective_question, tuple(state.pending_facts)
+                effective_question, pending_request.facts
             )
         ):
             confirmed_referents = tuple(
@@ -5617,7 +5816,7 @@ def answer_question_with_state(
             )
             request = conversation.build_conversation_request(
                 effective_question,
-                tuple(state.pending_facts),
+                pending_request.facts,
                 confirmed_referents,
                 tuple(state.recent_frames),
                 tuple(selected_ids),
@@ -5642,6 +5841,7 @@ def answer_question_with_state(
             if len(materialized) != 1 or materialized[0].route != "attendance":
                 return _format_conversation_help(reply_locale), [], state
             contextual_unit = materialized[0]
+            request_view = contextual_unit.view
             prepared_facts = tuple(
                 fact
                 for fact in contextual_unit.facts
@@ -5667,6 +5867,7 @@ def answer_question_with_state(
             prepared_proposal=prepared_proposal,
             prepared_facts=prepared_facts,
             default_employees=employees_for_request,
+            request_view=request_view,
             access_context=access_context,
         )
         chunks = result.chunks
@@ -5675,12 +5876,14 @@ def answer_question_with_state(
         matched_count = result.matched_count
         resolved_employees = result.resolved_employees
     except ConstraintClarificationRequired as exc:
-        state.pending_question = effective_question
-        state.pending_proposal = exc.proposal
-        state.pending_facts = list(exc.facts)
-        state.pending_constraint = exc.pending
         _store_catalog_clarification(
-            state, effective_question, exc.proposal, exc.facts, exc.pending
+            state,
+            effective_question,
+            exc.proposal,
+            exc.facts,
+            exc.pending,
+            employees=employees_for_request,
+            contextual_unit=contextual_unit,
         )
         return (
             _format_constraint_clarification(
@@ -5691,12 +5894,14 @@ def answer_question_with_state(
             state,
         )
     except InterpretationClarificationRequired as exc:
-        state.pending_question = effective_question
-        state.pending_proposal = exc.proposal
-        state.pending_facts = list(exc.facts)
-        state.pending_interpretations = exc.candidates
         _store_interpretation_clarification(
-            state, effective_question, exc.proposal, exc.facts, exc.candidates
+            state,
+            effective_question,
+            exc.proposal,
+            exc.facts,
+            exc.candidates,
+            employees=employees_for_request,
+            contextual_unit=contextual_unit,
         )
         return (
             _format_interpretation_clarification(
@@ -5717,11 +5922,6 @@ def answer_question_with_state(
                 [],
                 state,
             )
-        state.pending_question = effective_question
-        state.pending_proposal = exc.proposal
-        state.pending_facts = list(exc.facts)
-        state.pending_candidates = exc.resolution.candidates
-        state.pending_interpretations = []
         _store_employee_clarification(
             state,
             effective_question,
@@ -5729,6 +5929,8 @@ def answer_question_with_state(
             exc.facts,
             exc.resolution,
             resolved_employees=exc.resolved_employees,
+            employees=employees_for_request,
+            contextual_unit=contextual_unit,
         )
         return (
             _format_employee_clarification(
@@ -5761,17 +5963,41 @@ def answer_question_with_state(
             prepared_proposal=None,
             options=options,
         )
-        _clear_pending_state(state)
-        state.pending_clarification = pending
-        state.pending_question = effective_question
-        state.pending_facts = list(exc.facts)
-        _sync_pending_request(state)
+        _write_pending_request(
+            state,
+            PendingRequestFrame(
+                original_question=effective_question,
+                reply_locale=reply_locale,
+                facts=exc.facts,
+                clarification=pending,
+                employees=tuple(
+                    EmployeeReferent(employee_id=item.employee_id, name=item.name)
+                    for item in employees_for_request
+                ),
+                view=request_view,
+                unit_id=contextual_unit.unit_id
+                if contextual_unit is not None
+                else None,
+                relation=(
+                    contextual_unit.relation if contextual_unit is not None else None
+                ),
+                explain_previous=(
+                    contextual_unit.explain_previous
+                    if contextual_unit is not None
+                    else False
+                ),
+                prior_result=(
+                    contextual_unit.prior_result
+                    if contextual_unit is not None
+                    else None
+                ),
+            ),
+        )
         return _format_surface_meaning_clarification(pending), [], state
     except MissingIntentRequired as exc:
-        _clear_pending_state(state)
         if exc.employees:
             state.selected_employees = exc.employees
-        state.pending_clarification = MissingIntentClarification(
+        pending = MissingIntentClarification(
             original_question=effective_question,
             reply_locale=reply_locale,
             facts=prepared_facts,
@@ -5785,15 +6011,35 @@ def answer_question_with_state(
                 else None
             ),
         )
-        state.pending_question = effective_question
-        state.pending_facts = list(prepared_facts)
-        state.pending_proposal = prepared_proposal
-        _sync_pending_request(state)
-        _upsert_referents(
+        pending_employees = employees_for_request or exc.employees
+        _write_pending_request(
             state,
-            tuple(
-                EmployeeReferent(employee_id=item.employee_id, name=item.name)
-                for item in exc.employees
+            PendingRequestFrame(
+                original_question=effective_question,
+                reply_locale=reply_locale,
+                facts=prepared_facts,
+                clarification=pending,
+                employees=tuple(
+                    EmployeeReferent(employee_id=item.employee_id, name=item.name)
+                    for item in pending_employees
+                ),
+                view=request_view,
+                unit_id=contextual_unit.unit_id
+                if contextual_unit is not None
+                else None,
+                relation=(
+                    contextual_unit.relation if contextual_unit is not None else None
+                ),
+                explain_previous=(
+                    contextual_unit.explain_previous
+                    if contextual_unit is not None
+                    else False
+                ),
+                prior_result=(
+                    contextual_unit.prior_result
+                    if contextual_unit is not None
+                    else None
+                ),
             ),
         )
         return (
@@ -5858,11 +6104,12 @@ def answer_question_with_state(
                         else uuid.uuid4().hex
                     ),
                     source_text=effective_question,
-                    facts=tuple(prepared_facts),
+                    facts=result.facts,
                     employees=tuple(
                         EmployeeReferent(employee_id=item.employee_id, name=item.name)
                         for item in confirmed
                     ),
+                    view=request_view,
                     result=_snapshot_successful_result(result),
                 ),
             ),

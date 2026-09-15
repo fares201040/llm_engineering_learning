@@ -753,11 +753,13 @@ class AccessScopeTests(unittest.TestCase):
             )
 
         refusal = answer._unrelated_refusal("en")
+        self.assertEqual(first_text.count("attendance records matched"), 0)
         self.assertEqual(first_text.count(refusal), 1)
         self.assertEqual(first_chunks, [])
         self.assertIsNotNone(pending_state.pending_clarification)
         self.assertIsNotNone(pending_state.pending_request)
         self.assertTrue(pending_state.pending_request.unrelated_refusal_given)
+        self.assertEqual(resumed_text.count("attendance records matched"), 1)
         self.assertIn("attendance records", resumed_text)
         self.assertNotIn(refusal, resumed_text)
         self.assertEqual(resumed_text.count(refusal), 0)

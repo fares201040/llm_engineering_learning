@@ -5671,7 +5671,40 @@ def _resume_conversation_employees(question, state, *, access_context=None):
         return _format_conversation_help(locale), [], state
     resolved, blocker = _resolve_conversation_employee_mentions(validated)
     if blocker is not None:
-        return _format_conversation_help(locale), [], state
+        resolution, reference, span = blocker
+        if resolution.outcome == "none":
+            return _format_employee_clarification(resolution, locale=locale), [], state
+        updated = state.model_copy(deep=True)
+        _store_employee_clarification(
+            updated,
+            pending.original_question,
+            None,
+            pending.facts,
+            resolution,
+            reference_text=reference,
+            reference_span=span,
+        )
+        request = validated.request
+        _write_pending_request(
+            updated,
+            updated.pending_request.model_copy(
+                update={
+                    "conversation_employee_pending": True,
+                    "conversation_decision": PendingConversation(
+                        context=request.context,
+                        decision=validated.decision,
+                        unit_ids=validated.unit_ids,
+                        facts=request.facts,
+                        employees=request.employees,
+                        prior_units=request.prior_units,
+                        active_choices=request.active_choices,
+                        views=request.views,
+                    ),
+                    "resolved_mentions": tuple(confirmed),
+                }
+            ),
+        )
+        return _format_employee_clarification(resolution, locale=locale), [], updated
     materialized = conversation.materialize_conversation_units(
         validated, resolved_mentions=resolved
     )
@@ -5846,6 +5879,25 @@ def _prepare_turn(
     )
 
 
+def _format_previous_result_explanation(
+    text: str, prior_result: ResultSnapshot | None, *, locale: str
+) -> str:
+    previous_count = prior_result.matched_count if prior_result is not None else None
+    if locale == "ar":
+        basis = (
+            f"استندت الإجابة السابقة إلى {previous_count} سجل مطابق"
+            if previous_count is not None
+            else "استندت الإجابة السابقة إلى الطلب نفسه الذي تم التحقق منه"
+        )
+        return f"{basis}، وقد أعدت تشغيل الطلب بأمان.\n{text}"
+    basis = (
+        f"The previous answer was based on {previous_count} matching records"
+        if previous_count is not None
+        else "The previous answer was based on the same verified request"
+    )
+    return f"{basis}; I safely re-ran that request.\n{text}"
+
+
 def _answer_compound_turn(
     question: str,
     units: tuple[PendingRequestFrame, ...],
@@ -5902,6 +5954,10 @@ def _answer_compound_turn(
             result.matched_count,
             locale=locale,
         )
+        if saved.explain_previous:
+            text = _format_previous_result_explanation(
+                text, saved.prior_result, locale=locale
+            )
         texts.append(_material_correction_note(saved.original_question) + text)
         chunks.extend(evidence)
         frames.append(
@@ -7022,25 +7078,9 @@ def _answer_question_with_state(
         locale=reply_locale,
     )
     if contextual_unit is not None and contextual_unit.explain_previous:
-        previous_count = (
-            contextual_unit.prior_result.matched_count
-            if contextual_unit.prior_result is not None
-            else None
+        text = _format_previous_result_explanation(
+            text, contextual_unit.prior_result, locale=reply_locale
         )
-        if reply_locale == "ar":
-            basis = (
-                f"استندت الإجابة السابقة إلى {previous_count} سجل مطابق"
-                if previous_count is not None
-                else "استندت الإجابة السابقة إلى الطلب نفسه الذي تم التحقق منه"
-            )
-            text = f"{basis}، وقد أعدت تشغيل الطلب بأمان.\n{text}"
-        else:
-            basis = (
-                f"The previous answer was based on {previous_count} matching records"
-                if previous_count is not None
-                else "The previous answer was based on the same verified request"
-            )
-            text = f"{basis}; I safely re-ran that request.\n{text}"
     confirmed = resolved_employees or employees_for_request
     _store_successful_turn(
         state,

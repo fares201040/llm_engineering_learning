@@ -114,6 +114,67 @@ class CompoundTurnTests(unittest.TestCase):
         self.assertEqual(initial, answer.ConversationState())
         self.assertEqual(state.recent_frames[0].original_question, self.question)
 
+    def _assert_compound_explanation(self, locale):
+        for count in (17, 0, None):
+            with self.subTest(previous_count=count):
+                prior = (
+                    answer.ResultSnapshot(matched_count=count)
+                    if count is not None
+                    else None
+                )
+                units = tuple(
+                    answer._pending_unit(
+                        answer.conversation.MaterializedConversationUnit(
+                            unit_id=f"unit-{index}",
+                            route="attendance",
+                            relation="explain_previous" if index == 0 else "new",
+                            source_text=source,
+                            explain_previous=index == 0,
+                            prior_result=prior,
+                        ),
+                        locale,
+                    )
+                    for index, source in enumerate(self.question.split(";"))
+                )
+                initial = answer.ConversationState()
+                text, _, state = answer._answer_compound_turn(
+                    self.question, units, initial, locale=locale
+                )
+                if locale == "ar":
+                    prefix = "استندت الإجابة السابقة إلى"
+                    basis = (
+                        f"{count} سجل مطابق"
+                        if count is not None
+                        else "الطلب نفسه الذي تم التحقق منه"
+                    )
+                    rerun = "وقد أعدت تشغيل الطلب بأمان."
+                else:
+                    prefix = "The previous answer was based on"
+                    basis = (
+                        f"{count} matching records"
+                        if count is not None
+                        else "the same verified request"
+                    )
+                    rerun = "I safely re-ran that request."
+                self.assertIn(f"{prefix} {basis}", text)
+                self.assertEqual(text.count(prefix), 1)
+                self.assertIn(rerun, text)
+                self.assertIn("3", text)
+                self.assertIn("2", text)
+                self.assertIsNone(state.pending_request)
+                self.assertEqual(len(state.recent_frames), 1)
+                self.assertEqual(
+                    [unit.result.scalar_value for unit in state.recent_frames[0].units],
+                    [3, 2],
+                )
+                self.assertEqual(initial, answer.ConversationState())
+
+    def test_compound_explanation_in_english(self):
+        self._assert_compound_explanation("en")
+
+    def test_compound_explanation_in_arabic(self):
+        self._assert_compound_explanation("ar")
+
     def test_later_blocker_prevents_all_execution_and_retains_full_request(self):
         question = "count attendance records; attendance"
         text, chunks, state = answer.answer_question_with_state(question, [], None)
@@ -345,6 +406,73 @@ class CompoundTurnTests(unittest.TestCase):
         text, _, completed = answer.answer_question_with_state("yes", [], restored)
         self.assertIsNone(completed.pending_request, text)
         self.assertEqual(len(completed.recent_frames[-1].units), 2)
+
+    def test_mixed_employee_confirmation_paths_resume_complete_request(self):
+        question = "count attendance records for Morgan; Taylor: count distinct dates"
+        employees = [
+            answer.EmployeeCandidate(employee_id="A10001", name="Morgan River"),
+            answer.EmployeeCandidate(employee_id="A10002", name="Taylor Stone"),
+        ]
+
+        def decide(request):
+            validated = segmented_decision(request)
+            first, second = validated.decision.units
+            start = question.index("Taylor")
+            second = second.model_copy(
+                update={
+                    "employee_mentions": (
+                        answer.conversation.ResolveEmployeeMention(
+                            source_span=(start, start + len("Taylor"))
+                        ),
+                    )
+                }
+            )
+            decision = answer.conversation.ConversationDecision.model_validate(
+                {"status": "resolved", "units": (first, second)}
+            )
+            answer.conversation.validate_conversation_decision(
+                decision, request.context
+            )
+            return replace(validated, decision=decision)
+
+        self.provider.side_effect = decide
+        with patch.object(answer, "load_employee_directory", return_value=employees):
+            text, _, initial = answer.answer_question_with_state(question, [], None)
+            self.assertEqual(initial.pending_clarification.reference_text, "Morgan")
+            self.provider.assert_not_called()
+            text, chunks, pending = answer.answer_question_with_state(
+                "yes", [], initial
+            )
+            self.assertIn("Taylor Stone", text)
+            self.assertEqual(pending.pending_clarification.reference_text, "Taylor")
+            self.assertIsNotNone(pending.pending_request.conversation_decision)
+            self.assertEqual(
+                [
+                    item.referent.employee_id
+                    for item in pending.pending_request.resolved_mentions
+                ],
+                ["A10001"],
+            )
+            self.assertEqual(chunks, [])
+            self.collection.get.assert_not_called()
+            self.assertEqual(pending.referents, [])
+            self.assertEqual(pending.recent_frames, [])
+            self.assertEqual(initial.pending_clarification.reference_text, "Morgan")
+            restored = answer.ConversationState.model_validate_json(
+                pending.model_dump_json()
+            )
+            text, _, completed = answer.answer_question_with_state("yes", [], restored)
+        self.assertIsNone(completed.pending_request, text)
+        self.assertEqual(len(completed.recent_frames), 1)
+        self.assertEqual(completed.recent_frames[0].original_question, question)
+        self.assertEqual(
+            [
+                [e.employee_id for e in u.employees]
+                for u in completed.recent_frames[0].units
+            ],
+            [["A10001"], ["A10002"]],
+        )
+        self.provider.assert_called_once()
 
     def test_provider_only_employee_mentions_resume_without_resegmentation(self):
         question = "Morgan: count attendance records; Taylor: count distinct dates"

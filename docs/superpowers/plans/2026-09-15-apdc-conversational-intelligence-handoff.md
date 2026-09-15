@@ -8,7 +8,9 @@ Worktree: `D:\w\apdc`
 
 - `32ac2093` — `test: enforce multilingual conversation parity`
 - `6cd22a32` — `test: verify conversational attendance safety and quality`
-- The handoff is included in the final documentation commit for this task.
+- `cdb8fe3f` — `fix: harden conversational review boundaries`
+- The independent review report and refreshed handoff are included in the final
+  documentation commit.
 
 ## Delivered scope
 
@@ -23,10 +25,11 @@ Task 10 completed the privacy/evaluator review. Production event emission uses
 an explicit key/value allowlist with recursive handling for mappings,
 sequences, dataclasses, model-like payloads, objects, and exceptions.
 Failure events carry controlled failure codes only. Application and evaluator
-failures use fixed safe diagnostics, and aggregate result values were removed
-from answer logging. Synthetic local evaluator contracts cover fast paths,
-context resumption, invalid provider decisions, call counts, no-partial-result
-atomicity, and analyst-visible `Question` columns.
+failures use fixed safe diagnostics, aggregate result values were removed from
+answer logging, and analyst detail tables retain `Question`. The independent
+review removed a circular test-only synthetic evaluator helper; real public
+answer, provider, compound-conversation, and atomicity suites own the relevant
+call-count and no-partial-result contracts.
 
 No real employee transcript, identity, expected value, manifest, migration, or
 private fixture was added.
@@ -43,17 +46,12 @@ PYTHONIOENCODING=utf-8
 
 Commands and results:
 
-- `python -m unittest discover -s week5 -p '*test*.py' -q` — 650 tests,
+- `python -m unittest discover -s week5 -p '*test*.py' -q` — 662 tests,
   0 failures, 6 existing skips.
-- `python -m unittest week5.new_implementation.test_answer -q` — 205 tests,
-  0 failures, 1 existing skip.
-- Multilingual focused suites (`test_language_understanding`,
-  `test_conversation_understanding`, `test_tolerant_input_robustness`,
-  `test_semantic_matrix`, `test_compound_conversation`) — 104 tests,
-  0 failures.
-- Final Task 10 focused suites (`test_observability`, `test_new_app`,
-  `test_new_evaluator`) — 27 tests, 0 failures.
-- `py_compile` passed for the changed production modules.
+- Unified Task 3–10 suites — 606 tests, 0 failures, 6 existing skips.
+- Independent final focused re-review — 89 tests, 0 failures.
+- Python compilation passed for implementation, evaluator, and application
+  scopes.
 - Scoped Ruff check and Ruff format check passed.
 - `git diff --check` passed.
 - Import and signature assertions for observability, application, and
@@ -65,12 +63,12 @@ during discovery. It is pre-existing and unrelated to this work.
 
 ## Review gate
 
-The final diff was independently re-read against the Task 9–10 briefs. The
-review checked production diagnostics for `logger.exception`, exception text,
-provider payloads, plan payloads, SQL, raw question/evidence, and aggregate
-answer values. It also checked the Task 9 source-span/locale paths, evaluator
-column preservation, test scope, and the unchanged planning boundary. No open
-Task 9 or Task 10 findings remain.
+The final diff was independently re-read against the Task 9–10 briefs after all
+review fixes. The review checked production diagnostics, normalized multilingual
+routing, source-span grounding, provider/retrieval/compiler/state/clarification
+boundaries, evaluator attribution and `Question` visibility, atomicity,
+deterministic rendering, test-only paths, and the unchanged planning boundary.
+No open Critical or Important Task 9 or Task 10 finding remains.
 
 ## Unrun live/private checks
 

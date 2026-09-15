@@ -241,8 +241,7 @@ FUZZY_NAME_THRESHOLD = settings.fuzzy_name_threshold
 ACCESS_DENIED_MESSAGE = "This demo supports authorized attendance questions only."
 _UNSUPPORTED_DOMAIN_PATTERN = re.compile(
     r"\b(?:payroll|salar(?:y|ies)|loans?|repayments?|benefits?)\b"
-    r"|\braw_source_rows\b|\bprivate\s+raw\b"
-    r"|\b(?:write|compose|create)\s+(?:a\s+)?(?:poem|story|song|joke)\b",
+    r"|\braw_source_rows\b|\bprivate\s+raw\b",
     flags=re.IGNORECASE,
 )
 
@@ -265,6 +264,26 @@ def _require_supported_attendance_question(question: str):
         raise PlanValidationError("Please enter an attendance question using words.")
     if _UNSUPPORTED_DOMAIN_PATTERN.search(question):
         raise DomainAccessDeniedError(ACCESS_DENIED_MESSAGE)
+
+
+def _social_reply(locale: str) -> str:
+    return (
+        "مرحبًا! يمكنني مساعدتك في أسئلة الحضور."
+        if locale == "ar"
+        else "Hello! I can help with attendance questions."
+    )
+
+
+def _social_acknowledgment(locale: str) -> str:
+    return "مرحبًا!" if locale == "ar" else "Hello!"
+
+
+def _unrelated_refusal(locale: str) -> str:
+    return (
+        "يمكنني المساعدة في أسئلة الحضور، لكن لا يمكنني المساعدة في الطلبات غير المتعلقة بالحضور."
+        if locale == "ar"
+        else "I can help with attendance questions, but I can't help with unrelated requests."
+    )
 
 
 class _LazyOpenAI:
@@ -6365,14 +6384,10 @@ def _answer_question_with_state(
         route = conversation.conversation_preflight_route(question)
         if route == "protected":
             return ACCESS_DENIED_MESSAGE, [], state
-        if route in {"social", "unrelated"}:
-            return (
-                "يمكنني مساعدتك في أسئلة الحضور."
-                if reply_locale == "ar"
-                else "I can help with attendance questions.",
-                [],
-                state,
-            )
+        if route == "social":
+            return _social_reply(reply_locale), [], state
+        if route == "unrelated":
+            return _unrelated_refusal(reply_locale), [], state
         _require_supported_attendance_question(question)
     except DomainAccessDeniedError:
         return ACCESS_DENIED_MESSAGE, [], state
@@ -6559,18 +6574,49 @@ def _answer_question_with_state(
                 materialized = conversation.materialize_conversation_units(
                     validated, resolved_mentions=resolved_mentions
                 )
-                if any(unit.route != "attendance" for unit in materialized):
-                    return _format_conversation_help(reply_locale), [], state
-                if len(materialized) > 1:
-                    return _answer_compound_turn(
-                        question,
-                        tuple(
-                            _pending_unit(unit, reply_locale) for unit in materialized
-                        ),
-                        state,
-                        locale=reply_locale,
-                        access_context=access_context,
+                attendance_units = tuple(
+                    unit for unit in materialized if unit.route == "attendance"
+                )
+                has_social = any(unit.route == "social" for unit in materialized)
+                has_unrelated = any(unit.route == "unrelated" for unit in materialized)
+                if not attendance_units:
+                    replies = []
+                    if has_social:
+                        replies.append(_social_acknowledgment(reply_locale))
+                    if has_unrelated:
+                        replies.append(_unrelated_refusal(reply_locale))
+                    return "\n\n".join(replies), [], state
+                if len(materialized) > 1 or has_social or has_unrelated:
+                    attendance_text, attendance_chunks, attendance_state = (
+                        _answer_compound_turn(
+                            question,
+                            tuple(
+                                _pending_unit(unit, reply_locale)
+                                for unit in attendance_units
+                            ),
+                            state,
+                            locale=reply_locale,
+                            access_context=access_context,
+                        )
                     )
+                    replies = []
+                    if has_social:
+                        replies.append(_social_acknowledgment(reply_locale))
+                    if attendance_text:
+                        replies.append(attendance_text)
+                    if has_unrelated and not (
+                        attendance_state.pending_request is not None
+                        and attendance_state.pending_request.unrelated_refusal_given
+                    ):
+                        replies.append(_unrelated_refusal(reply_locale))
+                        if attendance_state.pending_request is not None:
+                            _write_pending_request(
+                                attendance_state,
+                                attendance_state.pending_request.model_copy(
+                                    update={"unrelated_refusal_given": True}
+                                ),
+                            )
+                    return "\n\n".join(replies), attendance_chunks, attendance_state
                 contextual_unit = materialized[0]
             except conversation.ConversationDecisionValidationError:
                 return _format_conversation_help(reply_locale), [], state

@@ -361,6 +361,7 @@ class PendingRequestFrame(_StrictFrozenModel):
     pending_candidates: tuple[EmployeeOption, ...] = ()
     pending_constraint: PendingConstraintSnapshot | None = None
     pending_interpretations: tuple[InterpretationName, ...] = ()
+    unrelated_refusal_given: bool = False
 
     @field_validator("original_question")
     @classmethod

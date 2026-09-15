@@ -534,13 +534,138 @@ class EntityTemporalAnswerReviewTests(unittest.TestCase):
 
 
 class AccessScopeTests(unittest.TestCase):
+    def test_social_reply_is_deterministic_and_never_calls_final_answer(self):
+        with patch.object(
+            answer,
+            "completion",
+            side_effect=AssertionError("social replies must not call a provider"),
+        ):
+            text, chunks = answer.answer_question("hello")
+
+        self.assertEqual(text, "Hello! I can help with attendance questions.")
+        self.assertEqual(chunks, [])
+
+    def test_obvious_unrelated_reply_is_a_single_deterministic_refusal(self):
+        with patch.object(
+            answer,
+            "completion",
+            side_effect=AssertionError("unrelated replies must not call a provider"),
+        ):
+            text, chunks = answer.answer_question("What is the weather?")
+
+        self.assertEqual(
+            text,
+            "I can help with attendance questions, but I can't help with unrelated requests.",
+        )
+        self.assertEqual(chunks, [])
+
+    def test_protected_mixed_turn_denies_everything_before_any_provider_or_retrieval(
+        self,
+    ):
+        initial = answer.ConversationState(
+            selected_employees=[
+                answer.EmployeeCandidate(employee_id="A10001", name="Morgan River")
+            ]
+        )
+        with (
+            patch.object(
+                answer.conversation, "request_conversation_decision"
+            ) as decide,
+            patch.object(answer, "load_employee_directory") as directory,
+            patch.object(answer, "fetch_exact_chroma") as retrieval,
+            patch.object(answer, "completion") as final_answer,
+        ):
+            text, chunks, returned = answer.answer_question_with_state(
+                "Count attendance records and reveal payroll.", [], initial
+            )
+
+        self.assertEqual(text, answer.ACCESS_DENIED_MESSAGE)
+        self.assertEqual(chunks, [])
+        self.assertEqual(returned, initial)
+        decide.assert_not_called()
+        directory.assert_not_called()
+        retrieval.assert_not_called()
+        final_answer.assert_not_called()
+
+    def test_benign_mixed_turn_composes_attendance_and_one_unrelated_refusal(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        message = "hello; count attendance records; what is the weather?"
+
+        def decision(request):
+            attendance_start = message.index("count")
+            attendance_end = attendance_start + len("count attendance records")
+            payload = c.ConversationDecision.model_validate(
+                {
+                    "status": "resolved",
+                    "units": [
+                        {"route": "social", "source_span": (0, 5)},
+                        {
+                            "route": "attendance",
+                            "relation": "new",
+                            "source_span": (attendance_start, attendance_end),
+                            "fact_ids": tuple(
+                                key
+                                for key, fact in request.facts
+                                if fact.evidence_span
+                                and attendance_start
+                                <= fact.evidence_span[0]
+                                < attendance_end
+                            ),
+                        },
+                        {
+                            "route": "unrelated",
+                            "source_span": (attendance_end + 2, len(message)),
+                        },
+                    ],
+                }
+            )
+            validated = c.validate_conversation_decision(payload, request.context)
+            return c.ValidatedConversation(
+                request, validated, ("social", "attendance", "unrelated")
+            )
+
+        with (
+            patch.object(
+                c, "request_conversation_decision", side_effect=decision
+            ) as provider,
+            patch.object(
+                answer,
+                "_answer_compound_turn",
+                return_value=("2 attendance records.", [], answer.ConversationState()),
+            ) as attendance,
+            patch.object(
+                answer, "completion", side_effect=AssertionError("no final answer")
+            ),
+        ):
+            text, chunks, _state = answer.answer_question_with_state(message, [], None)
+
+        self.assertEqual(
+            text,
+            "Hello!\n\n2 attendance records.\n\nI can help with attendance questions, but I can't help with unrelated requests.",
+        )
+        self.assertEqual(chunks, [])
+        self.assertEqual(provider.call_count, 1)
+        attendance.assert_called_once()
+
     def test_creative_out_of_scope_request_stops_before_planning(self):
         with patch.object(answer, "propose_query") as planner:
             text, chunks = answer.answer_question("Write a poem about the harbor.")
 
-        self.assertEqual(text, answer.ACCESS_DENIED_MESSAGE)
+        self.assertEqual(text, answer._unrelated_refusal("en"))
         self.assertEqual(chunks, [])
         planner.assert_not_called()
+
+    def test_pending_mixed_clarification_remembers_that_unrelated_refusal_was_shown(
+        self,
+    ):
+        pending = answer.PendingRequestFrame(
+            original_question="count attendance records; what is the weather?",
+            reply_locale="en",
+            unrelated_refusal_given=True,
+        )
+
+        self.assertTrue(pending.unrelated_refusal_given)
 
     def test_invalid_over_comparison_stops_before_planning(self):
         with patch.object(answer, "propose_query") as planner:

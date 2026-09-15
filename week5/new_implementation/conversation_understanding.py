@@ -505,7 +505,8 @@ def conversation_preflight_route(
     ):
         return "social"
     if re.search(
-        r"\b(?:weather|recipe|recipes)\b|(?:الطقس|وصفة طبخ)", normalized
+        r"\b(?:weather|recipe|recipes|poem|story|song|joke)\b|(?:الطقس|وصفة طبخ|قصيدة|قصة|اغنية|نكتة)",
+        normalized,
     ) and not re.search(
         r"\b(?:attendance|employee|records?|days?|hours?|worked|overtime)\b|(?:حضور|موظف|سجلات|ايام|ساعات|عمل)",
         normalized,

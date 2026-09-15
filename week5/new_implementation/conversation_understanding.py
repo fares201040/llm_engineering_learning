@@ -1,6 +1,7 @@
 """Strict contracts for bounded, source-grounded conversation decisions."""
 
 from dataclasses import dataclass
+from collections.abc import Mapping
 import json
 import re
 import uuid
@@ -23,6 +24,7 @@ try:
         AttendanceUnitFrame,
         ConversationTurnFrame,
         EmployeeReferent,
+        ResultSnapshot,
         normalize_for_matching,
     )
     from .semantic_resolution import SemanticFact
@@ -33,6 +35,7 @@ except ImportError:
         AttendanceUnitFrame,
         ConversationTurnFrame,
         EmployeeReferent,
+        ResultSnapshot,
         normalize_for_matching,
     )
     from semantic_resolution import SemanticFact
@@ -54,6 +57,17 @@ ConversationAmbiguityReason = Literal[
     "missing_context",
     "insufficient_grounding",
 ]
+_RESULT_FACT_KINDS = frozenset(
+    {
+        "measure",
+        "calculation",
+        "projection",
+        "semantic_intent",
+        "result_intent",
+        "result_shape",
+    }
+)
+_EMPLOYEE_FIELDS = frozenset({"Employee_ID", "Name"})
 
 
 class _StrictFrozenModel(BaseModel):
@@ -466,9 +480,9 @@ ConversationUnitDraft = ConversationUnitDecision
 
 
 _CONTEXTUAL_LANGUAGE = re.compile(
-    r"\b(?:again|same|him|her|them|they|both|former|latter|separately|together)\b"
+    r"\b(?:again|same|him|her|them|they|both|former|latter|separately|together|explain|why)\b"
     r"|\b(?:what|how)\s+about\b|^(?:and|also|then)\b"
-    r"|(?:مرة أخرى|مجددا|نفسه|نفسها|كلاهما|كليهما|بشكل منفصل)"
+    r"|(?:مرة أخرى|مجددا|نفسه|نفسها|كلاهما|كليهما|بشكل منفصل|اشرح|لماذا)"
     r"|\b(?:له|لها|لهم|هو|هي|هم|معا)\b",
     re.I,
 )
@@ -554,6 +568,267 @@ class ValidatedConversation:
     request: ConversationRequest
     decision: ConversationDecision
     unit_ids: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MaterializedConversationUnit:
+    unit_id: str
+    route: ConversationRoute
+    relation: ConversationRelation | None
+    source_text: str
+    facts: tuple[SemanticFact, ...] = ()
+    employees: tuple[EmployeeReferent, ...] = ()
+    view: MultiEmployeeDateView | None = None
+    explain_previous: bool = False
+    prior_result: ResultSnapshot | None = None
+
+
+def materialize_unit_mask(message: str, source_span: tuple[int, int]) -> str:
+    """Retain one unit in place so every original source offset remains valid."""
+    start, end = source_span
+    return " " * start + message[start:end] + " " * (len(message) - end)
+
+
+def _trusted_fact(fact: SemanticFact) -> SemanticFact:
+    return fact.model_copy(
+        update={
+            "origin": "trusted_state",
+            "evidence_span": None,
+            "consumed_span": None,
+        }
+    )
+
+
+def _normalized_fact_values(fact: SemanticFact) -> frozenset[str]:
+    return frozenset(str(value).strip().casefold() for value in fact.values)
+
+
+def _facts_contradict(left: SemanticFact, right: SemanticFact) -> bool:
+    if (
+        left.kind != "filter"
+        or right.kind != "filter"
+        or left.field != right.field
+        or left.scope != right.scope
+    ):
+        return False
+    left_values = _normalized_fact_values(left)
+    right_values = _normalized_fact_values(right)
+    if left.operator == right.operator == "eq":
+        return left_values != right_values
+    if left.operator in {"eq", "in"} and right.operator in {"eq", "in"}:
+        return not bool(left_values & right_values)
+    if left.operator == "eq" and right.operator == "ne":
+        return bool(left_values & right_values)
+    if left.operator == "ne" and right.operator == "eq":
+        return bool(left_values & right_values)
+    return False
+
+
+def materialize_conversation_units(
+    validated: ValidatedConversation,
+    *,
+    resolved_mentions: Mapping[tuple[int, int], tuple[EmployeeReferent, ...]]
+    | None = None,
+) -> tuple[MaterializedConversationUnit, ...]:
+    """Map validated opaque choices back to server-owned state."""
+    if len(validated.unit_ids) != len(validated.decision.units):
+        raise ConversationDecisionValidationError("unit identifiers do not align")
+    facts = dict(validated.request.facts)
+    employees = dict(validated.request.employees)
+    prior_units = dict(validated.request.prior_units)
+    views = dict(validated.request.views)
+    resolved_mentions = resolved_mentions or {}
+    materialized = []
+    for unit_index, (unit_id, decision) in enumerate(
+        zip(validated.unit_ids, validated.decision.units)
+    ):
+        source_text = materialize_unit_mask(
+            validated.request.context.message, decision.source_span
+        )
+        if decision.route != "attendance":
+            materialized.append(
+                MaterializedConversationUnit(
+                    unit_id=unit_id,
+                    route=decision.route,
+                    relation=None,
+                    source_text=source_text,
+                )
+            )
+            continue
+        selected_facts = tuple(facts[fact_id] for fact_id in decision.fact_ids)
+        if any(fact.strength != "strong" for fact in selected_facts):
+            raise ConversationDecisionValidationError(
+                "low-confidence facts cannot be materialized"
+            )
+        selected_employees = []
+        for mention_index, mention in enumerate(decision.employee_mentions):
+            if isinstance(mention, ReferenceChoiceEmployeeMention):
+                selected_employees.append(employees[mention.choice_id])
+            elif isinstance(mention, ResolveEmployeeMention):
+                key = (unit_index, mention_index)
+                if key not in resolved_mentions:
+                    raise ConversationDecisionValidationError(
+                        "employee mention requires deterministic resolution"
+                    )
+                selected_employees.extend(resolved_mentions[key])
+            else:
+                if mention.unit_index >= unit_index:
+                    raise ConversationDecisionValidationError(
+                        "same-turn employee reference is unavailable"
+                    )
+                selected_employees.extend(materialized[mention.unit_index].employees)
+        selected_view = (
+            views[decision.view_choice_id]
+            if decision.view_choice_id is not None
+            else None
+        )
+        if decision.relation == "new":
+            materialized.append(
+                MaterializedConversationUnit(
+                    unit_id=unit_id,
+                    route="attendance",
+                    relation=decision.relation,
+                    source_text=source_text,
+                    facts=selected_facts,
+                    employees=tuple(dict.fromkeys(selected_employees)),
+                    view=selected_view,
+                )
+            )
+            continue
+        base = prior_units.get(decision.base_unit_choice_id)
+        if base is None:
+            raise ConversationDecisionValidationError("base-unit choice is unavailable")
+        if decision.relation == "modify_scope":
+            if any(fact.kind in _RESULT_FACT_KINDS for fact in selected_facts):
+                raise ConversationDecisionValidationError(
+                    "scope changes cannot replace result facts"
+                )
+            changed_fields = {
+                fact.field for fact in selected_facts if fact.field is not None
+            }
+            if selected_employees:
+                changed_fields.update(_EMPLOYEE_FIELDS)
+            inherited = tuple(
+                _trusted_fact(fact)
+                for fact in base.facts
+                if fact.field not in changed_fields
+                and not (selected_employees and fact.kind == "entity")
+            )
+            materialized.append(
+                MaterializedConversationUnit(
+                    unit_id=unit_id,
+                    route="attendance",
+                    relation=decision.relation,
+                    source_text=source_text,
+                    facts=inherited + selected_facts,
+                    employees=(
+                        tuple(dict.fromkeys(selected_employees))
+                        if selected_employees
+                        else base.employees
+                    ),
+                    view=selected_view,
+                    prior_result=base.result,
+                )
+            )
+            continue
+        if decision.relation == "replace_result":
+            if selected_employees or any(
+                fact.kind not in _RESULT_FACT_KINDS for fact in selected_facts
+            ):
+                raise ConversationDecisionValidationError(
+                    "result changes may contain only result facts"
+                )
+            inherited = tuple(
+                _trusted_fact(fact)
+                for fact in base.facts
+                if fact.kind not in _RESULT_FACT_KINDS
+            )
+            materialized.append(
+                MaterializedConversationUnit(
+                    unit_id=unit_id,
+                    route="attendance",
+                    relation=decision.relation,
+                    source_text=source_text,
+                    facts=inherited + selected_facts,
+                    employees=base.employees,
+                    prior_result=base.result,
+                )
+            )
+            continue
+        if decision.relation == "add_constraints":
+            if selected_employees or any(
+                fact.kind in _RESULT_FACT_KINDS for fact in selected_facts
+            ):
+                raise ConversationDecisionValidationError(
+                    "added constraints may contain only scope facts"
+                )
+            if any(
+                _facts_contradict(existing, added)
+                for existing in base.facts
+                for added in selected_facts
+            ):
+                raise ConversationDecisionValidationError(
+                    "added constraint contradicts trusted facts"
+                )
+            materialized.append(
+                MaterializedConversationUnit(
+                    unit_id=unit_id,
+                    route="attendance",
+                    relation=decision.relation,
+                    source_text=source_text,
+                    facts=(
+                        tuple(_trusted_fact(fact) for fact in base.facts)
+                        + selected_facts
+                    ),
+                    employees=base.employees,
+                    prior_result=base.result,
+                )
+            )
+            continue
+        if decision.relation == "change_view":
+            materialized.append(
+                MaterializedConversationUnit(
+                    unit_id=unit_id,
+                    route="attendance",
+                    relation=decision.relation,
+                    source_text=source_text,
+                    facts=tuple(_trusted_fact(fact) for fact in base.facts),
+                    employees=base.employees,
+                    view=selected_view,
+                    prior_result=base.result,
+                )
+            )
+            continue
+        if decision.relation == "explain_previous":
+            materialized.append(
+                MaterializedConversationUnit(
+                    unit_id=unit_id,
+                    route="attendance",
+                    relation=decision.relation,
+                    source_text=source_text,
+                    facts=tuple(_trusted_fact(fact) for fact in base.facts),
+                    employees=base.employees,
+                    explain_previous=True,
+                    prior_result=base.result,
+                )
+            )
+            continue
+        if decision.relation != "repeat":
+            raise ConversationDecisionValidationError(
+                "conversation relation is not materializable"
+            )
+        materialized.append(
+            MaterializedConversationUnit(
+                unit_id=unit_id,
+                route="attendance",
+                relation=decision.relation,
+                source_text=source_text,
+                facts=tuple(_trusted_fact(fact) for fact in base.facts),
+                employees=base.employees,
+                prior_result=base.result,
+            )
+        )
+    return tuple(materialized)
 
 
 def build_conversation_request(

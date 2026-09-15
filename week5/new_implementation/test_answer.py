@@ -3937,6 +3937,497 @@ class PostgresResultTests(unittest.TestCase):
 
 
 class ConversationGatewayTests(unittest.TestCase):
+    def test_validated_repeat_resumes_through_existing_deterministic_boundary(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        employee = answer.EmployeeCandidate(employee_id="A10001", name="Morgan River")
+        referent = answer.EmployeeReferent(**employee.model_dump())
+        prior_fact = answer.SemanticFact(
+            kind="measure",
+            concept_name="attendance_records",
+            evidence_text="records",
+            origin="question",
+            strength="strong",
+        )
+        state = answer.ConversationState(
+            referents=[referent],
+            active_referent_ids=[employee.employee_id],
+            recent_frames=[
+                answer.ConversationTurnFrame(
+                    original_question="count records for Morgan River",
+                    reply_locale="en",
+                    units=(
+                        answer.AttendanceUnitFrame(
+                            unit_id="prior-unit",
+                            source_text="count records for Morgan River",
+                            facts=(prior_fact,),
+                            employees=(referent,),
+                            result=answer.ResultSnapshot(),
+                        ),
+                    ),
+                )
+            ],
+        )
+
+        def decide(request):
+            decision = c.ConversationDecision.model_validate(
+                {
+                    "status": "resolved",
+                    "units": [
+                        {
+                            "route": "attendance",
+                            "relation": "repeat",
+                            "source_span": (0, 5),
+                            "base_unit_choice_id": request.context.prior_unit_choice_ids[
+                                0
+                            ],
+                        }
+                    ],
+                }
+            )
+            return c.ValidatedConversation(request, decision, ("resumed-unit",))
+
+        result = answer.ContextFetchResult(
+            [],
+            answer.QueryPlan(mode="exact", search_query="again"),
+            None,
+            0,
+            [employee],
+        )
+        with (
+            patch.object(answer, "load_employee_directory", return_value=[employee]),
+            patch.object(c, "request_conversation_decision", side_effect=decide),
+            patch.object(answer, "_fetch_context_result", return_value=result) as fetch,
+            patch.object(
+                answer, "_answer_from_context", return_value=("0 records.", [])
+            ),
+        ):
+            text, chunks, returned = answer.answer_question_with_state(
+                "again", [], state
+            )
+
+        self.assertEqual(text, "0 records.")
+        self.assertEqual(chunks, [])
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(fetch.call_args.kwargs["default_employees"], [employee])
+        inherited = fetch.call_args.kwargs["prepared_facts"]
+        self.assertEqual(inherited[0].concept_name, "attendance_records")
+        self.assertEqual(inherited[0].origin, "trusted_state")
+        self.assertEqual(returned.recent_frames[-1].units[0].unit_id, "resumed-unit")
+
+    def test_contextual_employee_change_is_resolved_by_directory_before_resumption(
+        self,
+    ):
+        from week5.new_implementation import conversation_understanding as c
+
+        old = answer.EmployeeCandidate(employee_id="A10001", name="Morgan River")
+        new = answer.EmployeeCandidate(employee_id="A10002", name="Sam North")
+        old_referent = answer.EmployeeReferent(**old.model_dump())
+        base_fact = answer.SemanticFact(
+            kind="measure",
+            concept_name="worked_days",
+            evidence_text="worked days",
+            origin="question",
+            strength="strong",
+        )
+        state = answer.ConversationState(
+            referents=[old_referent],
+            active_referent_ids=[old.employee_id],
+            recent_frames=[
+                answer.ConversationTurnFrame(
+                    original_question="worked days for Morgan River",
+                    reply_locale="en",
+                    units=(
+                        answer.AttendanceUnitFrame(
+                            unit_id="prior",
+                            source_text="worked days for Morgan River",
+                            facts=(base_fact,),
+                            employees=(old_referent,),
+                            result=answer.ResultSnapshot(),
+                        ),
+                    ),
+                )
+            ],
+        )
+        question = "what about A10002"
+        entity = answer.SemanticFact(
+            kind="entity",
+            field="Employee_ID",
+            values=(new.employee_id,),
+            evidence_text=new.employee_id,
+            evidence_span=(11, 17),
+            origin="question",
+            strength="strong",
+        )
+
+        def decide(request):
+            decision = c.ConversationDecision.model_validate(
+                {
+                    "status": "resolved",
+                    "units": [
+                        {
+                            "route": "attendance",
+                            "relation": "modify_scope",
+                            "source_span": (0, len(question)),
+                            "base_unit_choice_id": request.context.prior_unit_choice_ids[
+                                0
+                            ],
+                            "fact_ids": request.context.fact_choice_ids,
+                            "employee_mentions": (
+                                {"kind": "resolve", "source_span": (11, 17)},
+                            ),
+                        }
+                    ],
+                }
+            )
+            return c.ValidatedConversation(request, decision, ("changed",))
+
+        result = answer.ContextFetchResult(
+            [], answer.QueryPlan(mode="exact", search_query=question), None, 0, [new]
+        )
+        with (
+            patch.object(answer, "detect_semantic_facts", return_value=(entity,)),
+            patch.object(answer, "_facts_from_question_surface", return_value=()),
+            patch.object(answer, "load_employee_directory", return_value=[old, new]),
+            patch.object(c, "request_conversation_decision", side_effect=decide),
+            patch.object(answer, "_fetch_context_result", return_value=result) as fetch,
+            patch.object(answer, "_answer_from_context", return_value=("changed", [])),
+        ):
+            text, _, _ = answer.answer_question_with_state(question, [], state)
+
+        self.assertEqual(text, "changed")
+        self.assertEqual(fetch.call_args.kwargs["default_employees"], [new])
+        self.assertIn(
+            "worked_days",
+            {fact.concept_name for fact in fetch.call_args.kwargs["prepared_facts"]},
+        )
+
+    def test_both_binds_all_active_confirmed_referents(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        employees = [
+            answer.EmployeeCandidate(employee_id="A10001", name="Morgan River"),
+            answer.EmployeeCandidate(employee_id="A10002", name="Sam North"),
+            answer.EmployeeCandidate(employee_id="A10003", name="Taylor Lake"),
+        ]
+        referents = [answer.EmployeeReferent(**item.model_dump()) for item in employees]
+        state = answer.ConversationState(
+            referents=referents,
+            active_referent_ids=[item.employee_id for item in employees[:2]],
+        )
+        question = "worked days for both"
+        fact = answer.SemanticFact(
+            kind="measure",
+            concept_name="worked_days",
+            evidence_text="worked days",
+            evidence_span=(0, 11),
+            origin="question",
+            strength="strong",
+        )
+        entity = answer.SemanticFact(
+            kind="entity",
+            field="Name",
+            values=("both",),
+            evidence_text="both",
+            evidence_span=(16, 20),
+            origin="question",
+            strength="strong",
+        )
+
+        def decide(request):
+            decisions = tuple(
+                {
+                    "kind": "reference_choice",
+                    "source_span": (16, 20),
+                    "choice_id": choice_id,
+                }
+                for choice_id in request.context.employee_span_choices[0].choice_ids
+            )
+            return c.ValidatedConversation(
+                request,
+                c.ConversationDecision.model_validate(
+                    {
+                        "status": "resolved",
+                        "units": [
+                            {
+                                "route": "attendance",
+                                "relation": "new",
+                                "source_span": (0, len(question)),
+                                "fact_ids": request.context.fact_choice_ids,
+                                "employee_mentions": decisions,
+                            }
+                        ],
+                    }
+                ),
+                ("both-unit",),
+            )
+
+        result = answer.ContextFetchResult(
+            [],
+            answer.QueryPlan(mode="exact", search_query=question),
+            None,
+            0,
+            employees[:2],
+        )
+        with (
+            patch.object(answer, "detect_semantic_facts", return_value=(fact, entity)),
+            patch.object(answer, "_facts_from_question_surface", return_value=()),
+            patch.object(answer, "load_employee_directory", return_value=employees),
+            patch.object(c, "request_conversation_decision", side_effect=decide),
+            patch.object(answer, "_fetch_context_result", return_value=result) as fetch,
+            patch.object(answer, "_answer_from_context", return_value=("both", [])),
+        ):
+            text, _, _ = answer.answer_question_with_state(question, [], state)
+
+        self.assertEqual(text, "both")
+        self.assertEqual(fetch.call_args.kwargs["default_employees"], employees[:2])
+
+    def test_context_choice_resumes_the_selected_complete_prior_request(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        employees = [
+            answer.EmployeeCandidate(employee_id="A10001", name="Morgan River"),
+            answer.EmployeeCandidate(employee_id="A10002", name="Sam North"),
+        ]
+        facts = [
+            answer.SemanticFact(
+                kind="measure",
+                concept_name=concept,
+                evidence_text=evidence,
+                origin="question",
+                strength="strong",
+            )
+            for concept, evidence in (
+                ("attendance_records", "records"),
+                ("worked_days", "worked days"),
+            )
+        ]
+        units = tuple(
+            answer.AttendanceUnitFrame(
+                unit_id=f"prior-{index}",
+                source_text=fact.evidence_text,
+                facts=(fact,),
+                employees=(answer.EmployeeReferent(**employee.model_dump()),),
+                result=answer.ResultSnapshot(),
+            )
+            for index, (fact, employee) in enumerate(zip(facts, employees), start=1)
+        )
+        state = answer.ConversationState(
+            referents=[
+                answer.EmployeeReferent(**item.model_dump()) for item in employees
+            ],
+            active_referent_ids=[item.employee_id for item in employees],
+            recent_frames=[
+                answer.ConversationTurnFrame(
+                    original_question="two requests", reply_locale="en", units=units
+                )
+            ],
+        )
+
+        def ambiguous(request):
+            return c.ValidatedConversation(
+                request=request,
+                decision=c.ConversationDecision.model_validate(
+                    {"status": "ambiguous", "reason": "ambiguous_reference"}
+                ),
+                unit_ids=(),
+            )
+
+        result = answer.ContextFetchResult(
+            [],
+            answer.QueryPlan(mode="exact", search_query="again"),
+            None,
+            0,
+            [employees[1]],
+        )
+        with (
+            patch.object(answer, "load_employee_directory", return_value=employees),
+            patch.object(
+                c, "request_conversation_decision", side_effect=ambiguous
+            ) as decide,
+            patch.object(answer, "_fetch_context_result", return_value=result) as fetch,
+            patch.object(answer, "_answer_from_context", return_value=("second", [])),
+        ):
+            prompt, _, pending = answer.answer_question_with_state("again", [], state)
+            text, _, resumed = answer.answer_question_with_state("2", [], pending)
+
+        self.assertIn("previous attendance request", prompt.lower())
+        self.assertEqual(text, "second")
+        self.assertEqual(decide.call_count, 1)
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(
+            fetch.call_args.kwargs["prepared_facts"][0].concept_name, "worked_days"
+        )
+        self.assertEqual(fetch.call_args.kwargs["default_employees"], [employees[1]])
+        self.assertIsNone(resumed.pending_clarification)
+
+    def test_explain_previous_recompiles_and_describes_trusted_result_basis(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        fact = answer.SemanticFact(
+            kind="measure",
+            concept_name="attendance_records",
+            evidence_text="records",
+            origin="question",
+            strength="strong",
+        )
+        state = answer.ConversationState(
+            recent_frames=[
+                answer.ConversationTurnFrame(
+                    original_question="count records",
+                    reply_locale="en",
+                    units=(
+                        answer.AttendanceUnitFrame(
+                            unit_id="prior",
+                            source_text="count records",
+                            facts=(fact,),
+                            result=answer.ResultSnapshot(matched_count=4),
+                        ),
+                    ),
+                )
+            ]
+        )
+
+        def decide(request):
+            return c.ValidatedConversation(
+                request,
+                c.ConversationDecision.model_validate(
+                    {
+                        "status": "resolved",
+                        "units": [
+                            {
+                                "route": "attendance",
+                                "relation": "explain_previous",
+                                "source_span": (0, 12),
+                                "base_unit_choice_id": request.context.prior_unit_choice_ids[
+                                    0
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                ("explain",),
+            )
+
+        result = answer.ContextFetchResult(
+            [], answer.QueryPlan(mode="exact", search_query="explain that"), None, 4, []
+        )
+        with (
+            patch.object(c, "request_conversation_decision", side_effect=decide),
+            patch.object(answer, "_fetch_context_result", return_value=result) as fetch,
+            patch.object(
+                answer, "_answer_from_context", return_value=("4 records.", [])
+            ),
+        ):
+            text, _, _ = answer.answer_question_with_state("explain that", [], state)
+
+        self.assertEqual(fetch.call_count, 1)
+        self.assertIn("4 matching records", text)
+        self.assertIn("4 records.", text)
+
+    def test_employee_confirmation_resumes_the_complete_contextual_request(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        old = answer.EmployeeCandidate(employee_id="A10001", name="Morgan River")
+        new = answer.EmployeeCandidate(employee_id="A10002", name="Sam North")
+        base_fact = answer.SemanticFact(
+            kind="measure",
+            concept_name="worked_days",
+            evidence_text="worked days",
+            origin="question",
+            strength="strong",
+        )
+        state = answer.ConversationState(
+            referents=[answer.EmployeeReferent(**old.model_dump())],
+            active_referent_ids=[old.employee_id],
+            recent_frames=[
+                answer.ConversationTurnFrame(
+                    original_question="worked days for Morgan River",
+                    reply_locale="en",
+                    units=(
+                        answer.AttendanceUnitFrame(
+                            unit_id="prior",
+                            source_text="worked days for Morgan River",
+                            facts=(base_fact,),
+                            employees=(answer.EmployeeReferent(**old.model_dump()),),
+                            result=answer.ResultSnapshot(),
+                        ),
+                    ),
+                )
+            ],
+        )
+        question = "what about Sam"
+        entity = answer.SemanticFact(
+            kind="entity",
+            field="Name",
+            values=("Sam",),
+            evidence_text="Sam",
+            evidence_span=(11, 14),
+            origin="question",
+            strength="strong",
+        )
+
+        def decide(request):
+            selected = next(
+                key
+                for key, item in request.employees
+                if item.employee_id == new.employee_id
+            )
+            return c.ValidatedConversation(
+                request,
+                c.ConversationDecision.model_validate(
+                    {
+                        "status": "resolved",
+                        "units": [
+                            {
+                                "route": "attendance",
+                                "relation": "modify_scope",
+                                "source_span": (0, len(question)),
+                                "base_unit_choice_id": request.context.prior_unit_choice_ids[
+                                    0
+                                ],
+                                "fact_ids": request.context.fact_choice_ids,
+                                "employee_mentions": (
+                                    {
+                                        "kind": "reference_choice",
+                                        "source_span": (11, 14),
+                                        "choice_id": selected,
+                                    },
+                                ),
+                            }
+                        ],
+                    }
+                ),
+                ("confirmed-context",),
+            )
+
+        result = answer.ContextFetchResult(
+            [], answer.QueryPlan(mode="exact", search_query=question), None, 0, [new]
+        )
+        with (
+            patch.object(answer, "detect_semantic_facts", return_value=(entity,)),
+            patch.object(answer, "_facts_from_question_surface", return_value=()),
+            patch.object(answer, "load_employee_directory", return_value=[old, new]),
+            patch.object(
+                c, "request_conversation_decision", side_effect=decide
+            ) as gateway,
+            patch.object(answer, "_fetch_context_result", return_value=result) as fetch,
+            patch.object(
+                answer, "_answer_from_context", return_value=("confirmed", [])
+            ),
+        ):
+            _, _, pending = answer.answer_question_with_state(question, [], state)
+            text, _, _ = answer.answer_question_with_state("yes", [], pending)
+
+        self.assertEqual(text, "confirmed")
+        self.assertEqual(gateway.call_count, 1)
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(fetch.call_args.kwargs["default_employees"], [new])
+        self.assertIn(
+            "worked_days",
+            {fact.concept_name for fact in fetch.call_args.kwargs["prepared_facts"]},
+        )
+
     def test_grounded_both_projection_reaches_deterministic_path_without_completion(
         self,
     ):

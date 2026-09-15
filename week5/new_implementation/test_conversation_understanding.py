@@ -877,5 +877,660 @@ class ConversationContractTests(unittest.TestCase):
             )
 
 
+class ConversationMaterializationTests(unittest.TestCase):
+    def test_unit_mask_preserves_original_width_and_source_offsets(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        message = "hello and worked days for A10001"
+
+        masked = c.materialize_unit_mask(message, (10, len(message)))
+
+        self.assertEqual(len(masked), len(message))
+        self.assertEqual(masked[:10], " " * 10)
+        self.assertEqual(masked[10:], message[10:])
+
+    def test_repeat_maps_opaque_base_and_inherits_only_trusted_state(self):
+        from week5.new_implementation import conversation_understanding as c
+        from week5.new_implementation.language_understanding import ResultSnapshot
+
+        employee = c.EmployeeReferent(employee_id="A10001", name="Morgan River")
+        base_fact = c.SemanticFact(
+            kind="measure",
+            concept_name="worked_days",
+            evidence_text="worked days",
+            origin="question",
+            strength="strong",
+        )
+        frame = c.ConversationTurnFrame(
+            original_question="worked days for Morgan River",
+            reply_locale="en",
+            units=(
+                c.AttendanceUnitFrame(
+                    unit_id="stored-unit",
+                    source_text="worked days for Morgan River",
+                    facts=(base_fact,),
+                    employees=(employee,),
+                    result=ResultSnapshot(),
+                ),
+            ),
+        )
+        request = c.build_conversation_request(
+            "again", referents=(employee,), frames=(frame,)
+        )
+        decision = c.ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "source_span": (0, 5),
+                        "relation": "repeat",
+                        "base_unit_choice_id": request.context.prior_unit_choice_ids[0],
+                    }
+                ],
+            }
+        )
+        validated = c.ValidatedConversation(request, decision, ("new-unit",))
+
+        units = c.materialize_conversation_units(validated)
+
+        self.assertEqual(len(units), 1)
+        self.assertEqual(units[0].unit_id, "new-unit")
+        self.assertEqual(units[0].source_text, "again")
+        self.assertEqual(units[0].employees, (employee,))
+        self.assertEqual(units[0].facts[0].origin, "trusted_state")
+        self.assertEqual(units[0].facts[0].concept_name, "worked_days")
+
+    def test_new_unit_maps_authoritative_fact_employee_and_view_choices(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        message = "worked days for him"
+        employee = c.EmployeeReferent(employee_id="A10001", name="Morgan River")
+        fact = c.SemanticFact(
+            kind="measure",
+            concept_name="worked_days",
+            evidence_text="worked days",
+            evidence_span=(0, 11),
+            origin="question",
+            strength="strong",
+        )
+        request = c.build_conversation_request(
+            message,
+            (fact,),
+            (employee,),
+            active_referent_ids=(employee.employee_id,),
+            employee_sources=(
+                c.ConversationEmployeeSource(
+                    source_span=(16, 19), employee_ids=(employee.employee_id,)
+                ),
+            ),
+        )
+        fact_id = request.context.fact_choice_ids[0]
+        employee_id = request.context.employee_choice_ids[0]
+        view_id = next(key for key, value in request.views if value == "per_employee")
+        decision = c.ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "relation": "new",
+                        "source_span": (0, len(message)),
+                        "fact_ids": (fact_id,),
+                        "employee_mentions": (
+                            {
+                                "kind": "reference_choice",
+                                "source_span": (16, 19),
+                                "choice_id": employee_id,
+                            },
+                        ),
+                        "view_choice_id": view_id,
+                    }
+                ],
+            }
+        )
+
+        units = c.materialize_conversation_units(
+            c.ValidatedConversation(request, decision, ("new-unit",))
+        )
+
+        self.assertEqual(units[0].facts, (dict(request.facts)[fact_id],))
+        self.assertEqual(units[0].employees, (employee,))
+        self.assertEqual(units[0].view, "per_employee")
+
+    def test_same_turn_pronoun_inherits_confirmed_previous_unit_employees(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        message = "worked days for him and overtime hours for them"
+        employee = c.EmployeeReferent(employee_id="A10001", name="Morgan River")
+        facts = (
+            c.SemanticFact(
+                kind="measure",
+                concept_name="worked_days",
+                evidence_text="worked days",
+                evidence_span=(0, 11),
+                origin="question",
+                strength="strong",
+            ),
+            c.SemanticFact(
+                kind="calculation",
+                concept_name="sum",
+                field="Total_OT",
+                evidence_text="overtime hours",
+                evidence_span=(24, 38),
+                origin="question",
+                strength="strong",
+            ),
+        )
+        request = c.build_conversation_request(
+            message,
+            facts,
+            (employee,),
+            employee_sources=(
+                c.ConversationEmployeeSource(
+                    source_span=(16, 19), employee_ids=(employee.employee_id,)
+                ),
+            ),
+        )
+        fact_ids = request.context.fact_choice_ids
+        employee_choice = request.context.employee_choice_ids[0]
+        decision = c.ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "relation": "new",
+                        "source_span": (0, 19),
+                        "fact_ids": (fact_ids[0],),
+                        "employee_mentions": (
+                            {
+                                "kind": "reference_choice",
+                                "source_span": (16, 19),
+                                "choice_id": employee_choice,
+                            },
+                        ),
+                    },
+                    {
+                        "route": "attendance",
+                        "relation": "new",
+                        "source_span": (24, len(message)),
+                        "fact_ids": (fact_ids[1],),
+                        "employee_mentions": (
+                            {
+                                "kind": "previous_unit",
+                                "source_span": (43, 47),
+                                "unit_index": 0,
+                            },
+                        ),
+                    },
+                ],
+            }
+        )
+
+        units = c.materialize_conversation_units(
+            c.ValidatedConversation(request, decision, ("unit-1", "unit-2"))
+        )
+
+        self.assertEqual(units[1].employees, (employee,))
+        self.assertEqual(len(units[1].source_text), len(message))
+
+    def test_modify_scope_replaces_employee_and_date_but_keeps_result_and_constraints(
+        self,
+    ):
+        from week5.new_implementation import conversation_understanding as c
+        from week5.new_implementation.language_understanding import ResultSnapshot
+
+        old_employee = c.EmployeeReferent(employee_id="A10001", name="Morgan River")
+        new_employee = c.EmployeeReferent(employee_id="A10002", name="Sam North")
+        base_facts = (
+            c.SemanticFact(
+                kind="measure",
+                concept_name="worked_days",
+                evidence_text="worked days",
+                origin="question",
+                strength="strong",
+            ),
+            c.SemanticFact(
+                kind="filter",
+                field="Date",
+                operator="eq",
+                values=("2026-09-01",),
+                evidence_text="2026-09-01",
+                origin="question",
+                strength="strong",
+            ),
+            c.SemanticFact(
+                kind="filter",
+                field="Department",
+                operator="eq",
+                values=("Operations",),
+                evidence_text="Operations",
+                origin="question",
+                strength="strong",
+            ),
+        )
+        frame = c.ConversationTurnFrame(
+            original_question="worked days",
+            reply_locale="en",
+            units=(
+                c.AttendanceUnitFrame(
+                    unit_id="base",
+                    source_text="worked days",
+                    facts=base_facts,
+                    employees=(old_employee,),
+                    result=ResultSnapshot(),
+                ),
+            ),
+        )
+        message = "for Sam North on 2026-09-02"
+        date_fact = c.SemanticFact(
+            kind="filter",
+            field="Date",
+            operator="eq",
+            values=("2026-09-02",),
+            evidence_text="2026-09-02",
+            evidence_span=(17, 27),
+            origin="question",
+            strength="strong",
+        )
+        request = c.build_conversation_request(
+            message,
+            (date_fact,),
+            (old_employee, new_employee),
+            (frame,),
+            employee_sources=(
+                c.ConversationEmployeeSource(
+                    source_span=(4, 13), employee_ids=(new_employee.employee_id,)
+                ),
+            ),
+        )
+        decision = c.ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "relation": "modify_scope",
+                        "source_span": (0, len(message)),
+                        "base_unit_choice_id": request.context.prior_unit_choice_ids[0],
+                        "fact_ids": request.context.fact_choice_ids,
+                        "employee_mentions": (
+                            {
+                                "kind": "reference_choice",
+                                "source_span": (4, 13),
+                                "choice_id": request.context.employee_choice_ids[1],
+                            },
+                        ),
+                    }
+                ],
+            }
+        )
+
+        unit = c.materialize_conversation_units(
+            c.ValidatedConversation(request, decision, ("changed",))
+        )[0]
+
+        self.assertEqual(unit.employees, (new_employee,))
+        self.assertEqual(
+            [
+                (fact.kind, fact.field, fact.concept_name, fact.values)
+                for fact in unit.facts
+            ],
+            [
+                ("measure", None, "worked_days", ()),
+                ("filter", "Department", None, ("Operations",)),
+                ("filter", "Date", None, ("2026-09-02",)),
+            ],
+        )
+        self.assertEqual(
+            [fact.origin for fact in unit.facts],
+            ["trusted_state", "trusted_state", "question"],
+        )
+
+    def test_replace_result_keeps_scope_and_drops_every_prior_result_fact(self):
+        from week5.new_implementation import conversation_understanding as c
+        from week5.new_implementation.language_understanding import ResultSnapshot
+
+        employee = c.EmployeeReferent(employee_id="A10001", name="Morgan River")
+        base_facts = (
+            c.SemanticFact(
+                kind="measure",
+                concept_name="worked_days",
+                evidence_text="worked days",
+                origin="question",
+                strength="strong",
+            ),
+            c.SemanticFact(
+                kind="result_shape",
+                concept_name="scalar",
+                evidence_text="how many",
+                origin="question",
+                strength="strong",
+            ),
+            c.SemanticFact(
+                kind="filter",
+                field="Date",
+                operator="eq",
+                values=("2026-09-01",),
+                evidence_text="2026-09-01",
+                origin="question",
+                strength="strong",
+            ),
+        )
+        frame = c.ConversationTurnFrame(
+            original_question="worked days",
+            reply_locale="en",
+            units=(
+                c.AttendanceUnitFrame(
+                    unit_id="base",
+                    source_text="worked days",
+                    facts=base_facts,
+                    employees=(employee,),
+                    result=ResultSnapshot(),
+                ),
+            ),
+        )
+        message = "instead total overtime hours"
+        new_result = c.SemanticFact(
+            kind="calculation",
+            concept_name="sum",
+            field="Total_OT",
+            evidence_text="total overtime hours",
+            evidence_span=(8, len(message)),
+            origin="question",
+            strength="strong",
+        )
+        request = c.build_conversation_request(
+            message, (new_result,), (employee,), (frame,)
+        )
+        decision = c.ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "relation": "replace_result",
+                        "source_span": (0, len(message)),
+                        "base_unit_choice_id": request.context.prior_unit_choice_ids[0],
+                        "fact_ids": request.context.fact_choice_ids,
+                    }
+                ],
+            }
+        )
+
+        unit = c.materialize_conversation_units(
+            c.ValidatedConversation(request, decision, ("changed",))
+        )[0]
+
+        self.assertEqual(
+            [(fact.kind, fact.field, fact.concept_name) for fact in unit.facts],
+            [("filter", "Date", None), ("calculation", "Total_OT", "sum")],
+        )
+        self.assertEqual(unit.employees, (employee,))
+
+    def test_add_constraints_keeps_result_and_existing_scope(self):
+        from week5.new_implementation import conversation_understanding as c
+        from week5.new_implementation.language_understanding import ResultSnapshot
+
+        base_facts = (
+            c.SemanticFact(
+                kind="measure",
+                concept_name="attendance_records",
+                evidence_text="records",
+                origin="question",
+                strength="strong",
+            ),
+            c.SemanticFact(
+                kind="filter",
+                field="Date",
+                operator="gte",
+                values=("2026-09-01",),
+                evidence_text="from September 1",
+                origin="question",
+                strength="strong",
+            ),
+        )
+        frame = c.ConversationTurnFrame(
+            original_question="records from September 1",
+            reply_locale="en",
+            units=(
+                c.AttendanceUnitFrame(
+                    unit_id="base",
+                    source_text="records from September 1",
+                    facts=base_facts,
+                    result=ResultSnapshot(),
+                ),
+            ),
+        )
+        message = "only in Operations"
+        added = c.SemanticFact(
+            kind="filter",
+            field="Department",
+            operator="eq",
+            values=("Operations",),
+            evidence_text="Operations",
+            evidence_span=(8, len(message)),
+            origin="question",
+            strength="strong",
+        )
+        request = c.build_conversation_request(message, (added,), frames=(frame,))
+        decision = c.ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "relation": "add_constraints",
+                        "source_span": (0, len(message)),
+                        "base_unit_choice_id": request.context.prior_unit_choice_ids[0],
+                        "fact_ids": request.context.fact_choice_ids,
+                    }
+                ],
+            }
+        )
+
+        unit = c.materialize_conversation_units(
+            c.ValidatedConversation(request, decision, ("constrained",))
+        )[0]
+
+        self.assertEqual(
+            [(fact.kind, fact.field, fact.values) for fact in unit.facts],
+            [
+                ("measure", None, ()),
+                ("filter", "Date", ("2026-09-01",)),
+                ("filter", "Department", ("Operations",)),
+            ],
+        )
+
+    def test_change_view_keeps_request_and_maps_only_server_owned_view(self):
+        from week5.new_implementation import conversation_understanding as c
+        from week5.new_implementation.language_understanding import ResultSnapshot
+
+        fact = c.SemanticFact(
+            kind="measure",
+            concept_name="worked_days",
+            evidence_text="worked days",
+            origin="question",
+            strength="strong",
+        )
+        frame = c.ConversationTurnFrame(
+            original_question="worked days",
+            reply_locale="en",
+            units=(
+                c.AttendanceUnitFrame(
+                    unit_id="base",
+                    source_text="worked days",
+                    facts=(fact,),
+                    result=ResultSnapshot(),
+                ),
+            ),
+        )
+        request = c.build_conversation_request("separately", frames=(frame,))
+        view_choice = next(
+            key for key, value in request.views if value == "per_employee"
+        )
+        decision = c.ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "relation": "change_view",
+                        "source_span": (0, 10),
+                        "base_unit_choice_id": request.context.prior_unit_choice_ids[0],
+                        "view_choice_id": view_choice,
+                    }
+                ],
+            }
+        )
+
+        unit = c.materialize_conversation_units(
+            c.ValidatedConversation(request, decision, ("view",))
+        )[0]
+
+        self.assertEqual(unit.view, "per_employee")
+        self.assertEqual(unit.facts[0].origin, "trusted_state")
+
+    def test_explain_previous_keeps_grounded_request_and_marks_explanation(self):
+        from week5.new_implementation import conversation_understanding as c
+        from week5.new_implementation.language_understanding import ResultSnapshot
+
+        fact = c.SemanticFact(
+            kind="measure",
+            concept_name="attendance_records",
+            evidence_text="records",
+            origin="question",
+            strength="strong",
+        )
+        frame = c.ConversationTurnFrame(
+            original_question="count records",
+            reply_locale="en",
+            units=(
+                c.AttendanceUnitFrame(
+                    unit_id="base",
+                    source_text="count records",
+                    facts=(fact,),
+                    result=ResultSnapshot(matched_count=4),
+                ),
+            ),
+        )
+        request = c.build_conversation_request("explain that", frames=(frame,))
+        decision = c.ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "relation": "explain_previous",
+                        "source_span": (0, 12),
+                        "base_unit_choice_id": request.context.prior_unit_choice_ids[0],
+                    }
+                ],
+            }
+        )
+
+        unit = c.materialize_conversation_units(
+            c.ValidatedConversation(request, decision, ("explain",))
+        )[0]
+
+        self.assertTrue(unit.explain_previous)
+        self.assertEqual(unit.facts[0].origin, "trusted_state")
+        self.assertEqual(unit.prior_result.matched_count, 4)
+
+    def test_low_confidence_provider_selected_fact_is_rejected(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        fact = c.SemanticFact(
+            kind="measure",
+            concept_name="worked_days",
+            evidence_text="maybe days",
+            evidence_span=(0, 10),
+            origin="question",
+            strength="candidate",
+        )
+        request = c.build_conversation_request("maybe days", (fact,))
+        decision = c.ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "relation": "new",
+                        "source_span": (0, 10),
+                        "fact_ids": request.context.fact_choice_ids,
+                    }
+                ],
+            }
+        )
+
+        with self.assertRaisesRegex(
+            c.ConversationDecisionValidationError, "low-confidence"
+        ):
+            c.materialize_conversation_units(
+                c.ValidatedConversation(request, decision, ("unit",))
+            )
+
+    def test_added_constraint_that_contradicts_trusted_fact_is_rejected(self):
+        from week5.new_implementation import conversation_understanding as c
+        from week5.new_implementation.language_understanding import ResultSnapshot
+
+        frame = c.ConversationTurnFrame(
+            original_question="records on 2026-09-01",
+            reply_locale="en",
+            units=(
+                c.AttendanceUnitFrame(
+                    unit_id="base",
+                    source_text="records on 2026-09-01",
+                    facts=(
+                        c.SemanticFact(
+                            kind="filter",
+                            field="Date",
+                            operator="eq",
+                            values=("2026-09-01",),
+                            evidence_text="2026-09-01",
+                            origin="question",
+                            strength="strong",
+                        ),
+                    ),
+                    result=ResultSnapshot(),
+                ),
+            ),
+        )
+        message = "also on 2026-09-02"
+        fact = c.SemanticFact(
+            kind="filter",
+            field="Date",
+            operator="eq",
+            values=("2026-09-02",),
+            evidence_text="2026-09-02",
+            evidence_span=(8, len(message)),
+            origin="question",
+            strength="strong",
+        )
+        request = c.build_conversation_request(message, (fact,), frames=(frame,))
+        decision = c.ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "relation": "add_constraints",
+                        "source_span": (0, len(message)),
+                        "base_unit_choice_id": request.context.prior_unit_choice_ids[0],
+                        "fact_ids": request.context.fact_choice_ids,
+                    }
+                ],
+            }
+        )
+
+        with self.assertRaisesRegex(
+            c.ConversationDecisionValidationError, "contradicts"
+        ):
+            c.materialize_conversation_units(
+                c.ValidatedConversation(request, decision, ("unit",))
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

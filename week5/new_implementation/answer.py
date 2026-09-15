@@ -84,6 +84,8 @@ try:
     from .language_understanding import (
         CatalogClarification,
         CatalogOption,
+        ContextChoiceClarification,
+        ContextChoiceOption,
         EmployeeClarification,
         EmployeeOption,
         EmployeeReferent,
@@ -172,6 +174,8 @@ except ImportError:  # Running answer.py directly from its directory.
     from language_understanding import (
         CatalogClarification,
         CatalogOption,
+        ContextChoiceClarification,
+        ContextChoiceOption,
         EmployeeClarification,
         EmployeeOption,
         EmployeeReferent,
@@ -4653,6 +4657,42 @@ def _store_catalog_clarification(
     _sync_pending_request(state)
 
 
+def _store_context_clarification(
+    state: ConversationState,
+    question: str,
+    facts: tuple[SemanticFact, ...],
+    prior_units: Sequence[tuple[str, AttendanceUnitFrame]],
+    *,
+    locale: str,
+) -> ContextChoiceClarification:
+    pending = ContextChoiceClarification(
+        original_question=question,
+        reply_locale=locale,
+        facts=facts,
+        options=tuple(
+            ContextChoiceOption(
+                option_id=unit.unit_id,
+                label=(
+                    f"طلب الحضور السابق {index}"
+                    if locale == "ar"
+                    else f"Previous attendance request {index}"
+                ),
+            )
+            for index, (_choice_id, unit) in enumerate(prior_units, start=1)
+        ),
+    )
+    _write_pending_request(
+        state,
+        PendingRequestFrame(
+            original_question=question,
+            reply_locale=locale,
+            facts=facts,
+            clarification=pending,
+        ),
+    )
+    return pending
+
+
 def _interpretation_label(name: InterpretationName):
     return name.replace("_", " ")
 
@@ -4692,6 +4732,39 @@ def _format_surface_meaning_clarification(
         else "Which meaning did you intend?"
     )
     return f"{heading}\n{choices}\nReply with the number or displayed meaning."
+
+
+def _format_context_choice(pending: ContextChoiceClarification) -> str:
+    choices = "\n".join(
+        f"{index}. {option.label}"
+        for index, option in enumerate(pending.options, start=1)
+    )
+    if pending.reply_locale == "ar":
+        return f"أي طلب حضور سابق تقصد؟\n{choices}\nأرسل الرقم."
+    return f"Which previous attendance request did you mean?\n{choices}\nReply with the number."
+
+
+def _select_context_choice(
+    response: str, pending: ContextChoiceClarification
+) -> ContextChoiceOption | None:
+    normalized = normalize_for_matching(response)
+    if normalized.isdigit():
+        index = int(normalized) - 1
+        if 0 <= index < len(pending.options):
+            return pending.options[index]
+        return None
+    return next(
+        (
+            option
+            for option in pending.options
+            if normalized
+            in {
+                normalize_for_matching(option.option_id),
+                normalize_for_matching(option.label),
+            }
+        ),
+        None,
+    )
 
 
 def _select_surface_meaning(
@@ -4832,6 +4905,7 @@ def _conversation_employee_sources(
     facts: tuple[SemanticFact, ...],
     selected: Sequence[EmployeeCandidate],
     referents: Sequence[EmployeeReferent] = (),
+    active_referent_ids: Sequence[str] = (),
 ) -> tuple[conversation.ConversationEmployeeSource, ...]:
     """Bind explicit source text using the already verified employee resolution."""
     bindings = {}
@@ -4850,7 +4924,12 @@ def _conversation_employee_sources(
             )
         )
         if is_conversation_control_reference(fact.evidence_text):
-            allowed = tuple(item.employee_id for item in referents)
+            active = {item.casefold() for item in active_referent_ids}
+            allowed = tuple(
+                item.employee_id
+                for item in referents
+                if not active or item.employee_id.casefold() in active
+            )
         else:
             resolution = resolve_employee_reference(fact.evidence_text, list(selected))
             allowed = (
@@ -4871,6 +4950,41 @@ def _conversation_employee_sources(
     )
 
 
+def _resolve_conversation_employee_mentions(
+    validated: conversation.ValidatedConversation,
+) -> tuple[
+    dict[tuple[int, int], tuple[EmployeeReferent, ...]],
+    tuple[EmployeeResolution, str, tuple[int, int]] | None,
+]:
+    """Resolve provider-selected source spans through the authorized directory."""
+    resolve_mentions = [
+        (unit_index, mention_index, mention)
+        for unit_index, unit in enumerate(validated.decision.units)
+        if unit.route == "attendance"
+        for mention_index, mention in enumerate(unit.employee_mentions)
+        if isinstance(mention, conversation.ResolveEmployeeMention)
+    ]
+    if not resolve_mentions:
+        return {}, None
+    directory = load_employee_directory()
+    resolved = {}
+    message = validated.request.context.message
+    for unit_index, mention_index, mention in resolve_mentions:
+        start, end = mention.source_span
+        reference = message[start:end]
+        resolution = resolve_employee_reference(reference, directory)
+        if resolution.outcome != "unique" or resolution.match_method not in {
+            "exact_id",
+            "exact_name",
+        }:
+            return resolved, (resolution, reference, mention.source_span)
+        resolved[(unit_index, mention_index)] = tuple(
+            EmployeeReferent(employee_id=item.employee_id, name=item.name)
+            for item in resolution.candidates
+        )
+    return resolved, None
+
+
 def answer_question_with_state(
     question: str,
     history: list[dict] | None,
@@ -4880,6 +4994,7 @@ def answer_question_with_state(
 ) -> tuple[str, list[Result], ConversationState]:
     history = history or []
     state = state.model_copy(deep=True) if state is not None else ConversationState()
+    contextual_unit: conversation.MaterializedConversationUnit | None = None
     if len(question) > settings.conversation_max_input_chars:
         locale = "ar" if re.search(r"[\u0600-\u06ff]", question[:256]) else "en"
         return _format_conversation_help(locale), [], state
@@ -4923,6 +5038,17 @@ def answer_question_with_state(
             )
             if blocker is not None:
                 if blocker.outcome != "none":
+                    blocker_fact = next(
+                        (
+                            fact
+                            for fact in conversation_facts
+                            if fact.kind == "entity"
+                            and fact.evidence_span is not None
+                            and normalize_for_matching(fact.evidence_text)
+                            == normalize_for_matching(blocker.reference)
+                        ),
+                        None,
+                    )
                     _clear_pending_state(state)
                     state.pending_question = question
                     state.pending_facts = list(conversation_facts)
@@ -4934,6 +5060,16 @@ def answer_question_with_state(
                         conversation_facts,
                         blocker,
                         resolved_employees=selected,
+                        reference_text=(
+                            blocker_fact.evidence_text
+                            if blocker_fact is not None
+                            else None
+                        ),
+                        reference_span=(
+                            blocker_fact.evidence_span
+                            if blocker_fact is not None
+                            else None
+                        ),
                     )
                 return (
                     _format_employee_clarification(blocker, locale=reply_locale),
@@ -4951,13 +5087,43 @@ def answer_question_with_state(
                     tuple(request_state.recent_frames),
                     tuple(request_state.active_referent_ids),
                     employee_sources=_conversation_employee_sources(
-                        question, conversation_facts, selected, request_state.referents
+                        question,
+                        conversation_facts,
+                        selected,
+                        request_state.referents,
+                        request_state.active_referent_ids,
                     ),
                 )
-                conversation.request_conversation_decision(request)
+                validated = conversation.request_conversation_decision(request)
+                if validated is None:
+                    return _format_conversation_help(reply_locale), [], state
+                if validated.decision.status != "resolved":
+                    if (
+                        validated.decision.reason == "ambiguous_reference"
+                        and len(validated.request.prior_units) > 1
+                    ):
+                        pending = _store_context_clarification(
+                            state,
+                            question,
+                            conversation_facts,
+                            validated.request.prior_units,
+                            locale=reply_locale,
+                        )
+                        return _format_context_choice(pending), [], state
+                    return _format_conversation_help(reply_locale), [], state
+                resolved_mentions, mention_blocker = (
+                    _resolve_conversation_employee_mentions(validated)
+                )
+                if mention_blocker is not None:
+                    return _format_conversation_help(reply_locale), [], state
+                materialized = conversation.materialize_conversation_units(
+                    validated, resolved_mentions=resolved_mentions
+                )
+                if len(materialized) != 1 or materialized[0].route != "attendance":
+                    return _format_conversation_help(reply_locale), [], state
+                contextual_unit = materialized[0]
             except conversation.ConversationDecisionValidationError:
-                pass
-            return _format_conversation_help(reply_locale), [], state
+                return _format_conversation_help(reply_locale), [], state
 
     if state.pending_clarification is None:
         malformed = None
@@ -4997,12 +5163,77 @@ def answer_question_with_state(
                 state,
             )
 
-    effective_question = question
+    effective_question = (
+        contextual_unit.source_text if contextual_unit is not None else question
+    )
     prepared_proposal = None
-    prepared_facts: tuple[SemanticFact, ...] = ()
-    employees_for_request = state.selected_employees
+    prepared_facts: tuple[SemanticFact, ...] = (
+        contextual_unit.facts if contextual_unit is not None else ()
+    )
+    employees_for_request = (
+        [
+            EmployeeCandidate(employee_id=item.employee_id, name=item.name)
+            for item in contextual_unit.employees
+        ]
+        if contextual_unit is not None
+        else state.selected_employees
+    )
     if state.pending_clarification is not None:
         reply_locale = state.pending_clarification.reply_locale
+    if isinstance(state.pending_clarification, ContextChoiceClarification):
+        pending_context = state.pending_clarification
+        selected_context = _select_context_choice(question, pending_context)
+        if selected_context is None:
+            if _is_complete_new_attendance_question(question):
+                _clear_pending_state(state)
+                return answer_question_with_state(
+                    question, history, state, access_context=access_context
+                )
+            return _format_context_choice(pending_context), [], state
+        base = next(
+            (
+                unit
+                for frame in state.recent_frames
+                for unit in frame.units
+                if unit.unit_id == selected_context.option_id
+            ),
+            None,
+        )
+        current_directory = load_employee_directory()
+        current = {
+            (item.employee_id.casefold(), _normalize_name(item.name)): item
+            for item in current_directory
+        }
+        selected_employees = [
+            current.get((item.employee_id.casefold(), _normalize_name(item.name)))
+            for item in (base.employees if base is not None else ())
+        ]
+        if base is None or any(item is None for item in selected_employees):
+            _clear_pending_state(state)
+            return _format_conversation_help(reply_locale), [], state
+        effective_question = pending_context.original_question
+        prepared_facts = tuple(
+            fact.model_copy(
+                update={
+                    "origin": "trusted_state",
+                    "evidence_span": None,
+                    "consumed_span": None,
+                }
+            )
+            for fact in base.facts
+        )
+        employees_for_request = [
+            item for item in selected_employees if item is not None
+        ]
+        contextual_unit = conversation.MaterializedConversationUnit(
+            unit_id=uuid.uuid4().hex,
+            route="attendance",
+            relation="repeat",
+            source_text=effective_question,
+            facts=prepared_facts,
+            employees=tuple(base.employees),
+        )
+        _clear_pending_state(state)
     if isinstance(state.pending_clarification, MissingIntentClarification):
         if _is_complete_new_attendance_question(question):
             _clear_pending_state(state)
@@ -5361,6 +5592,73 @@ def answer_question_with_state(
             ),
         )
         employees_for_request = selected
+        if (
+            pending_employee is not None
+            and pending_employee.reference_span is not None
+            and state.recent_frames
+            and conversation.needs_conversation_decision(
+                effective_question, tuple(state.pending_facts)
+            )
+        ):
+            confirmed_referents = tuple(
+                {
+                    item.employee_id.casefold(): item
+                    for item in (
+                        *state.referents,
+                        *(
+                            EmployeeReferent(
+                                employee_id=candidate.employee_id,
+                                name=candidate.name,
+                            )
+                            for candidate in selected
+                        ),
+                    )
+                }.values()
+            )
+            request = conversation.build_conversation_request(
+                effective_question,
+                tuple(state.pending_facts),
+                confirmed_referents,
+                tuple(state.recent_frames),
+                tuple(selected_ids),
+                employee_sources=(
+                    conversation.ConversationEmployeeSource(
+                        source_span=pending_employee.reference_span,
+                        employee_ids=tuple(selected_ids),
+                    ),
+                ),
+            )
+            validated = conversation.request_conversation_decision(request)
+            if validated is None or validated.decision.status != "resolved":
+                return _format_conversation_help(reply_locale), [], state
+            resolved_mentions, mention_blocker = (
+                _resolve_conversation_employee_mentions(validated)
+            )
+            if mention_blocker is not None:
+                return _format_conversation_help(reply_locale), [], state
+            materialized = conversation.materialize_conversation_units(
+                validated, resolved_mentions=resolved_mentions
+            )
+            if len(materialized) != 1 or materialized[0].route != "attendance":
+                return _format_conversation_help(reply_locale), [], state
+            contextual_unit = materialized[0]
+            prepared_facts = tuple(
+                fact
+                for fact in contextual_unit.facts
+                if not (
+                    fact.kind == "entity"
+                    or (fact.kind == "filter" and fact.field in {"Employee_ID", "Name"})
+                )
+            ) + tuple(
+                fact
+                for fact in prepared_facts
+                if fact.kind == "filter" and fact.field == "Employee_ID"
+            )
+            effective_question = contextual_unit.source_text
+            employees_for_request = [
+                EmployeeCandidate(employee_id=item.employee_id, name=item.name)
+                for item in contextual_unit.employees
+            ]
 
     try:
         result = _fetch_context_result(
@@ -5526,6 +5824,26 @@ def answer_question_with_state(
         matched_count,
         locale=reply_locale,
     )
+    if contextual_unit is not None and contextual_unit.explain_previous:
+        previous_count = (
+            contextual_unit.prior_result.matched_count
+            if contextual_unit.prior_result is not None
+            else None
+        )
+        if reply_locale == "ar":
+            basis = (
+                f"استندت الإجابة السابقة إلى {previous_count} سجل مطابق"
+                if previous_count is not None
+                else "استندت الإجابة السابقة إلى الطلب نفسه الذي تم التحقق منه"
+            )
+            text = f"{basis}، وقد أعدت تشغيل الطلب بأمان.\n{text}"
+        else:
+            basis = (
+                f"The previous answer was based on {previous_count} matching records"
+                if previous_count is not None
+                else "The previous answer was based on the same verified request"
+            )
+            text = f"{basis}; I safely re-ran that request.\n{text}"
     confirmed = resolved_employees or employees_for_request
     _store_successful_turn(
         state,
@@ -5534,7 +5852,11 @@ def answer_question_with_state(
             reply_locale=reply_locale,
             units=(
                 AttendanceUnitFrame(
-                    unit_id=uuid.uuid4().hex,
+                    unit_id=(
+                        contextual_unit.unit_id
+                        if contextual_unit is not None
+                        else uuid.uuid4().hex
+                    ),
                     source_text=effective_question,
                     facts=tuple(prepared_facts),
                     employees=tuple(

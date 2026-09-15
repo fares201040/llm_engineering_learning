@@ -1,7 +1,7 @@
 # APDC Grounded Conversational Intelligence — Tasks 9–10 Handoff
 
-Date: 2026-09-15  
-Branch: `codex/apdc-conversational-intelligence`  
+Date: 2026-09-15
+Branch: `codex/apdc-conversational-intelligence`
 Worktree: `D:\w\apdc`
 
 ## Completed commits

@@ -159,6 +159,21 @@ class SessionStateTests(unittest.TestCase):
         self.assertIn("Relevant Context", context)
         self.assertEqual(state, answer.ConversationState())
 
+    def test_unexpected_answer_error_preserves_arabic_locale(self):
+        history = [{"role": "user", "content": "اعرض سجلات الحضور"}]
+        with patch.object(
+            new_app,
+            "answer_question_with_state",
+            side_effect=RuntimeError("private failure detail"),
+        ):
+            updated_history, _context, _state = new_app.chat_with_state(
+                history, answer.ConversationState()
+            )
+
+        text = updated_history[-1]["content"]
+        self.assertIn("تعذر", text)
+        self.assertNotIn("private failure detail", text)
+
 
 if __name__ == "__main__":
     unittest.main()

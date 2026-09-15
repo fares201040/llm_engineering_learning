@@ -25,6 +25,9 @@ try:
         ConversationTurnFrame,
         EmployeeReferent,
         ResultSnapshot,
+        contains_conversation_control,
+        contains_prior_conversation_reference,
+        is_conversation_control_residue,
         normalize_for_matching,
     )
     from .semantic_resolution import SemanticFact
@@ -36,6 +39,9 @@ except ImportError:
         ConversationTurnFrame,
         EmployeeReferent,
         ResultSnapshot,
+        contains_conversation_control,
+        contains_prior_conversation_reference,
+        is_conversation_control_residue,
         normalize_for_matching,
     )
     from semantic_resolution import SemanticFact
@@ -463,11 +469,29 @@ def validate_conversation_decision(
     residue = list(context.message)
     for start, end in unit_spans:
         residue[start:end] = " " * (end - start)
-    if any(
-        token.casefold() not in {"and", "then", "also", "و", "ثم", "أيضا", "أيضاً"}
-        for token in re.findall(r"\w+", "".join(residue))
-    ):
+    residue_text = "".join(residue)
+    if not is_conversation_control_residue(residue_text):
         raise ConversationDecisionValidationError("material source text was omitted")
+
+    def grounds_prior_attendance(unit: ConversationUnitDecision) -> bool:
+        return isinstance(unit, AttendanceUnitDecision) and (
+            unit.relation != "new" or bool(unit.employee_mentions)
+        )
+
+    if contains_prior_conversation_reference(residue_text) and not any(
+        grounds_prior_attendance(unit) for unit in decision.units
+    ):
+        raise ConversationDecisionValidationError(
+            "context reference requires a prior attendance unit"
+        )
+    for unit in decision.units:
+        start, end = unit.source_span
+        if contains_prior_conversation_reference(context.message[start:end]) and not (
+            grounds_prior_attendance(unit)
+        ):
+            raise ConversationDecisionValidationError(
+                "context reference requires a prior attendance unit"
+            )
     return decision
 
 
@@ -480,10 +504,8 @@ ConversationUnitDraft = ConversationUnitDecision
 
 
 _CONTEXTUAL_LANGUAGE = re.compile(
-    r"\b(?:again|same|him|her|them|they|both|former|latter|separately|together|explain|why)\b"
-    r"|\b(?:what|how)\s+about\b|^(?:and|also|then)\b"
-    r"|(?:مرة أخرى|مجددا|نفسه|نفسها|كلاهما|كليهما|الجميع|السابق|السابقة|الأول|الأولى|الثاني|الثانية|الأخير|الأخيرة|هذا|هذه|بشكل منفصل|اشرح|لماذا)"
-    r"|\b(?:له|لها|لهم|هو|هي|هم|معا)\b",
+    r"\b(?:explain|why)\b|\b(?:what|how)\s+about\b|^(?:and|also|then)\b"
+    r"|(?:اشرح|لماذا)",
     re.I,
 )
 
@@ -572,7 +594,10 @@ def needs_conversation_decision(message: str, facts: tuple[SemanticFact, ...]) -
             if quantifier:
                 start, end = quantifier.span()
                 contextual_text[start:end] = " " * (end - start)
-    if _CONTEXTUAL_LANGUAGE.search("".join(contextual_text)):
+    normalized_context = normalize_for_matching("".join(contextual_text))
+    if _CONTEXTUAL_LANGUAGE.search(normalized_context) or contains_conversation_control(
+        normalized_context
+    ):
         return True
     return bool(facts and re.search(r"\band\b|[;؛]|\bو\b", "".join(remaining), re.I))
 

@@ -274,6 +274,14 @@ def _access_denied_reply(locale: str) -> str:
     )
 
 
+def _safe_interpretation_reply(locale: str) -> str:
+    return (
+        "تعذر تفسير طلب الحضور بأمان. يرجى إعادة صياغته."
+        if locale == "ar"
+        else "I could not safely interpret that attendance request. Please rephrase it."
+    )
+
+
 def _social_reply(locale: str) -> str:
     return (
         "مرحبًا! يمكنني مساعدتك في أسئلة الحضور."
@@ -2261,6 +2269,28 @@ def format_plan_violations(violations: tuple[PlanViolation, ...]) -> str:
         )
     )
     return "; ".join(messages) + "."
+
+
+def _format_public_plan_violations(
+    violations: tuple[PlanViolation, ...], *, locale: str
+) -> str:
+    if locale == "en":
+        return format_plan_violations(violations)
+    labels = {
+        "invalid_schema": "تعذر التحقق من بنية الطلب",
+        "ungrounded_constraint": "اختير قيد غير مذكور في الطلب",
+        "uncovered_fact": "لم يتم تمثيل جزء مهم من الطلب",
+        "contradiction": "تتعارض الشروط المختارة",
+        "answer_contract_mismatch": "لا تتطابق الإجابة المطلوبة مع العملية الحسابية",
+        "unsupported_capability": "يتطلب الطلب عملية غير مدعومة حاليًا",
+        "ambiguous_value": "تحتاج إحدى القيم إلى توضيح",
+    }
+    messages = list(
+        dict.fromkeys(
+            labels.get(item.code, "تعذر التحقق من الطلب") for item in violations
+        )
+    )
+    return "؛ ".join(messages) + "."
 
 
 class SemanticPlanValidationError(PlanValidationError):
@@ -5135,7 +5165,7 @@ def _question_allows_multiple_employee_selection(question: str) -> bool:
     normalized = normalize_for_matching(question)
     return bool(
         re.search(r"\b(?:all|both)\b", normalized, re.IGNORECASE)
-        or re.search(r"(?:كلاهما|كليهما|الجميع|معا)", normalized)
+        or re.search(r"(?<!\w)و?ل?(?:كلاهما|كليهما|الجميع|معا)(?!\w)", normalized)
     )
 
 
@@ -6489,8 +6519,8 @@ def _answer_question_with_state(
         _require_supported_attendance_question(question)
     except DomainAccessDeniedError:
         return _access_denied_reply(reply_locale), [], state
-    except PlanValidationError as exc:
-        return f"I could not safely interpret that request: {exc}", [], state
+    except PlanValidationError:
+        return _safe_interpretation_reply(reply_locale), [], state
 
     if (
         not preparation_only
@@ -7516,11 +7546,18 @@ def _answer_question_with_state(
             [],
             state,
         )
-    except PlanValidationError as exc:
+    except SemanticPlanValidationError as exc:
         _clear_pending_state(state)
-        if reply_locale == "ar":
-            return f"تعذر تفسير الطلب بأمان: {exc}", [], state
-        return f"I could not safely interpret that request: {exc}", [], state
+        detail = _format_public_plan_violations(exc.violations, locale=reply_locale)
+        prefix = (
+            "تعذر تفسير الطلب بأمان:"
+            if reply_locale == "ar"
+            else "I could not safely interpret that request:"
+        )
+        return f"{prefix} {detail}", [], state
+    except PlanValidationError:
+        _clear_pending_state(state)
+        return _safe_interpretation_reply(reply_locale), [], state
 
     _clear_pending_state(state)
     if resolved_employees:

@@ -98,37 +98,64 @@ class ObservabilityTests(unittest.TestCase):
 
         logger.emit(
             "input_surface_analyzed",
-            question="private question A11017",
+            question="private question with employee token",
             evidence_text="private evidence",
         )
 
         self.assertNotIn("private question", events[-1])
-        self.assertNotIn("A11017", events[-1])
+        self.assertNotIn("employee token", events[-1])
 
     def test_request_ids_must_use_an_opaque_telemetry_format(self):
-        payload = redact({"event": "stage_complete", "request_id": "A11017"})
+        payload = redact({"event": "stage_complete", "request_id": "EMPLOYEE_SECRET"})
 
         self.assertNotIn("request_id", payload)
 
+    def test_request_ids_reject_content_shaped_prefixed_values(self):
+        payload = redact(
+            {"event": "stage_complete", "request_id": "request-private-employee"}
+        )
+
+        self.assertNotIn("request_id", payload)
+
+    def test_query_fingerprints_require_the_native_sha256_shape(self):
+        payload = redact(
+            {"event": "postgres_query_compiled", "fingerprint": "EMPLOYEE_SECRET"}
+        )
+
+        self.assertNotIn("fingerprint", payload)
+
+    def test_scalar_telemetry_fields_reject_booleans_and_nested_mappings(self):
+        payload = redact(
+            {
+                "event": "stage_complete",
+                "request_id": {"count": 7},
+                "fingerprint": False,
+                "candidate_count": True,
+            }
+        )
+
+        self.assertEqual(payload, {"event": "stage_complete"})
+
     def test_semantic_and_sql_sensitive_payloads_are_redacted(self):
+        safe_fingerprint = "a" * 64
         payload = redact(
             {
                 "event": "proposal_rejected",
                 "violation_codes": ["ungrounded_constraint"],
-                "evidence_text": "off days for A11017",
+                "evidence_text": "off days for a private employee token",
                 "catalog_value": "Secret Department",
                 "sql": "SELECT * FROM attendance_records",
-                "params": ["A11017"],
-                "fingerprint": "safe-fingerprint",
+                "params": ["SENSITIVE_EMPLOYEE_TOKEN"],
+                "fingerprint": safe_fingerprint,
             }
         )
         rendered = str(payload)
         self.assertIn("ungrounded_constraint", rendered)
-        self.assertIn("safe-fingerprint", rendered)
+        self.assertIn(safe_fingerprint, rendered)
         self.assertNotIn("off days", rendered)
         self.assertNotIn("Secret Department", rendered)
         self.assertNotIn("SELECT", rendered)
-        self.assertNotIn("A11017", rendered)
+        self.assertNotIn("SENSITIVE_EMPLOYEE_TOKEN", rendered)
 
     def test_redaction_recurses_through_structured_provider_and_plan_payloads(self):
         @dataclass(frozen=True)
@@ -140,19 +167,19 @@ class ObservabilityTests(unittest.TestCase):
             question: str
             choices: list[str]
 
-        private_text = "Private employee A11017 and database password"
+        private_text = "Private employee token and database password"
         payload = redact(
             {
                 "event": "stage_complete",
                 "state": "failure",
-                "request_id": ["PrivateA11017"],
+                "request_id": ["private-employee-token"],
                 "nested": {"question": private_text, "unexpected": private_text},
                 "tuple_payload": (private_text,),
                 "set_payload": {private_text},
                 "provider": ProviderPayload(
                     question=private_text, choices=[private_text]
                 ),
-                "plan": PlanPayload(query=private_text, employee_id="A11017"),
+                "plan": PlanPayload(query=private_text, employee_id="EMPLOYEE_SECRET"),
                 "exception": RuntimeError(private_text),
             }
         )
@@ -161,9 +188,26 @@ class ObservabilityTests(unittest.TestCase):
         self.assertEqual(payload["event"], "stage_complete")
         self.assertEqual(payload["state"], "failure")
         self.assertNotIn("Private employee", rendered)
-        self.assertNotIn("A11017", rendered)
+        self.assertNotIn("EMPLOYEE_SECRET", rendered)
         self.assertNotIn("password", rendered)
         self.assertNotIn("unexpected", rendered)
+
+    def test_redaction_drops_untrusted_set_members_without_calling_repr(self):
+        class UnsafeRepresentation:
+            def __repr__(self):
+                raise RuntimeError("private employee token")
+
+        payload = redact(
+            {
+                "event": "proposal_rejected",
+                "violation_codes": {
+                    "ungrounded_constraint",
+                    UnsafeRepresentation(),
+                },
+            }
+        )
+
+        self.assertEqual(payload["violation_codes"], ["ungrounded_constraint"])
 
     def test_stage_failure_emits_only_a_controlled_failure_code(self):
         events = []

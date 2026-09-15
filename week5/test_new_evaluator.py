@@ -122,6 +122,45 @@ class ApdcEvaluationDashboardTests(unittest.TestCase):
         self.assertEqual(details.loc[0, "Status"], "Failed (evaluation_error)")
         self.assertNotIn("password", details.to_string().lower())
         self.assertEqual(details.loc[0, "Question"], "Private question")
+        self.assertEqual(details.loc[0, "Cause"], "evaluation_runtime_failure")
+
+    def test_behavior_evaluation_does_not_misclassify_runtime_errors_as_provider(self):
+        dashboard = self.dashboard()
+        cases = [SimpleNamespace(question="Synthetic question", category="identity")]
+
+        with (
+            patch.object(dashboard.apdc_evaluation, "load_tests", return_value=cases),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "evaluate_behavior",
+                side_effect=RuntimeError("database failure detail"),
+            ),
+        ):
+            _summary, _categories, details = dashboard.run_behavior_evaluation(
+                0, progress=None
+            )
+
+        self.assertEqual(details.loc[0, "Cause"], "evaluation_runtime_failure")
+        self.assertNotIn("database failure detail", details.to_string())
+
+    def test_answer_evaluation_does_not_guess_timeout_stage(self):
+        dashboard = self.dashboard()
+        cases = [SimpleNamespace(question="Synthetic question", category="identity")]
+
+        with (
+            patch.object(dashboard.apdc_evaluation, "load_tests", return_value=cases),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "evaluate_answer_with_diagnostic",
+                side_effect=TimeoutError("ambiguous timeout detail"),
+            ),
+        ):
+            _summary, _categories, details = dashboard.run_answer_evaluation(
+                0, progress=None
+            )
+
+        self.assertEqual(details.loc[0, "Cause"], "evaluation_runtime_failure")
+        self.assertNotIn("ambiguous timeout detail", details.to_string())
 
     def test_answer_evaluation_reports_failure_causes_and_questions(self):
         dashboard = self.dashboard()
@@ -163,71 +202,6 @@ class ApdcEvaluationDashboardTests(unittest.TestCase):
         self.assertIn("3,964 records", rendered)
         self.assertIn("568 employees", rendered)
         self.assertIn("2026-09-01 through 2026-09-07", rendered)
-
-    def test_synthetic_local_cases_enforce_calls_atomicity_and_question_visibility(
-        self,
-    ):
-        dashboard = self.dashboard()
-
-        def runner(case):
-            if case.category == "synthetic_fast_path":
-                return dashboard.SyntheticObservation(
-                    conversation_calls=0,
-                    retrieval_calls=0,
-                    published_results=0,
-                )
-            if case.category == "synthetic_context_resume":
-                return dashboard.SyntheticObservation(
-                    conversation_calls=1,
-                    retrieval_calls=1,
-                    published_results=1,
-                )
-            return dashboard.SyntheticObservation(
-                conversation_calls=1,
-                retrieval_calls=0,
-                published_results=0,
-            )
-
-        details = dashboard.run_synthetic_conversation_evaluation(runner)
-
-        self.assertEqual(
-            details.columns.tolist(),
-            [
-                "Case",
-                "Category",
-                "Question",
-                "Conversation calls",
-                "Retrieval calls",
-                "Published results",
-                "Atomic",
-            ],
-        )
-        self.assertTrue(details["Atomic"].all())
-        self.assertEqual(
-            details["Question"].tolist(),
-            [
-                "hello",
-                "synthetic attendance request",
-                "invalid synthetic provider decision",
-            ],
-        )
-
-    def test_synthetic_local_cases_reject_partial_provider_failures(self):
-        dashboard = self.dashboard()
-
-        def runner(case):
-            return dashboard.SyntheticObservation(
-                conversation_calls=case.expected_conversation_calls,
-                retrieval_calls=case.expected_retrieval_calls,
-                published_results=case.expected_published_results,
-                partial_results=(
-                    1 if case.category == "synthetic_invalid_provider" else 0
-                ),
-            )
-
-        details = dashboard.run_synthetic_conversation_evaluation(runner)
-
-        self.assertFalse(details.loc[2, "Atomic"])
 
 
 if __name__ == "__main__":

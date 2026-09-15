@@ -10,6 +10,7 @@ if __package__:
         answer_question_with_state,
     )
     from .new_implementation.config import settings
+    from .new_implementation.language_understanding import analyze_question_surface
 else:
     from new_implementation.answer import (
         ConversationState,
@@ -17,6 +18,7 @@ else:
         answer_question_with_state,
     )
     from new_implementation.config import settings
+    from new_implementation.language_understanding import analyze_question_surface
 
 
 logger = logging.getLogger(__name__)
@@ -60,7 +62,11 @@ def chat_with_state(history, state):
         )
     except Exception:
         logger.error("APDC attendance answer failed safely")
-        answer = "I couldn't complete that request safely. Please try again."
+        answer = (
+            "تعذر إكمال هذا الطلب بأمان. يرجى المحاولة مرة أخرى."
+            if analyze_question_surface(last_message).reply_locale == "ar"
+            else "I couldn't complete that request safely. Please try again."
+        )
         context = []
         updated_state = state or ConversationState()
 

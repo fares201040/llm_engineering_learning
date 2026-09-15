@@ -90,6 +90,94 @@ class ConversationProviderTests(unittest.TestCase):
                     c.needs_conversation_decision(f"{control} attendance", (fact,))
                 )
 
+    def test_arabic_context_controls_accept_harmless_presentation_variants(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        fact = c.SemanticFact(
+            kind="measure",
+            concept_name="attendance_records",
+            evidence_text="attendance",
+            origin="question",
+            strength="strong",
+        )
+
+        self.assertTrue(c.needs_conversation_decision("الاوَّل attendance", (fact,)))
+
+    def test_arabic_coordinators_require_the_context_decision_path(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        fact = c.SemanticFact(
+            kind="measure",
+            concept_name="attendance_records",
+            evidence_text="attendance",
+            origin="question",
+            strength="strong",
+        )
+        for message in (
+            "ايضا attendance",
+            "أيضاً attendance",
+            "أَيْضًا attendance",
+            "ثم attendance",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(c.needs_conversation_decision(message, (fact,)))
+
+    def test_arabic_context_control_vocabulary_is_shared_by_routing_and_validation(
+        self,
+    ):
+        from week5.new_implementation import conversation_understanding as c
+
+        message = "نفس الموظف attendance"
+        attendance_span = (message.index("attendance"), len(message))
+        self.assertTrue(c.needs_conversation_decision(message, ()))
+        decision = c.ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "source_span": attendance_span,
+                        "relation": "repeat",
+                        "base_unit_choice_id": "prior:attendance",
+                    }
+                ],
+            }
+        )
+        context = c.ConversationDecisionContext(
+            message=message,
+            max_units=8,
+            prior_unit_choice_ids=("prior:attendance",),
+        )
+
+        self.assertEqual(c.validate_conversation_decision(decision, context), decision)
+
+    def test_prior_reference_inside_unit_span_requires_grounded_prior_relation(self):
+        from week5.new_implementation import conversation_understanding as c
+
+        message = "نفس الموظف attendance"
+        decision = c.ConversationDecision.model_validate(
+            {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "source_span": [0, len(message)],
+                        "relation": "new",
+                    }
+                ],
+            }
+        )
+        context = c.ConversationDecisionContext(
+            message=message,
+            max_units=8,
+            prior_unit_choice_ids=("prior:attendance",),
+        )
+
+        with self.assertRaisesRegex(
+            c.ConversationDecisionValidationError, "context reference"
+        ):
+            c.validate_conversation_decision(decision, context)
+
     def test_oversized_typed_frame_is_rejected_before_provider_input(self):
         from week5.new_implementation import conversation_understanding as c
         from week5.new_implementation.language_understanding import ResultSnapshot

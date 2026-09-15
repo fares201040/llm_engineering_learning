@@ -574,7 +574,7 @@ def normalize_for_matching(text: str) -> str:
     return _normalized_phrase(text)
 
 
-_CONVERSATION_CONTROL_REFERENCES = frozenset(
+_PRIOR_CONVERSATION_REFERENCES = frozenset(
     normalize_for_matching(value)
     for value in (
         "again",
@@ -587,14 +587,11 @@ _CONVERSATION_CONTROL_REFERENCES = frozenset(
         "him",
         "her",
         "them",
-        "both",
-        "all",
+        "they",
         "former",
         "the former",
         "latter",
         "the latter",
-        "separately",
-        "together",
         "مرة أخرى",
         "مجددا",
         "مجدداً",
@@ -607,9 +604,9 @@ _CONVERSATION_CONTROL_REFERENCES = frozenset(
         "هو",
         "هي",
         "هم",
-        "كلاهما",
-        "كليهما",
-        "الجميع",
+        "له",
+        "لها",
+        "لهم",
         "السابق",
         "السابقة",
         "الأول",
@@ -618,16 +615,71 @@ _CONVERSATION_CONTROL_REFERENCES = frozenset(
         "الثانية",
         "الأخير",
         "الأخيرة",
+    )
+)
+_CONVERSATION_CONTROL_REFERENCES = _PRIOR_CONVERSATION_REFERENCES | frozenset(
+    normalize_for_matching(value)
+    for value in (
+        "both",
+        "all",
+        "also",
+        "then",
+        "separately",
+        "together",
+        "كلاهما",
+        "كليهما",
+        "الجميع",
         "معا",
         "معاً",
         "بشكل منفصل",
+        "ايضا",
+        "ثم",
     )
+)
+
+
+def _bounded_phrase_pattern(values: frozenset[str]) -> re.Pattern[str]:
+    return re.compile(
+        r"(?<!\w)(?:"
+        + "|".join(
+            sorted((re.escape(value) for value in values), key=len, reverse=True)
+        )
+        + r")(?!\w)"
+    )
+
+
+_CONVERSATION_CONTROL_PATTERN = _bounded_phrase_pattern(
+    _CONVERSATION_CONTROL_REFERENCES
+)
+_PRIOR_CONVERSATION_PATTERN = _bounded_phrase_pattern(_PRIOR_CONVERSATION_REFERENCES)
+_CONVERSATION_RESIDUE_COORDINATORS = frozenset(
+    {"and", "then", "also", "و", "ثم", "ايضا"}
 )
 
 
 def is_conversation_control_reference(text: str) -> bool:
     """Return whether bare text is a control/reference, never a person's name."""
     return normalize_for_matching(text) in _CONVERSATION_CONTROL_REFERENCES
+
+
+def contains_conversation_control(text: str) -> bool:
+    """Return whether text contains a bounded registered conversation control."""
+    return bool(_CONVERSATION_CONTROL_PATTERN.search(normalize_for_matching(text)))
+
+
+def contains_prior_conversation_reference(text: str) -> bool:
+    """Return whether text contains a bounded reference requiring saved context."""
+    return bool(_PRIOR_CONVERSATION_PATTERN.search(normalize_for_matching(text)))
+
+
+def is_conversation_control_residue(text: str) -> bool:
+    """Accept residue made only of registered controls and coordinators."""
+    normalized = normalize_for_matching(text)
+    remainder = _CONVERSATION_CONTROL_PATTERN.sub(" ", normalized)
+    return all(
+        token in _CONVERSATION_RESIDUE_COORDINATORS
+        for token in re.findall(r"\w+", remainder)
+    )
 
 
 def _reply_locale(question: str) -> ReplyLocale:

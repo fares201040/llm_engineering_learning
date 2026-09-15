@@ -910,6 +910,46 @@ class AccessScopeTests(unittest.TestCase):
         self.assertEqual(chunks, [])
         planner.assert_not_called()
 
+    def test_public_answer_never_renders_internal_plan_validation_details(self):
+        private_detail = "private employee token in a provider payload"
+        with patch.object(
+            answer,
+            "_fetch_context_result",
+            side_effect=answer.PlanValidationError(private_detail),
+        ):
+            text, chunks, state = answer.answer_question_with_state(
+                "اعرض سجلات الحضور",
+                [],
+                answer.ConversationState(),
+            )
+
+        self.assertNotIn(private_detail, text)
+        self.assertNotIn("private employee token", text)
+        self.assertIn("تعذر", text)
+        self.assertEqual(chunks, [])
+        self.assertEqual(state, answer.ConversationState())
+
+    def test_arabic_semantic_rejection_keeps_controlled_localized_guidance(self):
+        violation = answer.PlanViolation(
+            code="unsupported_capability",
+            target="calculation",
+            message="private compiler detail",
+        )
+        with patch.object(
+            answer,
+            "_fetch_context_result",
+            side_effect=answer.SemanticPlanValidationError((violation,)),
+        ):
+            text, chunks, _state = answer.answer_question_with_state(
+                "اعرض سجلات الحضور",
+                [],
+                answer.ConversationState(),
+            )
+
+        self.assertIn("غير مدعوم", text)
+        self.assertNotIn("private compiler detail", text)
+        self.assertEqual(chunks, [])
+
     def test_invalid_numeric_comparison_stops_before_planning(self):
         with patch.object(answer, "propose_query") as planner:
             with self.assertRaisesRegex(
@@ -1937,17 +1977,29 @@ class EmployeeResolutionTests(unittest.TestCase):
 
     def test_arabic_multiple_employee_controls_are_confirmed_only_when_requested(self):
         candidates = [
-            answer.EmployeeCandidate(employee_id="A10001", name="Faris Ahmed"),
-            answer.EmployeeCandidate(employee_id="A10002", name="Faris North"),
+            answer.EmployeeCandidate(employee_id="A90001", name="Example Alpha"),
+            answer.EmployeeCandidate(employee_id="A90002", name="Example Beta"),
         ]
 
         self.assertTrue(
             answer._question_allows_multiple_employee_selection("أيام الغياب لكلاهما")
         )
+        for question in ("وكلاهما", "أيام الغياب ولكلاهما"):
+            with self.subTest(question=question):
+                self.assertTrue(
+                    answer._question_allows_multiple_employee_selection(question)
+                )
         self.assertEqual(
             answer._select_pending_employees("كلاهما", candidates, allow_multiple=True),
             candidates,
         )
+
+    def test_arabic_multiple_employee_controls_do_not_match_name_substrings(self):
+        for question in ("أيام الغياب لمعاذ", "اسأل الجميعي عن الحضور"):
+            with self.subTest(question=question):
+                self.assertFalse(
+                    answer._question_allows_multiple_employee_selection(question)
+                )
 
     def test_arabic_catalog_choice_uses_presentation_normalization(self):
         pending = answer.PendingConstraintData(

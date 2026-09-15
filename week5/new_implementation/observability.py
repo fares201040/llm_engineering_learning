@@ -178,8 +178,8 @@ _CONTROLLED_MATCH_METHODS = frozenset(
         "fuzzy",
     }
 )
-_OPAQUE_IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
-_REQUEST_ID = re.compile(r"^(?:request-[A-Za-z0-9._:-]{1,64}|[0-9a-f]{32})$")
+_QUERY_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
+_REQUEST_ID = re.compile(r"^(?:request-[0-9]{1,20}|[0-9a-f]{32})$")
 _FAILURE_CODES_BY_TYPE = {
     "DomainAccessDeniedError": "access_denied",
     "PlanValidationError": "plan_validation",
@@ -229,11 +229,49 @@ def _safe_string(value: str, key: str):
     if key == "request_id":
         return value if _REQUEST_ID.fullmatch(value) else None
     if key == "fingerprint":
-        return value if _OPAQUE_IDENTIFIER.fullmatch(value) else None
+        return value if _QUERY_FINGERPRINT.fullmatch(value) else None
     return None
 
 
 def _sanitize(value, *, key: str | None = None):
+    if key in _SAFE_STRING_KEYS:
+        return _safe_string(value, key) if isinstance(value, str) else None
+    if key in _SAFE_INT_KEYS:
+        return (
+            value
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0
+            else None
+        )
+    if key == "duration_seconds":
+        return (
+            value
+            if isinstance(value, float) and math.isfinite(value) and value >= 0
+            else None
+        )
+    if key == "match_method_counts":
+        if not isinstance(value, Mapping):
+            return None
+        return {
+            item_key: int(item_value)
+            for item_key, item_value in value.items()
+            if isinstance(item_key, str)
+            and item_key in _CONTROLLED_MATCH_METHODS
+            and isinstance(item_value, int)
+            and not isinstance(item_value, bool)
+            and item_value >= 0
+        }
+    if key in _SAFE_LIST_KEYS:
+        if not isinstance(value, (list, tuple, set, frozenset)):
+            return None
+        allowed = {
+            "violation_codes": _CONTROLLED_CODES,
+            "unsupported_capabilities": _CONTROLLED_CODES,
+            "fact_kinds": _CONTROLLED_FACT_KINDS,
+        }[key]
+        items = [item for item in value if isinstance(item, str) and item in allowed]
+        if isinstance(value, (set, frozenset)):
+            items.sort()
+        return items
     if isinstance(value, BaseException):
         return {"failure_code": _failure_code(value)}
     if hasattr(value, "model_dump") and callable(value.model_dump):
@@ -246,16 +284,6 @@ def _sanitize(value, *, key: str | None = None):
             value = asdict(value)
         except Exception:
             return "[REDACTED]"
-    elif key == "match_method_counts" and isinstance(value, Mapping):
-        return {
-            item_key: int(item_value)
-            for item_key, item_value in value.items()
-            if isinstance(item_key, str)
-            and item_key in _CONTROLLED_MATCH_METHODS
-            and isinstance(item_value, int)
-            and not isinstance(item_value, bool)
-            and item_value >= 0
-        }
     elif isinstance(value, Mapping):
         sanitized = {}
         for raw_key, item in value.items():
@@ -269,16 +297,6 @@ def _sanitize(value, *, key: str | None = None):
                 sanitized[normalized_key] = clean
         return sanitized
     elif isinstance(value, (list, tuple, set, frozenset)):
-        items = value
-        if isinstance(value, (set, frozenset)):
-            items = sorted(value, key=repr)
-        if key in _SAFE_LIST_KEYS:
-            allowed = {
-                "violation_codes": _CONTROLLED_CODES,
-                "unsupported_capabilities": _CONTROLLED_CODES,
-                "fact_kinds": _CONTROLLED_FACT_KINDS,
-            }[key]
-            return [item for item in items if isinstance(item, str) and item in allowed]
         return None
     elif hasattr(value, "__dict__") and not isinstance(value, type):
         try:

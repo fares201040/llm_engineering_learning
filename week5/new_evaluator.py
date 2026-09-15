@@ -1,7 +1,6 @@
 """Gradio dashboard for the APDC attendance evaluation suite."""
 
 from collections import defaultdict
-from dataclasses import dataclass
 
 import gradio as gr
 import pandas as pd
@@ -30,6 +29,10 @@ def _evaluation_failure_status():
     return "Failed (evaluation_error)"
 
 
+def _evaluation_failure_cause(_error: Exception):
+    return "evaluation_runtime_failure"
+
+
 def _category_frame(values, metric_name):
     rows = [
         {"Category": category, metric_name: sum(scores) / len(scores)}
@@ -37,93 +40,6 @@ def _category_frame(values, metric_name):
         if scores
     ]
     return pd.DataFrame(rows, columns=["Category", metric_name])
-
-
-@dataclass(frozen=True)
-class SyntheticConversationCase:
-    """Private-data-free contract for local conversational safety checks."""
-
-    category: str
-    question: str
-    turns: tuple[str, ...]
-    expected_conversation_calls: int
-    expected_retrieval_calls: int
-    expected_published_results: int
-
-
-@dataclass(frozen=True)
-class SyntheticObservation:
-    """Call-count and atomicity facts supplied by a local test runner."""
-
-    conversation_calls: int
-    retrieval_calls: int
-    published_results: int
-    partial_results: int = 0
-
-
-SYNTHETIC_CONVERSATION_CASES = (
-    SyntheticConversationCase(
-        category="synthetic_fast_path",
-        question="hello",
-        turns=(),
-        expected_conversation_calls=0,
-        expected_retrieval_calls=0,
-        expected_published_results=0,
-    ),
-    SyntheticConversationCase(
-        category="synthetic_context_resume",
-        question="synthetic attendance request",
-        turns=("same synthetic scope",),
-        expected_conversation_calls=1,
-        expected_retrieval_calls=1,
-        expected_published_results=1,
-    ),
-    SyntheticConversationCase(
-        category="synthetic_invalid_provider",
-        question="invalid synthetic provider decision",
-        turns=(),
-        expected_conversation_calls=1,
-        expected_retrieval_calls=0,
-        expected_published_results=0,
-    ),
-)
-
-
-def run_synthetic_conversation_evaluation(runner):
-    """Evaluate local synthetic call-count and no-partial-result contracts."""
-    details = []
-    for index, case in enumerate(SYNTHETIC_CONVERSATION_CASES):
-        observation = runner(case)
-        if not isinstance(observation, SyntheticObservation):
-            raise TypeError("synthetic runner must return SyntheticObservation")
-        counts_match = (
-            observation.conversation_calls == case.expected_conversation_calls
-            and observation.retrieval_calls == case.expected_retrieval_calls
-            and observation.published_results == case.expected_published_results
-        )
-        details.append(
-            {
-                "Case": index,
-                "Category": case.category,
-                "Question": case.question,
-                "Conversation calls": observation.conversation_calls,
-                "Retrieval calls": observation.retrieval_calls,
-                "Published results": observation.published_results,
-                "Atomic": counts_match and observation.partial_results == 0,
-            }
-        )
-    return pd.DataFrame(
-        details,
-        columns=[
-            "Case",
-            "Category",
-            "Question",
-            "Conversation calls",
-            "Retrieval calls",
-            "Published results",
-            "Atomic",
-        ],
-    )
 
 
 def run_dataset_verification():
@@ -168,7 +84,7 @@ def run_behavior_evaluation(maximum, progress=gr.Progress()):
                     "Cause": diagnostic.cause if diagnostic else "",
                 }
             )
-        except Exception:
+        except Exception as exc:
             category_scores[case.category].append(0.0)
             details.append(
                 {
@@ -177,7 +93,7 @@ def run_behavior_evaluation(maximum, progress=gr.Progress()):
                     "Question": case.question,
                     "Status": _evaluation_failure_status(),
                     "Failed checks": "evaluation_error",
-                    "Cause": "provider_structural_failure",
+                    "Cause": _evaluation_failure_cause(exc),
                 }
             )
         _update_progress(progress, index, len(cases), f"Behavior case {index}")
@@ -285,7 +201,7 @@ def run_answer_evaluation(maximum, progress=gr.Progress()):
                     "Cause": diagnostic.cause if diagnostic else "",
                 }
             )
-        except Exception:
+        except Exception as exc:
             details.append(
                 {
                     "Case": index - 1,
@@ -295,7 +211,7 @@ def run_answer_evaluation(maximum, progress=gr.Progress()):
                     "Completeness": None,
                     "Relevance": None,
                     "Status": _evaluation_failure_status(),
-                    "Cause": "provider_structural_failure",
+                    "Cause": _evaluation_failure_cause(exc),
                 }
             )
         _update_progress(progress, index, len(cases), f"Answer case {index}")

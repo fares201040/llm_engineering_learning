@@ -211,7 +211,7 @@ class MultiEmployeeDateViewReducerTests(unittest.TestCase):
             "لكل موظف", answer.format_multi_employee_date_views(result, locale="ar")
         )
 
-    def test_reducer_deduplicates_fills_zero_rows_and_detects_overflow(self):
+    def test_reducer_fills_zero_rows_and_detects_overflow(self):
         compiled = answer.CompiledMultiEmployeeDateViews(
             employee_ids=("A10001", "A10002", "A10003"),
             views=(
@@ -232,7 +232,6 @@ class MultiEmployeeDateViewReducerTests(unittest.TestCase):
             intersection_rows=[
                 {"group_0": "2026-09-01", "value": 3},
                 {"group_0": "2026-09-02", "value": 2},
-                {"group_0": "2026-09-02", "value": 2},
             ],
             execution_group_limit=3,
         )
@@ -250,6 +249,78 @@ class MultiEmployeeDateViewReducerTests(unittest.TestCase):
                 ],
                 union_value=0,
                 intersection_rows=[],
+                execution_group_limit=3,
+            )
+
+    def test_reducer_accepts_postgres_date_group_values(self):
+        compiled = answer.CompiledMultiEmployeeDateViews(
+            employee_ids=("A10001", "A10002"),
+            views=("intersection_dates",),
+        )
+
+        result = answer.reduce_multi_employee_date_views(
+            compiled,
+            employee_names={},
+            per_employee_rows=[],
+            union_value=None,
+            intersection_rows=[{"group_0": date(2026, 9, 1), "value": 2}],
+            execution_group_limit=3,
+        )
+
+        self.assertEqual(result.intersection_dates, 1)
+
+    def test_reducer_rejects_duplicate_intersection_groups(self):
+        compiled = answer.CompiledMultiEmployeeDateViews(
+            employee_ids=("A10001", "A10002"),
+            views=("intersection_dates",),
+        )
+
+        with self.assertRaises(answer.PlanValidationError):
+            answer.reduce_multi_employee_date_views(
+                compiled,
+                employee_names={},
+                per_employee_rows=[],
+                union_value=None,
+                intersection_rows=[
+                    {"group_0": "2026-09-01", "value": 1},
+                    {"group_0": "2026-09-01", "value": 1},
+                ],
+                execution_group_limit=3,
+            )
+
+    def test_reducer_rejects_malformed_intersection_counts(self):
+        compiled = answer.CompiledMultiEmployeeDateViews(
+            employee_ids=("A10001", "A10002"),
+            views=("intersection_dates",),
+        )
+
+        for value in (1.5, -1, 0, 3):
+            with (
+                self.subTest(value=value),
+                self.assertRaises(answer.PlanValidationError),
+            ):
+                answer.reduce_multi_employee_date_views(
+                    compiled,
+                    employee_names={},
+                    per_employee_rows=[],
+                    union_value=None,
+                    intersection_rows=[{"group_0": "2026-09-01", "value": value}],
+                    execution_group_limit=3,
+                )
+
+    def test_reducer_rejects_malformed_intersection_dates(self):
+        compiled = answer.CompiledMultiEmployeeDateViews(
+            employee_ids=("A10001", "A10002"),
+            views=("intersection_dates",),
+        )
+
+        with self.assertRaises(answer.PlanValidationError):
+            answer.reduce_multi_employee_date_views(
+                compiled,
+                employee_names={},
+                per_employee_rows=[],
+                union_value=None,
+                intersection_rows=[{"group_0": "not-a-date", "value": 2}],
                 execution_group_limit=3,
             )
 
@@ -600,6 +671,25 @@ class AccessScopeTests(unittest.TestCase):
             text, chunks = answer.answer_question(message)
 
         self.assertEqual(text, answer.ACCESS_DENIED_MESSAGE)
+        self.assertEqual(chunks, [])
+        decide.assert_not_called()
+        directory.assert_not_called()
+        retrieval.assert_not_called()
+        final_answer.assert_not_called()
+
+    def test_arabic_protected_turn_uses_deterministic_localized_denial(self):
+        message = "احسب سجلات الحضور واعرض الرواتب"
+        with (
+            patch.object(
+                answer.conversation, "request_conversation_decision"
+            ) as decide,
+            patch.object(answer, "load_employee_directory") as directory,
+            patch.object(answer, "fetch_exact_chroma") as retrieval,
+            patch.object(answer, "completion") as final_answer,
+        ):
+            text, chunks = answer.answer_question(message)
+
+        self.assertEqual(text, "هذا العرض يدعم أسئلة الحضور المصرح بها فقط.")
         self.assertEqual(chunks, [])
         decide.assert_not_called()
         directory.assert_not_called()
@@ -4919,7 +5009,7 @@ class ConversationGatewayTests(unittest.TestCase):
         self.assertEqual(fetch.call_args.kwargs["request_view"], "per_employee")
         self.assertEqual(resumed.recent_frames[-1].units[0].view, "per_employee")
 
-    def test_selected_view_reaches_the_real_execution_plan_boundary(self):
+    def test_selected_view_does_not_mutate_the_typed_executable_plan(self):
         fact = answer.SemanticFact(
             kind="measure",
             concept_name="attendance_records",
@@ -4957,8 +5047,8 @@ class ConversationGatewayTests(unittest.TestCase):
                 request_view="per_employee",
             )
 
-        self.assertEqual(executed[0].request_view, "per_employee")
-        self.assertEqual(result.plan.request_view, "per_employee")
+        self.assertFalse(hasattr(executed[0], "request_view"))
+        self.assertFalse(hasattr(result.plan, "request_view"))
 
     def test_explain_previous_recompiles_and_describes_trusted_result_basis(self):
         from week5.new_implementation import conversation_understanding as c

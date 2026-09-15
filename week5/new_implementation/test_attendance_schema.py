@@ -37,6 +37,30 @@ class SemanticSchemaContractTests(unittest.TestCase):
         )
         self.assertNotIn("employee_days", get_args(schema.AnswerUnit))
 
+    def test_multi_employee_date_result_rejects_inconsistent_or_duplicate_views(self):
+        schema = importlib.import_module("week5.new_implementation.attendance_schema")
+        employee = schema.MultiEmployeeDateEmployeeResult(
+            employee_id="A10001", name="A", dates=1
+        )
+
+        invalid_payloads = (
+            {"views": ()},
+            {"views": ("all_views",)},
+            {"views": ("union_dates", "union_dates"), "union_dates": 1},
+            {"views": ("union_dates",)},
+            {"views": ("per_employee",), "per_employee": ()},
+            {"views": ("employee_days",), "employee_days": None},
+            {"views": ("intersection_dates",), "intersection_dates": None},
+            {"views": ("union_dates",), "union_dates": 1, "employee_days": 1},
+            {
+                "views": ("per_employee",),
+                "per_employee": (employee, employee),
+            },
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload), self.assertRaises(ValidationError):
+                schema.MultiEmployeeDateViewsResult(**payload)
+
     def test_projection_is_rows_only_and_has_unique_fields(self):
         schema = importlib.import_module("week5.new_implementation.attendance_schema")
         for shape, projection in (("scalar", ["Date"]), ("rows", ["Date", "Date"])):

@@ -266,6 +266,14 @@ def _require_supported_attendance_question(question: str):
         raise DomainAccessDeniedError(ACCESS_DENIED_MESSAGE)
 
 
+def _access_denied_reply(locale: str) -> str:
+    return (
+        "هذا العرض يدعم أسئلة الحضور المصرح بها فقط."
+        if locale == "ar"
+        else ACCESS_DENIED_MESSAGE
+    )
+
+
 def _social_reply(locale: str) -> str:
     return (
         "مرحبًا! يمكنني مساعدتك في أسئلة الحضور."
@@ -2146,18 +2154,35 @@ def reduce_multi_employee_date_views(
             )
         per_employee_values[employee_id] = numeric
     intersection_dates: set[str] = set()
+    seen_intersection_dates: set[str] = set()
     for row in intersection_rows:
         date_value, value = row.get("group_0"), row.get("value")
-        if (
-            not isinstance(date_value, str)
-            or not isinstance(value, (int, float))
-            or isinstance(value, bool)
-        ):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise PlanValidationError(
                 "Derived attendance groups could not be safely completed."
             )
-        if int(value) == value and int(value) == len(compiled.employee_ids):
-            intersection_dates.add(date_value)
+        numeric = int(value)
+        if numeric != value or not 1 <= numeric <= len(compiled.employee_ids):
+            raise PlanValidationError(
+                "Derived attendance groups could not be safely completed."
+            )
+        try:
+            normalized_date = (
+                date_value.isoformat()
+                if type(date_value) is date
+                else date.fromisoformat(date_value).isoformat()
+            )
+        except (TypeError, ValueError):
+            raise PlanValidationError(
+                "Derived attendance groups could not be safely completed."
+            ) from None
+        if normalized_date in seen_intersection_dates:
+            raise PlanValidationError(
+                "Derived attendance groups could not be safely completed."
+            )
+        seen_intersection_dates.add(normalized_date)
+        if numeric == len(compiled.employee_ids):
+            intersection_dates.add(normalized_date)
     rows = tuple(
         MultiEmployeeDateEmployeeResult(
             employee_id=employee_id,
@@ -4287,9 +4312,6 @@ def _prepare_context_request(
             "Plan revalidation reported ready without an executable plan."
         )
     plan = ExecutableQueryPlan.model_validate(revalidated.executable_plan.model_dump())
-    # The view remains trusted conversational metadata; Task 7 maps it only to
-    # compiler-owned primitives after this normal plan has been revalidated.
-    object.__setattr__(plan, "request_view", request_view)
 
     employee_scope = next(
         (
@@ -6206,6 +6228,13 @@ def _prepare_turn(
                 pending = pending.model_copy(update={"clarification_text": text})
             retained.append(pending or saved)
             blockers.append(TurnBlocker(index, text, pending))
+    if (
+        not blockers
+        and sum(item.plan.answer_contract.shape == "narrative" for item in requests) > 1
+    ):
+        blockers.append(
+            TurnBlocker(0, _format_conversation_help(units[0].reply_locale), None)
+        )
     return TurnPreparationResult(
         None if blockers else PreparedTurn(tuple(requests)),
         tuple(blockers),
@@ -6383,14 +6412,14 @@ def _answer_question_with_state(
         _require_attendance_access(access_context)
         route = conversation.conversation_preflight_route(question)
         if route == "protected":
-            return ACCESS_DENIED_MESSAGE, [], state
+            return _access_denied_reply(reply_locale), [], state
         if route == "social":
             return _social_reply(reply_locale), [], state
         if route == "unrelated":
             return _unrelated_refusal(reply_locale), [], state
         _require_supported_attendance_question(question)
     except DomainAccessDeniedError:
-        return ACCESS_DENIED_MESSAGE, [], state
+        return _access_denied_reply(reply_locale), [], state
     except PlanValidationError as exc:
         return f"I could not safely interpret that request: {exc}", [], state
 

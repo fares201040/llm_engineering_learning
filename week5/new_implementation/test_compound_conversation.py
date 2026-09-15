@@ -655,6 +655,35 @@ class CompoundTurnTests(unittest.TestCase):
         self.assertEqual((chunks, trace), ([], []))
         self.assertNotIn("private", text)
 
+    def test_multiple_narrative_units_stop_before_retrieval_or_final_answer(self):
+        question = "attendance patterns; attendance summaries"
+        initial = answer.ConversationState()
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="narrative"))]
+        )
+        evidence = [
+            answer.Result(
+                page_content="synthetic attendance evidence",
+                metadata={"domain": "attendance", "chunk_type": "attendance_record"},
+            )
+        ]
+
+        with (
+            patch.object(
+                answer, "fetch_semantic_chroma", return_value=evidence
+            ) as fetch,
+            patch.object(answer, "completion", return_value=response) as completion,
+        ):
+            text, chunks, state = answer.answer_question_with_state(
+                question, [], initial
+            )
+
+        self.assertIn("split", text.lower())
+        self.assertEqual(chunks, [])
+        self.assertEqual(state, initial)
+        fetch.assert_not_called()
+        completion.assert_not_called()
+
     def test_arabic_compound_and_budget_responses(self):
         question = "كم عدد أيام العمل المجدولة؟; كم عدد أيام الغياب؟"
         text, _, state = answer.answer_question_with_state(question, [], None)

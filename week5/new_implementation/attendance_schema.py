@@ -452,6 +452,28 @@ class MultiEmployeeDateViewsResult(BaseModel):
     union_dates: int | None = Field(default=None, ge=0)
     intersection_dates: int | None = Field(default=None, ge=0)
 
+    @model_validator(mode="after")
+    def _views_match_the_complete_result_payload(self):
+        selected = set(self.views)
+        if (
+            not self.views
+            or "all_views" in selected
+            or len(selected) != len(self.views)
+        ):
+            raise ValueError("result views must be expanded, non-empty, and unique")
+        present = {
+            "per_employee": bool(self.per_employee),
+            "employee_days": self.employee_days is not None,
+            "union_dates": self.union_dates is not None,
+            "intersection_dates": self.intersection_dates is not None,
+        }
+        if any(present[view] != (view in selected) for view in present):
+            raise ValueError("result values must exactly match the selected views")
+        employee_ids = [item.employee_id for item in self.per_employee]
+        if len(employee_ids) != len(set(employee_ids)):
+            raise ValueError("per-employee result identities must be unique")
+        return self
+
 
 @dataclass(frozen=True)
 class FieldDefinition:

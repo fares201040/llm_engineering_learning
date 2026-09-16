@@ -1,5 +1,6 @@
 """Pure compilation of verified plans into parameterized PostgreSQL artifacts."""
 
+from collections.abc import Collection
 from dataclasses import dataclass
 import hashlib
 import re
@@ -39,6 +40,107 @@ class CompiledPostgresQuery:
     params: tuple[object, ...]
     purpose: Literal["sample", "count", "aggregation", "coverage", "profile"]
     fingerprint: str
+
+
+GeneratedAggregateOperation = Literal[
+    "count", "distinct_count", "sum", "average", "min", "max"
+]
+
+
+@dataclass(frozen=True)
+class GeneratedAggregateChoice:
+    operation: GeneratedAggregateOperation
+    field: str | None
+
+
+_GENERATED_AGGREGATE_PATTERN = re.compile(
+    r"""
+    \A\s*SELECT\s+
+    (?:
+        (?P<count_all>COUNT\s*\(\s*\*\s*\))
+        |
+        (?P<function>COUNT|SUM|AVG|MIN|MAX)\s*\(\s*
+        (?:(?P<distinct>DISTINCT)\s+)?
+        (?P<field>[A-Za-z_][A-Za-z0-9_]*)\s*\)
+    )
+    \s+AS\s+value\s+FROM\s+attendance_scope\s*\Z
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def validate_generated_aggregate_sql(
+    sql: str,
+    *,
+    candidate_fields: Collection[str],
+    expected_operation: GeneratedAggregateOperation,
+) -> GeneratedAggregateChoice:
+    """Reduce one provider-authored logical SELECT to a trusted registry choice."""
+    if not isinstance(sql, str):
+        raise TypeError("Generated aggregate SQL must be a string.")
+    supported_operations = {
+        "count",
+        "distinct_count",
+        "sum",
+        "average",
+        "min",
+        "max",
+    }
+    if expected_operation not in supported_operations:
+        raise ValueError("Unsupported expected aggregate operation.")
+    if isinstance(candidate_fields, (str, bytes)) or any(
+        not isinstance(field, str) for field in candidate_fields
+    ):
+        raise TypeError("Candidate fields must be a collection of field names.")
+
+    match = _GENERATED_AGGREGATE_PATTERN.fullmatch(sql)
+    if match is None:
+        raise ValueError("Generated SQL is not an allowed scalar aggregate statement.")
+
+    if match.group("count_all") is not None:
+        choice = GeneratedAggregateChoice("count", None)
+    else:
+        function = match.group("function").upper()
+        distinct = match.group("distinct") is not None
+        if function == "COUNT":
+            if not distinct:
+                raise ValueError("COUNT over a field must use DISTINCT.")
+            operation: GeneratedAggregateOperation = "distinct_count"
+        else:
+            if distinct:
+                raise ValueError("DISTINCT is supported only with COUNT.")
+            operation = {
+                "SUM": "sum",
+                "AVG": "average",
+                "MIN": "min",
+                "MAX": "max",
+            }[function]
+
+        requested_field = match.group("field")
+        registry_fields = {
+            registry_field.casefold(): registry_field
+            for registry_field in FIELD_DEFINITIONS
+        }
+        field = registry_fields.get(requested_field.casefold())
+        candidate_field_keys = {candidate.casefold() for candidate in candidate_fields}
+        if field is None or field.casefold() not in candidate_field_keys:
+            raise ValueError(
+                "Generated SQL field is not a request-local registry field."
+            )
+        definition = FIELD_DEFINITIONS[field]
+        if operation == "distinct_count" and not definition.aggregatable:
+            raise ValueError("distinct_count requires an aggregatable field.")
+        if operation in {"sum", "average", "min", "max"} and (
+            definition.storage_type != "number"
+        ):
+            raise ValueError(f"{operation} requires a numeric field.")
+        choice = GeneratedAggregateChoice(operation, field)
+
+    if choice.operation != expected_operation:
+        raise ValueError(
+            "Generated SQL operation does not match the grounded operation."
+        )
+    return choice
 
 
 def _fingerprint(sql: str) -> str:
@@ -307,6 +409,30 @@ def compile_aggregation_queries(
     else:
         sql = f"SELECT {expression} AS value FROM {table} WHERE {where.sql}"
     return (_query(sql, where.params, "aggregation"),)
+
+
+def compile_generated_aggregate_query(
+    choice: GeneratedAggregateChoice,
+    plan: ExecutableQueryPlan,
+    table_name: str = "attendance_records",
+) -> CompiledPostgresQuery:
+    """Compile a validated logical choice through the trusted plan compiler."""
+    if type(choice) is not GeneratedAggregateChoice:
+        raise TypeError(
+            "Generated aggregation compilation requires a validated choice."
+        )
+    plan = _require_executable(plan)
+    if plan.answer_contract.shape != "scalar" or plan.group_by or plan.projection:
+        raise ValueError("Generated aggregation compilation requires a scalar plan.")
+    if choice.operation != plan.aggregation or choice.field != plan.aggregation_field:
+        raise ValueError(
+            "Generated aggregate choice does not match the executable plan."
+        )
+
+    queries = compile_aggregation_queries(plan, table_name=table_name)
+    if len(queries) != 1 or queries[0].purpose != "aggregation":
+        raise ValueError("Generated aggregation must compile to exactly one query.")
+    return queries[0]
 
 
 def compile_multi_employee_date_query(

@@ -22,7 +22,11 @@ ResolutionKind = Literal[
     "free_text",
 ]
 EvidenceOrigin = Literal[
-    "question", "trusted_state", "deterministic_default", "user_clarification"
+    "question",
+    "trusted_state",
+    "deterministic_default",
+    "user_clarification",
+    "provider_decision",
 ]
 PlanningStatus = Literal["ready", "ambiguous", "unsupported"]
 UnsupportedCapability = Literal[
@@ -373,6 +377,39 @@ class PlannerDecision(_StrictPlannerModel):
                 raise ValueError("unsupported decisions require capabilities")
             if self.selections or self.clarification_need_ids:
                 raise ValueError("unsupported decisions cannot select or clarify")
+        return self
+
+
+class GeneratedAggregateSqlDecision(_StrictPlannerModel):
+    """Untrusted provider response for the narrow logical aggregate fallback."""
+
+    status: Literal["ready", "ambiguous", "unsupported"]
+    sql: str | None = Field(default=None, max_length=512)
+    candidate_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("candidate_ids")
+    @classmethod
+    def _candidate_ids_must_be_nonblank_and_unique(cls, value: list[str]) -> list[str]:
+        if any(not candidate_id.strip() for candidate_id in value):
+            raise ValueError("candidate identifiers must not be blank")
+        if len(value) != len(set(value)):
+            raise ValueError("candidate identifiers must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def _validate_status_shape(self):
+        if self.status == "ready":
+            if self.sql is None or not self.sql:
+                raise ValueError("ready decisions require SQL")
+            if self.candidate_ids:
+                raise ValueError("ready decisions cannot contain candidate identifiers")
+        elif self.status == "ambiguous":
+            if self.sql is not None:
+                raise ValueError("ambiguous decisions cannot contain SQL")
+            if not self.candidate_ids:
+                raise ValueError("ambiguous decisions require candidate identifiers")
+        elif self.sql is not None or self.candidate_ids:
+            raise ValueError("unsupported decisions cannot contain SQL or candidates")
         return self
 
 

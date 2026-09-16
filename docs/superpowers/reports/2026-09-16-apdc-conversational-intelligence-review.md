@@ -196,10 +196,11 @@ not employee values.
   (`answer.py:1459-1471`), generated-aggregate attempts (`answer.py:918-1004`),
   reranking (`answer.py:3325-3398`), and final answer generation
   (`answer.py:5744-5755`). If pgvector is enabled, the embedding API call at
-  `answer.py:3272-3280` must also be counted. Count attempted provider calls
-  separately from budget claims and record only the integer count; never record
-  payloads. Grounded deterministic requests should remain at zero provider
-  completions.
+  `answer.py:3272-3280` must also be counted; if Chroma semantic retrieval is
+  enabled, count its embedding API call at `answer.py:2444-2448` as well. Count
+  attempted provider calls separately from budget claims and record only the
+  integer count; never record payloads. Grounded deterministic requests should
+  remain at zero provider completions.
 
 ### Privacy-safe observation schema
 

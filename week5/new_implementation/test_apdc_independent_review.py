@@ -176,6 +176,103 @@ class AggregateDecisionBoundaryReviewTests(unittest.TestCase):
 
         completion.assert_not_called()
 
+    def test_unrelated_unresolved_meaning_is_not_ignored_for_aggregate_subject(self):
+        unresolved = answer.SurfaceCandidate(
+            candidate_id="unresolved-interpretation",
+            target_kind="interpretation",
+            target_name="absent_days",
+            evidence_text="absent",
+            evidence_span=(24, 30),
+            method="fuzzy",
+            score=0.8,
+        )
+        selected = answer.SurfaceCandidate(
+            candidate_id="selected-field",
+            target_kind="field",
+            target_name="Total_Worked_Hrs",
+            evidence_text="total working hours",
+            evidence_span=(4, 23),
+            method="fuzzy",
+            score=0.8,
+        )
+        candidate = answer._GeneratedAggregateCandidate(
+            "field-1", "Total_Worked_Hrs", selected
+        )
+        with patch.object(
+            answer, "_unresolved_surface_candidates", return_value=(unresolved,)
+        ):
+            self.assertTrue(
+                answer._generated_aggregate_has_external_ambiguity(
+                    "sum total working hours absent", (candidate,)
+                )
+            )
+
+    def test_provider_and_default_operation_conflict_fails_closed(self):
+        facts = (
+            answer.SemanticFact(
+                kind="calculation",
+                field="Total_Worked_Hrs",
+                concept_name="sum",
+                evidence_text="provider sum",
+                origin="provider_decision",
+                strength="strong",
+            ),
+            answer.SemanticFact(
+                kind="calculation",
+                field="Total_Worked_Hrs",
+                concept_name="average",
+                evidence_text="default average",
+                origin="deterministic_default",
+                strength="strong",
+            ),
+        )
+        self.assertIsNone(
+            answer._generated_aggregate_operation("sum total working hours", facts)
+        )
+
+    def test_trusted_operation_conflicting_with_surface_fails_closed(self):
+        for origin in ("trusted_state", "user_clarification"):
+            with self.subTest(origin=origin):
+                facts = (
+                    answer.SemanticFact(
+                        kind="calculation",
+                        field="Total_Worked_Hrs",
+                        concept_name="average",
+                        evidence_text="trusted average",
+                        origin=origin,
+                        strength="strong",
+                    ),
+                )
+                self.assertIsNone(
+                    answer._generated_aggregate_operation(
+                        "sum total working hours", facts
+                    )
+                )
+
+    def test_postfix_registered_field_does_not_replace_intended_subject(self):
+        with (
+            patch.object(answer, "completion") as completion,
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            self.assertRaises(answer.SurfaceMeaningClarificationRequired),
+        ):
+            answer._prepare_context_request("sum total working hours overtime")
+
+        completion.assert_not_called()
+
+    def test_separate_field_suffix_constraint_is_retained_and_fails_closed(self):
+        with (
+            patch.object(answer, "completion") as completion,
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            self.assertRaises(answer.SemanticPlanValidationError),
+        ):
+            answer._prepare_context_request(
+                "sum total working hours and overtime field"
+            )
+
+        completion.assert_not_called()
+
     def test_generated_sql_provider_error_name_remains_compatible(self):
         self.assertIs(
             answer.GeneratedSqlProviderError,

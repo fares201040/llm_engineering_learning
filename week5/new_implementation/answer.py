@@ -702,7 +702,7 @@ _GENERATED_AGGREGATE_OPERATIONS = frozenset(
 
 def _typed_aggregate_operation_from_facts(
     facts: tuple[SemanticFact, ...],
-) -> str | None:
+) -> tuple[str | None, bool]:
     """Read only already-typed aggregate operations from request-local facts."""
     operations = {
         fact.concept_name
@@ -718,7 +718,9 @@ def _typed_aggregate_operation_from_facts(
         }
         and fact.concept_name in _GENERATED_AGGREGATE_OPERATIONS
     }
-    return next(iter(operations)) if len(operations) == 1 else None
+    if len(operations) > 1:
+        return None, True
+    return (next(iter(operations)), False) if operations else (None, False)
 
 
 def _aggregate_operation_spans(
@@ -749,20 +751,9 @@ def _generated_aggregate_operation_from_surface(
     surface,
 ) -> str | None:
     """Derive one operation, rejecting conflicting typed matches fail-closed."""
-    trusted = {
-        fact.concept_name
-        for fact in facts
-        if fact.kind == "calculation"
-        and fact.strength == "strong"
-        and fact.origin in {"trusted_state", "user_clarification"}
-        and fact.concept_name in _GENERATED_AGGREGATE_OPERATIONS
-    }
-    if len(trusted) > 1:
+    typed_operation, typed_conflict = _typed_aggregate_operation_from_facts(facts)
+    if typed_conflict:
         return None
-    if trusted:
-        return next(iter(trusted))
-
-    typed_facts = _typed_aggregate_operation_from_facts(facts)
     surface_operations = {
         candidate.target_name
         for candidate in surface.candidates
@@ -772,11 +763,11 @@ def _generated_aggregate_operation_from_surface(
     }
     if len(surface_operations) > 1:
         return None
-    if typed_facts is not None and surface_operations:
-        if typed_facts not in surface_operations:
+    if typed_operation is not None and surface_operations:
+        if typed_operation not in surface_operations:
             return None
-        return typed_facts
-    return typed_facts or next(iter(surface_operations), None)
+        return typed_operation
+    return typed_operation or next(iter(surface_operations), None)
 
 
 def _generated_aggregate_operation(
@@ -950,22 +941,12 @@ def _generated_aggregate_has_external_ambiguity(
     unresolved = _unresolved_surface_candidates(question)
     if not unresolved:
         return False
-    relevant = tuple(
-        item
-        for item in unresolved
-        if any(
-            _surface_spans_overlap(item.evidence_span, candidate.surface.evidence_span)
-            for candidate in candidates
-        )
-    )
-    if not relevant:
-        return False
-    if len(relevant) != 1 or relevant[0].target_kind != "predicate":
+    if len(unresolved) != 1 or unresolved[0].target_kind != "predicate":
         return True
-    predicate = BUSINESS_PREDICATE_DEFINITIONS.get(relevant[0].target_name)
+    predicate = BUSINESS_PREDICATE_DEFINITIONS.get(unresolved[0].target_name)
     if predicate is None:
         return True
-    ambiguity_span = relevant[0].evidence_span
+    ambiguity_span = unresolved[0].evidence_span
     overlapping_fields = {
         candidate.field
         for candidate in candidates
@@ -989,16 +970,55 @@ def _drop_natural_aggregate_field_suffix(
     }
     if not aggregate_fields:
         return facts
+    surface = analyze_question_surface(question)
+    operation_names = {
+        fact.concept_name
+        for fact in facts
+        if fact.kind == "calculation"
+        and fact.strength == "strong"
+        and fact.concept_name in _GENERATED_AGGREGATE_OPERATIONS
+    }
+    operation_spans = tuple(
+        candidate.evidence_span
+        for candidate in surface.candidates
+        if candidate.target_kind == "calculation"
+        and candidate.target_name in operation_names
+        and candidate.method in {"exact", "localized_alias"}
+    )
     field_candidates = {
-        normalize_for_matching(candidate.evidence_text)
-        for candidate in analyze_question_surface(question).candidates
+        candidate
+        for candidate in surface.candidates
         if candidate.target_kind == "field"
         and candidate.target_name in aggregate_fields
         and candidate.method in {"exact", "localized_alias"}
     }
-    if not field_candidates:
+    natural_suffixes = set()
+    for candidate in field_candidates:
+        suffix = re.match(
+            r"\s+field\s*[.,!?;:]?\s*$",
+            question[candidate.evidence_span[1] :],
+            re.IGNORECASE,
+        )
+        if suffix is None:
+            continue
+        if not any(
+            operation_span[1] <= candidate.evidence_span[0]
+            and re.fullmatch(
+                r"[\s,]*(?:(?:of|the|a|an)[\s,]*){0,2}",
+                question[operation_span[1] : candidate.evidence_span[0]],
+                re.IGNORECASE,
+            )
+            for operation_span in operation_spans
+        ):
+            continue
+        suffix_end = candidate.evidence_span[1] + suffix.end()
+        natural_suffixes.add(
+            normalize_for_matching(
+                question[candidate.evidence_span[0] : suffix_end]
+            )
+        )
+    if not natural_suffixes:
         return facts
-    natural_suffixes = {f"{evidence} field" for evidence in field_candidates}
     return tuple(
         fact
         for fact in facts
@@ -4870,6 +4890,19 @@ def _prepare_context_request(
         meaning_candidates
         and _generated_aggregate_has_external_ambiguity(question, meaning_candidates)
     )
+    if surface_meaning_pending:
+        unresolved_candidates = _unresolved_surface_candidates(question)
+        event_logger.emit(
+            "input_clarification_required",
+            request_id=request_id,
+            stage="input_understanding",
+            state="paused",
+            clarification_kind="semantic_interpretation",
+            candidate_count=len(unresolved_candidates),
+        )
+        raise SurfaceMeaningClarificationRequired(
+            merge_semantic_facts(prepared_facts, detected_facts), unresolved_candidates
+        )
     if any(
         fact.kind == "unsupported"
         and fact.strength == "strong"

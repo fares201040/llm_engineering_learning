@@ -853,3 +853,21 @@ parameterized compilation remain local and trusted.
 ### Commit
 
 Commit message: `fix: make aggregate provider context typed only`.
+
+## Task 3 fix round 3 — fail-closed semantic conflicts
+
+The typed-only provider boundary remained intact, while four local semantic
+gaps were closed. Strong typed calculation facts now distinguish conflict from
+absence and are always reconciled with exact/localized surface operations.
+Unresolved external interpretations no longer disappear merely because their
+span does not overlap the selected aggregate field. A second registered field
+appended after postfix operation wording cannot replace the original subject;
+the request pauses for clarification. Finally, the benign `<alias> field`
+cleanup is limited to the terminal adjacent grammatical form, so a separate
+constraint-like phrase remains fail closed.
+
+The focused Task 3 class passed all 13 tests in 18.376 seconds, including the
+five new review regressions and all prior privacy, typed-payload, deterministic
+count, legitimate-language, trusted-compilation, and compatibility checks.
+`git diff --check` passed. No pre-existing test suite was run at this stage,
+and `planning_decisions.py` remains unchanged.

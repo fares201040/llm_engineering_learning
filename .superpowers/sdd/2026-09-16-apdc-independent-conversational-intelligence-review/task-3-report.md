@@ -317,3 +317,42 @@ private values, question field, SQL, or schema text.
 ### Commit
 
 Commit message: `fix: make aggregate provider context typed only`.
+
+## Fix round 3: fail closed on aggregate semantic conflicts
+
+The fresh review of fix round 2 accepted the typed-only provider boundary but
+found four local fail-open cases: unrelated unresolved meaning could be ignored,
+conflicting typed operations could collapse to the same value as no operation,
+an appended registered field could replace a preceding aggregate subject, and
+the natural `<alias> field` cleanup could remove a separate constraint.
+
+The original Luna-max implementer left the focused tests and implementation
+changes uncommitted and its session ended before reporting. A replacement
+session also ended without a report. The primary agent preserved the shared
+edits, inspected their complete diff, and performed the allowed focused
+verification rather than restarting or running any pre-existing suite.
+
+The correction now distinguishes typed-operation conflict from absence,
+cross-checks typed operations against surface operations regardless of fact
+origin, treats any unresolved non-predicate/external interpretation as a
+clarification boundary, and limits the benign `field` cleanup to a terminal,
+adjacent grammatical suffix after the aggregate operation and selected field.
+An appended alternate registered field now pauses for clarification rather than
+changing the compiled aggregation subject.
+
+Focused command:
+
+```powershell
+& '.venv\Scripts\python.exe' -m unittest -v week5.new_implementation.test_apdc_independent_review.AggregateDecisionBoundaryReviewTests
+```
+
+Result: exit code 0; all 13 focused tests passed in 18.376 seconds. The five
+round-3 regressions cover unrelated unresolved meaning, conflicting
+provider/default operations, trusted-state and user-clarification conflicts,
+postfix alternate registered fields, and a separate constraint-like `field`
+phrase. The earlier typed-only payload, diverse hostile suffix, legitimate
+`from`/`field` phrasing, count zero-call, trusted compiler, and compatibility
+checks also remained green. `git diff --check` passed. No pre-existing test file
+or suite was run, and `planning_decisions.py` was not modified.
+
+Commit message: `fix: fail closed on aggregate semantic conflicts`.

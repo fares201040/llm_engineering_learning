@@ -1,7 +1,7 @@
 """Canonical APDC attendance fields and deterministic calculation semantics."""
 
 from dataclasses import dataclass, replace
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from datetime import date, datetime, time
 from decimal import Decimal, InvalidOperation
 import json
@@ -383,6 +383,8 @@ class PlannerDecision(_StrictPlannerModel):
 class GeneratedAggregateSqlDecision(_StrictPlannerModel):
     """Untrusted provider response for the narrow logical aggregate fallback."""
 
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, strict=True)
+
     status: Literal["ready", "ambiguous", "unsupported"]
     sql: str | None = Field(default=None, max_length=512)
     candidate_ids: list[str] = Field(default_factory=list)
@@ -411,6 +413,26 @@ class GeneratedAggregateSqlDecision(_StrictPlannerModel):
         elif self.sql is not None or self.candidate_ids:
             raise ValueError("unsupported decisions cannot contain SQL or candidates")
         return self
+
+
+def validate_generated_aggregate_decision(
+    decision: GeneratedAggregateSqlDecision,
+    *,
+    allowed_candidate_ids: Collection[str],
+) -> GeneratedAggregateSqlDecision:
+    """Require ambiguous provider choices to remain request-local."""
+    if type(decision) is not GeneratedAggregateSqlDecision:
+        raise TypeError("Expected a generated aggregate SQL decision.")
+    if isinstance(allowed_candidate_ids, (str, bytes)) or any(
+        not isinstance(candidate_id, str) for candidate_id in allowed_candidate_ids
+    ):
+        raise TypeError("Allowed candidate identifiers must be strings.")
+    allowed = frozenset(allowed_candidate_ids)
+    if decision.status == "ambiguous" and any(
+        candidate_id not in allowed for candidate_id in decision.candidate_ids
+    ):
+        raise ValueError("Ambiguous candidate identifiers must be request-local.")
+    return decision
 
 
 class ExecutableQueryPlan(QueryPlan):

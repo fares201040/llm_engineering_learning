@@ -422,7 +422,12 @@ def compile_generated_aggregate_query(
             "Generated aggregation compilation requires a validated choice."
         )
     plan = _require_executable(plan)
-    if plan.answer_contract.shape != "scalar" or plan.group_by or plan.projection:
+    if (
+        plan.answer_contract.shape != "scalar"
+        or plan.answer_contract.grain
+        or plan.group_by
+        or plan.projection
+    ):
         raise ValueError("Generated aggregation compilation requires a scalar plan.")
     if choice.operation != plan.aggregation or choice.field != plan.aggregation_field:
         raise ValueError(

@@ -8,6 +8,7 @@ from week5.new_implementation.attendance_schema import (
     FilterCondition,
     GeneratedAggregateSqlDecision,
     QueryPlan,
+    validate_generated_aggregate_decision,
 )
 from week5.new_implementation.postgres_compiler import (
     GeneratedAggregateChoice,
@@ -77,6 +78,41 @@ class GeneratedAggregateSqlDecisionTests(unittest.TestCase):
         for payload in invalid_payloads:
             with self.subTest(payload=payload), self.assertRaises(ValidationError):
                 GeneratedAggregateSqlDecision.model_validate(payload)
+
+    def test_request_local_validator_rejects_unknown_ambiguous_candidate_ids(self):
+        decision = GeneratedAggregateSqlDecision(
+            status="ambiguous", candidate_ids=["field-1", "field-2"]
+        )
+
+        self.assertIs(
+            validate_generated_aggregate_decision(
+                decision, allowed_candidate_ids={"field-1", "field-2", "field-3"}
+            ),
+            decision,
+        )
+        with self.assertRaises(ValueError):
+            validate_generated_aggregate_decision(
+                decision, allowed_candidate_ids={"field-1", "field-3"}
+            )
+
+    def test_python_model_boundary_rejects_coercion_but_json_remains_valid(self):
+        invalid_payloads = [
+            {
+                "status": "ready",
+                "sql": b"SELECT COUNT(*) AS value FROM attendance_scope",
+            },
+            {"status": "ambiguous", "candidate_ids": ("field-1",)},
+            {"status": "ambiguous", "candidate_ids": [b"field-1"]},
+        ]
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload), self.assertRaises(ValidationError):
+                GeneratedAggregateSqlDecision.model_validate(payload)
+
+        decision = GeneratedAggregateSqlDecision.model_validate_json(
+            '{"status":"ambiguous","candidate_ids":["field-1"]}'
+        )
+        self.assertEqual(decision.candidate_ids, ["field-1"])
 
 
 class GeneratedAggregateSqlValidationTests(unittest.TestCase):
@@ -272,6 +308,20 @@ class GeneratedAggregateCompilationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             compile_generated_aggregate_query(
                 GeneratedAggregateChoice("count", None), plan
+            )
+
+    def test_rejects_scalar_answer_contract_with_nonempty_grain(self):
+        plan = self._plan().model_copy(
+            update={
+                "answer_contract": AnswerContract(
+                    shape="scalar", unit="hours", grain=["Department"]
+                )
+            }
+        )
+
+        with self.assertRaises(ValueError):
+            compile_generated_aggregate_query(
+                GeneratedAggregateChoice("sum", "Total_OT"), plan
             )
 
     def test_fingerprint_is_stable_across_different_bound_values(self):

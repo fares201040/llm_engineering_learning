@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
 from week5.new_implementation import answer
+from week5.new_implementation.decision_budget import claim_provider_call
 
 
 def segmented_decision(request):
@@ -72,7 +73,7 @@ class CompoundTurnTests(unittest.TestCase):
             )
         )
         self.collection = self.stack.enter_context(patch.object(answer, "collection"))
-        self.stack.enter_context(
+        self.completion = self.stack.enter_context(
             patch.object(
                 answer,
                 "completion",
@@ -86,6 +87,109 @@ class CompoundTurnTests(unittest.TestCase):
                 for day in ("2026-09-01", "2026-09-01", "2026-09-02")
             ],
         }
+
+    @staticmethod
+    def _generated_response(content):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(content=content),
+                )
+            ]
+        )
+
+    def test_compound_generated_fallback_prepares_every_unit_before_execution(self):
+        question = "how many total working hours; how many total working hours"
+
+        def segmented_provider(request):
+            claim_provider_call()
+            return segmented_decision(request)
+
+        self.provider.side_effect = segmented_provider
+        self.completion.side_effect = [
+            self._generated_response(
+                '{"status":"ready","sql":"SELECT SUM(Total_Worked_Hrs) AS value '
+                'FROM attendance_scope"}'
+            ),
+            self._generated_response("not json"),
+        ]
+        initial = answer.ConversationState()
+        with (
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "execute_exact_postgres") as execute,
+            patch.object(answer, "_import_psycopg") as database,
+            patch.object(
+                answer,
+                "compile_generated_aggregate_query",
+                wraps=answer.compile_generated_aggregate_query,
+            ) as compile_generated,
+        ):
+            text, chunks, state = answer.answer_question_with_state(
+                question, [], initial
+            )
+
+        self.assertTrue(text)
+        self.assertEqual(chunks, [])
+        self.assertIsNotNone(state.pending_request)
+        self.assertEqual(len(state.pending_request.compound_units), 2)
+        self.assertEqual(self.provider.call_count, 1)
+        self.assertEqual(self.completion.call_count, 2)
+        compile_generated.assert_called_once()
+        execute.assert_not_called()
+        database.assert_not_called()
+        self.assertEqual(initial, answer.ConversationState())
+
+    def test_successful_compound_fallback_uses_normal_result_and_state_path(self):
+        question = "how many total working hours; how many total working hours"
+
+        def segmented_provider(request):
+            claim_provider_call()
+            return segmented_decision(request)
+
+        self.provider.side_effect = segmented_provider
+        ready = self._generated_response(
+            '{"status":"ready","sql":"SELECT SUM(Total_Worked_Hrs) AS value '
+            'FROM attendance_scope"}'
+        )
+        self.completion.side_effect = [ready, ready]
+        connection = MagicMock()
+        connection.__enter__.return_value = connection
+        connection.__exit__.return_value = None
+        connection.cursor.return_value.__enter__.return_value = MagicMock()
+        results = [
+            ([], {"operation": "sum", "field": "Total_Worked_Hrs", "value": 8.0}, 1),
+            ([], {"operation": "sum", "field": "Total_Worked_Hrs", "value": 9.0}, 1),
+        ]
+        with (
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(
+                answer,
+                "_import_psycopg",
+                return_value=(
+                    SimpleNamespace(connect=lambda *args, **kwargs: connection),
+                    None,
+                ),
+            ),
+            patch.object(
+                answer, "execute_exact_postgres", side_effect=results
+            ) as execute,
+        ):
+            text, chunks, state = answer.answer_question_with_state(
+                question, [], answer.ConversationState()
+            )
+
+        self.assertTrue(text)
+        self.assertEqual(chunks, [])
+        self.assertIsNone(state.pending_request)
+        self.assertEqual(len(state.recent_frames), 1)
+        self.assertEqual(
+            [unit.result.scalar_value for unit in state.recent_frames[0].units],
+            [8.0, 9.0],
+        )
+        self.assertEqual(self.provider.call_count, 1)
+        self.assertEqual(self.completion.call_count, 2)
+        self.assertEqual(execute.call_count, 2)
 
     def test_public_turn_prepares_all_before_retrieval_and_commits_one_complete_frame(
         self,

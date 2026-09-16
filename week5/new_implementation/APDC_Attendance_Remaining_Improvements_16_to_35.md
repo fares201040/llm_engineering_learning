@@ -555,6 +555,27 @@ Only genuinely unresolved request-local candidate identifiers may cross the
 provider decision boundary, and supported fully grounded requests make zero
 provider planning calls. The former authoritative-fact overlay has been deleted.
 
+The sole SQL-shaped exception is a narrow PostgreSQL-only fallback for one
+scalar aggregate whose operation is already grounded and whose field phrase is
+limited to request-local registry candidates. The deterministic parser/compiler
+remains primary and makes zero provider calls for fully grounded English,
+Arabic, and mixed-language requests. The fallback accepts only one logical
+`SELECT` over `attendance_scope` using `COUNT(*)`, `COUNT(DISTINCT field)`,
+`SUM`, `AVG`, `MIN`, or `MAX`. Provider SQL is validation input only: it is
+reduced to a canonical operation/field choice and never executed, retained, or
+copied into state. The registry-owned PostgreSQL compiler rebuilds the real SQL
+and binds all employee and filter values through the ordinary parameter path.
+
+Conversation decisions, planning decisions, and fallback generation share a
+hard three-provider-call budget for the complete turn, including compound
+preparation. Malformed schema or logical SQL receives at most two strict,
+privacy-safe repairs; provider failure, unsupported output, or budget exhaustion
+fails closed before retrieval. Prompts use a redacted question copy and only
+request-local registry metadata, while typed field ambiguity uses the existing
+clarification lifecycle and resumes without another SQL call. Grouping,
+windows, predicates, projections, joins, subqueries, multiple statements, and
+all Chroma execution remain outside this fallback and continue to be rejected.
+
 The projection + identity + temporal composition defect was traced to evidence
 being sliced from a same-width entity-masked buffer. Parsing still uses that role
 buffer, but evidence is now sliced from the untouched request. Public synthetic

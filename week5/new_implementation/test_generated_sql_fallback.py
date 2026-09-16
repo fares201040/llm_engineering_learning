@@ -40,6 +40,159 @@ class DecisionBudgetTests(unittest.TestCase):
 
 
 class GeneratedSqlFallbackTests(unittest.TestCase):
+    def test_pure_arabic_localized_operation_can_use_request_local_field_fallback(self):
+        generated = _response(
+            '{"status":"ready","sql":"SELECT SUM(Total_Worked_Hrs) AS value '
+            'FROM attendance_scope"}'
+        )
+        with (
+            patch.object(answer, "completion", return_value=generated) as completion,
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+        ):
+            prepared = answer._prepare_context_request("مجموع ساعات الشغل")
+
+        self.assertEqual(prepared.plan.aggregation, "sum")
+        self.assertEqual(prepared.plan.aggregation_field, "Total_Worked_Hrs")
+        calculation = next(
+            fact for fact in prepared.facts if fact.kind == "calculation"
+        )
+        self.assertEqual(calculation.origin, "provider_decision")
+        self.assertEqual(
+            answer.analyze_question_surface(prepared.question).reply_locale, "ar"
+        )
+        completion.assert_called_once()
+
+    def test_arabic_dominant_mixed_language_fallback_preserves_arabic_locale(self):
+        question = "فضلا احسب مجموع total working hours"
+        generated = _response(
+            '{"status":"ready","sql":"SELECT SUM(Total_Worked_Hrs) AS value '
+            'FROM attendance_scope"}'
+        )
+        with (
+            patch.object(answer, "completion", return_value=generated) as completion,
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=(
+                    [],
+                    {"operation": "sum", "field": "Total_Worked_Hrs", "value": 8.0},
+                    1,
+                ),
+            ) as execute,
+        ):
+            text, chunks, state = answer.answer_question_with_state(
+                question, [], answer.ConversationState()
+            )
+
+        self.assertEqual(chunks, [])
+        self.assertRegex(text, r"[؀-ۿ]")
+        self.assertEqual(state.recent_frames[-1].reply_locale, "ar")
+        plan = execute.call_args.args[0]
+        self.assertEqual(plan.aggregation, "sum")
+        self.assertEqual(plan.aggregation_field, "Total_Worked_Hrs")
+        completion.assert_called_once()
+
+    def test_already_grounded_arabic_field_keeps_zero_call_deterministic_path(self):
+        with (
+            patch.object(answer, "completion") as completion,
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+        ):
+            prepared = answer._prepare_context_request("مجموع ساعات العمل")
+
+        self.assertEqual(prepared.plan.aggregation, "sum")
+        self.assertEqual(prepared.plan.aggregation_field, "Total_Worked_Hrs")
+        calculation = next(
+            fact for fact in prepared.facts if fact.kind == "calculation"
+        )
+        self.assertEqual(calculation.origin, "question")
+        completion.assert_not_called()
+
+    def test_arabic_field_ambiguity_resumes_without_another_provider_call(self):
+        ambiguous = _response('{"status":"ambiguous","candidate_ids":["field-1"]}')
+        with (
+            patch.object(answer, "completion", return_value=ambiguous),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+        ):
+            text, chunks, state = answer.answer_question_with_state(
+                "مجموع ساعات الشغل", [], answer.ConversationState()
+            )
+
+        self.assertTrue(text)
+        self.assertEqual(chunks, [])
+        self.assertEqual(state.pending_request.reply_locale, "ar")
+        self.assertIsInstance(
+            state.pending_request.clarification, answer.MeaningClarification
+        )
+        self.assertEqual(
+            state.pending_request.clarification.options[0].target_kind, "field"
+        )
+
+        with (
+            patch.object(answer, "completion") as completion,
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=(
+                    [],
+                    {"operation": "sum", "field": "Total_Worked_Hrs", "value": 8.0},
+                    1,
+                ),
+            ),
+        ):
+            resumed_text, _chunks, resumed = answer.answer_question_with_state(
+                "1", [], state
+            )
+
+        completion.assert_not_called()
+        self.assertIn("8", resumed_text)
+        self.assertRegex(resumed_text, r"[؀-ۿ]")
+        self.assertIsNone(resumed.pending_request)
+
+    def test_contextual_he_has_fallback_retains_employee_scope(self):
+        generated = _response(
+            '{"status":"ready","sql":"SELECT SUM(Total_Worked_Hrs) AS value '
+            'FROM attendance_scope"}'
+        )
+        contextual = conversation.MaterializedConversationUnit(
+            unit_id="context-1",
+            route="attendance",
+            relation="new",
+            source_text="how many total working hours he has",
+            employees=(
+                answer.EmployeeReferent(employee_id="A10001", name="Private Name"),
+            ),
+        )
+        with (
+            patch.object(answer, "completion", return_value=generated) as completion,
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+        ):
+            prepared = answer._answer_question_with_state(
+                "ignored",
+                [],
+                answer.ConversationState(),
+                contextual_unit=contextual,
+                preparation_only=True,
+            )
+
+        self.assertIsInstance(prepared, answer.PreparedContextRequest)
+        self.assertEqual(prepared.plan.aggregation, "sum")
+        self.assertEqual(prepared.plan.aggregation_field, "Total_Worked_Hrs")
+        employee_filter = next(
+            condition
+            for condition in prepared.plan.filters
+            if condition.field == "Employee_ID"
+        )
+        self.assertEqual(employee_filter.value, "A10001")
+        self.assertEqual(prepared.postgres_queries.aggregation[0].params, ("A10001",))
+        completion.assert_called_once()
+
     def test_multiple_unresolved_meanings_inside_field_phrase_block_fallback(self):
         with (
             patch.object(answer, "completion") as completion,

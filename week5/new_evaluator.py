@@ -44,7 +44,8 @@ def _category_frame(values, metric_name):
     return pd.DataFrame(rows, columns=["Category", metric_name])
 
 
-_BIRD_METRIC_VERSION = "apdc-bird-contract-ex-v3"
+_BIRD_METRIC_VERSION = "apdc-bird-contract-ex-v4"
+_GENERATED_FALLBACK_VERSION = "generated-aggregate-v1"
 _BIRD_CACHE_LIMIT = 512
 _BIRD_CACHE = OrderedDict()
 _BIRD_COMPONENTS = (
@@ -61,12 +62,34 @@ def clear_bird_cache():
     _BIRD_CACHE.clear()
 
 
+def _bird_runtime_fingerprint():
+    """Return a value-free identity for execution-affecting public runtime flags."""
+    settings = apdc_evaluation.settings
+    payload = {
+        "fallback": _GENERATED_FALLBACK_VERSION,
+        "rag_model": settings.rag_model,
+        "conversation_model": settings.conversation_model,
+        "constraint_candidate_limit": settings.constraint_candidate_limit,
+        "postgres_enabled": bool(
+            settings.enable_postgres and apdc_evaluation.POSTGRES_DSN
+        ),
+        "pgvector_enabled": bool(
+            settings.enable_postgres
+            and settings.enable_pgvector
+            and apdc_evaluation.POSTGRES_DSN
+        ),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _bird_cache_key(dataset_fingerprint, case):
     payload = case.model_dump(mode="json")
     fields_set = sorted(getattr(case, "model_fields_set", ()))
     encoded = json.dumps(
         {
             "metric": _BIRD_METRIC_VERSION,
+            "runtime": _bird_runtime_fingerprint(),
             "dataset": dataset_fingerprint,
             "case": payload,
             "case_fields_set": fields_set,
@@ -493,10 +516,12 @@ def build_app():
                 "BIRD-style Contract Execution Accuracy compares grounded "
                 "execution against verified APDC output contracts. Cases without a "
                 "verified output contract are skipped. Official R-VES is not "
-                "reported because this corpus has no gold-SQL timing contract."
+                "reported because this corpus has no gold-SQL timing contract. "
+                "Verified verdicts are cached only for the same dataset, case, and "
+                "safe execution-runtime fingerprint."
             )
             bird_recompute = gr.Checkbox(
-                label="Recompute cached deterministic results", value=False
+                label="Recompute cached verified results", value=False
             )
             bird_button = gr.Button("Run BIRD Evaluation", variant="primary")
             bird_summary = gr.Markdown()

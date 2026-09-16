@@ -1,3 +1,4 @@
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -19,6 +20,66 @@ def bird_case(**overrides):
 
 
 class BirdCaseEvaluationTests(unittest.TestCase):
+    def test_generated_fallback_runs_through_real_fetch_context_without_private_detail(
+        self,
+    ):
+        question = "how many total working hours for A10001"
+        raw_sql = "SELECT SUM(Total_Worked_Hrs) AS value FROM attendance_scope"
+        response = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    finish_reason="stop",
+                    message=SimpleNamespace(
+                        content=json.dumps({"status": "ready", "sql": raw_sql})
+                    ),
+                )
+            ]
+        )
+        case = bird_case(
+            question=question,
+            expected_matched_count=1,
+            expected_calculation={
+                "operation": "sum",
+                "field": "Total_Worked_Hrs",
+                "value": 8.0,
+            },
+        )
+        employee = answer.EmployeeCandidate(employee_id="A10001", name="Private Name")
+        calculation = {
+            "operation": "sum",
+            "field": "Total_Worked_Hrs",
+            "value": 8.0,
+        }
+
+        with (
+            patch.object(answer, "completion", return_value=response) as completion,
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "load_employee_directory", return_value=[employee]),
+            patch.object(
+                answer,
+                "execute_exact_postgres",
+                return_value=([], calculation, 1),
+            ) as execute,
+        ):
+            result = evaluation.evaluate_bird_case(case)
+
+        self.assertEqual(result.status, "evaluated")
+        self.assertEqual(result.execution_accuracy, 1.0)
+        self.assertEqual(
+            result.components,
+            {"matched_count": True, "calculation": True},
+        )
+        completion.assert_called_once()
+        execute.assert_called_once()
+        plan = execute.call_args.args[0]
+        self.assertEqual(plan.aggregation, "sum")
+        self.assertEqual(plan.aggregation_field, "Total_Worked_Hrs")
+        self.assertEqual(case.question, question)
+        rendered = result.model_dump_json()
+        for private in (raw_sql, "A10001", "Private Name", "attendance_scope"):
+            self.assertNotIn(private, rendered)
+
     def test_exact_execution_requires_every_applicable_verified_output(self):
         case = bird_case(
             expected_matched_count=2,

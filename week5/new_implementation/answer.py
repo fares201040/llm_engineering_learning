@@ -693,7 +693,7 @@ def _generated_aggregate_operation(
         candidate.target_name
         for candidate in surface.candidates
         if candidate.target_kind == "calculation"
-        and candidate.method == "exact"
+        and candidate.method in {"exact", "localized_alias"}
         and candidate.target_name in _GENERATED_AGGREGATE_OPERATIONS
     }
     operations = trusted or grounded
@@ -1014,6 +1014,32 @@ def _request_generated_aggregate(
     raise _field_clarification(facts, candidates)
 
 
+def _generated_fallback_combined_facts(
+    prepared_facts: tuple[SemanticFact, ...],
+    detected_facts: tuple[SemanticFact, ...],
+) -> tuple[SemanticFact, ...]:
+    """Prefer freshly detected copies of the same unsupported marker."""
+    refreshed_unsupported = {
+        (fact.concept_name, normalize_for_matching(fact.evidence_text))
+        for fact in detected_facts
+        if fact.kind == "unsupported" and fact.strength == "strong"
+    }
+    retained_prepared = tuple(
+        fact
+        for fact in prepared_facts
+        if not (
+            fact.kind == "unsupported"
+            and fact.strength == "strong"
+            and (
+                fact.concept_name,
+                normalize_for_matching(fact.evidence_text),
+            )
+            in refreshed_unsupported
+        )
+    )
+    return merge_semantic_facts(retained_prepared, detected_facts)
+
+
 def _apply_generated_aggregate_fallback(
     question: str,
     prepared_facts: tuple[SemanticFact, ...],
@@ -1021,16 +1047,22 @@ def _apply_generated_aggregate_fallback(
 ) -> tuple[
     tuple[SemanticFact, ...], tuple[SemanticFact, ...], GeneratedAggregateChoice | None
 ]:
-    combined = merge_semantic_facts(prepared_facts, detected_facts)
+    combined = _generated_fallback_combined_facts(prepared_facts, detected_facts)
     unsupported = tuple(
         fact
         for fact in combined
         if fact.kind == "unsupported" and fact.strength == "strong"
     )
+    has_unsupported_marker = (
+        len(unsupported) == 1
+        and unsupported[0].concept_name == "unsupported_calculation"
+    )
+    has_localized_missing_result = (
+        not unsupported and not _request_has_supported_result(combined)
+    )
     if (
         not _postgres_enabled()
-        or len(unsupported) != 1
-        or unsupported[0].concept_name != "unsupported_calculation"
+        or not (has_unsupported_marker or has_localized_missing_result)
         or any(
             fact.kind in {"group_by", "projection", "percentage_denominator"}
             and fact.strength == "strong"
@@ -1053,7 +1085,16 @@ def _apply_generated_aggregate_fallback(
         ),
         None,
     )
-    cleaned = tuple(
+    cleaned_prepared = tuple(
+        fact
+        for fact in prepared_facts
+        if not (
+            fact.kind == "unsupported"
+            and fact.concept_name == "unsupported_calculation"
+            and fact.strength == "strong"
+        )
+    )
+    cleaned_detected = tuple(
         fact
         for fact in detected_facts
         if not (
@@ -1063,16 +1104,7 @@ def _apply_generated_aggregate_fallback(
         )
     )
     if trusted is not None:
-        prepared_facts = tuple(
-            fact
-            for fact in prepared_facts
-            if not (
-                fact.kind == "unsupported"
-                and fact.concept_name == "unsupported_calculation"
-                and fact.strength == "strong"
-            )
-        )
-        return prepared_facts, cleaned, None
+        return cleaned_prepared, cleaned_detected, None
     candidates = _generated_aggregate_candidates(question, combined)
     if not candidates or _generated_aggregate_has_external_ambiguity(
         question, candidates
@@ -1091,7 +1123,7 @@ def _apply_generated_aggregate_fallback(
         origin="provider_decision",
         strength="strong",
     )
-    return merge_semantic_facts(prepared_facts, (fact,)), cleaned, choice
+    return merge_semantic_facts(cleaned_prepared, (fact,)), cleaned_detected, choice
 
 
 def _generated_aggregate_fallback_pending(
@@ -1099,17 +1131,23 @@ def _generated_aggregate_fallback_pending(
     prepared_facts: tuple[SemanticFact, ...],
     detected_facts: tuple[SemanticFact, ...],
 ) -> bool:
-    combined = merge_semantic_facts(prepared_facts, detected_facts)
+    combined = _generated_fallback_combined_facts(prepared_facts, detected_facts)
     unsupported = tuple(
         fact
         for fact in combined
         if fact.kind == "unsupported" and fact.strength == "strong"
     )
+    has_unsupported_marker = (
+        len(unsupported) == 1
+        and unsupported[0].concept_name == "unsupported_calculation"
+    )
+    has_localized_missing_result = (
+        not unsupported and not _request_has_supported_result(combined)
+    )
     candidates = _generated_aggregate_candidates(question, combined)
     return bool(
         _postgres_enabled()
-        and len(unsupported) == 1
-        and unsupported[0].concept_name == "unsupported_calculation"
+        and (has_unsupported_marker or has_localized_missing_result)
         and _generated_aggregate_operation(question, combined) is not None
         and candidates
         and not _generated_aggregate_has_external_ambiguity(question, candidates)

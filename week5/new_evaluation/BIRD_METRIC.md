@@ -45,7 +45,10 @@ score is unavailable rather than zero.
 ## Efficiency and caching
 
 Successful verdicts are cached in process using a bounded cache keyed by the
-metric version, verified dataset fingerprint, and complete case fingerprint.
+metric/fallback version, verified dataset fingerprint, safe runtime fingerprint,
+and complete case fingerprint. The runtime fingerprint covers only public model
+identifiers and effective PostgreSQL/pgvector enablement; it never contains a
+DSN, table contents, parameters, prompts, generated SQL, or private values.
 The case fingerprint includes which Pydantic fields were explicitly supplied,
 so omitted expectations do not collide with explicit defaults. Changing any of
 those inputs causes recomputation. Skips and failures are not cached. Analysts

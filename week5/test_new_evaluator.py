@@ -508,6 +508,105 @@ class ApdcEvaluationDashboardTests(unittest.TestCase):
             dashboard._bird_cache_key("dataset-a", explicit),
         )
 
+    def test_bird_cache_key_changes_with_safe_runtime_fingerprint(self):
+        dashboard = self.dashboard()
+        case = dashboard_case("Runtime drift", token="stable")
+
+        with patch.object(
+            dashboard,
+            "_bird_runtime_fingerprint",
+            side_effect=["runtime-a", "runtime-b"],
+        ):
+            first = dashboard._bird_cache_key("dataset-a", case)
+            second = dashboard._bird_cache_key("dataset-a", case)
+
+        self.assertNotEqual(first, second)
+
+    def test_bird_runtime_fingerprint_uses_only_safe_execution_flags(self):
+        dashboard = self.dashboard()
+        first_settings = SimpleNamespace(
+            rag_model="public-model-a",
+            conversation_model="public-conversation-a",
+            constraint_candidate_limit=4,
+            enable_postgres=True,
+            enable_pgvector=False,
+        )
+        second_settings = SimpleNamespace(
+            rag_model="public-model-b",
+            conversation_model="public-conversation-a",
+            constraint_candidate_limit=4,
+            enable_postgres=True,
+            enable_pgvector=False,
+        )
+        private_dsn = "postgresql://private-user:private-pass@private-host/private-db"
+
+        with (
+            patch.object(dashboard.apdc_evaluation, "settings", first_settings),
+            patch.object(dashboard.apdc_evaluation, "POSTGRES_DSN", private_dsn),
+        ):
+            first = dashboard._bird_runtime_fingerprint()
+        with (
+            patch.object(dashboard.apdc_evaluation, "settings", second_settings),
+            patch.object(dashboard.apdc_evaluation, "POSTGRES_DSN", private_dsn),
+        ):
+            second = dashboard._bird_runtime_fingerprint()
+
+        self.assertNotEqual(first, second)
+        self.assertRegex(first, r"\A[0-9a-f]{64}\Z")
+        for private in ("private-user", "private-pass", "private-host", "private-db"):
+            self.assertNotIn(private, first)
+
+    def test_bird_mixed_pass_skip_and_runtime_failure_denominator(self):
+        dashboard = self.dashboard()
+        dashboard.clear_bird_cache()
+        cases = [
+            dashboard_case("Pass", token="pass"),
+            dashboard_case("Skip", token="skip"),
+            dashboard_case("Runtime", token="runtime"),
+        ]
+        outcomes = [
+            SimpleNamespace(
+                status="evaluated",
+                execution_accuracy=1.0,
+                components={"matched_count": True},
+                reason=None,
+            ),
+            SimpleNamespace(
+                status="skipped",
+                execution_accuracy=None,
+                components={},
+                reason="no_verified_output_contract",
+            ),
+            RuntimeError("private prompt SQL parameters"),
+        ]
+
+        with (
+            patch.object(dashboard.apdc_evaluation, "load_tests", return_value=cases),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "verify_dataset",
+                return_value={"fingerprint": "dataset-a"},
+            ),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "evaluate_bird_case",
+                side_effect=outcomes,
+            ),
+        ):
+            summary, components, details = dashboard.run_bird_evaluation(
+                0, False, progress=None
+            )
+
+        self.assertIn("BIRD-style Contract EX: 100.0%", summary)
+        self.assertIn("evaluated 1 · skipped 1 · failed 1", summary)
+        self.assertEqual(components["Evaluated"].tolist(), [1])
+        self.assertEqual(details["Question"].tolist(), ["Pass", "Skip", "Runtime"])
+        self.assertEqual(
+            details["Status"].tolist(),
+            ["Passed", "Skipped", "Failed (evaluation_error)"],
+        )
+        self.assertNotIn("private", details.to_string().lower())
+
     def test_app_adds_bird_as_fifth_tab_without_changing_existing_tab_order(self):
         dashboard = self.dashboard()
 

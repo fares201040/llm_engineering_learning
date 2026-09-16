@@ -588,6 +588,45 @@ class CompoundFailureAtomicityReviewTests(unittest.TestCase):
     """Public D15 regression for compound preparation atomicity."""
 
     @staticmethod
+    def _seed_non_empty_state():
+        employee = answer.EmployeeReferent(employee_id="A10001", name="Alex North")
+        candidate = answer.EmployeeCandidate(employee_id="A10001", name="Alex North")
+        fact = answer.SemanticFact(
+            kind="measure",
+            concept_name="attendance_records",
+            evidence_text="attendance records",
+            origin="trusted_state",
+            strength="strong",
+        )
+        frame = answer.ConversationTurnFrame(
+            original_question="synthetic prior attendance request",
+            reply_locale="en",
+            units=(
+                answer.AttendanceUnitFrame(
+                    unit_id="synthetic-prior-unit",
+                    source_text="synthetic prior attendance request",
+                    facts=(fact,),
+                    employees=(employee,),
+                    result=answer.ResultSnapshot(
+                        matched_count=1,
+                        operation="count",
+                        scalar_value=1,
+                    ),
+                ),
+            ),
+        )
+        return answer.ConversationState(
+            selected_employees=[candidate],
+            referents=[employee],
+            active_referent_ids=[employee.employee_id],
+            recent_frames=[frame],
+            pending_candidates=[
+                answer.EmployeeCandidate(employee_id="A10002", name="Sam River")
+            ],
+            pending_facts=[fact],
+        )
+
+    @staticmethod
     def _resolved_segments(request):
         claim_provider_call()
         conversation = answer.conversation
@@ -702,8 +741,8 @@ class CompoundFailureAtomicityReviewTests(unittest.TestCase):
             counters["provider"] += 1
             return self._resolved_segments(_args[0])
 
-        original = answer.ConversationState()
-        caller_state = original
+        caller_state = self._seed_non_empty_state()
+        before_json = caller_state.model_dump_json()
         with ExitStack() as stack:
             stack.enter_context(
                 patch.object(answer, "load_attendance_catalog_candidates", return_value={})
@@ -813,14 +852,171 @@ class CompoundFailureAtomicityReviewTests(unittest.TestCase):
         self.assertTrue(text)
         self.assertEqual(chunks, [])
         self.assertIsInstance(returned, answer.ConversationState)
-        self.assertEqual(returned.model_dump_json(), original.model_dump_json())
-        self.assertEqual(caller_state.model_dump_json(), original.model_dump_json())
-        self.assertIs(caller_state, original)
+        self.assertEqual(returned.model_dump_json(), before_json)
+        self.assertEqual(caller_state.model_dump_json(), before_json)
+        self.assertIsNot(returned, caller_state)
         self.assertIsNone(returned.pending_request)
         self.assertIsNone(returned.pending_clarification)
-        self.assertEqual(returned.recent_frames, [])
-        self.assertEqual(returned.referents, [])
-        self.assertEqual(returned.active_referent_ids, [])
+        self.assertEqual(len(returned.recent_frames), 1)
+        self.assertEqual(len(returned.referents), 1)
+        self.assertEqual(returned.active_referent_ids, ["A10001"])
+
+    def test_all_blocker_compound_resumes_each_unit_in_order(self):
+        question = "attendance; attendance"
+        counters = {
+            "prep": 0,
+            "execute-turn": 0,
+            "execute-unit": 0,
+            "postgres": 0,
+            "chroma": 0,
+            "connection": 0,
+            "provider": 0,
+            "partial-publication": 0,
+        }
+
+        def wrap_prepare(original):
+            def wrapped(*args, **kwargs):
+                counters["prep"] += 1
+                return original(*args, **kwargs)
+
+            return wrapped
+
+        def wrap_execute_turn(original):
+            def wrapped(*args, **kwargs):
+                counters["execute-turn"] += 1
+                return original(*args, **kwargs)
+
+            return wrapped
+
+        def wrap_execute_unit(original):
+            def wrapped(*args, **kwargs):
+                counters["execute-unit"] += 1
+                sink = answer._EVALUATION_TRACE_SINK.get()
+                before = len(sink) if sink is not None else 0
+                result = original(*args, **kwargs)
+                after = len(sink) if sink is not None else before
+                counters["partial-publication"] += max(0, after - before)
+                return result
+
+            return wrapped
+
+        def wrap_postgres(original):
+            def wrapped(*args, **kwargs):
+                counters["postgres"] += 1
+                return original(*args, **kwargs)
+
+            return wrapped
+
+        def wrap_connection(original):
+            def wrapped(*args, **kwargs):
+                counters["connection"] += 1
+                return original(*args, **kwargs)
+
+            return wrapped
+
+        def fake_chroma(*_args, **_kwargs):
+            counters["chroma"] += 1
+            return []
+
+        def fake_provider(*_args, **_kwargs):
+            counters["provider"] += 1
+            return self._resolved_segments(_args[0])
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(answer, "load_attendance_catalog_candidates", return_value={})
+            )
+            stack.enter_context(patch.object(answer, "load_employee_directory", return_value=[]))
+            stack.enter_context(patch.object(answer, "_postgres_enabled", return_value=False))
+            stack.enter_context(
+                patch.object(answer.conversation, "needs_conversation_decision", return_value=True)
+            )
+            stack.enter_context(
+                patch.object(
+                    answer.conversation,
+                    "request_conversation_decision",
+                    side_effect=fake_provider,
+                )
+            )
+            stack.enter_context(
+                patch.object(answer, "fetch_exact_chroma", side_effect=fake_chroma)
+            )
+            stack.enter_context(
+                patch.object(answer, "fetch_semantic_chroma", side_effect=fake_chroma)
+            )
+            stack.enter_context(
+                patch.object(answer, "fetch_chroma_coverage", side_effect=fake_chroma)
+            )
+            stack.enter_context(
+                patch.object(
+                    answer,
+                    "_prepare_context_request",
+                    side_effect=wrap_prepare(answer._prepare_context_request),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    answer,
+                    "_execute_prepared_turn",
+                    side_effect=wrap_execute_turn(answer._execute_prepared_turn),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    answer,
+                    "_execute_prepared_context",
+                    side_effect=wrap_execute_unit(answer._execute_prepared_context),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    answer,
+                    "execute_exact_postgres",
+                    side_effect=wrap_postgres(answer.execute_exact_postgres),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    answer,
+                    "_import_psycopg",
+                    side_effect=wrap_connection(answer._import_psycopg),
+                )
+            )
+
+            text, chunks, state = answer.answer_question_with_state(
+                question, [], answer.ConversationState()
+            )
+            self.assertTrue(text)
+            self.assertEqual(chunks, [])
+            self.assertIsNotNone(state.pending_request)
+            self.assertEqual(len(state.pending_request.compound_units), 2)
+            self.assertEqual(state.pending_request.compound_index, 0)
+            self.assertEqual(counters["provider"], 1)
+            self.assertEqual(counters["execute-turn"], 0)
+            self.assertEqual(counters["execute-unit"], 0)
+
+            text, chunks, state = answer.answer_question_with_state("1", [], state)
+            self.assertTrue(text)
+            self.assertEqual(chunks, [])
+            self.assertIsNotNone(state.pending_request)
+            self.assertEqual(len(state.pending_request.compound_units), 2)
+            self.assertEqual(state.pending_request.compound_index, 1)
+            self.assertEqual(counters["provider"], 1)
+            self.assertEqual(counters["execute-turn"], 0)
+            self.assertEqual(counters["execute-unit"], 0)
+
+            text, chunks, state = answer.answer_question_with_state("1", [], state)
+
+        self.assertTrue(text)
+        self.assertEqual(chunks, [])
+        self.assertIsNone(state.pending_request)
+        self.assertEqual(len(state.recent_frames), 1)
+        self.assertEqual(len(state.recent_frames[0].units), 2)
+        self.assertEqual(counters["provider"], 1)
+        self.assertEqual(counters["execute-turn"], 1)
+        self.assertEqual(counters["execute-unit"], 2)
+        self.assertEqual(counters["postgres"], 0)
+        self.assertEqual(counters["connection"], 0)
 
 
 class ProtectedPreflightHistoryRedactionReviewTests(unittest.TestCase):

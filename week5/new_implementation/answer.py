@@ -7745,7 +7745,7 @@ def _answer_compound_turn(
         fatal = next((item for item in prepared.blockers if item.pending is None), None)
         if fatal is not None:
             return fatal.text, [], state
-        if prepared.prepared_count:
+        if prepared.prepared_count and response is None:
             return prepared.blockers[0].text, [], state
         blocker = prepared.blockers[0]
         updated = state.model_copy(deep=True)

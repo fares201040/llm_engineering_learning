@@ -380,14 +380,19 @@ class PlannerDecision(_StrictPlannerModel):
         return self
 
 
-class GeneratedAggregateSqlDecision(_StrictPlannerModel):
-    """Untrusted provider response for the narrow logical aggregate fallback."""
+class GeneratedAggregateDecision(_StrictPlannerModel):
+    """Untrusted provider response for a request-local aggregate choice."""
 
-    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True, strict=True)
-
-    status: Literal["ready", "ambiguous", "unsupported"]
-    sql: str | None = Field(default=None, max_length=512)
+    status: Literal["resolved", "ambiguous", "unsupported"]
+    candidate_id: str | None = None
     candidate_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("candidate_id")
+    @classmethod
+    def _candidate_id_must_be_nonblank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("candidate identifiers must not be blank")
+        return value
 
     @field_validator("candidate_ids")
     @classmethod
@@ -400,29 +405,35 @@ class GeneratedAggregateSqlDecision(_StrictPlannerModel):
 
     @model_validator(mode="after")
     def _validate_status_shape(self):
-        if self.status == "ready":
-            if self.sql is None or not self.sql:
-                raise ValueError("ready decisions require SQL")
+        if self.status == "resolved":
+            if self.candidate_id is None:
+                raise ValueError("resolved decisions require one candidate identifier")
             if self.candidate_ids:
-                raise ValueError("ready decisions cannot contain candidate identifiers")
+                raise ValueError(
+                    "resolved decisions cannot contain candidate identifiers"
+                )
         elif self.status == "ambiguous":
-            if self.sql is not None:
-                raise ValueError("ambiguous decisions cannot contain SQL")
+            if self.candidate_id is not None:
+                raise ValueError(
+                    "ambiguous decisions cannot contain one candidate identifier"
+                )
             if not self.candidate_ids:
                 raise ValueError("ambiguous decisions require candidate identifiers")
-        elif self.sql is not None or self.candidate_ids:
-            raise ValueError("unsupported decisions cannot contain SQL or candidates")
+        elif self.candidate_id is not None or self.candidate_ids:
+            raise ValueError(
+                "unsupported decisions cannot contain candidate identifiers"
+            )
         return self
 
 
 def validate_generated_aggregate_decision(
-    decision: GeneratedAggregateSqlDecision,
+    decision: GeneratedAggregateDecision,
     *,
     allowed_candidate_ids: Collection[str],
-) -> GeneratedAggregateSqlDecision:
-    """Require ambiguous provider choices to remain request-local."""
-    if type(decision) is not GeneratedAggregateSqlDecision:
-        raise TypeError("Expected a generated aggregate SQL decision.")
+) -> GeneratedAggregateDecision:
+    """Require provider choices to remain within request-local candidates."""
+    if type(decision) is not GeneratedAggregateDecision:
+        raise TypeError("Expected a generated aggregate decision.")
     if isinstance(allowed_candidate_ids, (str, bytes)) or not isinstance(
         allowed_candidate_ids, Collection
     ):
@@ -431,10 +442,15 @@ def validate_generated_aggregate_decision(
     if any(not isinstance(candidate_id, str) for candidate_id in candidate_ids):
         raise TypeError("Allowed candidate identifiers must be strings.")
     allowed = frozenset(candidate_ids)
-    if decision.status == "ambiguous" and any(
-        candidate_id not in allowed for candidate_id in decision.candidate_ids
-    ):
-        raise ValueError("Ambiguous candidate identifiers must be request-local.")
+    selected = (
+        (decision.candidate_id,)
+        if decision.status == "resolved"
+        else tuple(decision.candidate_ids)
+        if decision.status == "ambiguous"
+        else ()
+    )
+    if any(candidate_id not in allowed for candidate_id in selected):
+        raise ValueError("Aggregate candidate identifiers must be request-local.")
     return decision
 
 

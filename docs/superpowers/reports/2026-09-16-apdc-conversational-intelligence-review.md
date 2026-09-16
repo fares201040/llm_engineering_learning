@@ -642,3 +642,51 @@ enumeration, history, diagnostics, repetition/paraphrase, comparison, and
 long-noisy-message observations. They do not replace the 50-turn run; they
 explain why T-50 remains LIMITED and identify A-01 and A-05 as concrete
 defects while preserving A-02, A-04, and A-06 as PASS containment outcomes.
+
+## Task 3: typed aggregate decision boundary
+
+Owning-layer root cause: the aggregate fallback in `answer.py` crosses the
+provider boundary with `GeneratedAggregateSqlDecision.sql`, then delegates to
+the logical-SQL regex in `postgres_compiler.py`. The retry payload is reduced
+to `validation_code` plus `prior_sql`, so it does not repeat the original
+operation, request-local candidate IDs, or safe candidate metadata. This is a
+provider-decision contract defect; trusted parameterized compilation and
+execution are downstream and already reject non-executable plans.
+
+Focused RED command:
+
+```powershell
+& '.venv\Scripts\python.exe' -m unittest -v week5.new_implementation.test_apdc_independent_review.AggregateDecisionBoundaryReviewTests
+```
+
+Observed RED output: 3 tests ran; the grounded attendance-record count guard
+passed, while `test_malformed_response_repair_repeats_typed_payload_and_resolves_field`
+errored with `GeneratedSqlProviderError: generated SQL provider failure` on the
+first malformed response, and
+`test_resolved_candidate_id_compiles_through_trusted_parameterized_aggregate`
+errored with `SurfaceMeaningClarificationRequired` because the SQL-shaped
+contract rejected `{"status":"resolved","candidate_id":"field-1"}`. Exit
+code was 1. No existing test file or suite was run.
+
+Task 3 GREEN and isolated boundary evidence:
+
+```powershell
+& '.venv\Scripts\python.exe' -m unittest -v week5.new_implementation.test_apdc_independent_review.AggregateDecisionBoundaryReviewTests
+```
+
+Exit code 0; all 3 focused tests passed (`OK`). Public preparation of
+`count attendance records` produced `COUNT(*)`, no aggregation field, and zero
+provider calls. A typed repair repeated operation `sum`, request-local
+`field-1`, safe candidate metadata, and `invalid_schema`; the resolved ID was
+mapped locally to `Total_Worked_Hrs`. The resolved path's provider prompt had
+no `SELECT`, and trusted compilation produced one parameterized `SUM` query.
+
+Privacy and ownership probes found no private names/IDs/dates/filter values,
+DSNs, physical tables, SQL, prior provider output, or exception details in
+captured provider payloads or controlled telemetry. Typed model probes rejected
+unknown resolved/ambiguous IDs, invalid status shapes, duplicate/blank IDs, and
+an extra SQL key. Already-grounded field requests and a direct grounded count
+decision made zero provider calls. `py_compile` passed for all four changed
+Python files. The affected manual boundary scenario is PASS for deterministic
+count, typed request-local field selection, self-contained repair, and trusted
+parameterized compilation. No existing test file or suite was run.

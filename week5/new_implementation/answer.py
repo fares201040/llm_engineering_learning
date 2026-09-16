@@ -750,9 +750,13 @@ def _generated_aggregate_has_external_ambiguity(
     return not required_fields or not required_fields.issubset(overlapping_fields)
 
 
-def _redacted_generated_question(question: str, facts: tuple[SemanticFact, ...]) -> str:
+def _redacted_generated_question(
+    question: str,
+    facts: tuple[SemanticFact, ...],
+    resolved_private_values: Sequence[str] = (),
+) -> str:
     redacted = question
-    private_values = []
+    private_values = [str(value) for value in resolved_private_values if value]
     try:
         resolved_dates = resolve_relative_date_filters(question)
     except PlanValidationError:
@@ -830,10 +834,13 @@ def _generated_aggregate_prompt(
     question: str,
     facts: tuple[SemanticFact, ...],
     candidates: tuple[_GeneratedAggregateCandidate, ...],
+    resolved_private_values: Sequence[str] = (),
 ) -> str:
     operation = _generated_aggregate_operation(question, facts)
     payload = {
-        "question": _redacted_generated_question(question, facts),
+        "question": _redacted_generated_question(
+            question, facts, resolved_private_values
+        ),
         "operation": operation,
         "logical_table": "attendance_scope",
         "allowed_forms": [
@@ -900,11 +907,14 @@ def _request_generated_aggregate(
     question: str,
     facts: tuple[SemanticFact, ...],
     candidates: tuple[_GeneratedAggregateCandidate, ...],
+    resolved_private_values: Sequence[str] = (),
 ) -> GeneratedAggregateChoice:
     operation = _generated_aggregate_operation(question, facts)
     candidate_ids = {candidate.candidate_id for candidate in candidates}
     candidate_fields = tuple(candidate.field for candidate in candidates)
-    prompt = _generated_aggregate_prompt(question, facts, candidates)
+    prompt = _generated_aggregate_prompt(
+        question, facts, candidates, resolved_private_values
+    )
     for _attempt in range(1, 4):
         try:
             claim_provider_call()
@@ -1044,6 +1054,7 @@ def _apply_generated_aggregate_fallback(
     question: str,
     prepared_facts: tuple[SemanticFact, ...],
     detected_facts: tuple[SemanticFact, ...],
+    resolved_private_values: Sequence[str] = (),
 ) -> tuple[
     tuple[SemanticFact, ...], tuple[SemanticFact, ...], GeneratedAggregateChoice | None
 ]:
@@ -1110,7 +1121,9 @@ def _apply_generated_aggregate_fallback(
         question, candidates
     ):
         return prepared_facts, detected_facts, None
-    choice = _request_generated_aggregate(question, combined, candidates)
+    choice = _request_generated_aggregate(
+        question, combined, candidates, resolved_private_values
+    )
     surface = next(
         candidate.surface for candidate in candidates if candidate.field == choice.field
     )
@@ -4835,7 +4848,14 @@ def _prepare_context_request(
     fallback_detected_facts = merge_semantic_facts(detected_facts, date_facts)
     prepared_facts, detected_facts, generated_aggregate_choice = (
         _apply_generated_aggregate_fallback(
-            question, prepared_facts, fallback_detected_facts
+            question,
+            prepared_facts,
+            fallback_detected_facts,
+            tuple(
+                private_value
+                for employee in default_employees or ()
+                for private_value in (employee.employee_id, employee.name)
+            ),
         )
     )
     initial_facts = merge_semantic_facts(prepared_facts, detected_facts, date_facts)

@@ -40,6 +40,44 @@ class DecisionBudgetTests(unittest.TestCase):
 
 
 class GeneratedSqlFallbackTests(unittest.TestCase):
+    def test_resolved_employee_identity_is_redacted_from_production_prompt(self):
+        generated = _response(
+            '{"status":"ready","sql":"SELECT SUM(Total_Worked_Hrs) AS value '
+            'FROM attendance_scope"}'
+        )
+        cases = (
+            ("sam", "how many total working hours for sam"),
+            ("رامي", "مجموع ساعات الشغل للموظف رامي"),
+        )
+
+        for name, question in cases:
+            with (
+                self.subTest(name=name),
+                patch.object(
+                    answer, "completion", return_value=generated
+                ) as completion,
+                patch.object(answer, "_postgres_enabled", return_value=True),
+                patch.object(
+                    answer,
+                    "load_employee_directory",
+                    return_value=[
+                        answer.EmployeeCandidate(employee_id="A10001", name=name)
+                    ],
+                ),
+                patch.object(
+                    answer, "load_attendance_catalog_candidates", return_value={}
+                ),
+            ):
+                prepared = answer._prepare_context_request(question)
+
+            prompt = completion.call_args.kwargs["messages"][0]["content"]
+            self.assertNotIn(name, prompt)
+            self.assertNotIn("A10001", prompt)
+            self.assertEqual(
+                prepared.postgres_queries.aggregation[0].params,
+                ("A10001",),
+            )
+
     def test_pure_arabic_localized_operation_can_use_request_local_field_fallback(self):
         generated = _response(
             '{"status":"ready","sql":"SELECT SUM(Total_Worked_Hrs) AS value '

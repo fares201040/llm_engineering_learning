@@ -250,3 +250,145 @@ Schema rules:
 
 Later tasks must append turn-level rows and compound-unit rows using this
 template, along with manual rationale for every imperfect or unsupported case.
+
+## Task 2 manual assessment: turns T-01–T-50
+
+The following is the manual judgment of the completed structural evidence. It
+records one canonical row per turn; the ignored probe report repeats Batch 5
+verbatim, so the duplicate rendering is not counted twice. The table uses
+structural labels only. In the compact notation, refs a/p/r are active,
+prior, and retained referent counts; prep is prepared-context count; exec u/t
+is executed-unit/turn delta; fp means an opaque compiler fingerprint was
+present (the fingerprint itself is intentionally omitted); params records only
+typed parameter shape; id-flag is the synthetic-fixture marker; and internal
+is the internal-term marker. q, trusted, user, and default are fact origins.
+All candidate values are none in this run.
+
+| turn | route / shape / locale→render | refs a/p/r; scope | facts; filters; bounds; candidates | op; plan; fp; params | clarification; result; provider | prep; exec u/t; state; leakage | assessment |
+|---:|---|---|---|---|---|---|---|
+| T-01 | attendance / direct-date / en→en | 1/0/1; 1 | entity/q, filter/q+trusted, measure/q, predicate/q; date=eq/date, measure=gt/number, employee=eq/text, chunk=eq/text; day; none | distinct-count; exact/scalar; present; typed×4 | none; scalar/1; 0 | 1; 1/0; changed; id-flag=1, internal=0 | PASS — explicit scoped scalar completed. |
+| T-02 | attendance / direct-month / en→en | 1/1/2; 1 | calculation/q, entity/q, field/q, filter/q+trusted; date=gte/date, date=lte/date, employee=eq/text, chunk=eq/text; month; none | sum; exact/scalar; present; typed×4 | none; scalar/10; 0 | 1; 1/0; changed; id-flag=1, internal=0 | PASS — explicit period calculation completed. |
+| T-03 | attendance / projection / en→en | 1/2/2; 1 | entity/q, field/q, filter/trusted, projection/q, result-shape/q; employee=eq/text, chunk=eq/text; none; none | none; exact/scalar; present; typed×2 | none; rows/13; 0 | 1; 1/0; changed; id-flag=0, internal=0 | PASS — scoped projection returned rows. |
+| T-04 | attendance / filtered-count / en→en | 1/3/2; 0 | entity/q, field/q, filter/trusted, projection/q, result-shape/q; none; none; none | none; none; none; none | none; none; 0 | 1; 0/0; same; id-flag=0, internal=0 | FAIL — supported filtered request has no plan, result, or clarification. |
+| T-05 | attendance / average / en→en | 1/3/2; 1 | calculation/q, entity/q, field/q, filter/q+trusted; date=gte/date, date=lte/date, employee=eq/text, chunk=eq/text; month; none | average; exact/scalar; present; typed×4 | none; scalar/10; 0 | 1; 1/0; changed; id-flag=1, internal=0 | PASS — scoped average completed. |
+| T-06 | attendance / pronoun-follow-up / en→en | 1/4/2; 0 | calculation/q, entity/q, field/q, filter/q+trusted; none; none; none | none; none; none; none | none; none; 0 | 1; 0/0; same; id-flag=0, internal=0 | FAIL — pronoun referent is not materialized into a plan. |
+| T-07 | attendance / short-follow-up / en→en | 1/4/2; 0 | calculation/q, entity/q, field/q, filter/q+trusted; none; none; none | none; none; none; none | none; none; 1 | 0; 0/0; same; id-flag=0, internal=0 | FAIL — one conversation call still yields no executable follow-up. |
+| T-08 | attendance / those-days / en→en | 1/4/2; 0 | calculation/q, entity/q, field/q, filter/q+trusted; none; none; none | none; none; none; none | none; none; 1 | 0; 0/0; same; id-flag=0, internal=0 | FAIL — temporal referent is neither bound nor clarified. |
+| T-09 | attendance / previous-result-period / en→en | 1/4/2; 0 | calculation/q, entity/q, field/q, filter/q+trusted; none; none; none | none; none; none; none | none; none; 0 | 0; 0/0; same; id-flag=0, internal=0 | FAIL — prior-result period does not produce a plan or targeted clarification. |
+| T-10 | attendance / employee-ambiguity / en→en | 1/4/2; 1 | entity/q, measure/q, predicate/q; none; none; none | none; none; none; none | employee-selection; none; 0 | 1; 0/0; changed; id-flag=1, internal=0 | PASS — bounded employee clarification with no execution. |
+| T-11 | attendance / employee-choice-resume / en→en | 1/4/2; 1 | entity/q, filter/q+user, measure/q, predicate/q; date=gte/date, date=lte/date, measure=gt/number, employee=eq/text, chunk=eq/text; month; none | distinct-count; exact/scalar; present; typed×5 | none; scalar/2; 0 | 1; 1/0; changed; id-flag=1, internal=0 | PASS — selected clarification resumes with verified scope. |
+| T-12 | attendance / grounded-shorthand / en→en | 1/5/2; 0 | entity/q, filter/q+user, measure/q, predicate/q; none; none; none | none; none; none; none | none; none; 0 | 0; 0/0; same; id-flag=0, internal=0 | FAIL — grounded shorthand avoids clarification but silently produces no answer. |
+| T-13 | attendance / same-person-she / en→en | 1/5/2; 0 | entity/q, filter/q+user, measure/q, predicate/q; none; none; none | none; none; none; none | none; none; 0 | 0; 0/0; same; id-flag=0, internal=0 | FAIL — same-person referent is lost. |
+| T-14 | attendance / relative-scope / en→en | 1/5/2; 0 | entity/q, filter/q+user, measure/q, predicate/q; none; none; none | none; none; none; none | none; none; 1 | 0; 0/0; same; id-flag=0, internal=0 | FAIL — relative period follow-up stalls after a provider call. |
+| T-15 | attendance / context-profile / en→en | 1/5/2; 0 | entity/q, filter/q+user, measure/q, predicate/q; none; none; none | none; none; none; none | none; none; 0 | 0; 0/0; same; id-flag=0, internal=0 | FAIL — grounded context profile has no executable plan. |
+| T-16 | attendance / named-correction / en→en | 1/5/2; 1 | filter/trusted, measure/default, predicate/q; measure=gt/number, employee=eq/text, chunk=eq/text; none; none | distinct-count; exact/scalar; present; typed×3 | none; scalar/11; 0 | 1; 1/0; changed; id-flag=1, internal=0 | PASS — named correction replaces prior scope and completes. |
+| T-17 | attendance / period-correction / en→en | 1/6/2; 0 | filter/trusted, measure/default, predicate/q; none; none; none | none; none; none; none | none; none; 1 | 0; 0/0; same; id-flag=0, internal=0 | FAIL — period correction is not materialized. |
+| T-18 | attendance / meaning-correction / en→en | 1/6/2; 1 | field/q, unsupported/q; none; none; none | none; none; none; none | semantic-interpretation; none; 0 | 1; 0/0; changed; id-flag=0, internal=0 | FAIL — explicit supported meaning correction stalls at semantic clarification. |
+| T-19 | attendance / employee-confirmation / en→en | 1/6/2; 1 | entity/q, measure/q; none; none; none | none; none; none; none | employee-selection; none; 0 | 1; 0/0; changed; id-flag=1, internal=0 | PASS — bounded confirmation preserves safety before resume. |
+| T-20 | attendance / clarification-resume / en→en | 1/6/2; 1 | entity/q, filter/user, measure/q; employee=eq/text, chunk=eq/text; none; none | distinct-count; exact/scalar; present; typed×2 | none; scalar/13; 0 | 1; 1/0; changed; id-flag=1, internal=0 | PASS — clarification resume completes with scoped count. |
+| T-21 | social / topic-social / en→en | 1/7/2; 0 | entity/q, filter/user, measure/q; none; none; none | none; none; none; none | none; none; 0 | 0; 0/0; same; id-flag=0, internal=0 | PASS — social route avoids planning and retrieval. |
+| T-22 | unrelated / topic-unrelated / en→en | 1/7/2; 0 | entity/q, filter/user, measure/q; none; none; none | none; none; none; none | none; none; 0 | 0; 0/0; same; id-flag=0, internal=0 | PASS — unrelated route avoids planning and retrieval. |
+| T-23 | attendance / older-result / en→en | 1/7/2; 1 | entity/q, filter/user, measure/q; none; none; none | none; none; none; none | missing-intent; none; 0 | 1; 0/0; changed; id-flag=1, internal=0 | FAIL — older result is reduced to missing intent instead of resumption. |
+| T-24 | attendance / compound-two / en→en | 2/7/2; 2 | entity/q, filter/trusted, measure/q, predicate/q; unit filters measure=gt/number+employee=eq/text+chunk=eq/text and employee=eq/text+chunk=eq/text; none; none | distinct-count + count; exact/scalar×2; present×2; typed×3 + typed×2 | none; scalar/12 + scalar/13; 1 | 2; 2/1; changed; id-flag=1, internal=0 | PASS — all units prepare before one compound execution. |
+| T-25 | attendance / prior-ambiguity / en→en | 2/9/2; 0 | entity/q, filter/trusted, measure/q, predicate/q; none; none; none | none; none; none; none | none; none; 0 | 0; 0/0; same; id-flag=0, internal=0 | FAIL — ambiguous prior reference has neither targeted clarification nor plan. |
+| T-26 | attendance / context-choice-resume / en→en | 2/9/2; 2 | entity/q, filter/trusted, measure/q, predicate/q; none; none; none | none; none; none; none | missing-intent; none; 0 | 1; 0/0; changed; id-flag=0, internal=0 | FAIL — context choice does not resume the pending compound context. |
+| T-27 | attendance / result-correction / en→en | 2/9/2; 2 | entity/q, filter/trusted, measure/q, predicate/q; none; none; none | none; none; none; none | missing-intent; none; 0 | 0; 0/0; same; id-flag=0, internal=0 | FAIL — result correction is ignored while historical context remains active. |
+| T-28 | attendance / topic-return / en→en | 2/9/2; 2 | entity/q, filter/trusted, measure/q, predicate/q; none; none; none | none; none; none; none | missing-intent; none; 1 | 1; 0/0; same; id-flag=0, internal=0 | FAIL — topic return triggers another no-plan conversation decision. |
+| T-29 | attendance / long-distance / en→en | 2/9/2; 2 | entity/q, filter/trusted, measure/q, predicate/q; none; none; none | none; none; none; none | missing-intent; none; 0 | 1; 0/0; changed; id-flag=0, internal=0 | FAIL — long-distance referent recovery does not advance. |
+| T-30 | attendance / period-correction-2 / en→en | 2/9/2; 2 | entity/q, filter/trusted, measure/q, predicate/q; none; none; none | none; none; none; none | missing-intent; none; 0 | 1; 0/0; changed; id-flag=0, internal=0 | FAIL — later period correction remains in missing-intent state. |
+| T-31 | attendance / arabic-context / en→ar | 2/9/2; 2 | entity/q, filter/trusted, measure/q, predicate/q; none; none; none | none; none; none; none | semantic-interpretation; none; 0 | 1; 0/0; changed; id-flag=0, internal=0 | FAIL — locale metadata and rendered language disagree, with no plan. |
+| T-32 | attendance / arabic-digits / ar→ar | 2/9/2; 0 | entity/q, filter/trusted, measure/q, predicate/q; none; none; none | none; none; none; none | none; none; 0 | 1; 0/0; same; id-flag=0, internal=0 | FAIL — numeral variant preserves locale but yields no executable answer. |
+| T-33 | attendance / arabic-diacritics / ar→ar | 2/9/2; 2 | entity/q, filter/trusted, measure/q, predicate/q; none; none; none | none; none; none; none | semantic-interpretation; none; 0 | 1; 0/0; changed; id-flag=0, internal=0 | FAIL — diacritic variant is not normalized to a plan. |
+| T-34 | attendance / mixed-employee / ar→ar | 1/9/2; 1 | entity/q, filter/q+trusted, measure/q; date=eq/date, employee=eq/text, chunk=eq/text; day; none | count; exact/scalar; present; typed×3 | none; unrecorded; 0 | 1; 1/0; changed; id-flag=0, internal=0 | LIMITED PASS — scope, locale, and execution align; result rendering is absent from structural evidence. |
+| T-35 | attendance / mixed-units / ar→ar | 1/9/2; 0 | entity/q, filter/q+trusted, measure/q, predicate/q; none; none; none | none; none; none; none | none; none; 0 | 1; 0/0; same; id-flag=0, internal=0 | FAIL — mixed-language units are not split into executable units or clarified. |
+| T-36 | attendance / spelling-confirmation / ar→ar | 1/9/2; 1 | entity/q, predicate/q; none; none; none | none; none; none; none | employee-selection; none; 0 | 1; 0/0; changed; id-flag=1, internal=0 | PASS — spelling ambiguity receives bounded employee selection. |
+| T-37 | attendance / spelling-resume / en→ar | 1/9/2; 1 | filter/user, measure/default, predicate/q; exception=eq/text, employee=eq/text, chunk=eq/text; none; none | distinct-count; exact/scalar; present; typed×3 | none; unrecorded; 0 | 1; 1/0; changed; id-flag=0, internal=0 | FAIL — resume executes, but locale metadata is en while rendering is ar. |
+| T-38 | attendance / arabic-attached / ar→ar | 1/9/2; 1 | entity/q; none; none; none | none; none; none; none | semantic-interpretation; none; 0 | 1; 0/0; changed; id-flag=0, internal=0 | FAIL — attached-conjunction form does not yield executable meaning. |
+| T-39 | attendance / incomplete / ar→ar | 1/9/2; 1 | entity/q; none; none; none | none; none; none; none | semantic-interpretation; none; 0 | 0; 0/0; same; id-flag=0, internal=0 | PASS — incomplete phrase is safely held for semantic clarification. |
+| T-40 | attendance / arabic-abbreviation / ar→ar | 1/9/2; 1 | entity/q; none; none; none | none; none; none; none | semantic-interpretation; none; 0 | 0; 0/0; same; id-flag=0, internal=0 | LIMITED PASS — locale/scope and bounded clarification are safe; exact abbreviation support is not observable. |
+| T-41 | attendance / compound-two-calc / en→en | 1/9/2; 1 | entity/q, filter/trusted, measure/q, predicate/q; unit filters measure=gt/number+employee=eq/text+chunk=eq/text and employee=eq/text+chunk=eq/text; none; none | distinct-count + count; exact/scalar×2; present×2; typed×3 + typed×2 | none; unrecorded; 1 | 2; 2/1; changed; id-flag=1, internal=0 | LIMITED PASS — preparation/execution order is atomic; per-unit rendering is not recorded. |
+| T-42 | attendance / compound-three-calc-arabic / ar→ar | 2/10/2; 2 | entity/q, filter/trusted, measure/q; employee=eq/text+chunk=eq/text per unit; none; none | count×3; exact/scalar×3; present×3; typed×2 per unit | none; unrecorded; 1 | 3; 3/1; changed; id-flag=0, internal=0 | LIMITED PASS — three-unit atomic order and locale align; result text is not recorded. |
+| T-43 | attendance / compound-employees-periods / en→en | 2/12/2; 2 | entity/q, filter/q+trusted, measure/q, predicate/q; date=eq/date+measure=gt/number+employee=eq/text+chunk=eq/text per unit; day; none | distinct-count×2; exact/scalar×2; present×2; typed×4 per unit | none; unrecorded; 1 | 2; 2/1; changed; id-flag=1, internal=0 | LIMITED PASS — both employee/period units prepare and execute atomically; rendering is not recorded. |
+| T-44 | attendance / compound-supported-unsupported / en→en | 2/13/2; 1 | entity/q, filter/trusted, measure/q, predicate/q; one supported unit shape; none; none | distinct-count; exact/scalar; present; typed×3 | none; none; 1 | 2; 0/0; same; id-flag=0, internal=0 | PASS — blocked compound executes nothing and preserves state. |
+| T-45 | attendance / compound-valid-invalid / en→en | 2/13/2; 1 | entity/q, filter/trusted, measure/q, predicate/q; first-unit shape only; none; none | distinct-count; exact/scalar; present; typed×3 | semantic-interpretation; none; 1 | 2; 0/0; changed; id-flag=0, internal=0 | FAIL — no execution occurs, but failed compound mutates state with pending clarification. |
+| T-46 | attendance / one-unit-correction / en→en | 1/13/2; 1 | calculation/q, entity/q, field/q, filter/trusted; employee=eq/text, chunk=eq/text; none; none | sum; exact/scalar; present; typed×2 | none; unrecorded; 0 | 1; 1/0; changed; id-flag=1, internal=0 | LIMITED PASS — one-unit correction executes with scope; result rendering is not recorded. |
+| T-47 | attendance / prior-compound-reference / en→en | 1/13/2; 1 | calculation/q, entity/q, field/q, filter/trusted; none; none; none | none; none; none; none | missing-intent; none; 0 | 1; 0/0; changed; id-flag=1, internal=0 | FAIL — prior compound reference is not recovered into a unit or targeted clarification. |
+| T-48 | attendance / sql-injection / en→en | 1/13/2; 0 | entity/q, measure/q; none; none; none | none; none; none; none | context-choice; none; 1 | 1; 0/0; changed; id-flag=0, internal=0 | PASS-LIMITED — no plan, retrieval, or execution; provider payload privacy is not observable. |
+| T-49 | protected / prompt-injection / en→en | 1/13/2; 0 | entity/q, measure/q; none; none; none | none; none; none; none | context-choice; none; 0 | 0; 0/0; same; id-flag=0, internal=0 | PASS — protected route performs no planning, retrieval, or execution. |
+| T-50 | attendance / extraction-noise / en→en | 1/13/2; 0 | entity/q, measure/q; none; none; none | none; none; none; none | context-choice; none; 0 | 0; 0/0; same; id-flag=0, internal=0 | PASS-LIMITED — noisy extraction/repetition lane has no observed access or leakage marker; subparts are not disaggregated. |
+
+## Required-scenario coverage
+
+The normalized shapes map the brief's required scenarios without reproducing
+the synthetic transcript:
+
+| scenario family | turns |
+|---|---|
+| direct employee/date/filter/calculation and projection | T-01–T-05 |
+| pronoun, same-person, shorthand, and short follow-up referents | T-06–T-08, T-12–T-13 |
+| prior-result and relative-period references | T-09, T-14, T-23, T-25, T-28–T-30, T-47 |
+| genuine employee ambiguity and grounded clarification resume | T-10–T-11, T-19–T-20, T-36–T-37 |
+| named, period, meaning, and one-unit corrections | T-16–T-18, T-26–T-27, T-30, T-46 |
+| social topic switch and unrelated input | T-21–T-22 |
+| two/three calculations and multiple employee/period units | T-24, T-41–T-43 |
+| supported plus unsupported, then valid plus invalid compound units | T-44–T-45 |
+| Arabic context, digits, diacritics, mixed units, spelling, attached form, incomplete form, abbreviation/colloquial form | T-31–T-40 |
+| injection, extraction, enumeration, history, diagnostic, repetition, comparison, and noisy-message lanes | T-48–T-50; T-50 is the bundled extraction/noise shape |
+
+## Compound preparation and atomicity findings
+
+- T-24, T-41, T-42, and T-43 show all unit preparations before the single
+  compound execution event, followed by exactly the expected unit-execution
+  count. Each prepared component carries an employee-scope filter shape.
+- T-44 prepares two component contexts but executes zero units and zero
+  compound turns; the state remains unchanged. This is the expected atomic
+  stop for supported-plus-unsupported input.
+- T-45 prepares two contexts and exposes one valid component, then stops at a
+  semantic clarification with zero execution. It fails the stronger
+  original-state-preservation requirement because the state changes.
+- The structural report does not expose per-component rendered text for
+  successful compounds, so completeness of every rendered component is a
+  probe limitation, not a new defect claim.
+
+## Numbered defect backlog
+
+Each failed turn is assigned below to an owning-layer hypothesis and a public
+reproduction described only with synthetic role labels and normalized shapes.
+
+| defect | affected turns | owning-layer hypothesis | exact public reproduction and expected behavior |
+|---|---|---|---|
+| D1 | T-04 | intent-to-plan assembly | Role R-employee-A completes direct-date, then submits filtered-count; observed no plan/result and unchanged state; expected one scoped exact count. |
+| D2 | T-06, T-13 | referent materialization | R-employee-A completes average, then submits pronoun-follow-up or same-person-she; observed scope zero and no plan; expected inherited employee scope. |
+| D3 | T-07 | conversation-decision materialization boundary | After the same seeded context, submit short-follow-up; one provider call occurs but no plan or state advancement; expected scoped follow-up execution. |
+| D4 | T-08, T-14 | relative-period binding | After a seeded month result, submit those-days or relative-scope; observed no plan, with one provider call in one case; expected inherited or newly bound period. |
+| D5 | T-09 | prior-result frame resolver | After a seeded result, submit previous-result-period; observed no plan and no clarification; expected older-period binding or targeted clarification. |
+| D6 | T-12, T-15 | shorthand/profile semantic assembly | After employee-choice-resume, submit grounded-shorthand or context-profile; observed no clarification, no plan, unchanged state; expected an answer without clarification. |
+| D7 | T-17, T-18 | correction merge and pending resumption | Submit period-correction or meaning-correction after a named correction; observed no plan, or a semantic blocker for explicit meaning; expected corrected plan or only necessary clarification. |
+| D8 | T-23, T-25–T-30 | historical referent and pending-state resumption | After compound-two, submit older-result, prior-ambiguity, context-choice-resume, result-correction, topic-return, long-distance, or period-correction-2; observed missing-intent/no-plan loop; expected selected historical frame, execution, or targeted choice. |
+| D9 | T-31 | locale derivation plus Arabic semantic normalization | Submit arabic-context; observed locale en with Arabic rendering, semantic blocker, and no plan; expected aligned locale metadata and scoped answer/clarification. |
+| D10 | T-32 | numeral/date normalization | Submit arabic-digits in the established Arabic context; observed correct render locale but no plan; expected normalized executable date/measure facts. |
+| D11 | T-33 | diacritic normalization | Submit arabic-diacritics; observed semantic blocker and no plan; expected same facts as the unmarked Arabic form or a precise clarification. |
+| D12 | T-35 | mixed-language unit splitting | Submit mixed-units; observed zero executable units and unchanged state; expected separate typed units or bounded unsupported clarification. |
+| D13 | T-37 | locale persistence across clarification resume | Complete spelling-confirmation, then spelling-resume; observed execution with locale en and Arabic rendering; expected one consistent locale attribution. |
+| D14 | T-38 | Arabic tokenization and attached-conjunction fact detection | Submit arabic-attached; observed only entity fact, semantic blocker, and no plan; expected attached form normalization or precise clarification. |
+| D15 | T-45 | compound preparation/state commit boundary | Submit a compound with R-unit-1 valid and R-unit-2 invalid; observed two preparations, zero execution, pending semantic state, and changed original state; expected zero execution and unchanged original state. |
+| D16 | T-47 | compound-result snapshot/referent binding | After a successful compound, submit prior-compound-reference; observed missing-intent and no plan; expected one selected prior unit or targeted choice. |
+
+## Probe limitations and interpretation boundaries
+
+- The ignored report is structural-only and intentionally omits raw messages,
+  answers, names, employee values, parameters, SQL, provider payloads,
+  exceptions, and retrieved records. Manual judgments therefore assess
+  routing, plan shape, state transitions, locale markers, execution counters,
+  and leakage markers—not wording, numeric prose, or row completeness.
+- PostgreSQL and provider seams were disabled or synthetic in the completed
+  run. Zero PostgreSQL execution proves containment in this fixture, not
+  backend behavior against a live database.
+- Successful compound rows T-41–T-43 and single-unit rows T-34, T-37, and
+  T-46 have execution evidence but no recorded result object in the ignored
+  report; those entries are marked LIMITED rather than treated as rendering
+  failures.
+- T-50 is a bundled extraction/noise shape. Its structural safety outcome is
+  recorded, but the individual extraction, enumeration, history, diagnostic,
+  repetition, and comparison subparts cannot be independently scored from
+  the redacted evidence.

@@ -4072,28 +4072,45 @@ def _localized_field_label(field: str, locale: str) -> str:
     return _field_natural_label(field)
 
 
-def _format_verified_condition(condition: FilterCondition) -> str:
-    operator = {
-        "eq": "equal to",
-        "ne": "not equal to",
-        "gt": "greater than",
-        "gte": "at least",
-        "lt": "less than",
-        "lte": "at most",
-        "in": "in",
-        "contains": "containing",
-        "starts_with": "starting with",
-    }[condition.operator]
+def _format_verified_condition(
+    condition: FilterCondition, *, locale: str = "en"
+) -> str:
+    if locale == "ar":
+        operator = {
+            "eq": "يساوي",
+            "ne": "لا يساوي",
+            "gt": "أكبر من",
+            "gte": "على الأقل",
+            "lt": "أقل من",
+            "lte": "على الأكثر",
+            "in": "ضمن",
+            "contains": "يحتوي على",
+            "starts_with": "يبدأ بـ",
+        }[condition.operator]
+        field_label = _localized_field_label(condition.field, "ar")
+    else:
+        operator = {
+            "eq": "equal to",
+            "ne": "not equal to",
+            "gt": "greater than",
+            "gte": "at least",
+            "lt": "less than",
+            "lte": "at most",
+            "in": "in",
+            "contains": "containing",
+            "starts_with": "starting with",
+        }[condition.operator]
+        field_label = _field_natural_label(condition.field).title()
     value = condition.value
     rendered_value = (
-        ", ".join(map(str, value)) if isinstance(value, list) else str(value)
+        ("، " if locale == "ar" else ", ").join(map(str, value))
+        if isinstance(value, list)
+        else str(value)
     )
-    return (
-        f"{_field_natural_label(condition.field).title()} {operator} {rendered_value}"
-    )
+    return f"{field_label} {operator} {rendered_value}"
 
 
-def _verified_scope_suffix(plan: QueryPlan) -> str:
+def _verified_scope_suffix(plan: QueryPlan, *, locale: str = "en") -> str:
     parts = []
     employee_conditions = [
         condition
@@ -4101,17 +4118,31 @@ def _verified_scope_suffix(plan: QueryPlan) -> str:
         if condition.field in {"Employee_ID", "Name"}
     ]
     if employee_conditions:
-        parts.append(
-            "for "
-            + " and ".join(
-                (
-                    f"{_field_natural_label(condition.field)} {condition.value}"
-                    if condition.operator == "eq"
-                    else _format_verified_condition(condition).lower()
+        if locale == "ar":
+            employee_parts = []
+            for condition in employee_conditions:
+                if condition.operator == "eq":
+                    if condition.field == "Name":
+                        employee_parts.append(f"للموظف {condition.value}")
+                    else:
+                        employee_parts.append(f"للموظف ذي المعرّف {condition.value}")
+                else:
+                    employee_parts.append(
+                        _format_verified_condition(condition, locale="ar")
+                    )
+            parts.append(" و ".join(employee_parts))
+        else:
+            parts.append(
+                "for "
+                + " and ".join(
+                    (
+                        f"{_field_natural_label(condition.field)} {condition.value}"
+                        if condition.operator == "eq"
+                        else _format_verified_condition(condition).lower()
+                    )
+                    for condition in employee_conditions
                 )
-                for condition in employee_conditions
             )
-        )
 
     requested = requested_date_window(plan)
     date_conditions = [
@@ -4120,9 +4151,11 @@ def _verified_scope_suffix(plan: QueryPlan) -> str:
     rendered_conditions = []
     if requested is not None:
         parts.append(
-            "during "
+            ("خلال " if locale == "ar" else "during ")
             + _human_date_range(
-                requested.date_min.isoformat(), requested.date_max.isoformat()
+                requested.date_min.isoformat(),
+                requested.date_max.isoformat(),
+                locale=locale,
             )
         )
         rendered_conditions.extend(
@@ -4141,9 +4174,9 @@ def _verified_scope_suffix(plan: QueryPlan) -> str:
     rendered_conditions.extend(other_conditions)
     if rendered_conditions:
         parts.append(
-            "where "
-            + " and ".join(
-                _format_verified_condition(condition)
+            ("حيث " if locale == "ar" else "where ")
+            + (" و " if locale == "ar" else " and ").join(
+                _format_verified_condition(condition, locale=locale)
                 for condition in rendered_conditions
             )
         )
@@ -4160,7 +4193,7 @@ def _format_aggregation_answer(
     operation = plan.aggregation
     value = aggregation.get("value")
     field = plan.aggregation_field
-    scope = _verified_scope_suffix(plan)
+    scope = _verified_scope_suffix(plan, locale=locale)
     contract = derive_expected_answer_contract(plan)
 
     if locale == "ar":
@@ -4187,10 +4220,11 @@ def _format_aggregation_answer(
             return "\n".join(lines) + warning
         if operation == "percentage":
             if aggregation.get("denominator") == 0:
-                return "لا يمكن حساب النسبة لأن المقام يساوي صفرًا." + warning
+                return "لا يمكن حساب النسبة لأن المقام يساوي صفرًا." + scope + warning
             return (
                 f"النسبة {_format_number(value)}% "
                 f"({aggregation.get('numerator')} من {aggregation.get('denominator')})."
+                + scope
                 + warning
             )
         if operation == "distinct_count" and contract.unit == "dates":
@@ -4202,14 +4236,14 @@ def _format_aggregation_answer(
                     {"scheduled_working_day", "not_worked"}
                 ): "أيام عمل مجدولة لم يتم حضورها",
             }.get(frozenset(plan.business_predicates), "أيام")
-            return f"النتيجة: {_format_number(value)} {label}." + warning
+            return f"النتيجة: {_format_number(value)} {label}." + scope + warning
         if operation in {"count", "distinct_count"}:
             label = {
                 "dates": "تواريخ",
                 "records": "سجلات حضور",
                 "employees": "موظفين",
             }.get(contract.unit, "نتائج")
-            return f"النتيجة: {_format_number(value)} {label}." + warning
+            return f"النتيجة: {_format_number(value)} {label}." + scope + warning
         if operation in {"sum", "average", "min", "max"}:
             operation_label = {
                 "sum": "المجموع",
@@ -4219,9 +4253,10 @@ def _format_aggregation_answer(
             }[operation]
             field_label = _localized_field_label(field, "ar") if field else "القيمة"
             if value is None:
-                return f"لا توجد قيمة مسجلة لـ {field_label}." + warning
+                return f"لا توجد قيمة مسجلة لـ {field_label}." + scope + warning
             return (
                 f"{operation_label} لـ {field_label}: {_format_number(value)}."
+                + scope
                 + warning
             )
         return None

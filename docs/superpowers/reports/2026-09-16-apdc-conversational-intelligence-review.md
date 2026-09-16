@@ -929,3 +929,63 @@ resolution_conflict= conflict
 focused class; `planning_decisions.py` remains unchanged. No pre-existing test
 file or suite was run. Commit message: `fix: make aggregate conflicts
 resumable and explicit`.
+
+## Task 4 — Arabic scalar aggregation scope
+
+The owning layer was the deterministic renderer in `answer.py`. The verified
+English scope helper already consumed only `QueryPlan.filters`, and
+`_format_aggregation_answer()` computed that suffix once, but the Arabic branch
+returned every scalar operation before appending it. The correction keeps the
+verified-plan-only data flow, adds localized employee/date/filter wording, and
+uses the same one computed suffix for Arabic percentage, count,
+distinct-count, sum, average, minimum, and maximum scalar branches. English and
+grouped rendering remain unchanged.
+
+### Focused RED
+
+Command:
+
+```powershell
+& '.venv\Scripts\python.exe' -m unittest -v week5.new_implementation.test_apdc_independent_review.ArabicAggregationScopeReviewTests
+```
+
+Exit code 1. Both new tests failed as expected because the pre-fix Arabic
+scalar output was only `النتيجة: 3 سجلات حضور.`. The direct regression reported
+`'للموظف Morgan River' not found`, and the compound regression reported the
+same missing scope in its first paragraph. No pre-existing test file or suite
+was run.
+
+### Focused GREEN
+
+The same command exited 0:
+
+```text
+----------------------------------------------------------------------
+Ran 2 tests in 0.080s
+
+OK
+```
+
+The direct regression now contains `للموظف Morgan River` and
+`خلال سبتمبر 1-7، 2026`. The compound regression emits two paragraphs and
+maps Morgan River/September to the first result and Taylor Stone/October to
+the second, with neither paragraph containing the other unit's scope.
+
+### Manual/public probes
+
+The public `answer_question_with_state()` path was run with a synthetic typed
+`ContextFetchResult` and the backend fetch seam patched; it returned
+`النتيجة: 3 سجلات حضور. للموظف Morgan River خلال سبتمبر 1-7، 2026.` with no
+pending request and
+no chunks. The affected compound renderer probe returned two independently
+scoped paragraphs for Morgan River/September and Taylor Stone/October, with
+`compound_mapping=True`, `chunks=[]`, and `pending=None`. The scalar branch
+sweep reported `True` for percentage, count, distinct-count, sum, average,
+min, and max scope checks. The English probe preserved the existing
+`3 attendance records matched the requested criteria. For name Morgan River
+during September 1-7, 2026.` output, and an unscoped English count remained
+`3 attendance records matched the requested criteria.`.
+
+Allowed checks also passed: `py_compile` for `answer.py` and the focused test
+file (exit code 0), and `git diff --check` (exit code 0). No pre-existing test
+file or suite was run; `planning_decisions.py` was unchanged.

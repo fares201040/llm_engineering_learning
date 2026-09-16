@@ -445,5 +445,100 @@ class AggregateDecisionBoundaryReviewTests(unittest.TestCase):
                 )
 
 
+class ArabicAggregationScopeReviewTests(unittest.TestCase):
+    @staticmethod
+    def _plan(employee, start, end, *, operation="count", field=None):
+        unit = "records" if operation == "count" else "value"
+        return answer.ExecutableQueryPlan(
+            mode="exact",
+            search_query="synthetic public fixture",
+            filters=[
+                answer.FilterCondition(field="Name", operator="eq", value=employee),
+                answer.FilterCondition(field="Date", operator="gte", value=start),
+                answer.FilterCondition(field="Date", operator="lte", value=end),
+            ],
+            aggregation=operation,
+            aggregation_field=field,
+            answer_contract=answer.AnswerContract(
+                shape="scalar", unit=unit, subject_field=field
+            ),
+        )
+
+    def test_direct_arabic_scalar_keeps_verified_employee_and_period_scope(self):
+        plan = self._plan("Morgan River", "2026-09-01", "2026-09-07")
+
+        text = answer._format_aggregation_answer(
+            plan, {"operation": "count", "value": 3}, locale="ar"
+        )
+
+        self.assertIn("للموظف Morgan River", text)
+        self.assertIn("خلال سبتمبر 1-7، 2026", text)
+        self.assertNotIn("Taylor Stone", text)
+        self.assertNotIn("أكتوبر", text)
+
+    def test_arabic_compound_scalars_keep_their_distinct_verified_scopes(self):
+        first_plan = self._plan("Morgan River", "2026-09-01", "2026-09-07")
+        second_plan = self._plan("Taylor Stone", "2026-10-01", "2026-10-07")
+        first_unit = answer.PendingRequestFrame(
+            original_question="كم عدد سجلات الحضور لموظف مورغان؟",
+            reply_locale="ar",
+            unit_id="first",
+            relation="new",
+        )
+        second_unit = answer.PendingRequestFrame(
+            original_question="كم عدد سجلات الحضور لموظف تايلور؟",
+            reply_locale="ar",
+            unit_id="second",
+            relation="new",
+        )
+        prepared = answer.TurnPreparationResult(
+            turn=answer.PreparedTurn((None, None)),
+            blockers=(),
+            units=(first_unit, second_unit),
+        )
+        execution = answer.TurnExecutionResult(
+            results=(
+                answer.ContextFetchResult(
+                    chunks=[],
+                    plan=first_plan,
+                    aggregation={"operation": "count", "value": 3},
+                    matched_count=3,
+                    resolved_employees=[],
+                ),
+                answer.ContextFetchResult(
+                    chunks=[],
+                    plan=second_plan,
+                    aggregation={"operation": "count", "value": 3},
+                    matched_count=3,
+                    resolved_employees=[],
+                ),
+            )
+        )
+
+        with (
+            patch.object(answer, "_prepare_turn", return_value=prepared),
+            patch.object(answer, "_execute_prepared_turn", return_value=execution),
+        ):
+            text, chunks, state = answer._answer_compound_turn(
+                "كم عدد سجلات الحضور لموظف مورغان؛ كم عدد سجلات الحضور لموظف تايلور",
+                (first_unit, second_unit),
+                answer.ConversationState(),
+                locale="ar",
+            )
+
+        paragraphs = text.split("\n\n")
+        self.assertEqual(len(paragraphs), 2)
+        self.assertIn("للموظف Morgan River", paragraphs[0])
+        self.assertIn("خلال سبتمبر 1-7، 2026", paragraphs[0])
+        self.assertNotIn("Taylor Stone", paragraphs[0])
+        self.assertNotIn("أكتوبر", paragraphs[0])
+        self.assertIn("للموظف Taylor Stone", paragraphs[1])
+        self.assertIn("خلال أكتوبر 1-7، 2026", paragraphs[1])
+        self.assertNotIn("Morgan River", paragraphs[1])
+        self.assertNotIn("سبتمبر", paragraphs[1])
+        self.assertEqual(chunks, [])
+        self.assertIsNone(state.pending_request)
+
+
 if __name__ == "__main__":
     unittest.main()

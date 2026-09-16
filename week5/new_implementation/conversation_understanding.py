@@ -20,7 +20,7 @@ from pydantic import (
 try:
     from .config import settings
     from .decision_budget import claim_provider_call
-    from .attendance_schema import MultiEmployeeDateView
+    from .attendance_schema import FIELD_DEFINITIONS, MultiEmployeeDateView
     from .language_understanding import (
         AttendanceUnitFrame,
         ConversationTurnFrame,
@@ -28,6 +28,8 @@ try:
         ResultSnapshot,
         contains_conversation_control,
         contains_prior_conversation_reference,
+        conversation_control_spans,
+        is_conversation_control_reference,
         is_conversation_control_residue,
         normalize_for_matching,
     )
@@ -35,7 +37,7 @@ try:
 except ImportError:
     from config import settings
     from decision_budget import claim_provider_call
-    from attendance_schema import MultiEmployeeDateView
+    from attendance_schema import FIELD_DEFINITIONS, MultiEmployeeDateView
     from language_understanding import (
         AttendanceUnitFrame,
         ConversationTurnFrame,
@@ -43,6 +45,8 @@ except ImportError:
         ResultSnapshot,
         contains_conversation_control,
         contains_prior_conversation_reference,
+        conversation_control_spans,
+        is_conversation_control_reference,
         is_conversation_control_residue,
         normalize_for_matching,
     )
@@ -619,6 +623,11 @@ def needs_conversation_decision(message: str, facts: tuple[SemanticFact, ...]) -
             contextual_text[start:end] = " " * (end - start)
     if sum(fact.kind == "entity" for fact in facts) > 1:
         return True
+    if any(
+        fact.kind == "entity" and is_conversation_control_reference(fact.evidence_text)
+        for fact in facts
+    ):
+        return True
     remaining = list(message)
     projections = []
     for fact in facts:
@@ -725,6 +734,31 @@ def _facts_contradict(left: SemanticFact, right: SemanticFact) -> bool:
     return False
 
 
+def _materialize_result_facts(facts: tuple[SemanticFact, ...]) -> tuple[SemanticFact, ...]:
+    """Promote a bare numeric field in a result replacement to a typed sum."""
+    materialized = []
+    for fact in facts:
+        if (
+            fact.kind == "field"
+            and fact.field is not None
+            and (definition := FIELD_DEFINITIONS.get(fact.field)) is not None
+            and definition.storage_type == "number"
+            and definition.aggregatable
+        ):
+            materialized.append(
+                fact.model_copy(
+                    update={
+                        "kind": "calculation",
+                        "concept_name": "sum",
+                        "origin": "deterministic_default",
+                    }
+                )
+            )
+        else:
+            materialized.append(fact)
+    return tuple(materialized)
+
+
 def materialize_conversation_units(
     validated: ValidatedConversation,
     *,
@@ -784,13 +818,33 @@ def materialize_conversation_units(
             else None
         )
         if decision.relation == "new":
+            employee_scope = ()
+            if selected_employees:
+                employee_ids = tuple(
+                    dict.fromkeys(item.employee_id for item in selected_employees)
+                )
+                employee_scope = (
+                    SemanticFact(
+                        kind="filter",
+                        field="Employee_ID",
+                        operator="eq" if len(employee_ids) == 1 else "in",
+                        values=(
+                            (employee_ids[0],)
+                            if len(employee_ids) == 1
+                            else employee_ids
+                        ),
+                        evidence_text=" ".join(employee_ids),
+                        origin="trusted_state",
+                        strength="strong",
+                    ),
+                )
             materialized.append(
                 MaterializedConversationUnit(
                     unit_id=unit_id,
                     route="attendance",
                     relation=decision.relation,
                     source_text=source_text,
-                    facts=selected_facts,
+                    facts=employee_scope + selected_facts,
                     employees=tuple(dict.fromkeys(selected_employees)),
                     view=selected_view,
                 )
@@ -800,10 +854,10 @@ def materialize_conversation_units(
         if base is None:
             raise ConversationDecisionValidationError("base-unit choice is unavailable")
         if decision.relation == "modify_scope":
-            if any(fact.kind in _RESULT_FACT_KINDS for fact in selected_facts):
-                raise ConversationDecisionValidationError(
-                    "scope changes cannot replace result facts"
-                )
+            selected_facts = _materialize_result_facts(selected_facts)
+            replaces_result = any(
+                fact.kind in _RESULT_FACT_KINDS for fact in selected_facts
+            )
             changed_fields = {
                 fact.field for fact in selected_facts if fact.field is not None
             }
@@ -812,7 +866,8 @@ def materialize_conversation_units(
             inherited = tuple(
                 _trusted_fact(fact)
                 for fact in base.facts
-                if fact.field not in changed_fields
+                if (not replaces_result or fact.kind not in _RESULT_FACT_KINDS)
+                and fact.field not in changed_fields
                 and not (selected_employees and fact.kind == "entity")
             )
             materialized.append(
@@ -833,12 +888,17 @@ def materialize_conversation_units(
             )
             continue
         if decision.relation == "replace_result":
+            result_facts = _materialize_result_facts(selected_facts)
             if selected_employees or any(
-                fact.kind not in _RESULT_FACT_KINDS for fact in selected_facts
+                fact.kind not in _RESULT_FACT_KINDS | {"predicate"}
+                for fact in result_facts
             ):
                 raise ConversationDecisionValidationError(
                     "result changes may contain only result facts"
                 )
+            scope_facts = tuple(
+                fact for fact in result_facts if fact.kind == "predicate"
+            )
             inherited = tuple(
                 _trusted_fact(fact)
                 for fact in base.facts
@@ -850,7 +910,9 @@ def materialize_conversation_units(
                     route="attendance",
                     relation=decision.relation,
                     source_text=source_text,
-                    facts=inherited + selected_facts,
+                    facts=inherited + scope_facts + tuple(
+                        fact for fact in result_facts if fact.kind != "predicate"
+                    ),
                     employees=base.employees,
                     view=getattr(base, "view", None),
                     prior_result=base.result,
@@ -926,7 +988,7 @@ def materialize_conversation_units(
                 unit_id=unit_id,
                 route="attendance",
                 relation=decision.relation,
-                source_text=source_text,
+                source_text=base.source_text,
                 facts=tuple(_trusted_fact(fact) for fact in base.facts),
                 employees=base.employees,
                 view=getattr(base, "view", None),
@@ -967,6 +1029,7 @@ def build_conversation_request(
         if all(item.employee_id.casefold() in retained for item in unit.employees)
     )
     fact_choices = []
+    control_spans = conversation_control_spans(message)
     for fact in facts:
         if fact.origin != "question":
             continue
@@ -981,6 +1044,11 @@ def build_conversation_request(
         if not spans:
             raise ConversationDecisionValidationError("fact source cannot be located")
         for start, end in spans:
+            if any(
+                control_start <= start and end <= control_end
+                for control_start, control_end in control_spans
+            ):
+                continue
             if (
                 not (0 <= start < end <= len(message))
                 or message[start:end].casefold() != fact.evidence_text.casefold()

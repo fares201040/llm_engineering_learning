@@ -635,13 +635,33 @@ _PRIOR_CONVERSATION_REFERENCES = frozenset(
         "same",
         "same one",
         "same employee",
+        "same person",
+        "the same employee",
+        "the same person",
+        "that employee",
+        "those days",
+        "that period",
+        "previous result",
+        "the previous result",
+        "first result",
+        "second result",
+        "third result",
+        "the first",
+        "the second",
+        "the third",
         "this",
         "that",
         "it",
+        "he",
+        "she",
         "him",
         "her",
+        "his",
+        "hers",
         "them",
         "they",
+        "their",
+        "theirs",
         "former",
         "the former",
         "latter",
@@ -719,6 +739,15 @@ def is_conversation_control_reference(text: str) -> bool:
 def contains_conversation_control(text: str) -> bool:
     """Return whether text contains a bounded registered conversation control."""
     return bool(_CONVERSATION_CONTROL_PATTERN.search(normalize_for_matching(text)))
+
+
+def conversation_control_spans(text: str) -> tuple[tuple[int, int], ...]:
+    """Return source spans occupied by registered conversation controls."""
+    normalized = _normalize_with_source_map(text)
+    return tuple(
+        normalized.source_span(*match.span())
+        for match in _CONVERSATION_CONTROL_PATTERN.finditer(normalized.text)
+    )
 
 
 def contains_prior_conversation_reference(text: str) -> bool:

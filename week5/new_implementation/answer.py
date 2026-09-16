@@ -3273,7 +3273,28 @@ def _numeric_comparison_value(question: str):
 def _references_selected_employee(question: str) -> bool:
     return bool(
         re.search(
-            r"\b(?:this|that)\s+employee\b"
+            r"\b(?:same|this|that)\s+(?:person|employee)\b"
+            r"|\b(?:he|she|him|her|his|hers|they|them|their|theirs)\b",
+            question,
+            re.I,
+        )
+    )
+
+
+def _conversation_employee_reference_facts(
+    question: str,
+) -> tuple[SemanticFact, ...]:
+    return tuple(
+        SemanticFact(
+            kind="entity",
+            field="Name",
+            evidence_text=match.group(0),
+            evidence_span=match.span(),
+            origin="question",
+            strength="candidate",
+        )
+        for match in re.finditer(
+            r"\b(?:same|this|that)\s+(?:person|employee)\b"
             r"|\b(?:he|she|him|her|his|hers|they|them|their|theirs)\b",
             question,
             re.I,
@@ -4812,6 +4833,35 @@ def _complete_registered_short_form(
                     evidence_text=summary_match.group(0),
                     evidence_span=summary_match.span(),
                     origin="question",
+                    strength="strong",
+                ),
+            ),
+        )
+    numeric_fields = tuple(
+        dict.fromkeys(
+            fact.field
+            for fact in facts
+            if fact.kind == "field"
+            and fact.strength == "strong"
+            and fact.field in FIELD_DEFINITIONS
+            and FIELD_DEFINITIONS[fact.field].storage_type == "number"
+            and FIELD_DEFINITIONS[fact.field].aggregatable
+        )
+    )
+    if len(numeric_fields) == 1:
+        field_fact = next(
+            fact for fact in facts if fact.kind == "field" and fact.field == numeric_fields[0]
+        )
+        return merge_semantic_facts(
+            facts,
+            (
+                SemanticFact(
+                    kind="calculation",
+                    field=numeric_fields[0],
+                    concept_name="sum",
+                    evidence_text=field_fact.evidence_text,
+                    evidence_span=field_fact.evidence_span,
+                    origin="deterministic_default",
                     strength="strong",
                 ),
             ),
@@ -6882,6 +6932,38 @@ def _context_unit_with_employees(
     )
 
 
+def _context_unit_with_relative_period(
+    unit: conversation.MaterializedConversationUnit,
+) -> conversation.MaterializedConversationUnit:
+    """Replace inherited date scope only when the current turn names a period."""
+    relative_dates = resolve_relative_date_filters(unit.source_text)
+    if not relative_dates:
+        return unit
+    date_facts = tuple(
+        SemanticFact(
+            kind="filter",
+            field=condition.field,
+            operator=condition.operator,
+            values=(condition.value,),
+            evidence_text=unit.source_text,
+            origin="question",
+            strength="strong",
+        )
+        for condition in relative_dates
+    )
+    return conversation.MaterializedConversationUnit(
+        unit_id=unit.unit_id,
+        route=unit.route,
+        relation=unit.relation,
+        source_text=unit.source_text,
+        facts=tuple(fact for fact in unit.facts if fact.field != "Date") + date_facts,
+        employees=unit.employees,
+        view=unit.view,
+        explain_previous=unit.explain_previous,
+        prior_result=unit.prior_result,
+    )
+
+
 def _materialize_repeated_context_segments(
     pending: PendingRequestFrame, base: AttendanceUnitFrame
 ) -> tuple[conversation.MaterializedConversationUnit, ...]:
@@ -7920,6 +8002,43 @@ def _answer_question_with_state(
         _clear_pending_state(state)
 
     if (
+        not preparation_only
+        and contextual_unit is None
+        and state.pending_request is not None
+        and isinstance(
+            state.pending_request.clarification, MissingIntentClarification
+        )
+        and state.pending_request.employees
+        and _references_selected_employee(question)
+        and _is_complete_new_attendance_question(question)
+    ):
+        retained_employees = tuple(state.pending_request.employees)
+        employee_ids = tuple(item.employee_id for item in retained_employees)
+        contextual_unit = conversation.MaterializedConversationUnit(
+            unit_id=uuid.uuid4().hex,
+            route="attendance",
+            relation="new",
+            source_text=question,
+            facts=(
+                SemanticFact(
+                    kind="filter",
+                    field="Employee_ID",
+                    operator="eq" if len(employee_ids) == 1 else "in",
+                    values=(
+                        (employee_ids[0],)
+                        if len(employee_ids) == 1
+                        else employee_ids
+                    ),
+                    evidence_text=" ".join(employee_ids),
+                    origin="trusted_state",
+                    strength="strong",
+                ),
+            ),
+            employees=retained_employees,
+        )
+        _clear_pending_state(state)
+
+    if (
         contextual_unit is None
         and (
             state.pending_request is None
@@ -7936,7 +8055,25 @@ def _answer_question_with_state(
                 ResolutionContext(catalog={}, reference_date=_current_local_date()),
             ),
             _facts_from_question_surface(question),
+            _conversation_employee_reference_facts(question),
         )
+        relative_dates = resolve_relative_date_filters(question)
+        if relative_dates:
+            conversation_facts = merge_semantic_facts(
+                conversation_facts,
+                tuple(
+                    SemanticFact(
+                        kind="filter",
+                        field=condition.field,
+                        operator=condition.operator,
+                        values=(condition.value,),
+                        evidence_text=question,
+                        origin="question",
+                        strength="strong",
+                    )
+                    for condition in relative_dates
+                ),
+            )
         if conversation.needs_conversation_decision(question, conversation_facts):
             selected, blocker = _conversation_employee_blocker(
                 question, conversation_facts
@@ -8321,6 +8458,9 @@ def _answer_question_with_state(
             for item in contextual_unit.employees
         ]
         _clear_pending_state(state)
+    if contextual_unit is not None:
+        contextual_unit = _context_unit_with_relative_period(contextual_unit)
+        prepared_facts = contextual_unit.facts
     if pending_request is not None and isinstance(
         pending_request.clarification, MissingIntentClarification
     ):
@@ -8759,6 +8899,15 @@ def _answer_question_with_state(
                 EmployeeCandidate(employee_id=item.employee_id, name=item.name)
                 for item in contextual_unit.employees
             ]
+
+    if contextual_unit is not None and not preparation_only:
+        return _answer_compound_turn(
+            question,
+            (_pending_unit(contextual_unit, reply_locale),),
+            state,
+            locale=reply_locale,
+            access_context=access_context,
+        )
 
     try:
         fetch = _prepare_context_request if preparation_only else _fetch_context_result

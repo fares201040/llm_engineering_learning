@@ -1275,5 +1275,498 @@ class ProtectedPreflightHistoryRedactionReviewTests(unittest.TestCase):
         )
 
 
+class ConversationReferentResumptionReviewTests(unittest.TestCase):
+    """Focused public G2 regressions for referent materialization and replay."""
+
+    _DIRECTORY = [
+        answer.EmployeeCandidate(employee_id="A10001", name="Alex North"),
+        answer.EmployeeCandidate(employee_id="A10002", name="Sam River"),
+    ]
+
+    @staticmethod
+    def _counter_state():
+        return {
+            "prep": 0,
+            "execute-turn": 0,
+            "execute-unit": 0,
+            "postgres": 0,
+            "chroma": 0,
+            "connection": 0,
+            "provider": 0,
+            "partial-publication": 0,
+        }
+
+    @staticmethod
+    def _plan_filters(plan):
+        return tuple(
+            (item.field, item.operator, item.value) for item in plan.filters
+        )
+
+    def _provider(self, counters, materialized, requests):
+        def decide(request):
+            counters["provider"] += 1
+            requests.append(request)
+            message = request.context.message.casefold()
+            prior_ids = request.context.prior_unit_choice_ids
+            if "first result" in message:
+                relation = "repeat"
+                base_id = prior_ids[0] if prior_ids else None
+            elif "previous result" in message:
+                relation = "repeat"
+                base_id = prior_ids[-1] if prior_ids else None
+            elif "last month" in message:
+                relation = "modify_scope"
+                base_id = prior_ids[-1] if prior_ids else None
+            elif "overtime" in message:
+                relation = "replace_result"
+                base_id = prior_ids[-1] if prior_ids else None
+            elif prior_ids and ("those days" in message or "same person" in message):
+                relation = "replace_result"
+                base_id = prior_ids[-1]
+            else:
+                relation = "new"
+                base_id = None
+
+            if relation == "repeat":
+                fact_ids = ()
+            elif relation == "replace_result":
+                fact_ids = tuple(
+                    key
+                    for key, fact in request.facts
+                    if fact.strength == "strong"
+                    and fact.kind
+                    in {
+                        "field",
+                        "predicate",
+                        "measure",
+                        "calculation",
+                        "projection",
+                        "semantic_intent",
+                        "result_intent",
+                        "result_shape",
+                    }
+                )
+            else:
+                fact_ids = tuple(
+                    key for key, fact in request.facts if fact.strength == "strong"
+                )
+            mentions = []
+            if relation == "new":
+                for binding in request.context.employee_span_choices:
+                    if binding.choice_ids:
+                        mentions.append(
+                            {
+                                "kind": "reference_choice",
+                                "source_span": binding.source_span,
+                                "choice_id": binding.choice_ids[0],
+                            }
+                        )
+                        break
+            payload = {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "relation": relation,
+                        "source_span": (0, len(request.context.message)),
+                        "base_unit_choice_id": base_id,
+                        "fact_ids": fact_ids,
+                        "employee_mentions": mentions,
+                    }
+                ],
+            }
+            decision = answer.conversation.ConversationDecision.model_validate(payload)
+            decision = answer.conversation.validate_conversation_decision(
+                decision, request.context
+            )
+            validated = answer.conversation.ValidatedConversation(
+                request, decision, (f"g2-unit-{len(materialized)}",)
+            )
+            return validated
+
+        return decide
+
+    def _runtime(self, counters, plans):
+        original_prepare = answer._prepare_context_request
+        original_execute_turn = answer._execute_prepared_turn
+
+        def prepare(*args, **kwargs):
+            counters["prep"] += 1
+            prepared = original_prepare(*args, **kwargs)
+            plans.append(prepared)
+            return prepared
+
+        def execute(prepared, *, resources=None):
+            if resources is None:
+                counters["execute-turn"] += 1
+            counters["execute-unit"] += 1
+            if prepared.backend == "chroma":
+                counters["chroma"] += 1
+            return answer.ContextFetchResult(
+                chunks=[],
+                plan=prepared.plan,
+                aggregation={
+                    "operation": prepared.plan.aggregation,
+                    "field": prepared.plan.aggregation_field,
+                    "value": 3,
+                },
+                matched_count=1,
+                resolved_employees=list(prepared.employees),
+                facts=prepared.facts,
+            )
+
+        def execute_turn(turn):
+            counters["execute-turn"] += 1
+            return original_execute_turn(turn)
+
+        return prepare, execute, execute_turn
+
+    def _patches(self, counters, plans, materialized, requests):
+        prepare, execute, execute_turn = self._runtime(counters, plans)
+        original_materialize = answer.conversation.materialize_conversation_units
+
+        def capture_materialized(*args, **kwargs):
+            units = original_materialize(*args, **kwargs)
+            materialized.extend(units)
+            return units
+
+        stack = ExitStack()
+        stack.enter_context(
+            patch.object(answer, "load_employee_directory", return_value=self._DIRECTORY)
+        )
+        stack.enter_context(
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={})
+        )
+        stack.enter_context(patch.object(answer, "_postgres_enabled", return_value=False))
+        stack.enter_context(patch.object(answer, "_prepare_context_request", side_effect=prepare))
+        stack.enter_context(patch.object(answer, "_execute_prepared_context", side_effect=execute))
+        stack.enter_context(patch.object(answer, "_execute_prepared_turn", side_effect=execute_turn))
+        stack.enter_context(
+            patch.object(answer, "_answer_from_context", return_value=("synthetic answer", []))
+        )
+        stack.enter_context(
+            patch.object(
+                answer.conversation,
+                "request_conversation_decision",
+                side_effect=self._provider(counters, materialized, requests),
+            )
+        )
+        stack.enter_context(
+            patch.object(
+                answer.conversation,
+                "materialize_conversation_units",
+                side_effect=capture_materialized,
+            )
+        )
+        return stack
+
+    def _seed(self, question, counters, plans, materialized, requests):
+        with self._patches(counters, plans, materialized, requests):
+            text, chunks, state = answer.answer_question_with_state(
+                question, [], None
+            )
+        self.assertTrue(text)
+        self.assertEqual(chunks, [])
+        self.assertIsNone(state.pending_request)
+        counters.update(self._counter_state())
+        plans.clear()
+        materialized.clear()
+        requests.clear()
+        return state
+
+    def _run(self, question, state, counters, plans, materialized, requests):
+        with self._patches(counters, plans, materialized, requests):
+            return answer.answer_question_with_state(question, [], state)
+
+    def _assert_success(self, text, chunks, state, counters):
+        self.assertTrue(text)
+        self.assertEqual(chunks, [])
+        self.assertIsNone(state.pending_request)
+        self.assertEqual(
+            counters,
+            {
+                "prep": 1,
+                "execute-turn": 1,
+                "execute-unit": 1,
+                "postgres": 0,
+                "chroma": 1,
+                "connection": 0,
+                "provider": counters["provider"],
+                "partial-publication": 0,
+            },
+        )
+
+    def test_pronoun_follow_up_materializes_verified_employee_and_relative_period(self):
+        counters = self._counter_state()
+        plans, materialized, requests = [], [], []
+        state = self._seed(
+            "How many worked days did Alex North have in September 2026?",
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+        text, chunks, returned = self._run(
+            "How many attendance records did he have last week?",
+            state,
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+
+        self._assert_success(text, chunks, returned, counters)
+        self.assertEqual(counters["provider"], 1)
+        self.assertEqual([item.employee_id for item in returned.referents], ["A10001"])
+        filters = self._plan_filters(plans[-1].plan)
+        self.assertEqual(
+            [field for field, _operator, _value in filters if field == "Employee_ID"],
+            ["Employee_ID"],
+        )
+        self.assertEqual(
+            [field for field, _operator, _value in filters if field == "Date"],
+            ["Date", "Date"],
+        )
+        self.assertEqual(materialized[-1].employees[0].employee_id, "A10001")
+        prompt = answer.conversation._conversation_prompt(requests[-1])
+        self.assertNotIn("Alex North", prompt)
+        self.assertNotIn("A10001", prompt)
+
+    def test_short_follow_up_replaces_result_and_retains_prior_snapshot(self):
+        counters = self._counter_state()
+        plans, materialized, requests = [], [], []
+        state = self._seed(
+            "Average lateness for Alex North in September 2026",
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+        text, chunks, returned = self._run(
+            "And his overtime?", state, counters, plans, materialized, requests
+        )
+
+        self._assert_success(text, chunks, returned, counters)
+        self.assertEqual(counters["provider"], 1)
+        self.assertEqual(materialized[-1].relation, "replace_result")
+        self.assertEqual(materialized[-1].employees[0].employee_id, "A10001")
+        self.assertIsNotNone(materialized[-1].prior_result)
+        self.assertEqual(materialized[-1].prior_result.operation, "average")
+        selected = [fact for fact in materialized[-1].facts if fact.field == "Total_OT"]
+        self.assertEqual(len(selected), 1)
+        self.assertEqual(selected[0].origin, "deterministic_default")
+        self.assertEqual(plans[-1].plan.aggregation_field, "Total_OT")
+
+    def test_relative_period_referents_preserve_then_replace_verified_dates(self):
+        counters = self._counter_state()
+        plans, materialized, requests = [], [], []
+        state = self._seed(
+            "What was the total overtime for Sam River in September 2026?",
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+        text, chunks, state = self._run(
+            "How many worked days did they have on those days?",
+            state,
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+        self._assert_success(text, chunks, state, counters)
+        self.assertEqual(counters["provider"], 1)
+        preserved_dates = [
+            item.value for item in plans[-1].plan.filters if item.field == "Date"
+        ]
+        self.assertEqual(preserved_dates, ["2026-09-01", "2026-09-30"])
+
+        counters.update(self._counter_state())
+        plans.clear()
+        materialized.clear()
+        requests.clear()
+        text, chunks, state = self._run(
+            "What about last month?", state, counters, plans, materialized, requests
+        )
+        self._assert_success(text, chunks, state, counters)
+        self.assertEqual(counters["provider"], 1)
+        changed_dates = [
+            item.value for item in plans[-1].plan.filters if item.field == "Date"
+        ]
+        self.assertEqual(len(changed_dates), 2)
+        self.assertNotEqual(changed_dates, preserved_dates)
+
+    def test_previous_result_in_period_replays_saved_frame_without_literal_employee(self):
+        counters = self._counter_state()
+        plans, materialized, requests = [], [], []
+        state = self._seed(
+            "What was the total overtime for Sam River in September 2026?",
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+        text, chunks, returned = self._run(
+            "What about the previous result in that period?",
+            state,
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+
+        self._assert_success(text, chunks, returned, counters)
+        self.assertEqual(counters["provider"], 1)
+        self.assertEqual(materialized[-1].relation, "repeat")
+        self.assertIsNotNone(materialized[-1].prior_result)
+        self.assertEqual(materialized[-1].employees[0].employee_id, "A10002")
+        self.assertNotIn("previous result", plans[-1].question.casefold())
+
+    def test_confirmed_employee_resumes_grounded_shorthand_and_profile(self):
+        counters = self._counter_state()
+        plans, materialized, requests = [], [], []
+        state = self._seed(
+            "How many worked days did Alex North have last month?",
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+        text, chunks, state = self._run(
+            "Alex North", state, counters, plans, materialized, requests
+        )
+        self.assertTrue(text)
+        self.assertEqual(chunks, [])
+        self.assertIsNotNone(state.pending_request)
+        counters.update(self._counter_state())
+        plans.clear()
+        materialized.clear()
+        requests.clear()
+        text, chunks, state = self._run(
+            "How many records for that employee?",
+            state,
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+        self._assert_success(text, chunks, state, counters)
+        self.assertEqual(counters["provider"], 0)
+        self.assertEqual(plans[-1].plan.filters[-2].field, "Employee_ID")
+        self.assertEqual(plans[-1].plan.filters[-2].value, "A10001")
+
+        counters.update(self._counter_state())
+        plans.clear()
+        materialized.clear()
+        requests.clear()
+        text, chunks, state = self._run(
+            "Show the profile for that employee in that period",
+            state,
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+        self._assert_success(text, chunks, state, counters)
+        self.assertEqual(counters["provider"], 1)
+        self.assertEqual(materialized[-1].employees[0].employee_id, "A10001")
+
+    def test_long_distance_follow_up_reuses_historical_referent(self):
+        counters = self._counter_state()
+        plans, materialized, requests = [], [], []
+        state = self._seed(
+            "How many worked days did Sam River have in September 2026?",
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+        counters.update(self._counter_state())
+        plans.clear()
+        materialized.clear()
+        requests.clear()
+        text, chunks, state = self._run(
+            "How many attendance records did Alex North have in October 2026?",
+            state,
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+        self._assert_success(text, chunks, state, counters)
+        counters.update(self._counter_state())
+        plans.clear()
+        materialized.clear()
+        requests.clear()
+        text, chunks, returned = self._run(
+            "Then show his department", state, counters, plans, materialized, requests
+        )
+
+        self._assert_success(text, chunks, returned, counters)
+        self.assertEqual(counters["provider"], 1)
+        self.assertEqual(materialized[-1].employees[0].employee_id, "A10001")
+        self.assertEqual(len(returned.recent_frames), 3)
+
+    def test_first_result_selects_first_saved_compound_unit(self):
+        employees = tuple(
+            answer.EmployeeReferent(employee_id=item.employee_id, name=item.name)
+            for item in self._DIRECTORY
+        )
+        fact = answer.SemanticFact(
+            kind="measure",
+            concept_name="attendance_records",
+            evidence_text="attendance records",
+            origin="question",
+            strength="strong",
+        )
+        frame = answer.ConversationTurnFrame(
+            original_question="synthetic compound request",
+            reply_locale="en",
+            units=(
+                answer.AttendanceUnitFrame(
+                    unit_id="compound-first",
+                    source_text="first synthetic result",
+                    facts=(fact,),
+                    employees=(employees[0],),
+                    result=answer.ResultSnapshot(
+                        matched_count=2, operation="count", scalar_value=2
+                    ),
+                ),
+                answer.AttendanceUnitFrame(
+                    unit_id="compound-second",
+                    source_text="second synthetic result",
+                    facts=(fact,),
+                    employees=(employees[1],),
+                    result=answer.ResultSnapshot(
+                        matched_count=4, operation="count", scalar_value=4
+                    ),
+                ),
+            ),
+        )
+        state = answer.ConversationState(
+            referents=list(employees),
+            active_referent_ids=[item.employee_id for item in employees],
+            recent_frames=[frame],
+        )
+        counters = self._counter_state()
+        plans, materialized, requests = [], [], []
+        text, chunks, returned = self._run(
+            "Repeat the first result",
+            state,
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+
+        self._assert_success(text, chunks, returned, counters)
+        self.assertEqual(counters["provider"], 1)
+        self.assertEqual(materialized[-1].relation, "repeat")
+        self.assertEqual(materialized[-1].employees[0].employee_id, "A10001")
+        self.assertEqual(materialized[-1].prior_result.matched_count, 2)
+        self.assertEqual(returned.recent_frames[-1].units[0].employees[0].employee_id, "A10001")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -535,9 +535,17 @@ def conversation_preflight_route(
     normalized = normalize_for_matching(message)
     if re.search(
         r"\b(?:payroll|salar(?:y|ies)|compensation|bonuses?|loans?|repayments?|benefits?|raw_source_rows)\b|\bprivate\s+raw\b"
+        r"|\b(?:drop|alter|create|truncate|insert|update|delete|select|union)\s+"
+        r"(?:table|schema|database|from|into|where|all)\b"
         r"|\b(?:ignore|disregard|forget)\s+(?:(?:previous|prior|all)\s+)*(?:instructions?|rules?)\b"
         r"|\boverride\s+(?:(?:your|the|all)\s+)?(?:instructions?|rules?)\b"
         r"|\b(?:reveal|show|print|give(?:\s+me)?|tell(?:\s+me)?)\s+(?:your\s+)?(?:hidden\s+)?system\s+prompt\b"
+        r"|\b(?:show|display|reveal|print|list|describe)\s+(?:your\s+)?(?:schema|tables?|columns?|database|metadata)\b"
+        r"|\b(?:what|which)\s+(?:did|have)\s+(?:i|we)\s+(?:ask|say|request|write)\b"
+        r"|\b(?:show|display|reveal|print|list|tell(?:\s+me)?)\s+(?:my|our|the)?\s*"
+        r"(?:conversation|chat|history|transcript|prior\s+(?:questions?|requests?|answers?))\b"
+        r"|\b(?:show|display|reveal|print|list|give(?:\s+me)?|tell(?:\s+me)?)\s+(?:your\s+)?"
+        r"(?:diagnostics?|debug(?:ging)?|internal\s+(?:state|details?|metadata))\b"
         r"|(?:تجاهل|تجاهلي)\s+(?:التعليمات|التوجيهات)\s+(?:السابقة|الماضية)"
         r"|(?:انس|انسي|تجاوز)\s+(?:كل\s+)?(?:التعليمات|التوجيهات)(?:\s+(?:السابقة|الماضية))?"
         r"|(?:اكشف|اظهر|اعرض|اطبع)\s+(?:موجه\s+النظام|تعليمات\s+النظام|الموجه\s+السري|الموجه\s+المخفي)"

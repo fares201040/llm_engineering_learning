@@ -40,6 +40,16 @@ class DecisionBudgetTests(unittest.TestCase):
 
 
 class GeneratedSqlFallbackTests(unittest.TestCase):
+    def test_multiple_unresolved_meanings_inside_field_phrase_block_fallback(self):
+        with (
+            patch.object(answer, "completion") as completion,
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            self.assertRaises(answer.SurfaceMeaningClarificationRequired),
+        ):
+            answer._prepare_context_request("total workd working hours")
+
+        completion.assert_not_called()
+
     def test_unresolved_meaning_outside_primary_field_phrase_blocks_fallback(self):
         with (
             patch.object(answer, "completion") as completion,

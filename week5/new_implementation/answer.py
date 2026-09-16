@@ -731,15 +731,23 @@ def _generated_aggregate_candidates(
 def _generated_aggregate_has_external_ambiguity(
     question: str, candidates: tuple[_GeneratedAggregateCandidate, ...]
 ) -> bool:
-    field_spans = tuple(candidate.surface.evidence_span for candidate in candidates)
-    return any(
-        not any(
-            ambiguity.evidence_span[0] < field_span[1]
-            and field_span[0] < ambiguity.evidence_span[1]
-            for field_span in field_spans
-        )
-        for ambiguity in _unresolved_surface_candidates(question)
-    )
+    unresolved = _unresolved_surface_candidates(question)
+    if not unresolved:
+        return False
+    if len(unresolved) != 1 or unresolved[0].target_kind != "predicate":
+        return True
+    predicate = BUSINESS_PREDICATE_DEFINITIONS.get(unresolved[0].target_name)
+    if predicate is None:
+        return True
+    ambiguity_span = unresolved[0].evidence_span
+    overlapping_fields = {
+        candidate.field
+        for candidate in candidates
+        if ambiguity_span[0] < candidate.surface.evidence_span[1]
+        and candidate.surface.evidence_span[0] < ambiguity_span[1]
+    }
+    required_fields = {required.field for required in predicate.required_filters}
+    return not required_fields or not required_fields.issubset(overlapping_fields)
 
 
 def _redacted_generated_question(question: str, facts: tuple[SemanticFact, ...]) -> str:

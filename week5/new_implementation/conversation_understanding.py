@@ -19,6 +19,7 @@ from pydantic import (
 
 try:
     from .config import settings
+    from .decision_budget import claim_provider_call
     from .attendance_schema import MultiEmployeeDateView
     from .language_understanding import (
         AttendanceUnitFrame,
@@ -33,6 +34,7 @@ try:
     from .semantic_resolution import SemanticFact
 except ImportError:
     from config import settings
+    from decision_budget import claim_provider_call
     from attendance_schema import MultiEmployeeDateView
     from language_understanding import (
         AttendanceUnitFrame,
@@ -1043,6 +1045,7 @@ def request_conversation_decision(
     if len(context.message) > settings.conversation_max_input_chars:
         return None
     try:
+        claim_provider_call()
         response = completion(
             model=settings.conversation_model,
             messages=[{"role": "user", "content": _conversation_prompt(request)}],

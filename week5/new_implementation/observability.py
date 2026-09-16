@@ -32,6 +32,8 @@ _SAFE_KEYS = frozenset(
         "violation_count",
         "duration_seconds",
         "fingerprint",
+        "attempt_number",
+        "selected_field",
         "failure_code",
         "violation_codes",
         "unsupported_capabilities",
@@ -50,6 +52,7 @@ _SAFE_INT_KEYS = frozenset(
         "parameter_count",
         "fact_count",
         "violation_count",
+        "attempt_number",
     }
 )
 _SAFE_STRING_KEYS = frozenset(
@@ -67,6 +70,7 @@ _SAFE_STRING_KEYS = frozenset(
         "clarification_kind",
         "failure_code",
         "fingerprint",
+        "selected_field",
     }
 )
 _SAFE_LIST_KEYS = frozenset(
@@ -102,6 +106,9 @@ _CONTROLLED_CODES = frozenset(
         "type_error",
         "missing_value",
         "internal_error",
+        "provider_failure",
+        "invalid_candidate_ids",
+        "invalid_logical_sql",
     }
 )
 _CONTROLLED_EVENTS = frozenset(
@@ -119,6 +126,7 @@ _CONTROLLED_EVENTS = frozenset(
         "query_compiled",
         "retrieval_complete",
         "stage_complete",
+        "generated_sql_decision",
     }
 )
 _CONTROLLED_STAGES = frozenset(
@@ -131,6 +139,7 @@ _CONTROLLED_STAGES = frozenset(
         "structured_retrieval",
         "semantic_search",
         "provider",
+        "generated_sql",
     }
 )
 _CONTROLLED_STATES = frozenset({"success", "rejected", "paused", "failure"})
@@ -155,6 +164,7 @@ _CONTROLLED_CLARIFICATIONS = frozenset(
 _CONTROLLED_FACT_KINDS = frozenset(
     {
         "entity",
+        "calculation",
         "filter",
         "measure",
         "predicate",
@@ -228,6 +238,12 @@ def _safe_string(value: str, key: str):
         return value if _REQUEST_ID.fullmatch(value) else None
     if key == "fingerprint":
         return value if _QUERY_FINGERPRINT.fullmatch(value) else None
+    if key == "selected_field":
+        try:
+            from .attendance_schema import FIELD_DEFINITIONS
+        except ImportError:
+            from attendance_schema import FIELD_DEFINITIONS
+        return value if value in FIELD_DEFINITIONS else None
     return None
 
 

@@ -659,7 +659,7 @@ class SurfaceMeaningClarificationRequired(ValueError):
         self.candidates = candidates
 
 
-class GeneratedSqlProviderError(RuntimeError):
+class GeneratedAggregateProviderError(RuntimeError):
     """A generated aggregate provider request failed without exposing provider text."""
 
 
@@ -673,6 +673,34 @@ class _GeneratedAggregateCandidate:
 _GENERATED_AGGREGATE_OPERATIONS = frozenset(
     {"count", "distinct_count", "sum", "average", "min", "max"}
 )
+_GENERATED_AGGREGATE_UNSAFE_SOURCE_PATTERN = re.compile(
+    r"""
+    (?:
+        ;|--|/\*|
+        \b(?:select|insert|update|delete|merge)\b|
+        \b(?:with)\s+[A-Za-z_][\w$]*\s+as\s*\(|
+        \b(?:from|join)\s+
+        ["'`]? [A-Za-z_][\w$]* ["'`]?
+        (?:\s*\.\s* ["'`]? [A-Za-z_][\w$]* ["'`]?) *
+        (?=\s*(?:where|join|on|group\s+by|order\s+by|having|limit|offset|union|;|$))|
+        \b(?:create|alter|drop|truncate|comment|grant|revoke)
+        (?:\s+(?:or\s+replace|if\s+(?:not\s+)?exists|temporary|temp))*
+        \s+(?:table|schema|view|index|function|procedure|type|trigger|role|database)\b|
+        \b(?:schema|schemas|columns?|fields?|ddl|sql)\b|
+        \b(?:information_schema|pg_catalog|sqlite_master)\b
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _safe_generated_aggregate_surface(question: str) -> str:
+    """Keep only the local natural-language surface before SQL/schema text."""
+    match = _GENERATED_AGGREGATE_UNSAFE_SOURCE_PATTERN.search(question)
+    if match is None:
+        return question
+    safe_surface = question[: match.start()].rstrip(" \t\r\n,;:")
+    return safe_surface or "[unsafe aggregate input removed]"
 
 
 def _generated_aggregate_operation(
@@ -753,7 +781,7 @@ def _redacted_generated_question(
     facts: tuple[SemanticFact, ...],
     resolved_private_values: Sequence[str] = (),
 ) -> str:
-    redacted = question
+    redacted = _safe_generated_aggregate_surface(question)
     private_values = [str(value) for value in resolved_private_values if value]
     try:
         resolved_dates = resolve_relative_date_filters(question)
@@ -834,11 +862,18 @@ def _generated_aggregate_prompt(
     candidates: tuple[_GeneratedAggregateCandidate, ...],
     resolved_private_values: Sequence[str] = (),
     validation_code: str | None = None,
+    *,
+    operation: str | None = None,
 ) -> str:
-    operation = _generated_aggregate_operation(question, facts)
+    safe_question = _safe_generated_aggregate_surface(question)
+    operation = (
+        operation
+        if operation is not None
+        else _generated_aggregate_operation(safe_question, facts)
+    )
     payload = {
         "question": _redacted_generated_question(
-            question, facts, resolved_private_values
+            safe_question, facts, resolved_private_values
         ),
         "operation": operation,
         "candidates": [
@@ -893,15 +928,17 @@ def _request_generated_aggregate(
     operation = _generated_aggregate_operation(question, facts)
     if operation == "count":
         return GeneratedAggregateChoice("count", None)
+    safe_question = _safe_generated_aggregate_surface(question)
     candidate_ids = {candidate.candidate_id for candidate in candidates}
     validation_code = None
     for _attempt in range(1, 4):
         prompt = _generated_aggregate_prompt(
-            question,
+            safe_question,
             facts,
             candidates,
             resolved_private_values,
             validation_code,
+            operation=operation,
         )
         try:
             claim_provider_call()
@@ -919,14 +956,14 @@ def _request_generated_aggregate(
             )
         except Exception:
             event_logger.emit(
-                "generated_sql_decision",
-                stage="generated_sql",
+                "generated_aggregate_decision",
+                stage="generated_aggregate",
                 state="failure",
                 attempt_number=_attempt,
                 operation=operation,
                 failure_code="provider_failure",
             )
-            raise GeneratedSqlProviderError(
+            raise GeneratedAggregateProviderError(
                 "generated aggregate provider failure"
             ) from None
         choices = getattr(response, "choices", ())
@@ -950,8 +987,8 @@ def _request_generated_aggregate(
             )
             if decision.status == "ambiguous":
                 event_logger.emit(
-                    "generated_sql_decision",
-                    stage="generated_sql",
+                    "generated_aggregate_decision",
+                    stage="generated_aggregate",
                     state="paused",
                     attempt_number=_attempt,
                     operation=operation,
@@ -961,8 +998,8 @@ def _request_generated_aggregate(
                 )
             if decision.status == "unsupported":
                 event_logger.emit(
-                    "generated_sql_decision",
-                    stage="generated_sql",
+                    "generated_aggregate_decision",
+                    stage="generated_aggregate",
                     state="rejected",
                     attempt_number=_attempt,
                     operation=operation,
@@ -972,7 +1009,7 @@ def _request_generated_aggregate(
                     (
                         PlanViolation(
                             "unsupported_calculation",
-                            "generated_sql",
+                            "generated_aggregate",
                             "The requested calculation is unsupported.",
                         ),
                     )
@@ -991,8 +1028,8 @@ def _request_generated_aggregate(
                 )
             choice = GeneratedAggregateChoice(operation, selected_candidate.field)
             event_logger.emit(
-                "generated_sql_decision",
-                stage="generated_sql",
+                "generated_aggregate_decision",
+                stage="generated_aggregate",
                 state="success",
                 attempt_number=_attempt,
                 operation=choice.operation,
@@ -1011,8 +1048,8 @@ def _request_generated_aggregate(
             )
         validation_code = code
         event_logger.emit(
-            "generated_sql_decision",
-            stage="generated_sql",
+            "generated_aggregate_decision",
+            stage="generated_aggregate",
             state="rejected",
             attempt_number=_attempt,
             operation=operation,
@@ -1121,18 +1158,40 @@ def _apply_generated_aggregate_fallback(
     choice = _request_generated_aggregate(
         question, combined, candidates, resolved_private_values
     )
-    surface = next(
-        candidate.surface for candidate in candidates if candidate.field == choice.field
-    )
-    fact = SemanticFact(
-        kind="calculation",
-        field=choice.field,
-        concept_name=choice.operation,
-        evidence_text=surface.evidence_text,
-        evidence_span=surface.evidence_span,
-        origin="provider_decision",
-        strength="strong",
-    )
+    if choice.operation == "count":
+        evidence = next(
+            (
+                fact
+                for fact in combined
+                if fact.kind == "unsupported"
+                and fact.concept_name == "unsupported_calculation"
+            ),
+            None,
+        )
+        fact = SemanticFact(
+            kind="calculation",
+            field=None,
+            concept_name="count",
+            evidence_text=evidence.evidence_text if evidence is not None else "count",
+            evidence_span=evidence.evidence_span if evidence is not None else None,
+            origin="deterministic_default",
+            strength="strong",
+        )
+    else:
+        surface = next(
+            candidate.surface
+            for candidate in candidates
+            if candidate.field == choice.field
+        )
+        fact = SemanticFact(
+            kind="calculation",
+            field=choice.field,
+            concept_name=choice.operation,
+            evidence_text=surface.evidence_text,
+            evidence_span=surface.evidence_span,
+            origin="provider_decision",
+            strength="strong",
+        )
     return merge_semantic_facts(cleaned_prepared, (fact,)), cleaned_detected, choice
 
 
@@ -3149,7 +3208,7 @@ def _prepare_postgres_queries(
     )
     if generated_choice is not None:
         event_logger.emit(
-            "generated_sql_decision",
+            "generated_aggregate_decision",
             stage="postgres_compilation",
             state="success",
             operation=generated_choice.operation,

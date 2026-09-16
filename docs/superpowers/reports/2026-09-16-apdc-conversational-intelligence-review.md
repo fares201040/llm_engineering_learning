@@ -690,3 +690,55 @@ decision made zero provider calls. `py_compile` passed for all four changed
 Python files. The affected manual boundary scenario is PASS for deterministic
 count, typed request-local field selection, self-contained repair, and trusted
 parameterized compilation. No existing test file or suite was run.
+
+## Task 3 fix round 1: aggregate decision privacy and count
+
+Owning-layer root cause: `answer.py`'s aggregate redaction boundary did not
+stop arbitrary SQL/schema-bearing user suffixes, and the fallback caller
+assumed every generated choice had a candidate-backed field. Deterministic
+`count` intentionally returns `GeneratedAggregateChoice("count", None)`, so
+the unconditional surface lookup raised `StopIteration` only when candidates
+were present. The fix is local to the aggregate decision boundary: a bounded
+central safety predicate preserves the safe natural-language prefix and the
+caller constructs a strong unfielded deterministic count fact. The trusted
+parameterized compiler remains authoritative.
+
+Focused RED command:
+
+```powershell
+& '.venv\Scripts\python.exe' -m unittest -v week5.new_implementation.test_apdc_independent_review.AggregateDecisionBoundaryReviewTests
+```
+
+Exit code 1. Five tests ran: the original three passed; the SQL/schema privacy
+test found `select` in the helper argument, and the count-with-candidates test
+errored with `StopIteration` at the candidate-surface lookup. The observed
+summary was `FAILED (failures=1, errors=1)`.
+
+Focused GREEN command (same command): exit code 0, five tests passed (`OK`,
+5 tests in 7.077s). The privacy regression covers synthetic `SELECT`,
+`CREATE TABLE`, and physical-table relation suffixes and directly checks a
+schema-dump surface; none reaches the prompt builder or completion payload.
+The count regression compiles `COUNT(*)`, leaves the plan field `None`,
+asserts strong `deterministic_default` provenance, and verifies no provider
+call.
+
+Isolated probe evidence:
+
+```text
+privacy_payload_cases=3 safe=True
+typed_call_contract=True parameterized_sql=True
+bound_parameter_count=1 sql_has_literal_date=False
+grounded_zero_call_count=True grounded_zero_call_field=True
+aggregate_telemetry_renamed=True controlled_events=2
+imports=ok renamed_controls=ok
+```
+
+The typed call retained `GeneratedAggregateDecision`, temperature zero,
+`num_retries=0`, configured timeout, and bounded tokens. Runtime telemetry now
+uses `generated_aggregate_decision` and `generated_aggregate`; no old
+generated-SQL event/stage remains in the touched runtime files. Syntax/import
+checks passed, no `planning_decisions.py` change was made, and no existing
+test file or suite was run. The old `GeneratedSqlProviderError` name remains
+in an intentionally unrun legacy SQL-contract test and historical evidence;
+no compatibility shim was added, and that migration is deferred outside this
+focused review.

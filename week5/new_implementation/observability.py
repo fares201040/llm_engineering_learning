@@ -108,7 +108,6 @@ _CONTROLLED_CODES = frozenset(
         "internal_error",
         "provider_failure",
         "invalid_candidate_ids",
-        "invalid_logical_sql",
     }
 )
 _CONTROLLED_EVENTS = frozenset(
@@ -126,7 +125,7 @@ _CONTROLLED_EVENTS = frozenset(
         "query_compiled",
         "retrieval_complete",
         "stage_complete",
-        "generated_sql_decision",
+        "generated_aggregate_decision",
     }
 )
 _CONTROLLED_STAGES = frozenset(
@@ -139,7 +138,7 @@ _CONTROLLED_STAGES = frozenset(
         "structured_retrieval",
         "semantic_search",
         "provider",
-        "generated_sql",
+        "generated_aggregate",
     }
 )
 _CONTROLLED_STATES = frozenset({"success", "rejected", "paused", "failure"})

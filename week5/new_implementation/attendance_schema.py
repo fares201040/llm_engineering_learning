@@ -423,11 +423,14 @@ def validate_generated_aggregate_decision(
     """Require ambiguous provider choices to remain request-local."""
     if type(decision) is not GeneratedAggregateSqlDecision:
         raise TypeError("Expected a generated aggregate SQL decision.")
-    if isinstance(allowed_candidate_ids, (str, bytes)) or any(
-        not isinstance(candidate_id, str) for candidate_id in allowed_candidate_ids
+    if isinstance(allowed_candidate_ids, (str, bytes)) or not isinstance(
+        allowed_candidate_ids, Collection
     ):
+        raise TypeError("Allowed candidate identifiers must be a collection.")
+    candidate_ids = tuple(allowed_candidate_ids)
+    if any(not isinstance(candidate_id, str) for candidate_id in candidate_ids):
         raise TypeError("Allowed candidate identifiers must be strings.")
-    allowed = frozenset(allowed_candidate_ids)
+    allowed = frozenset(candidate_ids)
     if decision.status == "ambiguous" and any(
         candidate_id not in allowed for candidate_id in decision.candidate_ids
     ):

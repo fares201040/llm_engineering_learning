@@ -1,4 +1,5 @@
 import unittest
+from collections.abc import Collection, Iterator
 
 from pydantic import ValidationError
 
@@ -15,6 +16,22 @@ from week5.new_implementation.postgres_compiler import (
     compile_generated_aggregate_query,
     validate_generated_aggregate_sql,
 )
+
+
+class _OneShotCandidateIdCollection(Collection[str]):
+    def __init__(self, values: list[str]):
+        self._values = values
+        self.iterations = 0
+
+    def __contains__(self, value: object) -> bool:
+        return value in self._values
+
+    def __iter__(self) -> Iterator[str]:
+        self.iterations += 1
+        return iter(self._values if self.iterations == 1 else ())
+
+    def __len__(self) -> int:
+        return len(self._values)
 
 
 class GeneratedAggregateSqlDecisionTests(unittest.TestCase):
@@ -94,6 +111,20 @@ class GeneratedAggregateSqlDecisionTests(unittest.TestCase):
             validate_generated_aggregate_decision(
                 decision, allowed_candidate_ids={"field-1", "field-3"}
             )
+
+    def test_request_local_validator_materializes_one_shot_collection_once(self):
+        decision = GeneratedAggregateSqlDecision(
+            status="ambiguous", candidate_ids=["field-1", "field-2"]
+        )
+        allowed_candidate_ids = _OneShotCandidateIdCollection(["field-1", "field-2"])
+
+        self.assertIs(
+            validate_generated_aggregate_decision(
+                decision, allowed_candidate_ids=allowed_candidate_ids
+            ),
+            decision,
+        )
+        self.assertEqual(allowed_candidate_ids.iterations, 1)
 
     def test_python_model_boundary_rejects_coercion_but_json_remains_valid(self):
         invalid_payloads = [

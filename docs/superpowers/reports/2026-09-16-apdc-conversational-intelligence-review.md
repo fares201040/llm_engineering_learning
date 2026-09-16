@@ -1377,3 +1377,94 @@ diff_check exit=0
 No pre-existing test file or suite was run. The focused class, the minimal
 normalized-route probe, compile/import checks, and `git diff --check` were the
 only verification actions.
+
+## Task 6 G6 — compound failure atomicity (D15)
+
+### Owning-layer diagnosis before production edits
+
+The public compound path already prepared both units before deciding whether
+to execute. For a valid first unit followed by a typed semantic blocker,
+`_prepare_turn()` returned one prepared request and one blocker, but
+`_answer_compound_turn()` treated that blocker as resumable and wrote a copied
+compound `PendingRequestFrame`. The turn correctly performed no execution, yet
+the returned state exposed a new pending frame instead of preserving the
+caller-visible state atomically.
+
+The native correction adds `prepared_count` to `TurnPreparationResult` and
+guards the compound return boundary: a blocker with any prepared unit returns
+the original state and bounded blocker text; compounds with no prepared units
+retain their existing clarification/resumption behavior. Planning contracts,
+provider contracts, successful compound execution, and `planning_decisions.py`
+are unchanged.
+
+### Strict RED/GREEN evidence
+
+The new focused public regression was run alone before the production edit:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest week5.new_implementation.test_apdc_independent_review.CompoundFailureAtomicityReviewTests.test_valid_first_ambiguous_later_compound_is_atomic
+```
+
+It failed at the returned-state deep-equivalence assertion because the old
+boundary returned a compound pending frame:
+
+```text
+F
+Ran 1 test in 1.731s
+FAILED (failures=1)
+```
+
+After the correction, the same focused test was run alone:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest -v week5.new_implementation.test_apdc_independent_review.CompoundFailureAtomicityReviewTests.test_valid_first_ambiguous_later_compound_is_atomic
+```
+
+```text
+test_valid_first_ambiguous_later_compound_is_atomic (...) ... ok
+Ran 1 test in 1.580s
+OK
+```
+
+### Exact D15 replay and evidence
+
+Synthetic public input (the canonical D15 replay):
+
+```text
+How many worked days for Alex North; what is the unknown statistic for Sam River
+```
+
+The deterministic typed conversation seam yields two attendance segments: the
+first is valid with a synthetic employee referent and the second reaches the
+native semantic clarification blocker. The focused regression asserts:
+
+```text
+prep=2, execute-turn=0, execute-unit=0, postgres=0,
+chroma=0, connection=0, provider=1, partial-publication=0
+```
+
+The preparation result has `turn=None`, `prepared_count=1`, and one blocker.
+The response is bounded, chunks are empty, no execution or partial trace is
+published, and both the returned `ConversationState` and caller-owned state
+remain deep-equivalent to the original with no pending request, frame, or
+referent delta.
+
+The native typed-provider probe made one decision call, validated two units,
+used the `ConversationDecision` response shape with zero retries, and found no
+private-marker content. A separate synthetic compiler probe confirmed
+tuple-shaped parameters; the D15 replay made no database, connection, vector,
+or parameter call. An all-blocker synthetic probe retained the existing
+clarification path, so successful/resumable compound behavior remains scoped.
+
+No raw provider output, SQL text, parameter value, DSN, physical schema,
+retrieved record, private fixture, or exception detail is emitted by the
+implementation, regression, or report.
+
+### G6 verification and disposition
+
+Allowed checks were limited to the focused regression, minimal synthetic/public
+probes, compile/import checks, and `git diff --check`; no pre-existing suite or
+file was run. `planning_decisions.py` is unchanged. D15 is resolved at the
+compound preparation/return boundary by the focused behavior commit
+(`fix: make mixed compound preparation atomic`). Worker report:
+`.superpowers/sdd/2026-09-16-apdc-independent-conversational-intelligence-review/task-6-g6-report.md`.

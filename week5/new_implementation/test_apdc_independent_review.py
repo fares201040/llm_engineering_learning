@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from week5.new_implementation import answer
+from week5.new_implementation.decision_budget import claim_provider_call
 
 
 def _response(content: str):
@@ -581,6 +582,245 @@ class GroupedRenderingSafetyReviewTests(unittest.TestCase):
 
     def test_arabic_grouped_cells_escape_markdown_controls(self):
         self._assert_safe_rows("ar")
+
+
+class CompoundFailureAtomicityReviewTests(unittest.TestCase):
+    """Public D15 regression for compound preparation atomicity."""
+
+    @staticmethod
+    def _resolved_segments(request):
+        claim_provider_call()
+        conversation = answer.conversation
+        units = []
+        start = 0
+        for index, clause in enumerate(request.context.message.split(";")):
+            end = start + len(clause)
+            units.append(
+                {
+                    "route": "attendance",
+                    "relation": "new",
+                    "source_span": (start, end),
+                    "fact_ids": tuple(
+                        key
+                        for key, fact in request.facts
+                        if fact.strength == "strong"
+                        and fact.evidence_span
+                        and start <= fact.evidence_span[0] < end
+                    ),
+                    "employee_mentions": [
+                        {
+                            "kind": "reference_choice",
+                            "source_span": binding.source_span,
+                            "choice_id": binding.choice_ids[0],
+                        }
+                        for binding in request.context.employee_span_choices
+                        if binding.choice_ids
+                        and start <= binding.source_span[0] < end
+                    ],
+                }
+            )
+            start = end + 1
+        decision = conversation.validate_conversation_decision(
+            conversation.ConversationDecision.model_validate(
+                {"status": "resolved", "units": units}
+            ),
+            request.context,
+        )
+        return conversation.ValidatedConversation(
+            request, decision, tuple(f"synthetic-unit-{index}" for index in range(len(units)))
+        )
+
+    def test_valid_first_ambiguous_later_compound_is_atomic(self):
+        question = (
+            "How many worked days for Alex North; what is the unknown statistic for Sam River"
+        )
+        counters = {
+            "prep": 0,
+            "execute-turn": 0,
+            "execute-unit": 0,
+            "postgres": 0,
+            "chroma": 0,
+            "connection": 0,
+            "provider": 0,
+            "partial-publication": 0,
+        }
+        prepared_results = []
+
+        def wrap_prepare(original):
+            def wrapped(*args, **kwargs):
+                counters["prep"] += 1
+                return original(*args, **kwargs)
+
+            return wrapped
+
+        def wrap_execute_turn(original):
+            def wrapped(*args, **kwargs):
+                counters["execute-turn"] += 1
+                return original(*args, **kwargs)
+
+            return wrapped
+
+        def wrap_turn(original):
+            def wrapped(*args, **kwargs):
+                result = original(*args, **kwargs)
+                prepared_results.append(result)
+                return result
+
+            return wrapped
+
+        def wrap_execute_unit(original):
+            def wrapped(*args, **kwargs):
+                counters["execute-unit"] += 1
+                sink = answer._EVALUATION_TRACE_SINK.get()
+                before = len(sink) if sink is not None else 0
+                result = original(*args, **kwargs)
+                after = len(sink) if sink is not None else before
+                counters["partial-publication"] += max(0, after - before)
+                return result
+
+            return wrapped
+
+        def wrap_postgres(original):
+            def wrapped(*args, **kwargs):
+                counters["postgres"] += 1
+                return original(*args, **kwargs)
+
+            return wrapped
+
+        def wrap_connection(original):
+            def wrapped(*args, **kwargs):
+                counters["connection"] += 1
+                return original(*args, **kwargs)
+
+            return wrapped
+
+        def fake_chroma(*_args, **_kwargs):
+            counters["chroma"] += 1
+            return []
+
+        def fake_provider(*_args, **_kwargs):
+            counters["provider"] += 1
+            return self._resolved_segments(_args[0])
+
+        original = answer.ConversationState()
+        caller_state = original
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(answer, "load_attendance_catalog_candidates", return_value={})
+            )
+            stack.enter_context(
+                patch.object(
+                    answer,
+                    "load_employee_directory",
+                    return_value=[
+                        answer.EmployeeCandidate(employee_id="A10001", name="Alex North"),
+                        answer.EmployeeCandidate(employee_id="A10002", name="Sam River"),
+                    ],
+                )
+            )
+            stack.enter_context(patch.object(answer, "_postgres_enabled", return_value=False))
+            stack.enter_context(
+                patch.object(
+                    answer,
+                    "fetch_exact_chroma",
+                    side_effect=fake_chroma,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    answer,
+                    "fetch_semantic_chroma",
+                    side_effect=fake_chroma,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    answer,
+                    "fetch_chroma_coverage",
+                    side_effect=fake_chroma,
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    answer,
+                    "_prepare_context_request",
+                    side_effect=wrap_prepare(answer._prepare_context_request),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    answer,
+                    "_prepare_turn",
+                    side_effect=wrap_turn(answer._prepare_turn),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    answer,
+                    "_execute_prepared_turn",
+                    side_effect=wrap_execute_turn(answer._execute_prepared_turn),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    answer,
+                    "_execute_prepared_context",
+                    side_effect=wrap_execute_unit(answer._execute_prepared_context),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    answer,
+                    "execute_exact_postgres",
+                    side_effect=wrap_postgres(answer.execute_exact_postgres),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    answer,
+                    "_import_psycopg",
+                    side_effect=wrap_connection(answer._import_psycopg),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    answer.conversation,
+                    "request_conversation_decision",
+                    side_effect=fake_provider,
+                )
+            )
+            text, chunks, returned = answer.answer_question_with_state(
+                question, [], caller_state
+            )
+
+        self.assertEqual(
+            counters,
+            {
+                "prep": 2,
+                "execute-turn": 0,
+                "execute-unit": 0,
+                "postgres": 0,
+                "chroma": 0,
+                "connection": 0,
+                "provider": 1,
+                "partial-publication": 0,
+            },
+        )
+        self.assertEqual(len(prepared_results), 1)
+        self.assertIsNone(prepared_results[0].turn)
+        self.assertEqual(prepared_results[0].prepared_count, 1)
+        self.assertEqual(len(prepared_results[0].blockers), 1)
+        self.assertTrue(text)
+        self.assertEqual(chunks, [])
+        self.assertIsInstance(returned, answer.ConversationState)
+        self.assertEqual(returned.model_dump_json(), original.model_dump_json())
+        self.assertEqual(caller_state.model_dump_json(), original.model_dump_json())
+        self.assertIs(caller_state, original)
+        self.assertIsNone(returned.pending_request)
+        self.assertIsNone(returned.pending_clarification)
+        self.assertEqual(returned.recent_frames, [])
+        self.assertEqual(returned.referents, [])
+        self.assertEqual(returned.active_referent_ids, [])
 
 
 class ProtectedPreflightHistoryRedactionReviewTests(unittest.TestCase):

@@ -542,6 +542,7 @@ class TurnPreparationResult:
     turn: PreparedTurn | None
     blockers: tuple[TurnBlocker, ...]
     units: tuple[PendingRequestFrame, ...]
+    prepared_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -7667,6 +7668,7 @@ def _prepare_turn(
                         ),
                     ),
                     units,
+                    len(requests),
                 )
             requests.append(prepared)
             retained.append(
@@ -7700,6 +7702,7 @@ def _prepare_turn(
         None if blockers else PreparedTurn(tuple(requests)),
         tuple(blockers),
         tuple(retained),
+        len(requests),
     )
 
 
@@ -7742,6 +7745,8 @@ def _answer_compound_turn(
         fatal = next((item for item in prepared.blockers if item.pending is None), None)
         if fatal is not None:
             return fatal.text, [], state
+        if prepared.prepared_count:
+            return prepared.blockers[0].text, [], state
         blocker = prepared.blockers[0]
         updated = state.model_copy(deep=True)
         _write_pending_request(

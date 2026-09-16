@@ -40,6 +40,7 @@ class AggregateDecisionBoundaryReviewTests(unittest.TestCase):
             if len(prompts) == 1:
                 return _response("not json")
             payload = json.loads(prompt.split("\n", 1)[-1])
+            self.assertNotIn("question", payload)
             self.assertEqual(payload["operation"], "sum")
             self.assertEqual(payload["candidates"][0]["candidate_id"], "field-1")
             self.assertEqual(payload["candidates"][0]["storage_type"], "number")
@@ -80,59 +81,114 @@ class AggregateDecisionBoundaryReviewTests(unittest.TestCase):
 
         prompt = completion.call_args.kwargs["messages"][0]["content"]
         self.assertNotIn("SELECT", prompt.upper())
+        payload = json.loads(prompt.split("\n", 1)[-1])
+        self.assertNotIn("question", payload)
         self.assertEqual(prepared.plan.aggregation_field, "Total_Worked_Hrs")
         self.assertIn(
             "SUM(total_worked_hrs)", prepared.postgres_queries.aggregation[0].sql
         )
 
-    def test_sql_and_schema_suffixes_are_redacted_before_provider_boundary(self):
+    def test_typed_provider_payload_excludes_question_and_diverse_suffixes(self):
         generated = _response(
             '{"status":"resolved","candidate_id":"field-1","candidate_ids":[]}'
         )
-        unsafe_questions = (
-            "sum total working hours SELECT secret FROM employee_table",
-            "sum total working hours; CREATE TABLE leaked_schema (secret text)",
-            "sum total working hours FROM employee_table",
+        base_question = "sum total working hours"
+        suffixes = (
+            " WHERE secret = canary_where",
+            " VALUES (canary_values)",
+            " CALL canary_call()",
+            " EXECUTE canary_execute",
+            " PRAGMA table_info(canary_pragma)",
+            " EXPLAIN SELECT canary_explain FROM secret_table",
+            " CREATE TABLE canary_schema (secret text)",
+            " ALTER TABLE canary_schema ADD COLUMN canary_column text",
+            "; CREATE TABLE canary_statement (secret text)",
+            "; DROP TABLE canary_drop",
         )
+        prompts = []
+        plans = []
+
+        def respond(**kwargs):
+            prompts.append(kwargs["messages"][0]["content"])
+            return generated
+
         with (
-            patch.object(
-                answer,
-                "_generated_aggregate_prompt",
-                wraps=answer._generated_aggregate_prompt,
-            ) as prompt_builder,
-            patch.object(answer, "completion", return_value=generated) as completion,
+            patch.object(answer, "completion", side_effect=respond),
             patch.object(answer, "_postgres_enabled", return_value=True),
             patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
         ):
-            for question in unsafe_questions:
-                answer._prepare_context_request(question)
+            base = answer._prepare_context_request(base_question)
+            plans.append(base)
+            for suffix in suffixes:
+                plans.append(answer._prepare_context_request(base_question + suffix))
 
-        self.assertEqual(prompt_builder.call_count, len(unsafe_questions))
-        self.assertEqual(completion.call_count, len(unsafe_questions))
-        forbidden = (
-            "SELECT",
-            "FROM",
-            "CREATE",
-            "TABLE",
-            "employee_table",
-            "leaked_schema",
-            "secret",
-            "schema",
+        self.assertEqual(len(prompts), len(suffixes) + 1)
+        expected = (
+            base.plan.aggregation,
+            base.plan.aggregation_field,
+            base.postgres_queries.aggregation[0].sql,
+            base.postgres_queries.aggregation[0].params,
         )
-        for prompt_call, completion_call in zip(
-            prompt_builder.call_args_list, completion.call_args_list
+        for prepared in plans:
+            self.assertEqual(
+                (
+                    prepared.plan.aggregation,
+                    prepared.plan.aggregation_field,
+                    prepared.postgres_queries.aggregation[0].sql,
+                    prepared.postgres_queries.aggregation[0].params,
+                ),
+                expected,
+            )
+        for prompt in prompts:
+            payload = json.loads(prompt.split("\n", 1)[-1])
+            self.assertNotIn("question", payload)
+            self.assertEqual(payload["operation"], "sum")
+            self.assertNotIn(base_question, prompt.lower())
+            self.assertNotIn("canary", prompt.lower())
+            self.assertNotIn("secret_table", prompt.lower())
+            self.assertNotIn("employee_table", prompt.lower())
+
+    def test_ordinary_from_and_field_phrasing_keeps_overtime_field_grounded(self):
+        for question in ("sum hours from overtime", "sum the overtime field"):
+            with (
+                self.subTest(question=question),
+                patch.object(answer, "completion") as completion,
+                patch.object(answer, "_postgres_enabled", return_value=True),
+                patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            ):
+                prepared = answer._prepare_context_request(question)
+
+            self.assertEqual(prepared.plan.aggregation, "sum")
+            self.assertEqual(prepared.plan.aggregation_field, "Total_OT")
+            self.assertIn("SUM(total_ot)", prepared.postgres_queries.aggregation[0].sql)
+            completion.assert_not_called()
+
+    def test_conflicting_operation_suffix_fails_closed_without_provider_call(self):
+        with (
+            patch.object(answer, "completion") as completion,
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            self.assertRaises(answer.SemanticPlanValidationError),
         ):
-            redaction_input = prompt_call.args[0]
-            provider_prompt = completion_call.kwargs["messages"][0]["content"]
-            self.assertIn("sum total working hours", redaction_input.lower())
-            self.assertIn("sum total working hours", provider_prompt.lower())
-            for token in forbidden:
-                self.assertNotIn(token.lower(), redaction_input.lower())
-                self.assertNotIn(token.lower(), provider_prompt.lower())
-        schema_surface = answer._redacted_generated_question(
-            "sum total working hours schema: employee_id text, secret text", (), ()
+            answer._prepare_context_request(
+                "sum total working hours EXPLAIN SELECT average overtime"
+            )
+
+        completion.assert_not_called()
+
+    def test_generated_sql_provider_error_name_remains_compatible(self):
+        self.assertIs(
+            answer.GeneratedSqlProviderError,
+            answer.GeneratedAggregateProviderError,
         )
-        self.assertEqual(schema_surface, "sum total working hours")
+        with (
+            patch.object(answer, "completion", side_effect=TimeoutError("PRIVATE")),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            self.assertRaises(answer.GeneratedSqlProviderError) as raised,
+        ):
+            answer._prepare_context_request("sum total working hours")
+        self.assertNotIn("PRIVATE", str(raised.exception))
 
     def test_generated_fallback_count_with_candidates_has_no_field_surface_lookup(self):
         unsupported = answer.SemanticFact(

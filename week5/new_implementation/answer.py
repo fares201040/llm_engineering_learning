@@ -663,6 +663,12 @@ class GeneratedAggregateProviderError(RuntimeError):
     """A generated aggregate provider request failed without exposing provider text."""
 
 
+# The old public name is retained for callers that still catch the provider
+# boundary exception.  Runtime telemetry and the implementation vocabulary are
+# aggregate-oriented; this alias is compatibility only.
+GeneratedSqlProviderError = GeneratedAggregateProviderError
+
+
 @dataclass(frozen=True)
 class _GeneratedAggregateCandidate:
     candidate_id: str
@@ -670,71 +676,183 @@ class _GeneratedAggregateCandidate:
     surface: SurfaceCandidate
 
 
+@dataclass(frozen=True)
+class _GeneratedAggregateProviderCandidate:
+    """Server-owned candidate metadata sent to the aggregate provider."""
+
+    candidate_id: str
+    storage_type: str
+    description: str
+    output_unit: str
+    natural_names: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _GeneratedAggregateContext:
+    """Server-owned context sent to the aggregate decision provider."""
+
+    operation: str | None
+    candidates: tuple[_GeneratedAggregateProviderCandidate, ...]
+
+
 _GENERATED_AGGREGATE_OPERATIONS = frozenset(
     {"count", "distinct_count", "sum", "average", "min", "max"}
 )
-_GENERATED_AGGREGATE_UNSAFE_SOURCE_PATTERN = re.compile(
-    r"""
-    (?:
-        ;|--|/\*|
-        \b(?:select|insert|update|delete|merge)\b|
-        \b(?:with)\s+[A-Za-z_][\w$]*\s+as\s*\(|
-        \b(?:from|join)\s+
-        ["'`]? [A-Za-z_][\w$]* ["'`]?
-        (?:\s*\.\s* ["'`]? [A-Za-z_][\w$]* ["'`]?) *
-        (?=\s*(?:where|join|on|group\s+by|order\s+by|having|limit|offset|union|;|$))|
-        \b(?:create|alter|drop|truncate|comment|grant|revoke)
-        (?:\s+(?:or\s+replace|if\s+(?:not\s+)?exists|temporary|temp))*
-        \s+(?:table|schema|view|index|function|procedure|type|trigger|role|database)\b|
-        \b(?:schema|schemas|columns?|fields?|ddl|sql)\b|
-        \b(?:information_schema|pg_catalog|sqlite_master)\b
-    )
-    """,
-    re.IGNORECASE | re.VERBOSE,
-)
 
 
-def _safe_generated_aggregate_surface(question: str) -> str:
-    """Keep only the local natural-language surface before SQL/schema text."""
-    match = _GENERATED_AGGREGATE_UNSAFE_SOURCE_PATTERN.search(question)
-    if match is None:
-        return question
-    safe_surface = question[: match.start()].rstrip(" \t\r\n,;:")
-    return safe_surface or "[unsafe aggregate input removed]"
-
-
-def _generated_aggregate_operation(
-    question: str, facts: tuple[SemanticFact, ...]
+def _typed_aggregate_operation_from_facts(
+    facts: tuple[SemanticFact, ...],
 ) -> str | None:
+    """Read only already-typed aggregate operations from request-local facts."""
+    operations = {
+        fact.concept_name
+        for fact in facts
+        if fact.kind == "calculation"
+        and fact.strength == "strong"
+        and fact.origin
+        in {
+            "trusted_state",
+            "user_clarification",
+            "provider_decision",
+            "deterministic_default",
+        }
+        and fact.concept_name in _GENERATED_AGGREGATE_OPERATIONS
+    }
+    return next(iter(operations)) if len(operations) == 1 else None
+
+
+def _aggregate_operation_spans(
+    operation: str | None,
+    facts: tuple[SemanticFact, ...],
+    surface,
+) -> tuple[tuple[int, int], ...]:
+    spans = [
+        candidate.evidence_span
+        for candidate in surface.candidates
+        if candidate.target_kind == "calculation"
+        and candidate.target_name == operation
+        and candidate.method in {"exact", "localized_alias"}
+    ]
+    if spans:
+        return tuple(dict.fromkeys(spans))
+    return tuple(
+        fact.evidence_span
+        for fact in facts
+        if fact.kind == "calculation"
+        and fact.concept_name == operation
+        and fact.evidence_span is not None
+    )
+
+
+def _generated_aggregate_operation_from_surface(
+    facts: tuple[SemanticFact, ...],
+    surface,
+) -> str | None:
+    """Derive one operation, rejecting conflicting typed matches fail-closed."""
     trusted = {
         fact.concept_name
         for fact in facts
         if fact.kind == "calculation"
         and fact.strength == "strong"
-        and fact.origin == "user_clarification"
+        and fact.origin in {"trusted_state", "user_clarification"}
         and fact.concept_name in _GENERATED_AGGREGATE_OPERATIONS
     }
-    surface = analyze_question_surface(question)
-    grounded = {
+    if len(trusted) > 1:
+        return None
+    if trusted:
+        return next(iter(trusted))
+
+    typed_facts = _typed_aggregate_operation_from_facts(facts)
+    surface_operations = {
         candidate.target_name
         for candidate in surface.candidates
         if candidate.target_kind == "calculation"
         and candidate.method in {"exact", "localized_alias"}
         and candidate.target_name in _GENERATED_AGGREGATE_OPERATIONS
     }
-    operations = trusted or grounded
-    return next(iter(operations)) if len(operations) == 1 else None
+    if len(surface_operations) > 1:
+        return None
+    if typed_facts is not None and surface_operations:
+        if typed_facts not in surface_operations:
+            return None
+        return typed_facts
+    return typed_facts or next(iter(surface_operations), None)
 
 
-def _generated_aggregate_candidates(
+def _generated_aggregate_operation(
     question: str, facts: tuple[SemanticFact, ...]
+) -> str | None:
+    surface = analyze_question_surface(question)
+    return _generated_aggregate_operation_from_surface(facts, surface)
+
+
+def _surface_candidate_method_rank(candidate: SurfaceCandidate) -> tuple[int, float]:
+    return (
+        {
+            "user_clarification": 4,
+            "exact": 3,
+            "localized_alias": 3,
+            "transliteration": 2,
+            "fuzzy": 1,
+        }.get(candidate.method, 0),
+        candidate.score,
+    )
+
+
+def _surface_spans_overlap(
+    left: tuple[int, int], right: tuple[int, int]
+) -> bool:
+    return left[0] < right[1] and right[0] < left[1]
+
+
+def _aggregate_candidate_clusters(
+    candidates: tuple[SurfaceCandidate, ...],
+) -> tuple[tuple[SurfaceCandidate, ...], ...]:
+    """Group overlapping typed matches into one local subject phrase."""
+    clusters: list[list[SurfaceCandidate]] = []
+    for candidate in sorted(
+        candidates,
+        key=lambda item: (item.evidence_span[0], item.evidence_span[1]),
+    ):
+        for cluster in clusters:
+            if any(
+                _surface_spans_overlap(candidate.evidence_span, item.evidence_span)
+                for item in cluster
+            ):
+                cluster.append(candidate)
+                break
+        else:
+            clusters.append([candidate])
+    return tuple(
+        tuple(sorted(cluster, key=lambda item: item.evidence_span))
+        for cluster in clusters
+    )
+
+
+def _aggregate_candidate_distance(
+    candidate: SurfaceCandidate,
+    operation_spans: tuple[tuple[int, int], ...],
+) -> int:
+    if not operation_spans:
+        return candidate.evidence_span[0]
+    start, end = candidate.evidence_span
+    return min(
+        0
+        if _surface_spans_overlap(candidate.evidence_span, operation_span)
+        else min(abs(start - operation_span[1]), abs(operation_span[0] - end))
+        for operation_span in operation_spans
+    )
+
+
+def _typed_aggregate_field_candidates(
+    question: str,
+    facts: tuple[SemanticFact, ...],
+    operation: str,
+    surface,
 ) -> tuple[_GeneratedAggregateCandidate, ...]:
-    operation = _generated_aggregate_operation(question, facts)
-    if operation is None:
-        return ()
-    unique: dict[str, SurfaceCandidate] = {}
-    for candidate in analyze_question_surface(question).candidates:
-        if candidate.target_kind != "field" or candidate.target_name in unique:
+    eligible: dict[str, SurfaceCandidate] = {}
+    for candidate in surface.candidates:
+        if candidate.target_kind != "field":
             continue
         definition = FIELD_DEFINITIONS.get(candidate.target_name)
         if (
@@ -747,11 +865,83 @@ def _generated_aggregate_candidates(
             definition.storage_type != "number"
         ):
             continue
-        unique[candidate.target_name] = candidate
+        previous = eligible.get(candidate.target_name)
+        if previous is None or _surface_candidate_method_rank(
+            candidate
+        ) > _surface_candidate_method_rank(previous):
+            eligible[candidate.target_name] = candidate
+    if not eligible:
+        return ()
+
+    operation_spans = _aggregate_operation_spans(
+        operation, facts, surface
+    )
+    field_candidates = tuple(eligible.values())
+    clusters = _aggregate_candidate_clusters(field_candidates)
+    if not clusters:
+        return ()
+    subject_cluster = min(
+        clusters,
+        key=lambda cluster: (
+            min(
+                _aggregate_candidate_distance(candidate, operation_spans)
+                for candidate in cluster
+            ),
+            min(candidate.evidence_span[0] for candidate in cluster),
+        ),
+    )
+    best_rank = max(_surface_candidate_method_rank(candidate)[0] for candidate in subject_cluster)
+    selected = tuple(
+        candidate
+        for candidate in subject_cluster
+        if _surface_candidate_method_rank(candidate)[0] == best_rank
+    )
     return tuple(
-        _GeneratedAggregateCandidate(f"field-{index}", field, surface)
-        for index, (field, surface) in enumerate(unique.items(), start=1)
+        _GeneratedAggregateCandidate(f"field-{index}", candidate.target_name, candidate)
+        for index, candidate in enumerate(
+            sorted(
+                selected,
+                key=lambda item: (
+                    item.evidence_span[0],
+                    item.evidence_span[1],
+                    item.target_name,
+                ),
+            ),
+            start=1,
+        )
     )[: settings.constraint_candidate_limit]
+
+
+def _aggregate_provider_context(
+    operation: str | None,
+    candidates: tuple[_GeneratedAggregateCandidate, ...],
+) -> _GeneratedAggregateContext:
+    """Project local matches into registry-owned provider metadata only."""
+    return _GeneratedAggregateContext(
+        operation=operation,
+        candidates=tuple(
+            _GeneratedAggregateProviderCandidate(
+                candidate_id=candidate.candidate_id,
+                storage_type=FIELD_DEFINITIONS[candidate.field].storage_type,
+                description=FIELD_DEFINITIONS[candidate.field].description,
+                output_unit=FIELD_DEFINITIONS[candidate.field].output_unit,
+                natural_names=tuple(
+                    FIELD_DEFINITIONS[candidate.field].natural_names
+                ),
+            )
+            for candidate in candidates
+        ),
+    )
+
+
+def _generated_aggregate_candidates(
+    question: str, facts: tuple[SemanticFact, ...]
+) -> tuple[_GeneratedAggregateCandidate, ...]:
+    surface = analyze_question_surface(question)
+    operation = _generated_aggregate_operation_from_surface(facts, surface)
+    if operation is None:
+        return ()
+    return _typed_aggregate_field_candidates(question, facts, operation, surface)
 
 
 def _generated_aggregate_has_external_ambiguity(
@@ -760,12 +950,22 @@ def _generated_aggregate_has_external_ambiguity(
     unresolved = _unresolved_surface_candidates(question)
     if not unresolved:
         return False
-    if len(unresolved) != 1 or unresolved[0].target_kind != "predicate":
+    relevant = tuple(
+        item
+        for item in unresolved
+        if any(
+            _surface_spans_overlap(item.evidence_span, candidate.surface.evidence_span)
+            for candidate in candidates
+        )
+    )
+    if not relevant:
+        return False
+    if len(relevant) != 1 or relevant[0].target_kind != "predicate":
         return True
-    predicate = BUSINESS_PREDICATE_DEFINITIONS.get(unresolved[0].target_name)
+    predicate = BUSINESS_PREDICATE_DEFINITIONS.get(relevant[0].target_name)
     if predicate is None:
         return True
-    ambiguity_span = unresolved[0].evidence_span
+    ambiguity_span = relevant[0].evidence_span
     overlapping_fields = {
         candidate.field
         for candidate in candidates
@@ -776,115 +976,55 @@ def _generated_aggregate_has_external_ambiguity(
     return not required_fields or not required_fields.issubset(overlapping_fields)
 
 
-def _redacted_generated_question(
-    question: str,
-    facts: tuple[SemanticFact, ...],
-    resolved_private_values: Sequence[str] = (),
-) -> str:
-    redacted = _safe_generated_aggregate_surface(question)
-    private_values = [str(value) for value in resolved_private_values if value]
-    try:
-        resolved_dates = resolve_relative_date_filters(question)
-    except PlanValidationError:
-        resolved_dates = []
-    private_values.extend(str(condition.value) for condition in resolved_dates)
-    for fact in facts:
-        if fact.kind in {"entity", "filter", "temporal"}:
-            private_values.extend(str(value) for value in fact.values)
-            if fact.kind == "entity" or fact.evidence_text != question:
-                private_values.append(fact.evidence_text)
-    private_values.extend(
-        match.group(0) for match in _EMPLOYEE_ID_LIKE_PATTERN.finditer(question)
-    )
-    private_values.extend(
-        match.group(0)
-        for match in re.finditer(
-            r"\b(?:\d{4}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{4})\b",
-            question,
+def _drop_natural_aggregate_field_suffix(
+    question: str, facts: tuple[SemanticFact, ...]
+) -> tuple[SemanticFact, ...]:
+    """Keep ``<field> field`` as natural wording, not an unsupported filter."""
+    aggregate_fields = {
+        fact.field
+        for fact in facts
+        if fact.kind == "calculation"
+        and fact.strength == "strong"
+        and fact.field in FIELD_DEFINITIONS
+    }
+    if not aggregate_fields:
+        return facts
+    field_candidates = {
+        normalize_for_matching(candidate.evidence_text)
+        for candidate in analyze_question_surface(question).candidates
+        if candidate.target_kind == "field"
+        and candidate.target_name in aggregate_fields
+        and candidate.method in {"exact", "localized_alias"}
+    }
+    if not field_candidates:
+        return facts
+    natural_suffixes = {f"{evidence} field" for evidence in field_candidates}
+    return tuple(
+        fact
+        for fact in facts
+        if not (
+            fact.kind == "unsupported"
+            and fact.concept_name == "unsupported_constraint"
+            and normalize_for_matching(fact.evidence_text) in natural_suffixes
         )
     )
-    private_values.extend(
-        match.group(0)
-        for match in re.finditer(
-            r"\b(?:yesterday|today|last week|this week|last month|this month|"
-            r"(?:last|past|previous)\s+\d{1,3}\s+days?)\b",
-            question,
-            re.I,
-        )
-    )
-    private_values.extend(
-        match.group(0)
-        for match in re.finditer(
-            r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
-            r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
-            r"nov(?:ember)?|dec(?:ember)?)(?:\s+\d{1,2}(?:st|nd|rd|th)?,?)?"
-            r"\s+\d{4}\b",
-            question,
-            re.I,
-        )
-    )
-    private_values.extend(
-        value
-        for value in (
-            POSTGRES_DSN,
-            POSTGRES_ATTENDANCE_TABLE,
-            POSTGRES_CHUNKS_TABLE,
-        )
-        if value
-    )
-    private_values.extend(
-        match.group(0)
-        for match in re.finditer(r"\bpostgres(?:ql)?://[^\s]+", question, re.I)
-    )
-    private_values.extend(
-        match.group(0)
-        for match in re.finditer(
-            r"\b(?:host|hostaddr|port|dbname|user|password)\s*=\s*[^\s]+",
-            question,
-            re.I,
-        )
-    )
-    private_values.extend(
-        match.group(0)
-        for match in re.finditer(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+\b", question)
-    )
-    for index, value in enumerate(
-        sorted({value for value in private_values if value}, key=len, reverse=True),
-        start=1,
-    ):
-        redacted = re.sub(re.escape(value), f"<private-{index}>", redacted, flags=re.I)
-    return redacted
 
 
 def _generated_aggregate_prompt(
-    question: str,
-    facts: tuple[SemanticFact, ...],
-    candidates: tuple[_GeneratedAggregateCandidate, ...],
-    resolved_private_values: Sequence[str] = (),
+    context: _GeneratedAggregateContext,
     validation_code: str | None = None,
-    *,
-    operation: str | None = None,
 ) -> str:
-    safe_question = _safe_generated_aggregate_surface(question)
-    operation = (
-        operation
-        if operation is not None
-        else _generated_aggregate_operation(safe_question, facts)
-    )
     payload = {
-        "question": _redacted_generated_question(
-            safe_question, facts, resolved_private_values
-        ),
-        "operation": operation,
+        "operation": context.operation,
         "candidates": [
             {
                 "candidate_id": candidate.candidate_id,
-                "storage_type": FIELD_DEFINITIONS[candidate.field].storage_type,
-                "description": FIELD_DEFINITIONS[candidate.field].description,
-                "output_unit": FIELD_DEFINITIONS[candidate.field].output_unit,
-                "natural_names": list(FIELD_DEFINITIONS[candidate.field].natural_names),
+                "storage_type": candidate.storage_type,
+                "description": candidate.description,
+                "output_unit": candidate.output_unit,
+                "natural_names": list(candidate.natural_names),
             }
-            for candidate in candidates
+            for candidate in context.candidates
         ],
         "response_shape": {
             "status": ["resolved", "ambiguous", "unsupported"],
@@ -928,17 +1068,13 @@ def _request_generated_aggregate(
     operation = _generated_aggregate_operation(question, facts)
     if operation == "count":
         return GeneratedAggregateChoice("count", None)
-    safe_question = _safe_generated_aggregate_surface(question)
+    context = _aggregate_provider_context(operation, candidates)
     candidate_ids = {candidate.candidate_id for candidate in candidates}
     validation_code = None
     for _attempt in range(1, 4):
         prompt = _generated_aggregate_prompt(
-            safe_question,
-            facts,
-            candidates,
-            resolved_private_values,
-            validation_code,
-            operation=operation,
+            context,
+            validation_code=validation_code,
         )
         try:
             claim_provider_call()
@@ -4597,8 +4733,11 @@ def _prepare_context_request(
         match_method_counts=method_counts,
     )
     surface_facts = _facts_from_question_surface(question)
-    detected_facts = merge_semantic_facts(
-        detect_semantic_facts(question, identity_context), surface_facts
+    detected_facts = _drop_natural_aggregate_field_suffix(
+        question,
+        merge_semantic_facts(
+            detect_semantic_facts(question, identity_context), surface_facts
+        ),
     )
     generated_aggregate_choice = None
     entity_resolution = None
@@ -4785,8 +4924,11 @@ def _prepare_context_request(
         employees=_employee_references(default_employees),
         reference_date=_current_local_date(),
     )
-    detected_facts = merge_semantic_facts(
-        detect_semantic_facts(question, pre_context), surface_facts
+    detected_facts = _drop_natural_aggregate_field_suffix(
+        question,
+        merge_semantic_facts(
+            detect_semantic_facts(question, pre_context), surface_facts
+        ),
     )
     detected_facts = _drop_detected_facts_overridden_by_trusted(
         prepared_facts, detected_facts
@@ -5043,7 +5185,9 @@ def _prepare_context_request(
         employees=_employee_references(default_employees),
         reference_date=pre_context.reference_date,
     )
-    refreshed_facts = detect_semantic_facts(question, resolution_context)
+    refreshed_facts = _drop_natural_aggregate_field_suffix(
+        question, detect_semantic_facts(question, resolution_context)
+    )
     refreshed_facts = _drop_detected_facts_overridden_by_trusted(
         initial_facts, refreshed_facts
     )

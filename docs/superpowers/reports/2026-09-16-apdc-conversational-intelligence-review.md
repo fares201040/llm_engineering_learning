@@ -742,3 +742,114 @@ test file or suite was run. The old `GeneratedSqlProviderError` name remains
 in an intentionally unrun legacy SQL-contract test and historical evidence;
 no compatibility shim was added, and that migration is deferred outside this
 focused review.
+
+## Task 3 fix round 2: typed-only aggregate provider context
+
+### Owning-layer root cause
+
+The aggregate fallback still crossed its provider boundary with a redacted
+question. The denylist could not prove exclusion of arbitrary SQL, DDL, or
+metadata text, and the same raw question was re-analyzed for operation and
+candidate derivation. That also made ordinary wording such as `from overtime`
+and `overtime field` vulnerable to SQL-oriented stripping. The compatibility
+break was separate but public: the aggregate exception had replaced the legacy
+`GeneratedSqlProviderError` name used by the repository contract.
+
+The correction removes the raw question from the provider request entirely.
+The provider receives a `_GeneratedAggregateContext` containing only the
+request-local operation and registry-owned candidate IDs, storage types,
+descriptions, output units, and natural names. Local field matches are grouped
+by typed source spans; the closest subject cluster wins, while conflicting
+operations fail closed. The provider can only return a validated candidate ID;
+the trusted parameterized PostgreSQL compiler remains authoritative. The old
+exception name is an alias to `GeneratedAggregateProviderError`, while runtime
+telemetry remains aggregate-oriented.
+
+### Focused RED
+
+Command:
+
+```powershell
+& '.venv\Scripts\python.exe' -m unittest -v week5.new_implementation.test_apdc_independent_review.AggregateDecisionBoundaryReviewTests
+```
+
+Exit code 1. Eight focused tests ran: five passed, the new exception
+compatibility check errored because `GeneratedSqlProviderError` was absent, the
+ordinary `sum the overtime field` case errored at the existing unsupported
+constraint boundary, and the typed payload assertions failed because the
+provider JSON still contained `question`. The repair case consequently
+surfaced the provider failure raised by its assertion. No existing test file or
+suite was run.
+
+### Focused GREEN
+
+The same command exited 0:
+
+```text
+test_conflicting_operation_suffix_fails_closed_without_provider_call ... ok
+test_generated_fallback_count_with_candidates_has_no_field_surface_lookup ... ok
+test_generated_sql_provider_error_name_remains_compatible ... ok
+test_grounded_count_needs_no_provider_field_decision ... ok
+test_ordinary_from_and_field_phrasing_keeps_overtime_field_grounded ... ok
+test_repair_prompt_repeats_operation_and_request_local_candidates ... ok
+test_resolved_candidate_id_compiles_through_trusted_parameterized_aggregate ... ok
+test_typed_provider_payload_excludes_question_and_diverse_suffixes ... ok
+----------------------------------------------------------------------
+Ran 8 tests in 16.424s
+
+OK
+```
+
+The focused regressions cover `WHERE`, `VALUES`, `CALL`, `EXECUTE`, `PRAGMA`,
+`EXPLAIN`, `CREATE TABLE`, `ALTER TABLE`, semicolon-separated `CREATE TABLE`,
+and semicolon-separated `DROP TABLE` suffixes. All produce the same
+typed payload and the same `SUM(total_worked_hrs)` trusted plan as the base
+request, with no question field, canary, secret table, or physical table text
+in the provider prompt. `sum hours from overtime` and `sum the overtime field`
+compile directly to `SUM(total_ot)` with zero provider calls. A conflicting
+operation suffix raises the typed semantic validation error before any
+provider call. Count remains deterministic `COUNT(*)` with no aggregation field
+and zero provider calls. The legacy exception alias catches provider failures
+without exposing the private exception detail.
+
+### Isolated probes and checks
+
+The manual typed-boundary probe reported:
+
+```text
+cases 11 calls 11
+all_plan_signatures_equal True
+payload_keys ['candidates', 'operation', 'response_shape']
+payloads_identical True
+raw_question_or_canary_leaked False
+provider_context_fields ['candidates', 'operation']
+legacy_exception_alias GeneratedAggregateProviderError True private_leaked False
+```
+
+The ordinary-language/count probe reported:
+
+```text
+phrase sum hours from overtime operation sum field Total_OT calls 0
+phrase sum the overtime field operation sum field Total_OT calls 0
+conflict SemanticPlanValidationError calls 0
+count count None calls 0
+```
+
+`py_compile` passed for `answer.py` and the focused test file (exit code 0),
+`git diff --check` passed (exit code 0), and `planning_decisions.py` was not
+modified. No pre-existing test file or suite was run.
+
+### Files and self-review
+
+Tracked implementation changes are limited to
+`week5/new_implementation/answer.py`,
+`week5/new_implementation/test_apdc_independent_review.py`, and this report.
+The requested SDD task report was updated at
+`.superpowers/sdd/2026-09-16-apdc-independent-conversational-intelligence-review/task-3-report.md`.
+The provider prompt has no question field and no raw user-authored input; no
+SQL/schema denylist remains on this boundary; candidate-to-field mapping and
+parameterized compilation remain local and trusted.
+
+### Commit
+
+Commit message: `fix: make aggregate provider context typed only`.

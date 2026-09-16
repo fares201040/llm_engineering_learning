@@ -226,6 +226,25 @@ class BirdCaseEvaluationTests(unittest.TestCase):
         self.assertEqual(result.execution_accuracy, 0.0)
         self.assertEqual(result.components, {"group_values": False})
 
+    def test_numeric_expected_group_identity_rejects_boolean_actual_identity(self):
+        case = bird_case(expected_group_values=[{"group": [1], "value": 2}])
+        calculation = {"rows": [{"group": [True], "value": 2}]}
+
+        with patch.object(
+            evaluation,
+            "fetch_context",
+            return_value=(
+                [],
+                SimpleNamespace(model_dump=lambda: {}),
+                calculation,
+                1,
+            ),
+        ):
+            result = evaluation.evaluate_bird_case(case)
+
+        self.assertEqual(result.execution_accuracy, 0.0)
+        self.assertEqual(result.components, {"group_values": False})
+
     def test_explicit_empty_group_contract_requires_an_empty_rows_list(self):
         case = bird_case(expected_group_values=[])
         calculations = (

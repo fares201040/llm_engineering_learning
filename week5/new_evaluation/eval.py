@@ -209,17 +209,27 @@ def _bird_group_values_match(actual: dict | None, expected: list[dict]) -> bool:
         return isinstance(rows, list) and not rows
     if not isinstance(rows, list) or len(rows) != len(expected):
         return False
-    actual_by_group = {tuple(row.get("group", [])): row.get("value") for row in rows}
-    if len(actual_by_group) != len(rows):
+    if any(
+        _bird_values_match(row.get("group", []), other.get("group", []))
+        for index, row in enumerate(rows)
+        for other in rows[index + 1 :]
+    ):
         return False
-    expected_by_group = {
-        tuple(row.get("group", [])): row.get("value") for row in expected
-    }
-    if len(expected_by_group) != len(expected):
+    if any(
+        _bird_values_match(row.get("group", []), other.get("group", []))
+        for index, row in enumerate(expected)
+        for other in expected[index + 1 :]
+    ):
         return False
-    return actual_by_group.keys() == expected_by_group.keys() and all(
-        _bird_values_match(actual_by_group[group], value)
-        for group, value in expected_by_group.items()
+    return all(
+        any(
+            _bird_values_match(
+                actual_row.get("group", []), expected_row.get("group", [])
+            )
+            and _bird_values_match(actual_row.get("value"), expected_row.get("value"))
+            for actual_row in rows
+        )
+        for expected_row in expected
     )
 
 

@@ -203,6 +203,17 @@ def _bird_values_match(actual, expected, *, key=None) -> bool:
     return actual == expected
 
 
+def _bird_group_identity_matches(actual, expected) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _bird_group_identity_matches(actual_item, expected_item)
+            for actual_item, expected_item in zip(actual, expected)
+        )
+    return actual == expected
+
+
 def _bird_group_values_match(actual: dict | None, expected: list[dict]) -> bool:
     rows = actual.get("rows") if isinstance(actual, dict) else None
     if not expected:
@@ -210,20 +221,20 @@ def _bird_group_values_match(actual: dict | None, expected: list[dict]) -> bool:
     if not isinstance(rows, list) or len(rows) != len(expected):
         return False
     if any(
-        _bird_values_match(row.get("group", []), other.get("group", []))
+        _bird_group_identity_matches(row.get("group", []), other.get("group", []))
         for index, row in enumerate(rows)
         for other in rows[index + 1 :]
     ):
         return False
     if any(
-        _bird_values_match(row.get("group", []), other.get("group", []))
+        _bird_group_identity_matches(row.get("group", []), other.get("group", []))
         for index, row in enumerate(expected)
         for other in expected[index + 1 :]
     ):
         return False
     return all(
         any(
-            _bird_values_match(
+            _bird_group_identity_matches(
                 actual_row.get("group", []), expected_row.get("group", [])
             )
             and _bird_values_match(actual_row.get("value"), expected_row.get("value"))

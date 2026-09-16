@@ -989,3 +989,137 @@ during September 1-7, 2026.` output, and an unscoped English count remained
 Allowed checks also passed: `py_compile` for `answer.py` and the focused test
 file (exit code 0), and `git diff --check` (exit code 0). No pre-existing test
 file or suite was run; `planning_decisions.py` was unchanged.
+
+## Task 5 — Escape deterministic grouped-result cells
+
+The owning layer was the deterministic Markdown renderer in
+`week5/new_implementation/answer.py`. Both English and Arabic grouped-result
+branches converted trusted group values directly with `str()` and joined them
+with Markdown pipe separators. A pipe in a group label therefore changed the
+cell structure, while a CR/LF in a label created an additional physical table
+row. The correction adds one shared private cell formatter that preserves
+blank-label localization, collapses CR/LF runs to one space, and escapes
+literal pipes. Numeric values continue through `_format_number()` unchanged;
+planning, retrieval, execution, scope suffixes, and privacy boundaries are not
+changed.
+
+### Focused RED
+
+Only the new focused class was run:
+
+```powershell
+& '.venv\Scripts\python.exe' -m unittest -v week5.new_implementation.test_apdc_independent_review.GroupedRenderingSafetyReviewTests
+```
+
+Exit code 1. Both new English and Arabic tests failed as expected before the
+formatter existed:
+
+```text
+test_arabic_grouped_cells_escape_markdown_controls (...) ... FAIL
+test_english_grouped_cells_escape_markdown_controls (...) ... FAIL
+
+AssertionError: 5 != 4
+----------------------------------------------------------------------
+Ran 2 tests in 0.002s
+
+FAILED (failures=2)
+```
+
+The five physical lines reproduced the newline-containing `Remote\nAnnex`
+value as an injected table line, establishing the feature-missing failure.
+No pre-existing test file or suite was run.
+
+### Implementation and focused GREEN
+
+`_format_group_cell()` now converts each group value to display text, maps
+`None` to the locale-specific blank label, replaces each CR/LF run with one
+space, and escapes `|` as `\|`. Both grouped branches call this same helper;
+headers, scope text, and numeric formatting are untouched.
+
+The same focused command exited 0:
+
+```text
+test_arabic_grouped_cells_escape_markdown_controls (...) ... ok
+test_english_grouped_cells_escape_markdown_controls (...) ... ok
+
+----------------------------------------------------------------------
+Ran 2 tests in 0.001s
+
+OK
+```
+
+The regressions use only the synthetic values `Ops | North` and
+`Remote\nAnnex`, assert `Ops \| North`, collapse the newline to `Remote Annex`,
+and require exactly one logical row per result in both locales.
+
+### Safe manual/public probe
+
+The following probe used a synthetic typed grouped plan and no backend,
+provider, schema, private value, or user question:
+
+```powershell
+@'
+import sys
+sys.stdout.reconfigure(encoding='utf-8')
+from week5.new_implementation import answer
+
+plan = answer.ExecutableQueryPlan(
+    mode='exact',
+    search_query='synthetic public fixture',
+    aggregation='count',
+    group_by=['Department'],
+    answer_contract=answer.AnswerContract(shape='grouped', unit='records'),
+)
+aggregation = {
+    'operation': 'count',
+    'group_by': ['Department'],
+    'rows': [
+        {'group': ['Ops | North'], 'value': 2},
+        {'group': ['Remote\nAnnex'], 'value': 3},
+    ],
+    'total_groups': 2,
+    'truncated': False,
+}
+for locale in ('en', 'ar'):
+    first = answer._format_aggregation_answer(plan, aggregation, locale=locale)
+    second = answer._format_aggregation_answer(plan, aggregation, locale=locale)
+    assert first == second
+    lines = first.splitlines()
+    assert len(lines) == 4
+    assert lines[2:] == [r'Ops \| North | 2', 'Remote Annex | 3']
+    assert '\r' not in first and 'Remote\nAnnex' not in first
+    print(f'{locale}_rows=', repr(first))
+
+crlf_aggregation = {
+    **aggregation,
+    'rows': [{'group': ['Remote\r\n\nAnnex | East'], 'value': 12.5}],
+}
+crlf = answer._format_aggregation_answer(plan, crlf_aggregation, locale='en')
+assert crlf.splitlines()[2:] == [r'Remote Annex \| East | 12.5']
+assert '\r' not in crlf and '\n' not in crlf.splitlines()[2]
+print('crlf_and_numeric=', repr(crlf))
+print('probe_status=PASS')
+'@ | & '.venv\Scripts\python.exe' -
+```
+
+Exact output (exit code 0):
+
+```text
+en_rows= 'Department | Count attendance records\n--- | ---\nOps \| North | 2\nRemote Annex | 3'
+ar_rows= 'القسم | النتيجة\n--- | ---\nOps \| North | 2\nRemote Annex | 3'
+crlf_and_numeric= 'Department | Count attendance records\n--- | ---\nRemote Annex \| East | 12.5'
+probe_status=PASS
+```
+
+Allowed checks also passed:
+
+```text
+py_compile answer.py test_apdc_independent_review.py: exit code 0
+git diff --check: exit code 0
+```
+
+Self-review confirmed Markdown row-injection resistance, CR/LF normalization,
+pipe escaping, English/Arabic localization parity, deterministic repeated
+rendering, unchanged numeric formatting, no private-value exposure, and no
+changes to accepted Task 3/4 invariants. `planning_decisions.py` remains
+unchanged. No pre-existing test file or suite was run.

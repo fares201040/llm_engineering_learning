@@ -540,5 +540,47 @@ class ArabicAggregationScopeReviewTests(unittest.TestCase):
         self.assertIsNone(state.pending_request)
 
 
+class GroupedRenderingSafetyReviewTests(unittest.TestCase):
+    @staticmethod
+    def _plan():
+        return answer.ExecutableQueryPlan(
+            mode="exact",
+            search_query="synthetic public fixture",
+            aggregation="count",
+            group_by=["Department"],
+            answer_contract=answer.AnswerContract(shape="grouped", unit="records"),
+        )
+
+    @staticmethod
+    def _aggregation():
+        return {
+            "operation": "count",
+            "group_by": ["Department"],
+            "rows": [
+                {"group": ["Ops | North"], "value": 2},
+                {"group": ["Remote\nAnnex"], "value": 3},
+            ],
+            "total_groups": 2,
+            "truncated": False,
+        }
+
+    def _assert_safe_rows(self, locale):
+        rendered = answer._format_aggregation_answer(
+            self._plan(), self._aggregation(), locale=locale
+        )
+        lines = rendered.splitlines()
+
+        self.assertEqual(len(lines), 4)
+        self.assertEqual(lines[2:], [r"Ops \| North | 2", "Remote Annex | 3"])
+        self.assertNotIn("\r", rendered)
+        self.assertNotIn("Remote\nAnnex", rendered)
+
+    def test_english_grouped_cells_escape_markdown_controls(self):
+        self._assert_safe_rows("en")
+
+    def test_arabic_grouped_cells_escape_markdown_controls(self):
+        self._assert_safe_rows("ar")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4072,6 +4072,12 @@ def _localized_field_label(field: str, locale: str) -> str:
     return _field_natural_label(field)
 
 
+def _format_group_cell(value, *, blank_label: str) -> str:
+    display = blank_label if value is None else str(value)
+    display = re.sub(r"[\r\n]+", " ", display)
+    return display.replace("|", r"\|")
+
+
 def _format_verified_condition(
     condition: FilterCondition, *, locale: str = "en"
 ) -> str:
@@ -4209,7 +4215,8 @@ def _format_aggregation_answer(
             lines = [" | ".join(headers), " | ".join(["---"] * len(headers))]
             for row in aggregation["rows"]:
                 group = [
-                    "(فارغ)" if item is None else str(item) for item in row["group"]
+                    _format_group_cell(item, blank_label="(فارغ)")
+                    for item in row["group"]
                 ]
                 lines.append(" | ".join([*group, _format_number(row["value"])]))
             if aggregation.get("truncated"):
@@ -4304,7 +4311,10 @@ def _format_aggregation_answer(
         ]
         lines = [" | ".join(headers), " | ".join(["---"] * len(headers))]
         for row in aggregation["rows"]:
-            group = ["(blank)" if item is None else str(item) for item in row["group"]]
+            group = [
+                _format_group_cell(item, blank_label="(blank)")
+                for item in row["group"]
+            ]
             lines.append(" | ".join([*group, _format_number(row["value"])]))
         if aggregation.get("truncated"):
             lines.append(

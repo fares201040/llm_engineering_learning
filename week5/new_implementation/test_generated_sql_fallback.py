@@ -40,6 +40,18 @@ class DecisionBudgetTests(unittest.TestCase):
 
 
 class GeneratedSqlFallbackTests(unittest.TestCase):
+    def test_unresolved_meaning_outside_primary_field_phrase_blocks_fallback(self):
+        with (
+            patch.object(answer, "completion") as completion,
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            self.assertRaises(answer.SurfaceMeaningClarificationRequired) as raised,
+        ):
+            answer._prepare_context_request("how many total working hours workd")
+
+        completion.assert_not_called()
+        self.assertEqual(raised.exception.candidates[0].target_kind, "predicate")
+        self.assertEqual(raised.exception.candidates[0].evidence_text, "workd")
+
     def test_total_working_hours_uses_trusted_sum_and_bound_employee_scope(self):
         generated = _response(
             '{"status":"ready","sql":"SELECT SUM(Total_Worked_Hrs) AS value FROM attendance_scope"}'
@@ -184,6 +196,84 @@ class GeneratedSqlFallbackTests(unittest.TestCase):
         payload = json.loads(prompt.split("\n", 1)[1])
         self.assertEqual(payload["operation"], "sum")
         self.assertEqual(payload["logical_table"], "attendance_scope")
+
+    def test_prompt_redacts_relative_presentation_and_configured_database_text(self):
+        dsn = "postgresql://private-user:private-pass@private-host/private-db"
+        table = "private_schema.private_attendance"
+        question = (
+            "how many total working hours yesterday on 2026/09/15 and 15-09-2026 "
+            f"using {table} at {dsn}"
+        )
+        facts = (
+            answer.SemanticFact(
+                kind="unsupported",
+                concept_name="unsupported_calculation",
+                evidence_text="total",
+                origin="question",
+                strength="strong",
+            ),
+        )
+        candidates = answer._generated_aggregate_candidates(question, facts)
+        with (
+            patch.object(answer, "POSTGRES_DSN", dsn),
+            patch.object(answer, "POSTGRES_ATTENDANCE_TABLE", table),
+        ):
+            prompt = answer._generated_aggregate_prompt(question, facts, candidates)
+
+        for private in (
+            "yesterday",
+            "2026/09/15",
+            "15-09-2026",
+            table,
+            dsn,
+            "private-user",
+            "private-host",
+        ):
+            self.assertNotIn(private, prompt)
+
+    def test_missing_finish_reason_is_repaired_and_never_accepted_as_ready(self):
+        missing_finish = SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=(
+                            '{"status":"ready","sql":"SELECT SUM(Total_Worked_Hrs) '
+                            'AS value FROM attendance_scope"}'
+                        )
+                    )
+                )
+            ]
+        )
+        ready = _response(
+            '{"status":"ready","sql":"SELECT SUM(Total_Worked_Hrs) AS value '
+            'FROM attendance_scope"}'
+        )
+        with (
+            patch.object(
+                answer, "completion", side_effect=[missing_finish, ready]
+            ) as call,
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+        ):
+            prepared = answer._prepare_context_request("how many total working hours")
+
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual(prepared.plan.aggregation_field, "Total_Worked_Hrs")
+
+    def test_redaction_does_not_mutate_original_analyst_question(self):
+        question = "how many total working hours yesterday"
+        ready = _response(
+            '{"status":"ready","sql":"SELECT SUM(Total_Worked_Hrs) AS value '
+            'FROM attendance_scope"}'
+        )
+        with (
+            patch.object(answer, "completion", return_value=ready),
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+        ):
+            prepared = answer._prepare_context_request(question)
+
+        self.assertEqual(prepared.question, question)
 
     def test_contextual_call_leaves_at_most_two_sql_calls(self):
         request = conversation.ConversationDecisionContext(

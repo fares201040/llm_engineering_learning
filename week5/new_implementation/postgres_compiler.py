@@ -422,9 +422,12 @@ def compile_generated_aggregate_query(
             "Generated aggregation compilation requires a validated choice."
         )
     plan = _require_executable(plan)
+    expected_subject = choice.field
+    expected_grain = [choice.field] if choice.field is not None else []
     if (
         plan.answer_contract.shape != "scalar"
-        or plan.answer_contract.grain
+        or plan.answer_contract.subject_field != expected_subject
+        or plan.answer_contract.grain != expected_grain
         or plan.group_by
         or plan.projection
     ):

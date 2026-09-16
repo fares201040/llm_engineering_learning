@@ -728,9 +728,28 @@ def _generated_aggregate_candidates(
     )[: settings.constraint_candidate_limit]
 
 
+def _generated_aggregate_has_external_ambiguity(
+    question: str, candidates: tuple[_GeneratedAggregateCandidate, ...]
+) -> bool:
+    field_spans = tuple(candidate.surface.evidence_span for candidate in candidates)
+    return any(
+        not any(
+            ambiguity.evidence_span[0] < field_span[1]
+            and field_span[0] < ambiguity.evidence_span[1]
+            for field_span in field_spans
+        )
+        for ambiguity in _unresolved_surface_candidates(question)
+    )
+
+
 def _redacted_generated_question(question: str, facts: tuple[SemanticFact, ...]) -> str:
     redacted = question
     private_values = []
+    try:
+        resolved_dates = resolve_relative_date_filters(question)
+    except PlanValidationError:
+        resolved_dates = []
+    private_values.extend(str(condition.value) for condition in resolved_dates)
     for fact in facts:
         if fact.kind in {"entity", "filter", "temporal"}:
             private_values.extend(str(value) for value in fact.values)
@@ -740,7 +759,52 @@ def _redacted_generated_question(question: str, facts: tuple[SemanticFact, ...])
         match.group(0) for match in _EMPLOYEE_ID_LIKE_PATTERN.finditer(question)
     )
     private_values.extend(
-        match.group(0) for match in re.finditer(r"\b\d{4}-\d{2}-\d{2}\b", question)
+        match.group(0)
+        for match in re.finditer(
+            r"\b(?:\d{4}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{4})\b",
+            question,
+        )
+    )
+    private_values.extend(
+        match.group(0)
+        for match in re.finditer(
+            r"\b(?:yesterday|today|last week|this week|last month|this month|"
+            r"(?:last|past|previous)\s+\d{1,3}\s+days?)\b",
+            question,
+            re.I,
+        )
+    )
+    private_values.extend(
+        match.group(0)
+        for match in re.finditer(
+            r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+            r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
+            r"nov(?:ember)?|dec(?:ember)?)(?:\s+\d{1,2}(?:st|nd|rd|th)?,?)?"
+            r"\s+\d{4}\b",
+            question,
+            re.I,
+        )
+    )
+    private_values.extend(
+        value
+        for value in (
+            POSTGRES_DSN,
+            POSTGRES_ATTENDANCE_TABLE,
+            POSTGRES_CHUNKS_TABLE,
+        )
+        if value
+    )
+    private_values.extend(
+        match.group(0)
+        for match in re.finditer(r"\bpostgres(?:ql)?://[^\s]+", question, re.I)
+    )
+    private_values.extend(
+        match.group(0)
+        for match in re.finditer(
+            r"\b(?:host|hostaddr|port|dbname|user|password)\s*=\s*[^\s]+",
+            question,
+            re.I,
+        )
     )
     private_values.extend(
         match.group(0)
@@ -863,7 +927,7 @@ def _request_generated_aggregate(
         message = getattr(choice, "message", None)
         if (
             choice is None
-            or getattr(choice, "finish_reason", "stop") != "stop"
+            or getattr(choice, "finish_reason", None) != "stop"
             or not isinstance(getattr(message, "content", None), str)
         ):
             content = ""
@@ -1002,7 +1066,9 @@ def _apply_generated_aggregate_fallback(
         )
         return prepared_facts, cleaned, None
     candidates = _generated_aggregate_candidates(question, combined)
-    if not candidates:
+    if not candidates or _generated_aggregate_has_external_ambiguity(
+        question, candidates
+    ):
         return prepared_facts, detected_facts, None
     choice = _request_generated_aggregate(question, combined, candidates)
     surface = next(
@@ -1031,12 +1097,14 @@ def _generated_aggregate_fallback_pending(
         for fact in combined
         if fact.kind == "unsupported" and fact.strength == "strong"
     )
+    candidates = _generated_aggregate_candidates(question, combined)
     return bool(
         _postgres_enabled()
         and len(unsupported) == 1
         and unsupported[0].concept_name == "unsupported_calculation"
         and _generated_aggregate_operation(question, combined) is not None
-        and _generated_aggregate_candidates(question, combined)
+        and candidates
+        and not _generated_aggregate_has_external_ambiguity(question, candidates)
         and not any(
             fact.kind in {"group_by", "projection", "percentage_denominator"}
             and fact.strength == "strong"
@@ -3016,13 +3084,7 @@ def _prepare_postgres_queries(
         (
             compile_generated_aggregate_query(
                 generated_choice,
-                plan.model_copy(
-                    update={
-                        "answer_contract": plan.answer_contract.model_copy(
-                            update={"grain": []}
-                        )
-                    }
-                ),
+                plan,
                 POSTGRES_ATTENDANCE_TABLE,
             ),
         )
@@ -4547,11 +4609,21 @@ def _prepare_context_request(
     fallback_pending = _generated_aggregate_fallback_pending(
         question, prepared_facts, tuple(detected_facts)
     )
+    meaning_candidates = _generated_aggregate_candidates(
+        question, merge_semantic_facts(prepared_facts, detected_facts)
+    )
+    surface_meaning_pending = bool(
+        meaning_candidates
+        and _generated_aggregate_has_external_ambiguity(question, meaning_candidates)
+    )
     if any(
         fact.kind == "unsupported"
         and fact.strength == "strong"
         and fact.concept_name not in {"unsupported_constraint", "percentage_population"}
         and not (fallback_pending and fact.concept_name == "unsupported_calculation")
+        and not (
+            surface_meaning_pending and fact.concept_name == "unsupported_calculation"
+        )
         for fact in detected_facts
     ):
         violations = CapabilityInvariant().check(
@@ -4658,6 +4730,9 @@ def _prepare_context_request(
         fact.kind == "unsupported"
         and fact.strength == "strong"
         and not (fallback_pending and fact.concept_name == "unsupported_calculation")
+        and not (
+            surface_meaning_pending and fact.concept_name == "unsupported_calculation"
+        )
         for fact in detected_facts
     ):
         violations = CapabilityInvariant().check(
@@ -4711,9 +4786,10 @@ def _prepare_context_request(
         )
         for condition in relative_dates
     )
+    fallback_detected_facts = merge_semantic_facts(detected_facts, date_facts)
     prepared_facts, detected_facts, generated_aggregate_choice = (
         _apply_generated_aggregate_fallback(
-            question, prepared_facts, tuple(detected_facts)
+            question, prepared_facts, fallback_detected_facts
         )
     )
     initial_facts = merge_semantic_facts(prepared_facts, detected_facts, date_facts)

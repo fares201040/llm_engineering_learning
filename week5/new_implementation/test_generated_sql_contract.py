@@ -341,11 +341,61 @@ class GeneratedAggregateCompilationTests(unittest.TestCase):
                 GeneratedAggregateChoice("count", None), plan
             )
 
-    def test_rejects_scalar_answer_contract_with_nonempty_grain(self):
+    def test_count_accepts_only_empty_native_subject_and_grain(self):
+        count_plan = self._plan().model_copy(
+            update={
+                "aggregation": "count",
+                "aggregation_field": None,
+                "answer_contract": AnswerContract(
+                    shape="scalar", unit="records", subject_field=None, grain=[]
+                ),
+            }
+        )
+
+        query = compile_generated_aggregate_query(
+            GeneratedAggregateChoice("count", None), count_plan
+        )
+        self.assertIn("COUNT(*)", query.sql)
+
+        wrong_contract = count_plan.model_copy(
+            update={
+                "answer_contract": AnswerContract(
+                    shape="scalar",
+                    unit="records",
+                    subject_field="Employee_ID",
+                    grain=["Employee_ID"],
+                )
+            }
+        )
+        with self.assertRaises(ValueError):
+            compile_generated_aggregate_query(
+                GeneratedAggregateChoice("count", None), wrong_contract
+            )
+
+    def test_accepts_native_scalar_subject_grain_and_rejects_wrong_grain(self):
+        native = self._plan().model_copy(
+            update={
+                "answer_contract": AnswerContract(
+                    shape="scalar",
+                    unit="hours",
+                    subject_field="Total_OT",
+                    grain=["Total_OT"],
+                )
+            }
+        )
+
+        query = compile_generated_aggregate_query(
+            GeneratedAggregateChoice("sum", "Total_OT"), native
+        )
+        self.assertIn("SUM(total_ot)", query.sql)
+
         plan = self._plan().model_copy(
             update={
                 "answer_contract": AnswerContract(
-                    shape="scalar", unit="hours", grain=["Department"]
+                    shape="scalar",
+                    unit="hours",
+                    subject_field="Total_OT",
+                    grain=["Department"],
                 )
             }
         )
@@ -386,7 +436,10 @@ class GeneratedAggregateCompilationTests(unittest.TestCase):
             aggregation="sum",
             aggregation_field="Total_OT",
             answer_contract=AnswerContract(
-                shape="scalar", unit="hours", subject_field="Total_OT", grain=[]
+                shape="scalar",
+                unit="hours",
+                subject_field="Total_OT",
+                grain=["Total_OT"],
             ),
         )
 

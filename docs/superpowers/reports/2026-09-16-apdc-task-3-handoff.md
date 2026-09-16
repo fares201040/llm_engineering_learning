@@ -124,4 +124,3 @@ or Minor findings.
 Start by confirming branch/HEAD/worktree status and reading the listed
 documents. Then execute Task 4 exactly as planned, continuing autonomously
 through Task 8 unless a genuine authorization/data blocker requires user input.
-

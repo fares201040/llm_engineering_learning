@@ -8129,10 +8129,25 @@ def _answer_question_with_state(
                 request_state = state.model_copy(deep=True)
                 if request_state.referents:
                     _revalidate_referents(request_state, load_employee_directory())
+                request_referents = tuple(
+                    {
+                        item.employee_id.casefold(): item
+                        for item in (
+                            *request_state.referents,
+                            *(
+                                EmployeeReferent(
+                                    employee_id=item.employee_id,
+                                    name=item.name,
+                                )
+                                for item in selected
+                            ),
+                        )
+                    }.values()
+                )
                 request = conversation.build_conversation_request(
                     question,
                     conversation_facts,
-                    tuple(request_state.referents),
+                    request_referents,
                     tuple(request_state.recent_frames),
                     tuple(request_state.active_referent_ids),
                     employee_sources=_conversation_employee_sources(

@@ -699,6 +699,52 @@ def materialize_unit_mask(message: str, source_span: tuple[int, int]) -> str:
     return " " * start + message[start:end] + " " * (len(message) - end)
 
 
+def _conversation_fact_spans(
+    message: str, fact: SemanticFact
+) -> tuple[tuple[int, int], ...]:
+    if fact.evidence_span is not None:
+        return (fact.evidence_span,)
+    return tuple(
+        match.span()
+        for match in re.finditer(re.escape(fact.evidence_text), message, re.I)
+    )
+
+
+def _masked_employee_message(
+    message: str,
+    facts: tuple[SemanticFact, ...],
+    employee_sources: tuple[ConversationEmployeeSource, ...],
+) -> str:
+    spans = {
+        source.source_span
+        for source in employee_sources
+        if not is_conversation_control_reference(
+            message[source.source_span[0] : source.source_span[1]]
+        )
+    }
+    for fact in facts:
+        if fact.origin != "question" or not (
+            fact.kind == "entity"
+            or (fact.kind == "filter" and fact.field in _EMPLOYEE_FIELDS)
+        ):
+            continue
+        spans.update(
+            span
+            for span in _conversation_fact_spans(message, fact)
+            if not is_conversation_control_reference(message[span[0] : span[1]])
+        )
+    masked = list(message)
+    for start, end in spans:
+        if not (0 <= start < end <= len(masked)):
+            raise ConversationDecisionValidationError(
+                "employee source span exceeds message bounds"
+            )
+        for index in range(start, end):
+            if not masked[index].isspace():
+                masked[index] = "•"
+    return "".join(masked)
+
+
 def _trusted_fact(fact: SemanticFact) -> SemanticFact:
     return fact.model_copy(
         update={
@@ -759,6 +805,25 @@ def _materialize_result_facts(facts: tuple[SemanticFact, ...]) -> tuple[Semantic
     return tuple(materialized)
 
 
+def _deduplicate_facts(facts: tuple[SemanticFact, ...]) -> tuple[SemanticFact, ...]:
+    unique = []
+    seen = set()
+    for fact in facts:
+        key = (
+            fact.kind,
+            fact.field,
+            fact.operator,
+            fact.values,
+            fact.concept_name,
+            fact.scope,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(fact)
+    return tuple(unique)
+
+
 def materialize_conversation_units(
     validated: ValidatedConversation,
     *,
@@ -790,7 +855,9 @@ def materialize_conversation_units(
                 )
             )
             continue
-        selected_facts = tuple(facts[fact_id] for fact_id in decision.fact_ids)
+        selected_facts = _deduplicate_facts(
+            tuple(facts[fact_id] for fact_id in decision.fact_ids)
+        )
         if any(fact.strength != "strong" for fact in selected_facts):
             raise ConversationDecisionValidationError(
                 "low-confidence facts cannot be materialized"
@@ -858,6 +925,9 @@ def materialize_conversation_units(
             replaces_result = any(
                 fact.kind in _RESULT_FACT_KINDS for fact in selected_facts
             )
+            replaces_predicates = any(
+                fact.kind == "predicate" for fact in selected_facts
+            )
             changed_fields = {
                 fact.field for fact in selected_facts if fact.field is not None
             }
@@ -867,6 +937,7 @@ def materialize_conversation_units(
                 _trusted_fact(fact)
                 for fact in base.facts
                 if (not replaces_result or fact.kind not in _RESULT_FACT_KINDS)
+                and (not replaces_predicates or fact.kind != "predicate")
                 and fact.field not in changed_fields
                 and not (selected_employees and fact.kind == "entity")
             )
@@ -903,6 +974,7 @@ def materialize_conversation_units(
                 _trusted_fact(fact)
                 for fact in base.facts
                 if fact.kind not in _RESULT_FACT_KINDS
+                and (not scope_facts or fact.kind != "predicate")
             )
             materialized.append(
                 MaterializedConversationUnit(
@@ -1017,6 +1089,7 @@ def build_conversation_request(
         for frame in frames[-settings.conversation_recent_frame_limit :]
     ):
         raise ConversationDecisionValidationError("typed context budget exceeded")
+    safe_message = _masked_employee_message(message, facts, employee_sources)
     employees = tuple(
         (uuid.uuid4().hex, item)
         for item in referents[-settings.conversation_referent_limit :]
@@ -1033,14 +1106,7 @@ def build_conversation_request(
     for fact in facts:
         if fact.origin != "question":
             continue
-        spans = (
-            (fact.evidence_span,)
-            if fact.evidence_span is not None
-            else tuple(
-                match.span()
-                for match in re.finditer(re.escape(fact.evidence_text), message, re.I)
-            )
-        )
+        spans = _conversation_fact_spans(message, fact)
         if not spans:
             raise ConversationDecisionValidationError("fact source cannot be located")
         for start, end in spans:
@@ -1059,14 +1125,19 @@ def build_conversation_request(
             fact_choices.append(
                 (
                     uuid.uuid4().hex,
-                    fact.model_copy(update={"evidence_span": (start, end)}),
+                    fact.model_copy(
+                        update={
+                            "evidence_text": safe_message[start:end],
+                            "evidence_span": (start, end),
+                        }
+                    ),
                 )
             )
     fact_choices = tuple(fact_choices)
     active = {item.casefold() for item in active_referent_ids}
     views = tuple((uuid.uuid4().hex, view) for view in get_args(MultiEmployeeDateView))
     context = ConversationDecisionContext(
-        message=message,
+        message=safe_message,
         employee_choice_ids=tuple(key for key, _ in employees),
         employee_span_choices=tuple(
             ConversationEmployeeSpanChoices(

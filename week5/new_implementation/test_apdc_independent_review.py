@@ -1306,26 +1306,65 @@ class ConversationReferentResumptionReviewTests(unittest.TestCase):
         def decide(request):
             counters["provider"] += 1
             requests.append(request)
-            message = request.context.message.casefold()
             prior_ids = request.context.prior_unit_choice_ids
-            if "first result" in message:
-                relation = "repeat"
-                base_id = prior_ids[0] if prior_ids else None
-            elif "previous result" in message:
-                relation = "repeat"
-                base_id = prior_ids[-1] if prior_ids else None
-            elif "last month" in message:
-                relation = "modify_scope"
-                base_id = prior_ids[-1] if prior_ids else None
-            elif "overtime" in message:
-                relation = "replace_result"
-                base_id = prior_ids[-1] if prior_ids else None
-            elif prior_ids and ("those days" in message or "same person" in message):
-                relation = "replace_result"
-                base_id = prior_ids[-1]
-            else:
+            strong_facts = tuple(
+                fact for _key, fact in request.facts if fact.strength == "strong"
+            )
+            has_employee_binding = any(
+                binding.choice_ids for binding in request.context.employee_span_choices
+            )
+            has_explicit_employee_binding = any(
+                "•" in request.context.message[start:end]
+                for binding in request.context.employee_span_choices
+                for start, end in (binding.source_span,)
+                if binding.choice_ids
+            )
+            has_result_field = any(
+                fact.kind == "field"
+                and fact.field in answer.FIELD_DEFINITIONS
+                and answer.FIELD_DEFINITIONS[fact.field].aggregatable
+                for fact in strong_facts
+            )
+            has_predicate = any(fact.kind == "predicate" for fact in strong_facts)
+            has_measure = any(fact.kind == "measure" for fact in strong_facts)
+            has_date_scope = any(
+                fact.kind == "filter" and fact.field == "Date"
+                for fact in strong_facts
+            )
+            has_result_intent = any(
+                fact.kind == "result_intent" for fact in strong_facts
+            )
+            if not prior_ids:
                 relation = "new"
                 base_id = None
+            elif has_result_intent:
+                relation = "new"
+                base_id = None
+            elif has_date_scope:
+                relation = "modify_scope"
+                base_id = prior_ids[-1]
+            elif len(prior_ids) > 1 and not has_employee_binding:
+                relation = "repeat"
+                base_id = prior_ids[0]
+            elif has_result_field:
+                relation = (
+                    "modify_scope"
+                    if has_explicit_employee_binding
+                    else "replace_result"
+                )
+                base_id = prior_ids[-1]
+            elif has_predicate or (has_measure and has_employee_binding):
+                relation = "replace_result"
+                base_id = prior_ids[-1]
+            elif has_measure and not has_employee_binding:
+                relation = "repeat"
+                base_id = prior_ids[-1]
+            elif strong_facts:
+                relation = "new"
+                base_id = None
+            else:
+                relation = "repeat"
+                base_id = prior_ids[-1]
 
             if relation == "repeat":
                 fact_ids = ()
@@ -1351,7 +1390,7 @@ class ConversationReferentResumptionReviewTests(unittest.TestCase):
                     key for key, fact in request.facts if fact.strength == "strong"
                 )
             mentions = []
-            if relation == "new":
+            if relation in {"new", "modify_scope"}:
                 for binding in request.context.employee_span_choices:
                     if binding.choice_ids:
                         mentions.append(
@@ -1421,7 +1460,9 @@ class ConversationReferentResumptionReviewTests(unittest.TestCase):
 
         return prepare, execute, execute_turn
 
-    def _patches(self, counters, plans, materialized, requests):
+    def _patches(
+        self, counters, plans, materialized, requests, *, provider=None
+    ):
         prepare, execute, execute_turn = self._runtime(counters, plans)
         original_materialize = answer.conversation.materialize_conversation_units
 
@@ -1448,7 +1489,11 @@ class ConversationReferentResumptionReviewTests(unittest.TestCase):
             patch.object(
                 answer.conversation,
                 "request_conversation_decision",
-                side_effect=self._provider(counters, materialized, requests),
+                side_effect=(
+                    provider
+                    if provider is not None
+                    else self._provider(counters, materialized, requests)
+                ),
             )
         )
         stack.enter_context(
@@ -1474,8 +1519,12 @@ class ConversationReferentResumptionReviewTests(unittest.TestCase):
         requests.clear()
         return state
 
-    def _run(self, question, state, counters, plans, materialized, requests):
-        with self._patches(counters, plans, materialized, requests):
+    def _run(
+        self, question, state, counters, plans, materialized, requests, *, provider=None
+    ):
+        with self._patches(
+            counters, plans, materialized, requests, provider=provider
+        ):
             return answer.answer_question_with_state(question, [], state)
 
     def _assert_success(self, text, chunks, state, counters):
@@ -1766,6 +1815,329 @@ class ConversationReferentResumptionReviewTests(unittest.TestCase):
         self.assertEqual(materialized[-1].employees[0].employee_id, "A10001")
         self.assertEqual(materialized[-1].prior_result.matched_count, 2)
         self.assertEqual(returned.recent_frames[-1].units[0].employees[0].employee_id, "A10001")
+
+    def test_provider_payload_redacts_explicit_employee_name_and_id(self):
+        for explicit, raw in (("Sam River", "Sam River"), ("A10002", "A10002")):
+            counters = self._counter_state()
+            plans, materialized, requests = [], [], []
+            state = self._seed(
+                "How many worked days did Alex North have in September 2026?",
+                counters,
+                plans,
+                materialized,
+                requests,
+            )
+            counters.update(self._counter_state())
+            plans.clear()
+            materialized.clear()
+            requests.clear()
+            text, chunks, returned = self._run(
+                f"What about overtime for {explicit}?",
+                state,
+                counters,
+                plans,
+                materialized,
+                requests,
+            )
+
+            self.assertTrue(text)
+            self.assertEqual(chunks, [])
+            self.assertIsNone(returned.pending_request)
+            self.assertEqual(counters["provider"], 1)
+            self.assertEqual(len(requests), 1)
+            prompt = answer.conversation._conversation_prompt(requests[-1])
+            self.assertNotIn(raw, prompt)
+            self.assertNotIn(raw, requests[-1].context.message)
+            self.assertEqual(
+                [item.employee_id for item in materialized[-1].employees], ["A10002"]
+            )
+            self.assertEqual(
+                [
+                    item.value
+                    for item in plans[-1].plan.filters
+                    if item.field == "Employee_ID"
+                ],
+                ["A10002"],
+            )
+
+    def test_compound_correction_replaces_prior_business_predicate(self):
+        counters = self._counter_state()
+        plans, materialized, requests = [], [], []
+        state = self._seed(
+            "How many worked days did Alex North have in September 2026?",
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+        counters.update(self._counter_state())
+        plans.clear()
+        materialized.clear()
+        requests.clear()
+
+        def provider(request):
+            counters["provider"] += 1
+            requests.append(request)
+            fact_ids = tuple(
+                key
+                for key, fact in request.facts
+                if fact.strength == "strong"
+                and fact.kind in {"predicate", "measure"}
+            )
+            payload = {
+                "status": "resolved",
+                "units": [
+                    {
+                        "route": "attendance",
+                        "relation": "replace_result",
+                        "source_span": (0, len(request.context.message)),
+                        "base_unit_choice_id": request.context.prior_unit_choice_ids[-1],
+                        "fact_ids": fact_ids,
+                        "employee_mentions": [],
+                    }
+                ],
+            }
+            decision = answer.conversation.validate_conversation_decision(
+                answer.conversation.ConversationDecision.model_validate(payload),
+                request.context,
+            )
+            return answer.conversation.ValidatedConversation(
+                request, decision, (f"g2-correction-{len(materialized)}",)
+            )
+
+        text, chunks, returned = self._run(
+            "How many absent days did he have?",
+            state,
+            counters,
+            plans,
+            materialized,
+            requests,
+            provider=provider,
+        )
+
+        self._assert_success(text, chunks, returned, counters)
+        self.assertEqual(materialized[-1].relation, "replace_result")
+        self.assertEqual(
+            [fact.concept_name for fact in materialized[-1].facts if fact.kind == "predicate"],
+            ["absent"],
+        )
+        self.assertEqual(
+            [
+                (item.field, item.operator, item.value)
+                for item in plans[-1].plan.filters
+                if item.field in {"Exception", "Total_Worked_Hrs"}
+            ],
+            [("Exception", "eq", "Absent")],
+        )
+
+    def test_d6_she_and_same_person_keep_verified_employee(self):
+        counters = self._counter_state()
+        plans, materialized, requests = [], [], []
+        state = self._seed(
+            "How many worked days did Alex North have last month?",
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+        for follow_up in (
+            "How many attendance records did she have last month?",
+            "How many attendance records did the same person have?",
+        ):
+            counters.update(self._counter_state())
+            plans.clear()
+            materialized.clear()
+            requests.clear()
+            text, chunks, state = self._run(
+                follow_up,
+                state,
+                counters,
+                plans,
+                materialized,
+                requests,
+            )
+            self._assert_success(text, chunks, state, counters)
+            self.assertEqual(
+                [item.employee_id for item in materialized[-1].employees], ["A10001"]
+            )
+            self.assertEqual(
+                [item.value for item in plans[-1].plan.filters if item.field == "Employee_ID"],
+                ["A10001"],
+            )
+
+    def test_ambiguous_context_selection_does_not_execute_or_publish(self):
+        counters = self._counter_state()
+        plans, materialized, requests = [], [], []
+        state = self._seed(
+            "How many worked days did Alex North have last month?",
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+        counters.update(self._counter_state())
+        plans.clear()
+        materialized.clear()
+        requests.clear()
+        text, chunks, state = self._run(
+            "How many attendance records did Sam River have last month?",
+            state,
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+        self.assertTrue(text)
+        self.assertEqual(chunks, [])
+        counters.update(self._counter_state())
+        plans.clear()
+        materialized.clear()
+        requests.clear()
+        before_frames = len(state.recent_frames)
+
+        def ambiguous_provider(request):
+            counters["provider"] += 1
+            requests.append(request)
+            decision = answer.conversation.ConversationDecision.model_validate(
+                {"status": "ambiguous", "reason": "ambiguous_reference"}
+            )
+            return answer.conversation.ValidatedConversation(request, decision, ())
+
+        text, chunks, returned = self._run(
+            "What about his overtime?",
+            state,
+            counters,
+            plans,
+            materialized,
+            requests,
+            provider=ambiguous_provider,
+        )
+
+        self.assertTrue(text)
+        self.assertEqual(chunks, [])
+        self.assertEqual(counters["provider"], 1)
+        self.assertEqual(counters["prep"], 0)
+        self.assertEqual(counters["execute-turn"], 0)
+        self.assertEqual(counters["execute-unit"], 0)
+        self.assertEqual(counters["chroma"], 0)
+        self.assertEqual(counters["partial-publication"], 0)
+        self.assertEqual(len(returned.recent_frames), before_frames)
+        self.assertIsNotNone(returned.pending_request)
+
+    def test_public_path_observes_real_turn_unit_and_storage_seams(self):
+        counters = self._counter_state()
+        plans, materialized, requests = [], [], []
+        state = self._seed(
+            "How many worked days did Alex North have last month?",
+            counters,
+            plans,
+            materialized,
+            requests,
+        )
+        counters.update(self._counter_state())
+        plans.clear()
+        materialized.clear()
+        requests.clear()
+        original_prepare = answer._prepare_context_request
+        original_turn = answer._execute_prepared_turn
+        original_unit = answer._execute_prepared_context
+        original_postgres = answer.execute_exact_postgres
+        original_import = answer._import_psycopg
+        original_materialize = answer.conversation.materialize_conversation_units
+        outer_trace = None
+        outer_size_before = None
+        unit_observations = []
+
+        def prepare(*args, **kwargs):
+            counters["prep"] += 1
+            prepared = original_prepare(*args, **kwargs)
+            plans.append(prepared)
+            return prepared
+
+        def execute_unit(prepared, *, resources=None):
+            counters["execute-unit"] += 1
+            unit_observations.append(
+                None if outer_trace is None else len(outer_trace)
+            )
+            return original_unit(prepared, resources=resources)
+
+        def execute_turn(turn):
+            nonlocal outer_trace, outer_size_before
+            counters["execute-turn"] += 1
+            outer_trace = answer._EVALUATION_TRACE_SINK.get()
+            outer_size_before = len(outer_trace) if outer_trace is not None else None
+            result = original_turn(turn)
+            if outer_trace is not None and outer_size_before is not None:
+                counters["partial-publication"] += max(
+                    0, len(outer_trace) - outer_size_before - 1
+                )
+            outer_trace = None
+            outer_size_before = None
+            return result
+
+        def fetch_exact(filters, *, domain="attendance"):
+            counters["chroma"] += 1
+            return []
+
+        def execute_postgres(*args, **kwargs):
+            counters["postgres"] += 1
+            return original_postgres(*args, **kwargs)
+
+        def import_psycopg(*args, **kwargs):
+            counters["connection"] += 1
+            return original_import(*args, **kwargs)
+
+        def capture_materialized(*args, **kwargs):
+            units = original_materialize(*args, **kwargs)
+            materialized.extend(units)
+            return units
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(answer, "load_employee_directory", return_value=self._DIRECTORY)
+            )
+            stack.enter_context(
+                patch.object(answer, "load_attendance_catalog_candidates", return_value={})
+            )
+            stack.enter_context(patch.object(answer, "_postgres_enabled", return_value=False))
+            stack.enter_context(patch.object(answer, "_prepare_context_request", side_effect=prepare))
+            stack.enter_context(patch.object(answer, "_execute_prepared_turn", side_effect=execute_turn))
+            stack.enter_context(patch.object(answer, "_execute_prepared_context", side_effect=execute_unit))
+            stack.enter_context(patch.object(answer, "fetch_exact_chroma", side_effect=fetch_exact))
+            stack.enter_context(patch.object(answer, "execute_exact_postgres", side_effect=execute_postgres))
+            stack.enter_context(patch.object(answer, "_import_psycopg", side_effect=import_psycopg))
+            stack.enter_context(
+                patch.object(
+                    answer.conversation,
+                    "request_conversation_decision",
+                    side_effect=self._provider(counters, materialized, requests),
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    answer.conversation,
+                    "materialize_conversation_units",
+                    side_effect=capture_materialized,
+                )
+            )
+            text, chunks, returned = answer.answer_question_with_state(
+                "How many attendance records did he have?", [], state
+            )
+
+        self.assertTrue(text)
+        self.assertEqual(chunks, [])
+        self.assertIsNone(returned.pending_request)
+        self.assertEqual(counters["prep"], 1)
+        self.assertEqual(counters["execute-turn"], 1)
+        self.assertEqual(counters["execute-unit"], 1)
+        self.assertEqual(counters["chroma"], 1)
+        self.assertEqual(counters["postgres"], 0)
+        self.assertEqual(counters["connection"], 0)
+        self.assertEqual(counters["provider"], 1)
+        self.assertEqual(counters["partial-publication"], 0)
+        self.assertEqual(unit_observations, [0])
+        self.assertEqual(len(materialized), 1)
+        self.assertEqual(len(returned.recent_frames), len(state.recent_frames) + 1)
 
 
 if __name__ == "__main__":

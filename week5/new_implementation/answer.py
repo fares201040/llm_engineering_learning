@@ -700,6 +700,14 @@ _GENERATED_AGGREGATE_OPERATIONS = frozenset(
 )
 
 
+@dataclass(frozen=True)
+class _GeneratedAggregateOperationResolution:
+    """Keep aggregate-operation conflicts distinct from an absent operation."""
+
+    status: Literal["absent", "resolved", "conflict"]
+    operation: str | None = None
+
+
 def _typed_aggregate_operation_from_facts(
     facts: tuple[SemanticFact, ...],
 ) -> tuple[str | None, bool]:
@@ -750,10 +758,19 @@ def _generated_aggregate_operation_from_surface(
     facts: tuple[SemanticFact, ...],
     surface,
 ) -> str | None:
-    """Derive one operation, rejecting conflicting typed matches fail-closed."""
+    """Derive one operation, preserving the legacy optional return contract."""
+    resolution = _generated_aggregate_operation_resolution_from_surface(facts, surface)
+    return resolution.operation if resolution.status == "resolved" else None
+
+
+def _generated_aggregate_operation_resolution_from_surface(
+    facts: tuple[SemanticFact, ...],
+    surface,
+) -> _GeneratedAggregateOperationResolution:
+    """Derive one operation while exposing conflict separately from absence."""
     typed_operation, typed_conflict = _typed_aggregate_operation_from_facts(facts)
     if typed_conflict:
-        return None
+        return _GeneratedAggregateOperationResolution("conflict")
     surface_operations = {
         candidate.target_name
         for candidate in surface.candidates
@@ -762,19 +779,48 @@ def _generated_aggregate_operation_from_surface(
         and candidate.target_name in _GENERATED_AGGREGATE_OPERATIONS
     }
     if len(surface_operations) > 1:
-        return None
+        return _GeneratedAggregateOperationResolution("conflict")
     if typed_operation is not None and surface_operations:
         if typed_operation not in surface_operations:
-            return None
-        return typed_operation
-    return typed_operation or next(iter(surface_operations), None)
+            return _GeneratedAggregateOperationResolution("conflict")
+        return _GeneratedAggregateOperationResolution("resolved", typed_operation)
+    operation = typed_operation or next(iter(surface_operations), None)
+    return _GeneratedAggregateOperationResolution(
+        "resolved" if operation is not None else "absent", operation
+    )
+
+
+def _generated_aggregate_operation_resolution(
+    question: str, facts: tuple[SemanticFact, ...]
+) -> _GeneratedAggregateOperationResolution:
+    return _generated_aggregate_operation_resolution_from_surface(
+        facts, analyze_question_surface(question)
+    )
+
+
+def _require_generated_aggregate_operation_consistency(
+    question: str, facts: tuple[SemanticFact, ...]
+) -> _GeneratedAggregateOperationResolution:
+    resolution = _generated_aggregate_operation_resolution(question, facts)
+    if resolution.status == "conflict":
+        raise SemanticPlanValidationError(
+            (
+                PlanViolation(
+                    "contradiction",
+                    "generated_aggregate_operation",
+                    "The request contains conflicting aggregate operations.",
+                    clarification_possible=True,
+                ),
+            )
+        )
+    return resolution
 
 
 def _generated_aggregate_operation(
     question: str, facts: tuple[SemanticFact, ...]
 ) -> str | None:
-    surface = analyze_question_surface(question)
-    return _generated_aggregate_operation_from_surface(facts, surface)
+    resolution = _generated_aggregate_operation_resolution(question, facts)
+    return resolution.operation if resolution.status == "resolved" else None
 
 
 def _surface_candidate_method_rank(candidate: SurfaceCandidate) -> tuple[int, float]:
@@ -936,9 +982,13 @@ def _generated_aggregate_candidates(
 
 
 def _generated_aggregate_has_external_ambiguity(
-    question: str, candidates: tuple[_GeneratedAggregateCandidate, ...]
+    question: str,
+    candidates: tuple[_GeneratedAggregateCandidate, ...],
+    confirmed_facts: tuple[SemanticFact, ...] = (),
 ) -> bool:
-    unresolved = _unresolved_surface_candidates(question)
+    unresolved = _unresolved_surface_candidates_after_confirmation(
+        question, confirmed_facts
+    )
     if not unresolved:
         return False
     if len(unresolved) != 1 or unresolved[0].target_kind != "predicate":
@@ -955,6 +1005,69 @@ def _generated_aggregate_has_external_ambiguity(
     }
     required_fields = {required.field for required in predicate.required_filters}
     return not required_fields or not required_fields.issubset(overlapping_fields)
+
+
+def _unresolved_surface_candidates_after_confirmation(
+    question: str,
+    confirmed_facts: tuple[SemanticFact, ...],
+) -> tuple[SurfaceCandidate, ...]:
+    return tuple(
+        candidate
+        for candidate in _unresolved_surface_candidates(question)
+        if not _surface_candidate_confirmed_by_facts(candidate, confirmed_facts)
+    )
+
+
+def _surface_candidate_confirmed_by_facts(
+    candidate: SurfaceCandidate,
+    confirmed_facts: tuple[SemanticFact, ...],
+) -> bool:
+    """Match only the selected request-local meaning at the same source span."""
+
+    def same_source(fact: SemanticFact) -> bool:
+        if candidate.evidence_span is not None:
+            return fact.evidence_span == candidate.evidence_span
+        return (
+            fact.evidence_span is None
+            and normalize_for_matching(fact.evidence_text)
+            == normalize_for_matching(candidate.evidence_text)
+        )
+
+    selected = tuple(
+        fact
+        for fact in confirmed_facts
+        if fact.origin == "user_clarification"
+        and fact.strength == "strong"
+        and same_source(fact)
+    )
+    if candidate.target_kind == "predicate":
+        return any(
+            fact.kind == "predicate" and fact.concept_name == candidate.target_name
+            for fact in selected
+        )
+    if candidate.target_kind == "result_intent":
+        return any(
+            fact.kind == "result_intent" and fact.concept_name == candidate.target_name
+            for fact in selected
+        )
+    if candidate.target_kind == "interpretation":
+        definition = INTERPRETATION_PRESETS.get(candidate.target_name)
+        if definition is None:
+            return False
+        return (
+            any(
+                fact.kind == "measure" and fact.concept_name == definition.measure
+                for fact in selected
+            )
+            and all(
+                any(
+                    fact.kind == "predicate" and fact.concept_name == predicate
+                    for fact in selected
+                )
+                for predicate in definition.business_predicates
+            )
+        )
+    return False
 
 
 def _drop_natural_aggregate_field_suffix(
@@ -1085,7 +1198,12 @@ def _request_generated_aggregate(
     candidates: tuple[_GeneratedAggregateCandidate, ...],
     resolved_private_values: Sequence[str] = (),
 ) -> GeneratedAggregateChoice:
-    operation = _generated_aggregate_operation(question, facts)
+    resolution = _require_generated_aggregate_operation_consistency(question, facts)
+    operation = resolution.operation
+    # Keep the existing local seam for deterministic count tests/callers that
+    # provide the operation independently of the surface registry.
+    if operation is None:
+        operation = _generated_aggregate_operation(question, facts)
     if operation == "count":
         return GeneratedAggregateChoice("count", None)
     context = _aggregate_provider_context(operation, candidates)
@@ -1308,7 +1426,7 @@ def _apply_generated_aggregate_fallback(
         return cleaned_prepared, cleaned_detected, None
     candidates = _generated_aggregate_candidates(question, combined)
     if not candidates or _generated_aggregate_has_external_ambiguity(
-        question, candidates
+        question, candidates, combined
     ):
         return prepared_facts, detected_facts, None
     choice = _request_generated_aggregate(
@@ -1375,7 +1493,9 @@ def _generated_aggregate_fallback_pending(
         and (has_unsupported_marker or has_localized_missing_result)
         and _generated_aggregate_operation(question, combined) is not None
         and candidates
-        and not _generated_aggregate_has_external_ambiguity(question, candidates)
+        and not _generated_aggregate_has_external_ambiguity(
+            question, candidates, combined
+        )
         and not any(
             fact.kind in {"group_by", "projection", "percentage_denominator"}
             and fact.strength == "strong"
@@ -4880,18 +5000,24 @@ def _prepare_context_request(
                 resolved_employees=selected,
             )
 
+    aggregate_facts = merge_semantic_facts(prepared_facts, detected_facts)
+    _require_generated_aggregate_operation_consistency(question, aggregate_facts)
     fallback_pending = _generated_aggregate_fallback_pending(
         question, prepared_facts, tuple(detected_facts)
     )
     meaning_candidates = _generated_aggregate_candidates(
-        question, merge_semantic_facts(prepared_facts, detected_facts)
+        question, aggregate_facts
     )
     surface_meaning_pending = bool(
         meaning_candidates
-        and _generated_aggregate_has_external_ambiguity(question, meaning_candidates)
+        and _generated_aggregate_has_external_ambiguity(
+            question, meaning_candidates, aggregate_facts
+        )
     )
     if surface_meaning_pending:
-        unresolved_candidates = _unresolved_surface_candidates(question)
+        unresolved_candidates = _unresolved_surface_candidates_after_confirmation(
+            question, aggregate_facts
+        )
         event_logger.emit(
             "input_clarification_required",
             request_id=request_id,

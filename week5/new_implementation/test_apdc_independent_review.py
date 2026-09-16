@@ -345,6 +345,105 @@ class AggregateDecisionBoundaryReviewTests(unittest.TestCase):
         self.assertEqual(count_facts[0].origin, "deterministic_default")
         self.assertEqual(count_facts[0].strength, "strong")
 
+    def test_public_meaning_clarification_resume_makes_progress(self):
+        question = "sum total working hours overtime"
+
+        def execute(prepared, *, resources=None):
+            del resources
+            return answer.ContextFetchResult(
+                chunks=[],
+                plan=prepared.plan,
+                aggregation={
+                    "operation": prepared.plan.aggregation,
+                    "field": prepared.plan.aggregation_field,
+                    "value": 12,
+                },
+                matched_count=1,
+                resolved_employees=[],
+                facts=prepared.facts,
+            )
+
+        with (
+            patch.object(answer, "_postgres_enabled", return_value=True),
+            patch.object(answer, "load_attendance_catalog_candidates", return_value={}),
+            patch.object(answer, "_execute_prepared_context", side_effect=execute),
+        ):
+            first_text, first_chunks, pending = answer.answer_question_with_state(
+                question, [], None
+            )
+            self.assertEqual(first_chunks, [])
+            self.assertIsNotNone(pending.pending_request)
+            self.assertIsInstance(
+                pending.pending_request.clarification,
+                answer.MeaningClarification,
+            )
+
+            resumed_text, resumed_chunks, resumed = answer.answer_question_with_state(
+                "1", [], pending
+            )
+
+        self.assertNotEqual(resumed_text, first_text)
+        self.assertIn("12", resumed_text)
+        self.assertEqual(resumed_chunks, [])
+        self.assertIsNone(resumed.pending_request)
+
+    def test_aggregate_operation_conflicts_reject_in_prepare_caller(self):
+        cases = (
+            (
+                "trusted surface conflict",
+                "sum total working hours overtime",
+                (
+                    answer.SemanticFact(
+                        kind="calculation",
+                        field="Total_Worked_Hrs",
+                        concept_name="average",
+                        evidence_text="trusted average",
+                        origin="trusted_state",
+                        strength="strong",
+                    ),
+                ),
+            ),
+            (
+                "provider default conflict",
+                "sum total working hours overtime",
+                (
+                    answer.SemanticFact(
+                        kind="calculation",
+                        field="Total_Worked_Hrs",
+                        concept_name="sum",
+                        evidence_text="provider sum",
+                        origin="provider_decision",
+                        strength="strong",
+                    ),
+                    answer.SemanticFact(
+                        kind="calculation",
+                        field="Total_Worked_Hrs",
+                        concept_name="average",
+                        evidence_text="default average",
+                        origin="deterministic_default",
+                        strength="strong",
+                    ),
+                ),
+            ),
+        )
+        for label, question, facts in cases:
+            with self.subTest(label=label):
+                with (
+                    patch.object(answer, "_postgres_enabled", return_value=True),
+                    patch.object(
+                        answer, "load_attendance_catalog_candidates", return_value={}
+                    ),
+                    self.assertRaises(answer.SemanticPlanValidationError) as raised,
+                ):
+                    answer._prepare_context_request(
+                        question, prepared_facts=facts
+                    )
+
+                self.assertIn(
+                    "contradiction",
+                    {violation.code for violation in raised.exception.violations},
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -356,3 +356,74 @@ checks also remained green. `git diff --check` passed. No pre-existing test file
 or suite was run, and `planning_decisions.py` was not modified.
 
 Commit message: `fix: fail closed on aggregate semantic conflicts`.
+
+## Fix round 4: resumable meaning clarification and explicit aggregate conflicts
+
+The fresh acceptance review found two caller-path defects in the round-3
+boundary. A selected surface meaning was stored as a `user_clarification` fact,
+but the aggregate ambiguity gate re-derived the original unresolved candidate
+without considering that fact, so public clarification resume repeated the same
+question forever. Separately, operation conflicts returned the same `None` as
+an absent operation; the caller could therefore continue into trusted-fact
+override and compile a trusted `average` while the surface requested `sum`.
+
+### Focused RED
+
+Command:
+
+```powershell
+& '.venv\Scripts\python.exe' -m unittest -v week5.new_implementation.test_apdc_independent_review.AggregateDecisionBoundaryReviewTests
+```
+
+Exit code 1. Fifteen focused tests ran. The new public clarification regression
+returned the identical `Did you mean this?` clarification after selecting
+option 1. The new caller-path conflict regression failed for the trusted
+surface case because no `SemanticPlanValidationError` was raised, and failed
+for the provider/default case because the violations had no `contradiction`
+code. The other twelve tests passed. No pre-existing test file or suite was
+run.
+
+### Focused GREEN
+
+The same command after the minimal fix exited 0:
+
+```text
+----------------------------------------------------------------------
+Ran 15 tests in 17.410s
+
+OK
+```
+
+The public flow now stores one meaning clarification, accepts option 1, and
+returns a deterministic aggregate answer with no pending clarification. The
+aggregate operation resolver has explicit `absent`, `resolved`, and `conflict`
+statuses; `_prepare_context_request` checks `conflict` before trusted-fact
+cleanup and raises a bounded `contradiction` violation. The legacy optional
+operation helper remains compatible for existing callers. Confirmation matching
+requires a strong request-local `user_clarification` fact of the selected
+meaning type at the exact evidence span; remaining unresolved candidates are
+still retained for fail-closed handling.
+
+### Isolated public/caller probes
+
+```text
+first_clarification= Did you mean this? | 1. worked | Reply with the number or displayed meaning.
+second_answer= Total total ot is 12. Where Total Worked Hrs greater than 0.0.
+second_pending= False
+second_operation= sum
+trusted_surface SemanticPlanValidationError ['contradiction'] provider_calls= 0
+provider_default SemanticPlanValidationError ['contradiction'] provider_calls= 0
+resolution_absent= absent
+resolution_conflict= conflict
+```
+
+`py_compile` passed for `answer.py` and the focused Task-3 class; `git diff
+--check` passed. `planning_decisions.py` remains unchanged. No pre-existing
+test file or suite was run.
+
+### Files and commit
+
+This round changes `week5/new_implementation/answer.py`, the focused Task-3
+class, and this report. The main review report records the same RED/GREEN and
+probe evidence. Commit message: `fix: make aggregate conflicts resumable and
+explicit`.

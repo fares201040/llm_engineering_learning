@@ -871,3 +871,61 @@ five new review regressions and all prior privacy, typed-payload, deterministic
 count, legitimate-language, trusted-compilation, and compatibility checks.
 `git diff --check` passed. No pre-existing test suite was run at this stage,
 and `planning_decisions.py` remains unchanged.
+
+## Task 3 fix round 4 — resumable meaning and explicit aggregate conflicts
+
+The fresh acceptance review found two caller-path defects. Public meaning
+clarification stored a selected surface meaning as a `user_clarification` fact,
+but the aggregate ambiguity gate recomputed unresolved candidates from the
+original question and repeated the same clarification forever. Also, typed
+operation conflicts returned `None`, indistinguishable from no operation; the
+caller could then let trusted-fact cleanup remove the surface `sum` and compile
+the trusted `average`.
+
+### Focused RED
+
+```powershell
+& '.venv\Scripts\python.exe' -m unittest -v week5.new_implementation.test_apdc_independent_review.AggregateDecisionBoundaryReviewTests
+```
+
+Exit code 1; 15 focused tests ran. The new public resume test received the
+identical `Did you mean this?` clarification after option 1. The new
+caller-path conflict test had no exception for trusted-vs-surface conflict and
+no `contradiction` violation for provider/default conflict; the other 12 tests
+passed. No pre-existing test file or suite was run.
+
+### Focused GREEN
+
+The same command exited 0:
+
+```text
+----------------------------------------------------------------------
+Ran 15 tests in 17.410s
+
+OK
+```
+
+The owning layer now uses an explicit `absent`, `resolved`, or `conflict`
+aggregate-operation status. `_prepare_context_request` honors `conflict`
+before trusted-fact override and raises a bounded `contradiction` violation.
+Selected meaning facts suppress only the matching request-local candidate at
+the exact evidence span; other unresolved candidates remain fail-closed. The
+legacy optional operation helper contract remains intact.
+
+Isolated public/caller probe:
+
+```text
+first_clarification= Did you mean this? | 1. worked | Reply with the number or displayed meaning.
+second_answer= Total total ot is 12. Where Total Worked Hrs greater than 0.0.
+second_pending= False
+second_operation= sum
+trusted_surface SemanticPlanValidationError ['contradiction'] provider_calls= 0
+provider_default SemanticPlanValidationError ['contradiction'] provider_calls= 0
+resolution_absent= absent
+resolution_conflict= conflict
+```
+
+`py_compile` and `git diff --check` passed for the changed implementation and
+focused class; `planning_decisions.py` remains unchanged. No pre-existing test
+file or suite was run. Commit message: `fix: make aggregate conflicts
+resumable and explicit`.

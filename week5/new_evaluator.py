@@ -1,6 +1,8 @@
 """Gradio dashboard for the APDC attendance evaluation suite."""
 
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
+import hashlib
+import json
 
 import gradio as gr
 import pandas as pd
@@ -40,6 +42,168 @@ def _category_frame(values, metric_name):
         if scores
     ]
     return pd.DataFrame(rows, columns=["Category", metric_name])
+
+
+_BIRD_METRIC_VERSION = "apdc-bird-contract-ex-v2"
+_BIRD_CACHE_LIMIT = 512
+_BIRD_CACHE = OrderedDict()
+_BIRD_COMPONENTS = (
+    ("matched_count", "Matched count"),
+    ("calculation", "Calculation"),
+    ("normalized_result", "Normalized result"),
+    ("record_ids", "Record IDs"),
+    ("group_values", "Grouped values"),
+)
+
+
+def clear_bird_cache():
+    """Clear process-local BIRD verdicts (primarily for controlled reruns)."""
+    _BIRD_CACHE.clear()
+
+
+def _bird_cache_key(dataset_fingerprint, case):
+    payload = case.model_dump(mode="json")
+    encoded = json.dumps(
+        {
+            "metric": _BIRD_METRIC_VERSION,
+            "dataset": dataset_fingerprint,
+            "case": payload,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _cache_bird_result(key, result):
+    _BIRD_CACHE[key] = result
+    _BIRD_CACHE.move_to_end(key)
+    while len(_BIRD_CACHE) > _BIRD_CACHE_LIMIT:
+        _BIRD_CACHE.popitem(last=False)
+
+
+def _bird_component_frame(component_values):
+    rows = []
+    for key, label in _BIRD_COMPONENTS:
+        values = component_values.get(key, [])
+        if values:
+            passed = sum(values)
+            rows.append(
+                {
+                    "Component": label,
+                    "Passed": passed,
+                    "Evaluated": len(values),
+                    "Score %": passed / len(values) * 100,
+                }
+            )
+    return pd.DataFrame(rows, columns=["Component", "Passed", "Evaluated", "Score %"])
+
+
+def _bird_detail_row(index, case, result, *, cached=False):
+    evaluated = result.status == "evaluated"
+    score = result.execution_accuracy if evaluated else None
+    row = {
+        "Case": index,
+        "Category": case.category,
+        "Question": case.question,
+        "Status": ("Passed" if score == 1.0 else "Failed" if evaluated else "Skipped"),
+        "Contract EX": score,
+        "Cause": result.reason or "",
+        "Cached": cached,
+    }
+    for key, label in _BIRD_COMPONENTS:
+        row[label] = result.components.get(key)
+    return row
+
+
+def run_bird_evaluation(maximum, force_recompute, progress=gr.Progress()):
+    detail_columns = [
+        "Case",
+        "Category",
+        "Question",
+        "Status",
+        "Contract EX",
+        *[label for _key, label in _BIRD_COMPONENTS],
+        "Cause",
+        "Cached",
+    ]
+
+    def unavailable(message):
+        return (
+            message,
+            _bird_component_frame({}),
+            pd.DataFrame(columns=detail_columns),
+        )
+
+    try:
+        cases = limit_cases(apdc_evaluation.load_tests(), maximum)
+    except Exception:
+        return unavailable(
+            "### BIRD-style Contract EX: unavailable  \n"
+            "Evaluation corpus is unavailable; no cases were scored.  \n"
+            "evaluated 0 · skipped 0 · failed 0"
+        )
+    try:
+        dataset_fingerprint = apdc_evaluation.verify_dataset()["fingerprint"]
+    except Exception:
+        return unavailable(
+            "### BIRD-style Contract EX: unavailable  \n"
+            "Dataset verification failed; no cases were scored.  \n"
+            "evaluated 0 · skipped 0 · failed 0"
+        )
+
+    component_values = defaultdict(list)
+    details = []
+    scores = []
+    skipped = 0
+    failures = 0
+
+    for index, case in enumerate(cases, start=1):
+        cached = False
+        try:
+            key = _bird_cache_key(dataset_fingerprint, case)
+            result = None if force_recompute else _BIRD_CACHE.get(key)
+            if result is None:
+                result = apdc_evaluation.evaluate_bird_case(case)
+                if result.status == "evaluated":
+                    _cache_bird_result(key, result)
+            else:
+                cached = True
+
+            if result.status == "evaluated":
+                scores.append(result.execution_accuracy)
+                for component, value in result.components.items():
+                    component_values[component].append(int(value))
+            else:
+                skipped += 1
+            details.append(_bird_detail_row(index - 1, case, result, cached=cached))
+        except Exception:
+            failures += 1
+            row = {
+                "Case": index - 1,
+                "Category": case.category,
+                "Question": case.question,
+                "Status": _evaluation_failure_status(),
+                "Contract EX": None,
+                **{label: None for _key, label in _BIRD_COMPONENTS},
+                "Cause": _evaluation_failure_cause(Exception()),
+                "Cached": False,
+            }
+            details.append(row)
+        _update_progress(progress, index, len(cases), f"BIRD case {index}")
+
+    count_summary = f"evaluated {len(scores)} · skipped {skipped} · failed {failures}"
+    if scores:
+        overall = sum(scores) / len(scores) * 100
+        summary = f"### BIRD-style Contract EX: {overall:.1f}%  \n{count_summary}"
+    else:
+        summary = f"### BIRD-style Contract EX: unavailable  \n{count_summary}"
+    return (
+        summary,
+        _bird_component_frame(component_values),
+        pd.DataFrame(details, columns=detail_columns),
+    )
 
 
 def run_dataset_verification():
@@ -320,6 +484,32 @@ def build_app():
                 run_answer_evaluation,
                 inputs=maximum,
                 outputs=[answer_summary, answer_chart, answer_details],
+            )
+
+        with gr.Tab("BIRD"):
+            gr.Markdown(
+                "BIRD-style Contract Execution Accuracy compares grounded "
+                "execution against verified APDC output contracts. Cases without a "
+                "verified output contract are skipped. Official R-VES is not "
+                "reported because this corpus has no gold-SQL timing contract."
+            )
+            bird_recompute = gr.Checkbox(
+                label="Recompute cached deterministic results", value=False
+            )
+            bird_button = gr.Button("Run BIRD Evaluation", variant="primary")
+            bird_summary = gr.Markdown()
+            bird_chart = gr.BarPlot(
+                x="Component",
+                y="Score %",
+                title="BIRD verified-output component scores",
+                y_lim=[0, 100],
+                height=360,
+            )
+            bird_details = gr.Dataframe(interactive=False)
+            bird_button.click(
+                run_bird_evaluation,
+                inputs=[maximum, bird_recompute],
+                outputs=[bird_summary, bird_chart, bird_details],
             )
 
     return app

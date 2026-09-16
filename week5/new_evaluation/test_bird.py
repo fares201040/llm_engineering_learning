@@ -1,0 +1,246 @@
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from week5.new_evaluation import eval as evaluation
+from week5.new_evaluation.test import TestQuestion
+
+
+def bird_case(**overrides):
+    values = {
+        "question": "How many verified records are there?",
+        "keywords": ["records"],
+        "reference_answer": "There are two records.",
+        "category": "count",
+    }
+    values.update(overrides)
+    return TestQuestion(**values)
+
+
+class BirdCaseEvaluationTests(unittest.TestCase):
+    def test_exact_execution_requires_every_applicable_verified_output(self):
+        case = bird_case(
+            expected_matched_count=2,
+            expected_calculation={"value": 2},
+            expected_record_ids=["record-1", "record-2"],
+        )
+        chunks = [SimpleNamespace(metadata={"record_id": "record-1"})]
+        plan = SimpleNamespace(model_dump=lambda: {})
+        calculation = {"value": 2}
+
+        with patch.object(
+            evaluation,
+            "fetch_context",
+            return_value=(chunks, plan, calculation, 2),
+        ):
+            result = evaluation.evaluate_bird_case(case)
+
+        self.assertEqual(result.status, "evaluated")
+        self.assertEqual(result.execution_accuracy, 0.0)
+        self.assertEqual(
+            result.components,
+            {
+                "matched_count": True,
+                "calculation": True,
+                "record_ids": False,
+            },
+        )
+
+    def test_case_without_verified_output_contract_is_skipped_without_execution(self):
+        case = bird_case()
+
+        with patch.object(evaluation, "fetch_context") as fetch:
+            result = evaluation.evaluate_bird_case(case)
+
+        self.assertEqual(result.status, "skipped")
+        self.assertIsNone(result.execution_accuracy)
+        self.assertEqual(result.components, {})
+        self.assertEqual(result.reason, "no_verified_output_contract")
+        fetch.assert_not_called()
+
+    def test_zero_matched_count_is_an_eligible_verified_output(self):
+        case = bird_case(expected_matched_count=0)
+        plan = SimpleNamespace(model_dump=lambda: {})
+
+        with patch.object(
+            evaluation,
+            "fetch_context",
+            return_value=([], plan, None, 0),
+        ):
+            result = evaluation.evaluate_bird_case(case)
+
+        self.assertEqual(result.execution_accuracy, 1.0)
+        self.assertEqual(result.components, {"matched_count": True})
+
+    def test_execution_failure_propagates_instead_of_becoming_a_scored_zero(self):
+        case = bird_case(expected_matched_count=2)
+
+        with patch.object(
+            evaluation,
+            "fetch_context",
+            side_effect=RuntimeError("database unavailable"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "database unavailable"):
+                evaluation.evaluate_bird_case(case)
+
+    def test_controlled_nonexecution_case_is_skipped_without_execution(self):
+        case = bird_case(
+            expected_matched_count=2,
+            expected_clarification_outcome="ambiguous",
+        )
+
+        with patch.object(evaluation, "fetch_context") as fetch:
+            result = evaluation.evaluate_bird_case(case)
+
+        self.assertEqual(result.status, "skipped")
+        self.assertEqual(result.reason, "unsupported_nonexecution_case")
+        fetch.assert_not_called()
+
+    def test_record_identity_rejects_unexpected_extra_records(self):
+        case = bird_case(expected_record_ids=["record-1"])
+        chunks = [
+            SimpleNamespace(metadata={"record_id": "record-1"}),
+            SimpleNamespace(metadata={"record_id": "unexpected"}),
+        ]
+
+        with patch.object(
+            evaluation,
+            "fetch_context",
+            return_value=(
+                chunks,
+                SimpleNamespace(model_dump=lambda: {}),
+                None,
+                2,
+            ),
+        ):
+            result = evaluation.evaluate_bird_case(case)
+
+        self.assertEqual(result.execution_accuracy, 0.0)
+        self.assertEqual(result.components, {"record_ids": False})
+
+    def test_group_values_reject_unexpected_extra_groups(self):
+        case = bird_case(expected_group_values=[{"group": ["A"], "value": 2}])
+        calculation = {
+            "rows": [
+                {"group": ["A"], "value": 2},
+                {"group": ["unexpected"], "value": 99},
+            ]
+        }
+
+        with patch.object(
+            evaluation,
+            "fetch_context",
+            return_value=(
+                [],
+                SimpleNamespace(model_dump=lambda: {}),
+                calculation,
+                2,
+            ),
+        ):
+            result = evaluation.evaluate_bird_case(case)
+
+        self.assertEqual(result.execution_accuracy, 0.0)
+        self.assertEqual(result.components, {"group_values": False})
+
+    def test_group_values_reject_duplicate_expected_group_keys(self):
+        case = bird_case(
+            expected_group_values=[
+                {"group": ["A"], "value": 2},
+                {"group": ["A"], "value": 2},
+            ]
+        )
+        calculation = {
+            "rows": [
+                {"group": ["A"], "value": 2},
+                {"group": ["unexpected"], "value": 99},
+            ]
+        }
+
+        with patch.object(
+            evaluation,
+            "fetch_context",
+            return_value=(
+                [],
+                SimpleNamespace(model_dump=lambda: {}),
+                calculation,
+                2,
+            ),
+        ):
+            result = evaluation.evaluate_bird_case(case)
+
+        self.assertEqual(result.execution_accuracy, 0.0)
+        self.assertEqual(result.components, {"group_values": False})
+
+    def test_explicit_empty_record_contract_is_evaluated(self):
+        case = bird_case(expected_record_ids=[])
+
+        with patch.object(
+            evaluation,
+            "fetch_context",
+            return_value=(
+                [],
+                SimpleNamespace(model_dump=lambda: {}),
+                None,
+                0,
+            ),
+        ):
+            result = evaluation.evaluate_bird_case(case)
+
+        self.assertEqual(result.status, "evaluated")
+        self.assertEqual(result.execution_accuracy, 1.0)
+        self.assertEqual(result.components, {"record_ids": True})
+
+    def test_output_only_bird_scoring_does_not_generate_an_answer(self):
+        case = bird_case(expected_calculation={"operation": "count", "value": 2})
+        calculation = {"operation": "count", "value": 2}
+
+        with (
+            patch.object(
+                evaluation,
+                "fetch_context",
+                return_value=(
+                    [],
+                    SimpleNamespace(model_dump=lambda: {}),
+                    calculation,
+                    2,
+                ),
+            ),
+            patch.object(evaluation, "answer_question") as answer,
+        ):
+            result = evaluation.evaluate_bird_case(case)
+
+        self.assertEqual(result.execution_accuracy, 1.0)
+        answer.assert_not_called()
+
+    def test_calculation_business_predicates_are_order_insensitive(self):
+        case = bird_case(
+            expected_calculation={
+                "operation": "distinct_count",
+                "business_predicates": ["scheduled_working_day", "not_worked"],
+                "value": 1,
+            }
+        )
+        calculation = {
+            "operation": "distinct_count",
+            "business_predicates": ["not_worked", "scheduled_working_day"],
+            "value": 1,
+        }
+
+        with patch.object(
+            evaluation,
+            "fetch_context",
+            return_value=(
+                [],
+                SimpleNamespace(model_dump=lambda: {}),
+                calculation,
+                1,
+            ),
+        ):
+            result = evaluation.evaluate_bird_case(case)
+
+        self.assertEqual(result.execution_accuracy, 1.0)
+        self.assertEqual(result.components, {"calculation": True})
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,6 +1,20 @@
+import gc
 import unittest
+import warnings
 from types import SimpleNamespace
 from unittest.mock import patch
+
+
+def dashboard_case(question, category="count", token="case-1"):
+    return SimpleNamespace(
+        question=question,
+        category=category,
+        model_dump=lambda mode="python": {
+            "question": question,
+            "category": category,
+            "token": token,
+        },
+    )
 
 
 class ApdcEvaluationDashboardTests(unittest.TestCase):
@@ -202,6 +216,262 @@ class ApdcEvaluationDashboardTests(unittest.TestCase):
         self.assertIn("3,964 records", rendered)
         self.assertIn("568 employees", rendered)
         self.assertIn("2026-09-01 through 2026-09-07", rendered)
+
+    def test_bird_evaluation_aggregates_exact_and_component_scores(self):
+        dashboard = self.dashboard()
+        cases = [dashboard_case("First"), dashboard_case("Second", token="case-2")]
+        results = [
+            SimpleNamespace(
+                status="evaluated",
+                execution_accuracy=1.0,
+                components={"matched_count": True, "calculation": True},
+                reason=None,
+            ),
+            SimpleNamespace(
+                status="evaluated",
+                execution_accuracy=0.0,
+                components={"matched_count": True, "calculation": False},
+                reason=None,
+            ),
+        ]
+
+        with (
+            patch.object(dashboard.apdc_evaluation, "load_tests", return_value=cases),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "verify_dataset",
+                return_value={"fingerprint": "dataset-a"},
+            ),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "evaluate_bird_case",
+                side_effect=results,
+            ),
+        ):
+            summary, components, details = dashboard.run_bird_evaluation(
+                0, False, progress=None
+            )
+
+        self.assertIn("BIRD-style Contract EX: 50.0%", summary)
+        self.assertIn("evaluated 2 · skipped 0 · failed 0", summary)
+        self.assertEqual(
+            components.to_dict("records"),
+            [
+                {
+                    "Component": "Matched count",
+                    "Passed": 2,
+                    "Evaluated": 2,
+                    "Score %": 100.0,
+                },
+                {
+                    "Component": "Calculation",
+                    "Passed": 1,
+                    "Evaluated": 2,
+                    "Score %": 50.0,
+                },
+            ],
+        )
+        self.assertEqual(details["Question"].tolist(), ["First", "Second"])
+        self.assertEqual(details["Status"].tolist(), ["Passed", "Failed"])
+        self.assertIn("Contract EX", details.columns)
+        self.assertNotIn("BIRD EX", details.columns)
+
+    def test_bird_unavailable_does_not_report_a_zero_score(self):
+        dashboard = self.dashboard()
+        case = dashboard_case("Unsupported")
+        skipped = SimpleNamespace(
+            status="skipped",
+            execution_accuracy=None,
+            components={},
+            reason="no_verified_output_contract",
+        )
+
+        with (
+            patch.object(dashboard.apdc_evaluation, "load_tests", return_value=[case]),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "verify_dataset",
+                return_value={"fingerprint": "dataset-a"},
+            ),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "evaluate_bird_case",
+                return_value=skipped,
+            ),
+        ):
+            summary, components, details = dashboard.run_bird_evaluation(
+                0, False, progress=None
+            )
+
+        self.assertIn("BIRD-style Contract EX: unavailable", summary)
+        self.assertNotIn("0.0%", summary)
+        self.assertIn("evaluated 0 · skipped 1 · failed 0", summary)
+        self.assertTrue(components.empty)
+        self.assertEqual(details.loc[0, "Status"], "Skipped")
+
+    def test_bird_dataset_verification_failure_is_explicit_and_scores_nothing(self):
+        dashboard = self.dashboard()
+        case = dashboard_case("Must not execute")
+
+        with (
+            patch.object(dashboard.apdc_evaluation, "load_tests", return_value=[case]),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "verify_dataset",
+                side_effect=RuntimeError("postgresql://employee:secret@private"),
+            ),
+            patch.object(dashboard.apdc_evaluation, "evaluate_bird_case") as evaluate,
+        ):
+            summary, components, details = dashboard.run_bird_evaluation(
+                0, False, progress=None
+            )
+
+        self.assertIn("BIRD-style Contract EX: unavailable", summary)
+        self.assertIn("Dataset verification failed", summary)
+        self.assertNotIn("secret", summary)
+        self.assertTrue(components.empty)
+        self.assertTrue(details.empty)
+        evaluate.assert_not_called()
+
+    def test_bird_missing_private_corpus_is_explicit_and_scores_nothing(self):
+        dashboard = self.dashboard()
+
+        with (
+            patch.object(
+                dashboard.apdc_evaluation,
+                "load_tests",
+                side_effect=FileNotFoundError("private/path/tests.jsonl"),
+            ),
+            patch.object(dashboard.apdc_evaluation, "verify_dataset") as verify_dataset,
+        ):
+            summary, components, details = dashboard.run_bird_evaluation(
+                0, False, progress=None
+            )
+
+        self.assertIn("BIRD-style Contract EX: unavailable", summary)
+        self.assertIn("Evaluation corpus is unavailable", summary)
+        self.assertNotIn("private/path", summary)
+        self.assertIn("evaluated 0 · skipped 0 · failed 0", summary)
+        self.assertTrue(components.empty)
+        self.assertTrue(details.empty)
+        verify_dataset.assert_not_called()
+
+    def test_bird_runtime_failure_is_sanitized_and_not_scored(self):
+        dashboard = self.dashboard()
+        case = dashboard_case("Analyst-visible question")
+
+        with (
+            patch.object(dashboard.apdc_evaluation, "load_tests", return_value=[case]),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "verify_dataset",
+                return_value={"fingerprint": "dataset-a"},
+            ),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "evaluate_bird_case",
+                side_effect=RuntimeError(
+                    "employee Alice prompt SQL SELECT secret params history"
+                ),
+            ),
+        ):
+            summary, _components, details = dashboard.run_bird_evaluation(
+                0, False, progress=None
+            )
+
+        self.assertIn("evaluated 0 · skipped 0 · failed 1", summary)
+        rendered = details.to_string().lower()
+        self.assertIn("analyst-visible question", rendered)
+        for private_value in ("alice", "select", "secret", "params", "history"):
+            self.assertNotIn(private_value, rendered)
+        self.assertEqual(details.loc[0, "Status"], "Failed (evaluation_error)")
+
+    def test_bird_cache_reuses_verified_result_and_force_recompute_bypasses_it(self):
+        dashboard = self.dashboard()
+        dashboard.clear_bird_cache()
+        case = dashboard_case("Cached", token="stable")
+        result = SimpleNamespace(
+            status="evaluated",
+            execution_accuracy=1.0,
+            components={"matched_count": True},
+            reason=None,
+        )
+
+        with (
+            patch.object(dashboard.apdc_evaluation, "load_tests", return_value=[case]),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "verify_dataset",
+                return_value={"fingerprint": "dataset-a"},
+            ),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "evaluate_bird_case",
+                return_value=result,
+            ) as evaluate,
+        ):
+            dashboard.run_bird_evaluation(0, False, progress=None)
+            _, _, cached_details = dashboard.run_bird_evaluation(
+                0, False, progress=None
+            )
+            dashboard.run_bird_evaluation(0, True, progress=None)
+
+        self.assertEqual(evaluate.call_count, 2)
+        self.assertTrue(cached_details.loc[0, "Cached"])
+
+    def test_bird_cache_key_changes_with_dataset_fingerprint(self):
+        dashboard = self.dashboard()
+        dashboard.clear_bird_cache()
+        case = dashboard_case("Dataset drift", token="stable")
+        result = SimpleNamespace(
+            status="evaluated",
+            execution_accuracy=1.0,
+            components={"matched_count": True},
+            reason=None,
+        )
+
+        with (
+            patch.object(dashboard.apdc_evaluation, "load_tests", return_value=[case]),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "verify_dataset",
+                side_effect=[
+                    {"fingerprint": "dataset-a"},
+                    {"fingerprint": "dataset-b"},
+                ],
+            ),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "evaluate_bird_case",
+                return_value=result,
+            ) as evaluate,
+        ):
+            dashboard.run_bird_evaluation(0, False, progress=None)
+            dashboard.run_bird_evaluation(0, False, progress=None)
+
+        self.assertEqual(evaluate.call_count, 2)
+
+    def test_app_adds_bird_as_fifth_tab_without_changing_existing_tab_order(self):
+        dashboard = self.dashboard()
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            app = dashboard.build_app()
+            try:
+                config = app.get_config_file()
+            finally:
+                app.close()
+                del app
+                gc.collect()
+        tabs = [
+            component["props"]["label"]
+            for component in config["components"]
+            if component["type"] == "tabitem"
+        ]
+
+        self.assertEqual(
+            tabs, ["Dataset", "Behavior", "Retrieval", "Answer Quality", "BIRD"]
+        )
 
 
 if __name__ == "__main__":

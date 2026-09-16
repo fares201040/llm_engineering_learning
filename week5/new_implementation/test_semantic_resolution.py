@@ -1000,6 +1000,34 @@ class BaselineOrderingGrammarTests(unittest.TestCase):
         )
         self.assertFalse([f for f in facts if f.kind == "unsupported"], facts)
 
+    def test_percentage_population_resolves_fully_quoted_categorical_operand(self):
+        cases = (
+            ("Exception", "OK"),
+            ("Department", "Operations"),
+            ("Country", "Yemen"),
+        )
+        context = ResolutionContext({field: (value,) for field, value in cases})
+
+        for field, value in cases:
+            with self.subTest(field=field):
+                facts = detect_semantic_facts(
+                    f"What percentage of all attendance records have {field} "
+                    f'equal to "{value}"?',
+                    context,
+                )
+
+                self.assertIn(
+                    (field, "eq", (value,), "percentage_numerator"),
+                    {
+                        (fact.field, fact.operator, fact.values, fact.scope)
+                        for fact in facts
+                        if fact.kind == "filter"
+                    },
+                )
+                self.assertFalse(
+                    [fact for fact in facts if fact.kind == "unsupported"], facts
+                )
+
     def test_temporal_superlatives_derive_date_order_and_explicit_limit(self):
         for phrase, direction in (("latest", "desc"), ("earliest", "asc")):
             facts = detect_semantic_facts(

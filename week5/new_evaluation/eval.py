@@ -123,6 +123,145 @@ class BehaviorEval(BaseModel):
     unsupported_capabilities_ok: bool = True
 
 
+class BirdCaseEval(BaseModel):
+    """Privacy-safe BIRD-style execution verdict for one APDC case."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    status: Literal["evaluated", "skipped"]
+    execution_accuracy: float | None = Field(default=None, ge=0, le=1)
+    components: dict[str, bool] = Field(default_factory=dict)
+    reason: (
+        Literal["no_verified_output_contract", "unsupported_nonexecution_case"] | None
+    ) = None
+
+
+_BIRD_OUTPUT_CONTRACTS = (
+    ("matched_count", "expected_matched_count", "matched_count_ok"),
+    ("calculation", "expected_calculation", "calculation_ok"),
+    ("normalized_result", "expected_normalized_result", "normalized_result_ok"),
+    ("record_ids", "expected_record_ids", "record_ids_ok"),
+    ("group_values", "expected_group_values", "group_values_ok"),
+)
+
+
+def _bird_has_output_expectation(test: TestQuestion, expectation_name: str) -> bool:
+    expectation = getattr(test, expectation_name)
+    if expectation_name == "expected_matched_count":
+        return expectation is not None
+    return expectation_name in test.model_fields_set
+
+
+def _bird_applicable_checks(test: TestQuestion):
+    applicable = []
+    for component, expectation_name, check_name in _BIRD_OUTPUT_CONTRACTS:
+        if _bird_has_output_expectation(test, expectation_name):
+            applicable.append((component, check_name))
+    return applicable
+
+
+def _bird_values_match(actual, expected, *, key=None) -> bool:
+    if isinstance(expected, float) and isinstance(actual, (int, float)):
+        return math.isclose(actual, expected, abs_tol=0.005)
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and all(
+            field in actual and _bird_values_match(actual[field], value, key=field)
+            for field, value in expected.items()
+        )
+    if isinstance(expected, list):
+        if key == "business_predicates":
+            return isinstance(actual, list) and set(actual) == set(expected)
+        return (
+            isinstance(actual, list)
+            and len(actual) == len(expected)
+            and all(
+                _bird_values_match(actual_item, expected_item)
+                for actual_item, expected_item in zip(actual, expected)
+            )
+        )
+    return actual == expected
+
+
+def _bird_group_values_match(actual: dict | None, expected: list[dict]) -> bool:
+    rows = actual.get("rows") if isinstance(actual, dict) else None
+    if not expected:
+        return not rows
+    if not isinstance(rows, list) or len(rows) != len(expected):
+        return False
+    actual_by_group = {tuple(row.get("group", [])): row.get("value") for row in rows}
+    if len(actual_by_group) != len(rows):
+        return False
+    expected_by_group = {
+        tuple(row.get("group", [])): row.get("value") for row in expected
+    }
+    if len(expected_by_group) != len(expected):
+        return False
+    return actual_by_group.keys() == expected_by_group.keys() and all(
+        _bird_values_match(actual_by_group[group], value)
+        for group, value in expected_by_group.items()
+    )
+
+
+def _bird_is_nonexecution_case(test: TestQuestion) -> bool:
+    return bool(
+        test.expected_error
+        or test.expected_exception_type
+        or test.expected_clarification_ids
+        or test.expected_clarification_outcome
+        or test.expected_violation_codes
+        or test.expected_unsupported_capabilities
+        or test.turns
+    )
+
+
+def evaluate_bird_case(test: TestQuestion) -> BirdCaseEval:
+    """Score verified outputs from one successful grounded execution.
+
+    This is an APDC adaptation of BIRD Execution Accuracy. It does not claim
+    official BIRD R-VES because this corpus has no gold SQL timing contract.
+    """
+    applicable = _bird_applicable_checks(test)
+    if not applicable:
+        return BirdCaseEval(
+            status="skipped",
+            reason="no_verified_output_contract",
+        )
+    if _bird_is_nonexecution_case(test):
+        return BirdCaseEval(
+            status="skipped",
+            reason="unsupported_nonexecution_case",
+        )
+
+    chunks, plan, calculation, matched_count = fetch_context(test.question)
+    actual_record_ids = {
+        str(chunk.metadata.get("record_id"))
+        for chunk in chunks
+        if chunk.metadata.get("record_id") is not None
+    }
+    normalized_actual = {
+        "plan": plan.model_dump(),
+        "calculation": calculation,
+        "matched_count": matched_count,
+    }
+    checks = {
+        "matched_count_ok": matched_count == test.expected_matched_count,
+        "calculation_ok": _bird_values_match(calculation, test.expected_calculation),
+        "normalized_result_ok": _bird_values_match(
+            normalized_actual, test.expected_normalized_result
+        ),
+        "record_ids_ok": actual_record_ids == set(test.expected_record_ids),
+        "group_values_ok": _bird_group_values_match(
+            calculation, test.expected_group_values
+        ),
+    }
+    components = {component: checks[check_name] for component, check_name in applicable}
+    return BirdCaseEval(
+        status="evaluated",
+        execution_accuracy=float(all(components.values())),
+        components=components,
+    )
+
+
 class AnswerExecutionTrace(BaseModel):
     """Non-sensitive structure captured from the exact answer execution."""
 

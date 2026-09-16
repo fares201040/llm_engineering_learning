@@ -1500,6 +1500,26 @@ class BaselineCapabilityParityTests(unittest.TestCase):
                 self.assertEqual(calculation["value"], value)
                 self.assertTrue(chunks)
 
+    def test_percentage_with_quoted_catalog_value_reaches_catalog_aware_planning(self):
+        self.rows[0]["Department"] = "Operations"
+        with patch.object(
+            self.answer,
+            "load_attendance_catalog_candidates",
+            return_value={"Department": ("Operations",)},
+        ):
+            chunks, plan, calculation, _count = self.answer.fetch_context(
+                "What percentage of all attendance records have Department "
+                'equal to "Operations"?'
+            )
+
+        self.assertEqual(plan.aggregation, "percentage")
+        self.assertEqual(plan.percentage_condition.field, "Department")
+        self.assertEqual(plan.percentage_condition.value, "Operations")
+        self.assertEqual(calculation["numerator"], 1)
+        self.assertEqual(calculation["denominator"], 5)
+        self.assertEqual(calculation["value"], 20.0)
+        self.assertTrue(chunks)
+
     def test_answer_evaluation_trace_is_from_the_rendered_public_execution(self):
         text, chunks, _state, trace = (
             self.answer._answer_question_with_evaluation_trace(

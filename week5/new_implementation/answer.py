@@ -4079,7 +4079,7 @@ def _prepare_context_request(
     if any(
         fact.kind == "unsupported"
         and fact.strength == "strong"
-        and fact.concept_name != "unsupported_constraint"
+        and fact.concept_name not in {"unsupported_constraint", "percentage_population"}
         for fact in detected_facts
     ):
         violations = CapabilityInvariant().check(

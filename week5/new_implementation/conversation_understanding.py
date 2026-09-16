@@ -529,23 +529,61 @@ _SOCIAL_TOKENS = frozenset(
 )
 
 
+_PROTECTED_REQUEST_VERB_PATTERN = (
+    r"(?:show|display|reveal|print|list|describe|tell|give|provide)"
+)
+_PROTECTED_REQUEST_FILLER_PATTERN = (
+    r"(?:me|us|your|my|our|the|please|kindly|hidden|all|this|that)"
+)
+_PROTECTED_OBJECT_PATTERN = (
+    r"(?:schemas?|tables?|columns?|database|metadata|conversation|chat|history|"
+    r"transcript|prior\s+(?:questions?|requests?|answers?)|diagnostics?|"
+    r"debug(?:ging)?|internal(?:\s+(?:state|details?|metadata))?|system\s+prompt)"
+)
+_HISTORY_ACTION_PATTERN = (
+    r"(?:ask(?:ed|s|ing)?|say(?:s|ing)?|said|request(?:ed|s|ing)?|"
+    r"writ(?:e|es|ing|ten|t)|wrote|tell(?:s|ing)?|told)"
+)
+_HISTORY_MARKER_PATTERN = (
+    r"(?:earlier|before|previous(?:ly)?|prior|history|conversation|transcript)"
+)
+
+
+def _contains_composable_protected_intent(normalized: str) -> bool:
+    request_shape = re.search(
+        rf"(?:\b(?:please|kindly)\s+|\b(?:could|would|can)\s+you\s+)?"
+        rf"\b{_PROTECTED_REQUEST_VERB_PATTERN}\b"
+        rf"(?:\s+{_PROTECTED_REQUEST_FILLER_PATTERN}\b){{0,5}}"
+        rf"\s+{_PROTECTED_OBJECT_PATTERN}\b",
+        normalized,
+        re.I,
+    )
+    if request_shape:
+        return True
+    history_shape = re.search(
+        rf"\b(?:what|which)\b"
+        rf"(?:\s+(?:did|do|have|has|was|were)\b)?"
+        rf"\s+(?:i|we)\b\s+{_HISTORY_ACTION_PATTERN}\b",
+        normalized,
+        re.I,
+    )
+    return bool(
+        history_shape
+        and re.search(rf"\b{_HISTORY_MARKER_PATTERN}\b", normalized, re.I)
+    )
+
+
 def conversation_preflight_route(
     message: str,
 ) -> Literal["protected", "social", "unrelated"] | None:
     normalized = normalize_for_matching(message)
-    if re.search(
+    if _contains_composable_protected_intent(normalized) or re.search(
         r"\b(?:payroll|salar(?:y|ies)|compensation|bonuses?|loans?|repayments?|benefits?|raw_source_rows)\b|\bprivate\s+raw\b"
         r"|\b(?:drop|alter|create|truncate|insert|update|delete|select|union)\s+"
         r"(?:table|schema|database|from|into|where|all)\b"
         r"|\b(?:ignore|disregard|forget)\s+(?:(?:previous|prior|all)\s+)*(?:instructions?|rules?)\b"
         r"|\boverride\s+(?:(?:your|the|all)\s+)?(?:instructions?|rules?)\b"
         r"|\b(?:reveal|show|print|give(?:\s+me)?|tell(?:\s+me)?)\s+(?:your\s+)?(?:hidden\s+)?system\s+prompt\b"
-        r"|\b(?:show|display|reveal|print|list|describe)\s+(?:your\s+)?(?:schema|tables?|columns?|database|metadata)\b"
-        r"|\b(?:what|which)\s+(?:did|have)\s+(?:i|we)\s+(?:ask|say|request|write)\b"
-        r"|\b(?:show|display|reveal|print|list|tell(?:\s+me)?)\s+(?:my|our|the)?\s*"
-        r"(?:conversation|chat|history|transcript|prior\s+(?:questions?|requests?|answers?))\b"
-        r"|\b(?:show|display|reveal|print|list|give(?:\s+me)?|tell(?:\s+me)?)\s+(?:your\s+)?"
-        r"(?:diagnostics?|debug(?:ging)?|internal\s+(?:state|details?|metadata))\b"
         r"|(?:تجاهل|تجاهلي)\s+(?:التعليمات|التوجيهات)\s+(?:السابقة|الماضية)"
         r"|(?:انس|انسي|تجاوز)\s+(?:كل\s+)?(?:التعليمات|التوجيهات)(?:\s+(?:السابقة|الماضية))?"
         r"|(?:اكشف|اظهر|اعرض|اطبع)\s+(?:موجه\s+النظام|تعليمات\s+النظام|الموجه\s+السري|الموجه\s+المخفي)"

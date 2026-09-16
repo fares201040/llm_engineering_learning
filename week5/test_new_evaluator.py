@@ -4,6 +4,8 @@ import warnings
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from week5.new_evaluation.test import TestQuestion
+
 
 def dashboard_case(question, category="count", token="case-1"):
     return SimpleNamespace(
@@ -386,6 +388,41 @@ class ApdcEvaluationDashboardTests(unittest.TestCase):
             self.assertNotIn(private_value, rendered)
         self.assertEqual(details.loc[0, "Status"], "Failed (evaluation_error)")
 
+    def test_bird_controlled_nonexecution_is_scored_and_reports_only_safe_cause(self):
+        dashboard = self.dashboard()
+        dashboard.clear_bird_cache()
+        case = dashboard_case("Analyst-visible question", token="controlled-failure")
+        result = SimpleNamespace(
+            status="evaluated",
+            execution_accuracy=0.0,
+            components={"matched_count": False, "record_ids": False},
+            reason="controlled_nonexecution",
+        )
+
+        with (
+            patch.object(dashboard.apdc_evaluation, "load_tests", return_value=[case]),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "verify_dataset",
+                return_value={"fingerprint": "dataset-a"},
+            ),
+            patch.object(
+                dashboard.apdc_evaluation,
+                "evaluate_bird_case",
+                return_value=result,
+            ),
+        ):
+            summary, components, details = dashboard.run_bird_evaluation(
+                0, False, progress=None
+            )
+
+        self.assertIn("BIRD-style Contract EX: 0.0%", summary)
+        self.assertIn("evaluated 1 · skipped 0 · failed 0", summary)
+        self.assertEqual(details.loc[0, "Question"], "Analyst-visible question")
+        self.assertEqual(details.loc[0, "Status"], "Failed")
+        self.assertEqual(details.loc[0, "Cause"], "controlled_nonexecution")
+        self.assertEqual(components["Passed"].tolist(), [0, 0])
+
     def test_bird_cache_reuses_verified_result_and_force_recompute_bypasses_it(self):
         dashboard = self.dashboard()
         dashboard.clear_bird_cache()
@@ -450,6 +487,26 @@ class ApdcEvaluationDashboardTests(unittest.TestCase):
             dashboard.run_bird_evaluation(0, False, progress=None)
 
         self.assertEqual(evaluate.call_count, 2)
+
+    def test_bird_cache_key_distinguishes_omitted_and_explicit_default_contracts(self):
+        dashboard = self.dashboard()
+        required = {
+            "question": "How many verified records are there?",
+            "keywords": ["records"],
+            "reference_answer": "There are no records.",
+            "category": "count",
+        }
+        omitted = TestQuestion(**required)
+        explicit = TestQuestion(**required, expected_record_ids=[])
+
+        self.assertEqual(
+            omitted.model_dump(mode="json"),
+            explicit.model_dump(mode="json"),
+        )
+        self.assertNotEqual(
+            dashboard._bird_cache_key("dataset-a", omitted),
+            dashboard._bird_cache_key("dataset-a", explicit),
+        )
 
     def test_app_adds_bird_as_fifth_tab_without_changing_existing_tab_order(self):
         dashboard = self.dashboard()

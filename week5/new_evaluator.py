@@ -44,7 +44,7 @@ def _category_frame(values, metric_name):
     return pd.DataFrame(rows, columns=["Category", metric_name])
 
 
-_BIRD_METRIC_VERSION = "apdc-bird-contract-ex-v2"
+_BIRD_METRIC_VERSION = "apdc-bird-contract-ex-v3"
 _BIRD_CACHE_LIMIT = 512
 _BIRD_CACHE = OrderedDict()
 _BIRD_COMPONENTS = (
@@ -63,11 +63,13 @@ def clear_bird_cache():
 
 def _bird_cache_key(dataset_fingerprint, case):
     payload = case.model_dump(mode="json")
+    fields_set = sorted(getattr(case, "model_fields_set", ()))
     encoded = json.dumps(
         {
             "metric": _BIRD_METRIC_VERSION,
             "dataset": dataset_fingerprint,
             "case": payload,
+            "case_fields_set": fields_set,
         },
         sort_keys=True,
         separators=(",", ":"),

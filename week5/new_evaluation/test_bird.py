@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from week5.new_evaluation import eval as evaluation
 from week5.new_evaluation.test import TestQuestion
+from week5.new_implementation import answer
 
 
 def bird_case(**overrides):
@@ -83,6 +84,37 @@ class BirdCaseEvaluationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "database unavailable"):
                 evaluation.evaluate_bird_case(case)
 
+    def test_controlled_product_nonexecution_scores_all_applicable_checks_zero(self):
+        case = bird_case(
+            expected_matched_count=2,
+            expected_record_ids=["record-1"],
+        )
+        controlled_failures = (
+            answer.PlanningClarificationRequired(None, ()),
+            answer.MissingIntentRequired([]),
+            answer.SurfaceMeaningClarificationRequired((), ()),
+            answer.SemanticPlanValidationError(()),
+            answer.PlanValidationError("private SQL and parameter details"),
+        )
+
+        for failure in controlled_failures:
+            with self.subTest(failure=type(failure).__name__):
+                with patch.object(
+                    evaluation,
+                    "fetch_context",
+                    side_effect=failure,
+                ):
+                    result = evaluation.evaluate_bird_case(case)
+
+                self.assertEqual(result.status, "evaluated")
+                self.assertEqual(result.execution_accuracy, 0.0)
+                self.assertEqual(
+                    result.components,
+                    {"matched_count": False, "record_ids": False},
+                )
+                self.assertEqual(result.reason, "controlled_nonexecution")
+                self.assertNotIn("private SQL", str(result))
+
     def test_controlled_nonexecution_case_is_skipped_without_execution(self):
         case = bird_case(
             expected_matched_count=2,
@@ -95,6 +127,29 @@ class BirdCaseEvaluationTests(unittest.TestCase):
         self.assertEqual(result.status, "skipped")
         self.assertEqual(result.reason, "unsupported_nonexecution_case")
         fetch.assert_not_called()
+
+    def test_none_clarification_outcome_does_not_prevent_verified_execution(self):
+        case = bird_case(
+            expected_matched_count=0,
+            expected_clarification_outcome="none",
+        )
+
+        with patch.object(
+            evaluation,
+            "fetch_context",
+            return_value=(
+                [],
+                SimpleNamespace(model_dump=lambda: {}),
+                None,
+                0,
+            ),
+        ) as fetch:
+            result = evaluation.evaluate_bird_case(case)
+
+        self.assertEqual(result.status, "evaluated")
+        self.assertEqual(result.execution_accuracy, 1.0)
+        self.assertEqual(result.components, {"matched_count": True})
+        fetch.assert_called_once_with(case.question)
 
     def test_record_identity_rejects_unexpected_extra_records(self):
         case = bird_case(expected_record_ids=["record-1"])
@@ -171,6 +226,33 @@ class BirdCaseEvaluationTests(unittest.TestCase):
         self.assertEqual(result.execution_accuracy, 0.0)
         self.assertEqual(result.components, {"group_values": False})
 
+    def test_explicit_empty_group_contract_requires_an_empty_rows_list(self):
+        case = bird_case(expected_group_values=[])
+        calculations = (
+            (None, False),
+            (0, False),
+            ({}, False),
+            ({"rows": [{"group": ["A"], "value": 1}]}, False),
+            ({"rows": []}, True),
+        )
+
+        for calculation, expected in calculations:
+            with self.subTest(calculation=calculation):
+                with patch.object(
+                    evaluation,
+                    "fetch_context",
+                    return_value=(
+                        [],
+                        SimpleNamespace(model_dump=lambda: {}),
+                        calculation,
+                        0,
+                    ),
+                ):
+                    result = evaluation.evaluate_bird_case(case)
+
+                self.assertEqual(result.execution_accuracy, float(expected))
+                self.assertEqual(result.components, {"group_values": expected})
+
     def test_explicit_empty_record_contract_is_evaluated(self):
         case = bird_case(expected_record_ids=[])
 
@@ -240,6 +322,58 @@ class BirdCaseEvaluationTests(unittest.TestCase):
 
         self.assertEqual(result.execution_accuracy, 1.0)
         self.assertEqual(result.components, {"calculation": True})
+
+    def test_numeric_contracts_reject_boolean_actual_values(self):
+        for expected_value in (1, 1.0):
+            with self.subTest(expected_value=expected_value):
+                case = bird_case(expected_calculation={"value": expected_value})
+                with patch.object(
+                    evaluation,
+                    "fetch_context",
+                    return_value=(
+                        [],
+                        SimpleNamespace(model_dump=lambda: {}),
+                        {"value": True},
+                        0,
+                    ),
+                ):
+                    result = evaluation.evaluate_bird_case(case)
+
+                self.assertEqual(result.execution_accuracy, 0.0)
+                self.assertEqual(result.components, {"calculation": False})
+
+    def test_matched_count_contract_rejects_boolean_actual_value(self):
+        case = bird_case(expected_matched_count=1)
+        with patch.object(
+            evaluation,
+            "fetch_context",
+            return_value=(
+                [],
+                SimpleNamespace(model_dump=lambda: {}),
+                None,
+                True,
+            ),
+        ):
+            result = evaluation.evaluate_bird_case(case)
+
+        self.assertEqual(result.execution_accuracy, 0.0)
+        self.assertEqual(result.components, {"matched_count": False})
+
+    def test_empty_mapping_expectations_do_not_create_a_verified_contract(self):
+        for expectation_name in (
+            "expected_calculation",
+            "expected_normalized_result",
+        ):
+            with self.subTest(expectation_name=expectation_name):
+                case = bird_case(**{expectation_name: {}})
+                with patch.object(evaluation, "fetch_context") as fetch:
+                    result = evaluation.evaluate_bird_case(case)
+
+                self.assertEqual(result.status, "skipped")
+                self.assertIsNone(result.execution_accuracy)
+                self.assertEqual(result.components, {})
+                self.assertEqual(result.reason, "no_verified_output_contract")
+                fetch.assert_not_called()
 
 
 if __name__ == "__main__":

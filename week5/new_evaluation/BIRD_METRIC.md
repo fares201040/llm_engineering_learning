@@ -30,17 +30,26 @@ extra execution metadata is ignored. The case Contract EX is 1 only when every
 applicable component matches; otherwise it is 0. Overall Contract EX is the
 arithmetic mean over cases that received a valid verdict.
 
+Explicit empty calculation or normalized-result mappings do not establish a
+verified contract. An explicit empty grouped-values contract matches only an
+executed calculation containing `rows: []`.
+
 Cases without verified output expectations and cases whose contract expects a
-controlled non-execution are skipped. Evaluator or infrastructure failures are
-reported separately and excluded from the scored denominator. If no case
-receives a verdict, the score is unavailable rather than zero.
+controlled non-execution are skipped. For an otherwise eligible output case,
+an actual controlled product non-execution is an evaluated mismatch: all
+applicable components receive 0 and the case remains in the denominator.
+Unexpected evaluator, database, or runtime failures are reported separately
+and excluded from the scored denominator. If no case receives a verdict, the
+score is unavailable rather than zero.
 
 ## Efficiency and caching
 
 Successful verdicts are cached in process using a bounded cache keyed by the
 metric version, verified dataset fingerprint, and complete case fingerprint.
-Changing any of those inputs causes recomputation. Skips and failures are not
-cached. Analysts can explicitly bypass the cache from the BIRD tab.
+The case fingerprint includes which Pydantic fields were explicitly supplied,
+so omitted expectations do not collide with explicit defaults. Changing any of
+those inputs causes recomputation. Skips and failures are not cached. Analysts
+can explicitly bypass the cache from the BIRD tab.
 
 ## Privacy boundary
 

@@ -16,8 +16,12 @@ if __package__ and __package__.startswith("week5."):
         POSTGRES_DSN,
         ConversationState,
         EmployeeClarificationRequired,
+        MissingIntentRequired,
+        PlanValidationError,
+        PlanningClarificationRequired,
         QueryPlan,
         SemanticPlanValidationError,
+        SurfaceMeaningClarificationRequired,
         _import_psycopg,
         answer_question,
         answer_question_with_state,
@@ -33,8 +37,12 @@ elif __package__ == "new_evaluation":
         POSTGRES_DSN,
         ConversationState,
         EmployeeClarificationRequired,
+        MissingIntentRequired,
+        PlanValidationError,
+        PlanningClarificationRequired,
         QueryPlan,
         SemanticPlanValidationError,
+        SurfaceMeaningClarificationRequired,
         _import_psycopg,
         answer_question,
         answer_question_with_state,
@@ -54,8 +62,12 @@ else:
         POSTGRES_DSN,
         ConversationState,
         EmployeeClarificationRequired,
+        MissingIntentRequired,
+        PlanValidationError,
+        PlanningClarificationRequired,
         QueryPlan,
         SemanticPlanValidationError,
+        SurfaceMeaningClarificationRequired,
         _import_psycopg,
         answer_question,
         answer_question_with_state,
@@ -132,7 +144,12 @@ class BirdCaseEval(BaseModel):
     execution_accuracy: float | None = Field(default=None, ge=0, le=1)
     components: dict[str, bool] = Field(default_factory=dict)
     reason: (
-        Literal["no_verified_output_contract", "unsupported_nonexecution_case"] | None
+        Literal[
+            "controlled_nonexecution",
+            "no_verified_output_contract",
+            "unsupported_nonexecution_case",
+        ]
+        | None
     ) = None
 
 
@@ -149,6 +166,8 @@ def _bird_has_output_expectation(test: TestQuestion, expectation_name: str) -> b
     expectation = getattr(test, expectation_name)
     if expectation_name == "expected_matched_count":
         return expectation is not None
+    if expectation_name in {"expected_calculation", "expected_normalized_result"}:
+        return bool(expectation)
     return expectation_name in test.model_fields_set
 
 
@@ -161,6 +180,8 @@ def _bird_applicable_checks(test: TestQuestion):
 
 
 def _bird_values_match(actual, expected, *, key=None) -> bool:
+    if isinstance(actual, bool) or isinstance(expected, bool):
+        return type(actual) is type(expected) and actual == expected
     if isinstance(expected, float) and isinstance(actual, (int, float)):
         return math.isclose(actual, expected, abs_tol=0.005)
     if isinstance(expected, dict):
@@ -185,7 +206,7 @@ def _bird_values_match(actual, expected, *, key=None) -> bool:
 def _bird_group_values_match(actual: dict | None, expected: list[dict]) -> bool:
     rows = actual.get("rows") if isinstance(actual, dict) else None
     if not expected:
-        return not rows
+        return isinstance(rows, list) and not rows
     if not isinstance(rows, list) or len(rows) != len(expected):
         return False
     actual_by_group = {tuple(row.get("group", [])): row.get("value") for row in rows}
@@ -207,7 +228,7 @@ def _bird_is_nonexecution_case(test: TestQuestion) -> bool:
         test.expected_error
         or test.expected_exception_type
         or test.expected_clarification_ids
-        or test.expected_clarification_outcome
+        or test.expected_clarification_outcome == "ambiguous"
         or test.expected_violation_codes
         or test.expected_unsupported_capabilities
         or test.turns
@@ -232,7 +253,21 @@ def evaluate_bird_case(test: TestQuestion) -> BirdCaseEval:
             reason="unsupported_nonexecution_case",
         )
 
-    chunks, plan, calculation, matched_count = fetch_context(test.question)
+    try:
+        chunks, plan, calculation, matched_count = fetch_context(test.question)
+    except (
+        PlanningClarificationRequired,
+        MissingIntentRequired,
+        SurfaceMeaningClarificationRequired,
+        SemanticPlanValidationError,
+        PlanValidationError,
+    ):
+        return BirdCaseEval(
+            status="evaluated",
+            execution_accuracy=0.0,
+            components={component: False for component, _check in applicable},
+            reason="controlled_nonexecution",
+        )
     actual_record_ids = {
         str(chunk.metadata.get("record_id"))
         for chunk in chunks
@@ -244,7 +279,9 @@ def evaluate_bird_case(test: TestQuestion) -> BirdCaseEval:
         "matched_count": matched_count,
     }
     checks = {
-        "matched_count_ok": matched_count == test.expected_matched_count,
+        "matched_count_ok": _bird_values_match(
+            matched_count, test.expected_matched_count
+        ),
         "calculation_ok": _bird_values_match(calculation, test.expected_calculation),
         "normalized_result_ok": _bird_values_match(
             normalized_actual, test.expected_normalized_result

@@ -8,11 +8,20 @@ the observation contract that later manual turns and compound cases must use.
 
 ### Baseline
 
-- Repository: `D:\projects\llm_engineering_ed_donner\llm_engineering`.
+- Repository: APDC workspace (local checkout).
 - Branch observed: `main`.
 - Starting HEAD observed for this task: `3b42e1a071dee3ee33aa94630d1c1f7c97ecf609`.
 - The approved starting commit in the review specification is
   `0f3d02243973d29954f6eb4b5a10e9c1fe2d686d`.
+- Required `git status --short` output was empty (clean worktree).
+- Required planning-file log output was exactly:
+
+  ```text
+  1547a2a4 feat: answer grounded employee profile questions
+  a3934f6c refactor: bound provider planning decisions
+  02ab3ca6 feat: assemble plans from deterministic facts
+  ```
+
 - `week5/new_implementation/planning_decisions.py` had no diff from the
   approved starting commit to the observed HEAD.
 - This task does not run an existing test file or suite and does not use live
@@ -29,7 +38,7 @@ not employee values.
    `week5/new_app.py:49-74` takes the last user message and prior UI history,
    passes `ConversationState` plus `LOCAL_DEMO_ACCESS` to
    `answer_question_with_state`, appends the returned assistant text, and
-   renders returned context through escaped HTML. `week5/new_app.py:93` creates
+   renders returned context through escaped HTML (`week5/new_app.py:27-40`). `week5/new_app.py:93` creates
    the typed Gradio state; `week5/new_app.py:121-129` wires submit to the
    stateful chat handler. The UI catch at `week5/new_app.py:63-71` returns a
    locale-safe generic failure and preserves the prior state.
@@ -161,7 +170,9 @@ not employee values.
     profiles (`:5660-5670`), escaped projection rows (`:5672-5703`),
     aggregations (`:5705-5713`), and exact count/sample summaries
     (`:5715-5731`). Only a remaining semantic narrative path calls the final
-    provider (`:5733-5755`), using messages assembled at `:5600-5645`.
+    provider only after the deterministic branches fall through (`:5733-5755`);
+    this is not limited to semantic-narrative plans. Messages are assembled at
+    `:5600-5645`.
 
 ### Provider and trust boundaries to verify later
 
@@ -178,9 +189,17 @@ not employee values.
   This is a review concern against the strict provider-input invariant and
   requires an explicit privacy decision in a later task; no raw record values
   are copied into this ledger.
-- Provider-call counts must be measured at the decision-budget seam. Grounded
-  deterministic requests should remain at zero provider calls; generated
-  aggregate, reranking, and final narrative paths are conditional.
+- Provider-call counts must be measured by instrumentation around every provider
+  completion/API call site, in addition to budgeted `claim_provider_call()`
+  events. The completion sites are conversation decisions
+  (`conversation_understanding.py:1048-1056`), the dormant planner decision
+  (`answer.py:1459-1471`), generated-aggregate attempts (`answer.py:918-1004`),
+  reranking (`answer.py:3325-3398`), and final answer generation
+  (`answer.py:5744-5755`). If pgvector is enabled, the embedding API call at
+  `answer.py:3272-3280` must also be counted. Count attempted provider calls
+  separately from budget claims and record only the integer count; never record
+  payloads. Grounded deterministic requests should remain at zero provider
+  completions.
 
 ### Privacy-safe observation schema
 
@@ -215,9 +234,12 @@ Schema rules:
   parameter values.
 - `result shape/count` records scalar/grouped/rows/narrative and counts only;
   no row contents.
-- Explicitly prohibited from this ledger: raw names, employee IDs, question
-  history, parameter values, SQL text, DSNs, exceptions, prompts, provider
-  payloads, unrestricted schema dumps, and raw retrieved records.
+- Explicitly prohibited from this ledger: raw names, employee IDs, private
+  identifiers, question history, parameter values, SQL text, DSNs, exceptions,
+  prompts, provider payloads, local or physical directories, unrestricted schema
+  dumps, and raw retrieved records. Only non-reversible request-local candidate
+  IDs required by this schema may appear, and they must never encode private
+  identifiers.
 
 ### Ledger template
 

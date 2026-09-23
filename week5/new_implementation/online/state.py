@@ -13,7 +13,7 @@ from .reference import PendingEmployeeConfirmation
 
 
 class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=True)
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, str_strip_whitespace=True)
 
 
 class VerifiedTurn(_Strict):

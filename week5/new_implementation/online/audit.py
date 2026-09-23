@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from typing import Annotated, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -79,6 +79,7 @@ def audit_with_one_repair(
     initial: PlannerResponse,
     planner_args: dict[str, object],
     audit_args: dict[str, object],
+    candidate_validator: Callable[[PlannerResponse], None] | None = None,
 ) -> PlannerResponse:
     """Retain a valid initial candidate if audit is unavailable; repaired candidates require final pass."""
 
@@ -101,6 +102,11 @@ def audit_with_one_repair(
     repaired = request_plan(**repaired_args)
     if not isinstance(repaired.decision, ReadyPlan):
         raise ProviderFailure("planner", "repair_rejected", "repair did not produce an executable plan")
+    if candidate_validator is not None:
+        try:
+            candidate_validator(repaired)
+        except ValueError as exc:
+            raise ProviderFailure("planner", "repair_rejected", str(exc)) from exc
     final = request_audit(candidate=repaired.decision, final=True, **audit_args)
     if not isinstance(final.decision, AuditPass):
         raise ProviderFailure("final_audit", "semantic_rejection", "final audit rejected the repaired plan")

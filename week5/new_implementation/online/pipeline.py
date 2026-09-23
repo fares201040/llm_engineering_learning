@@ -202,7 +202,12 @@ def run_turn(
                 max_output_tokens=settings.llm_reference_max_output_tokens,
                 observer=observer,
             )
-            bound_references = bind_references(question, reference, directory)
+            bound_references = bind_references(
+                question,
+                reference,
+                directory,
+                allowed_prior_ids=working.active_employee_ids,
+            )
         if bound_references.confirmation is not None:
             state = working.model_copy(update={"pending_employee_confirmation": bound_references.confirmation})
             return Clarification(reply=_confirmation_reply(bound_references, locale), state=state, reason="employee_confirmation")
@@ -223,7 +228,24 @@ def run_turn(
             "max_output_tokens": settings.llm_planner_max_output_tokens,
             "observer": observer,
         }
-        planned = deps.planner(**planner_args)
+
+        def validate_candidate(response) -> None:
+            candidate = response.decision
+            if not isinstance(candidate, ReadyPlan) or candidate.narrative_search is not None:
+                return
+            materialize_query(
+                message=question,
+                relationship=candidate.relationship,
+                base_turn_id=candidate.base_turn_id,
+                retained_component_ids=candidate.retained_component_ids,
+                current_filters=candidate.filters,
+                current_output=candidate.output,
+                trusted_components=working.trusted_components(),
+                catalog=ATTENDANCE_CATALOG,
+                limits=LIMITS,
+            )
+
+        planned = deps.planner(**planner_args, validator=validate_candidate)
         decision = planned.decision
         if isinstance(decision, AmbiguousPlan):
             return Clarification(reply=_clarification(decision.reason, decision.locale), state=working, reason=decision.reason)
@@ -253,7 +275,12 @@ def run_turn(
             "max_output_tokens": settings.llm_plan_audit_max_output_tokens,
             "observer": observer,
         }
-        planned = audit_with_one_repair(initial=planned, planner_args=planner_args, audit_args=audit_args)
+        planned = audit_with_one_repair(
+            initial=planned,
+            planner_args=planner_args,
+            audit_args=audit_args,
+            candidate_validator=validate_candidate,
+        )
         decision = planned.decision
         assert isinstance(decision, ReadyPlan)
         if decision.narrative_search is not None:

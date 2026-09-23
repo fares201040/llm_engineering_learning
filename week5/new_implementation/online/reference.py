@@ -9,7 +9,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .provider import CallBudget, TurnObserver, call_structured
+from .provider import CallBudget, ProviderFailure, TurnObserver, call_structured
 from .query import EvidenceSpan
 
 
@@ -96,17 +96,25 @@ def request_references(
             for match in re.finditer(r"\S+", question)
         ],
     }
-    return call_structured(
-        stage="reference",
-        model=model,
-        system=_SYSTEM,
-        payload=payload,
-        response_model=ReferenceResponse,
-        budget=budget,
-        timeout=timeout,
-        max_output_tokens=max_output_tokens,
-        observer=observer,
-    )
+    for attempt in (1, 2):
+        try:
+            return call_structured(
+                stage="reference",
+                model=model,
+                system=_SYSTEM,
+                payload=payload,
+                response_model=ReferenceResponse,
+                budget=budget,
+                timeout=timeout,
+                max_output_tokens=max_output_tokens,
+                observer=observer,
+                attempt=attempt,
+            )
+        except ProviderFailure as exc:
+            if exc.code != "invalid_schema" or attempt == 2:
+                raise
+            payload["repair"] = {"code": exc.code, "message": str(exc)}
+    raise AssertionError("unreachable")
 
 
 def _normalize(value: str) -> str:
@@ -128,6 +136,8 @@ def _forms(value: str) -> tuple[str, ...]:
 def _score(mention: str, employee: Employee) -> float:
     mentions = _forms(mention)
     candidates = _forms(employee.name) + _forms(employee.employee_id)
+    if not mentions or not candidates:
+        return 0.0
     return max(SequenceMatcher(None, left, right).ratio() for left in mentions for right in candidates)
 
 
@@ -137,6 +147,7 @@ def bind_references(
     directory: tuple[Employee, ...],
     *,
     threshold: float = FUZZY_THRESHOLD,
+    allowed_prior_ids: tuple[str, ...] = (),
 ) -> BoundReferences:
     if isinstance(decision.decision, AmbiguousReference):
         return BoundReferences(employee_ids=(), ambiguous=True)
@@ -148,6 +159,8 @@ def bind_references(
     resolved: list[str] = []
     for reference in decision.decision.references:
         if isinstance(reference, PriorReference):
+            if not set(reference.employee_ids) <= set(allowed_prior_ids):
+                return BoundReferences(employee_ids=(), ambiguous=True)
             resolved.extend(reference.employee_ids)
             continue
         span = reference.mention

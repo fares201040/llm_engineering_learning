@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import date, datetime, time
+from decimal import Decimal
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -67,19 +69,42 @@ class VerdictResponse(_Strict):
     decision: Verdict
 
 
+def _atom_value(value: object):
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (date, datetime, time)):
+        return value.isoformat()
+    return str(value)
+
+
 def facts_from_execution(bound: BoundAttendanceQuery, result: ExecutionResult) -> tuple[GroundedFact, ...]:
     atoms: list[FactAtom] = []
     for index, employee_id in enumerate(bound.employee_ids):
         atoms.append(FactAtom(atom_id=f"employee-{index}", role="employee_id", value=employee_id))
     for row_index, row in enumerate(result.rows):
         for column, value in row.items():
-            atoms.append(FactAtom(atom_id=f"row-{row_index}-{column}", role=column, value=value))
+            atoms.append(FactAtom(atom_id=f"row-{row_index}-{column}", role=column, value=_atom_value(value)))
     if result.coverage is not None:
         for key, value in result.coverage.model_dump(mode="json").items():
             atoms.append(FactAtom(atom_id=f"coverage-{key}", role=f"coverage_{key}", value=value))
-    for index, row in enumerate(result.witnesses):
+    row_witnesses = {
+        (str(row.get("employee_id")), str(row.get("date")))
+        for row in result.rows
+        if row.get("employee_id") is not None and row.get("date") is not None
+    }
+    unique_witnesses = []
+    seen_witnesses = set(row_witnesses)
+    for row in result.witnesses:
+        key = (str(row.get("employee_id")), str(row.get("date")))
+        if key in seen_witnesses:
+            continue
+        seen_witnesses.add(key)
+        unique_witnesses.append(row)
+    for index, row in enumerate(unique_witnesses):
         for column, value in row.items():
-            atoms.append(FactAtom(atom_id=f"witness-{index}-{column}", role=f"witness_{column}", value=value))
+            atoms.append(FactAtom(atom_id=f"witness-{index}-{column}", role=f"witness_{column}", value=_atom_value(value)))
     if not result.rows:
         atoms.append(FactAtom(atom_id="empty-result", role="matching_rows", value=0))
     return (GroundedFact(fact_id="result", kind="structured", atoms=tuple(atoms)),)
@@ -157,18 +182,24 @@ def generate_answer(
         }
         if repair is not None:
             payload["repair"] = repair
-        draft = call_structured(
-            stage="answer_writer",
-            model=writer_model,
-            system=_WRITER,
-            payload=payload,
-            response_model=AnswerDraft,
-            budget=budget,
-            timeout=timeout,
-            max_output_tokens=max_output_tokens,
-            observer=observer,
-            attempt=attempt,
-        )
+        try:
+            draft = call_structured(
+                stage="answer_writer",
+                model=writer_model,
+                system=_WRITER,
+                payload=payload,
+                response_model=AnswerDraft,
+                budget=budget,
+                timeout=timeout,
+                max_output_tokens=max_output_tokens,
+                observer=observer,
+                attempt=attempt,
+            )
+        except ProviderFailure as exc:
+            if attempt == 1 and exc.code == "invalid_schema":
+                repair = {"codes": [exc.code], "message": str(exc)}
+                continue
+            raise
         try:
             validate_draft(draft, facts)
         except ValueError as exc:

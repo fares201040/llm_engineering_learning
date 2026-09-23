@@ -1,5 +1,25 @@
 # PostgreSQL setup
 
+## Runtime read-only role
+
+Use a dedicated application role that can connect and select only the approved
+attendance objects. The exact role name is deployment-owned; its permissions should be
+equivalent to:
+
+```sql
+ALTER ROLE attendance_reader SET default_transaction_read_only = on;
+REVOKE ALL ON SCHEMA private_ingestion FROM attendance_reader;
+REVOKE ALL ON ALL TABLES IN SCHEMA private_ingestion FROM attendance_reader;
+GRANT USAGE ON SCHEMA public TO attendance_reader;
+GRANT SELECT ON TABLE attendance_records, knowledge_chunks TO attendance_reader;
+```
+
+The application also starts every attendance read in `REPEATABLE READ READ ONLY` and
+applies local statement, lock, and idle-transaction timeouts. The database role remains
+required so a code defect cannot turn the planner connection into a writer.
+Configure its connection separately as `POSTGRES_READONLY_DSN`; keep the ingestion
+writer connection in `POSTGRES_DSN`.
+
 The ingestion pipeline uses PostgreSQL for exact, structured attendance
 queries and keeps semantic vectors in Chroma by default. This works with a
 plain PostgreSQL installation; pgvector is optional.
@@ -26,11 +46,11 @@ powershell -ExecutionPolicy Bypass -File .\week5\new_implementation\setup_postgr
 
 ## Run ingestion
 
-Install Python dependencies and run the existing pipeline:
+Install Python dependencies and run the offline pipeline as a module:
 
 ```powershell
 uv sync
-uv run python .\week5\new_implementation\ingest.py
+uv run python -m week5.new_implementation.ingest
 ```
 
 The script loads `.env.postgres` regardless of the current working directory.
@@ -56,3 +76,21 @@ ENABLE_PGVECTOR=true
 
 Only enable that flag after `CREATE EXTENSION vector` succeeds on the target
 database.
+
+## Online runtime configuration
+
+`attendance-online/v1` is the only runtime and state version. Provider boundary
+versions are implementation details, not deployment settings. The decision stages
+default to `openai/gpt-4.1-nano`; useful overrides are:
+
+```env
+LLM_PLAN_AUDIT_MODEL=openai/gpt-4.1-nano
+LLM_PLAN_AUDIT_TIMEOUT_SECONDS=30
+LLM_PLAN_AUDIT_MAX_OUTPUT_TOKENS=1000
+LLM_REFERENCE_MODEL=openai/gpt-4.1-nano
+LLM_ANSWER_MODEL=openai/gpt-4.1-nano
+LLM_ANSWER_VERIFIER_MODEL=openai/gpt-4.1-nano
+```
+
+The shared active-turn limit is eleven provider calls. Keep
+`POSTGRES_READONLY_DSN` configured independently from the ingestion writer DSN.

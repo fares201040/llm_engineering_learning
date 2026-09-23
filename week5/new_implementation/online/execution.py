@@ -142,7 +142,8 @@ def _compile_condition(condition: Condition, catalog: AttendanceCatalog, params:
         return f"{expression} {sql_operator} %s"
     if scalar_type != "text":
         raise ValueError(f"{operator} requires a string field")
-    params[-1] = f"%{canonical}%" if operator == "contains" else f"{canonical}%"
+    escaped = str(canonical).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    params[-1] = f"%{escaped}%" if operator == "contains" else f"{escaped}%"
     return f"{expression} ILIKE %s ESCAPE '\\'"
 
 
@@ -224,7 +225,11 @@ def compile_main(
 
 def compile_coverage(bound: BoundAttendanceQuery, *, table: str, catalog: AttendanceCatalog = ATTENDANCE_CATALOG) -> CompiledQuery:
     params: list[object] = []
-    where = _where(bound, catalog, params)
+    if bound.employee_ids:
+        params.append(list(bound.employee_ids))
+        where = f" WHERE {catalog.physical_expression('employee_id')} = ANY(%s)"
+    else:
+        where = ""
     date_expression = catalog.physical_expression("date")
     return CompiledQuery(
         sql=f"SELECT MIN({date_expression}) AS available_start, MAX({date_expression}) AS available_end FROM {_identifier(table)}{where}",
@@ -279,9 +284,9 @@ def execute_postgres(
     witness_query = compile_witness(bound, table=table)
     with psycopg.connect(dsn, connect_timeout=connect_timeout, row_factory=dict_row) as connection:
         connection.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
-        connection.execute("SET LOCAL statement_timeout = %s", (statement_timeout_ms,))
-        connection.execute("SET LOCAL lock_timeout = %s", (lock_timeout_ms,))
-        connection.execute("SET LOCAL idle_in_transaction_session_timeout = %s", (idle_timeout_ms,))
+        connection.execute("SELECT set_config('statement_timeout', %s, true)", (str(statement_timeout_ms),))
+        connection.execute("SELECT set_config('lock_timeout', %s, true)", (str(lock_timeout_ms),))
+        connection.execute("SELECT set_config('idle_in_transaction_session_timeout', %s, true)", (str(idle_timeout_ms),))
         rows = tuple(dict(item) for item in connection.execute(main.sql, main.params).fetchmany(result_limit + 1))
         if len(rows) > result_limit:
             raise RuntimeError("result bound exceeded")

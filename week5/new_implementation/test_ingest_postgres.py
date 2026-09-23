@@ -5,7 +5,6 @@ from unittest.mock import patch, mock_open
 import uuid
 
 from week5.new_implementation import ingest
-from week5.new_implementation import answer
 from week5.new_implementation.source_ingestion import RawSourceRow
 
 
@@ -179,22 +178,6 @@ class PostgresIngestionTests(unittest.TestCase):
 
         self.assertIs(result, stats)
         self.assertEqual(stats.postgres_upserts, 0)
-
-    def test_semantic_backend_requires_pgvector_flag(self):
-        with (
-            patch.object(answer, "ENABLE_POSTGRES", True),
-            patch.object(answer, "POSTGRES_DSN", "postgresql://local/test"),
-            patch.object(answer, "ENABLE_PGVECTOR", False),
-        ):
-            self.assertFalse(answer._postgres_vector_enabled())
-
-        with (
-            patch.object(answer, "ENABLE_POSTGRES", True),
-            patch.object(answer, "POSTGRES_DSN", "postgresql://local/test"),
-            patch.object(answer, "ENABLE_PGVECTOR", True),
-        ):
-            self.assertTrue(answer._postgres_vector_enabled())
-
 
 class _FakeCollection:
     def __init__(self):

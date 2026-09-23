@@ -56,7 +56,8 @@ class ExecutionTests(unittest.TestCase):
         witness = compile_witness(bound, table="attendance_records")
         self.assertNotIn("Absent' OR 1=1 --", main.sql)
         self.assertIn("Absent' OR 1=1 --", main.params)
-        self.assertEqual(coverage.params, witness.params[:-1])
+        self.assertEqual(coverage.params[0], ["A1"])
+        self.assertEqual(witness.params[0], ["A1"])
 
     def test_out_of_scope_employee_is_rejected_before_compilation(self):
         access = AccessContext(

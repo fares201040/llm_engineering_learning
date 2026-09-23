@@ -114,6 +114,17 @@ class AggregateOutput(_StrictModel):
     ordering: tuple[Ordering, ...] = Field(default=(), max_length=8)
     limit: int | None = Field(default=None, ge=1, le=1000)
 
+    @model_validator(mode="after")
+    def _unique_outputs(self):
+        output_ids = [item.output_id for item in self.measures]
+        if len(output_ids) != len(set(output_ids)):
+            raise ValueError("aggregate output IDs must be unique")
+        if set(output_ids) & set(self.group_by):
+            raise ValueError("measure outputs cannot shadow grouping fields")
+        if len(self.group_by) != len(set(self.group_by)):
+            raise ValueError("grouping fields must be unique")
+        return self
+
 
 QueryOutput = Annotated[RowsOutput | AggregateOutput, Field(discriminator="kind")]
 
@@ -235,6 +246,12 @@ def validate_query(
                 issues.append(QueryIssue("list_cardinality", f"filters.{index}", "literal list is too large"))
             if any(isinstance(value, str) and len(value) > limits.max_literal_length for value in values):
                 issues.append(QueryIssue("literal_length", f"filters.{index}", "literal is too long"))
+            for value in values:
+                try:
+                    catalog.canonicalize_value(condition.field_id, value)
+                except ValueError:
+                    issues.append(QueryIssue("literal_type", f"filters.{index}", "literal is incompatible with field type"))
+                    break
         for predicate in _predicates(expression):
             if predicate.predicate_id not in catalog.predicates:
                 issues.append(QueryIssue("unknown_predicate", f"filters.{index}", "unknown business predicate"))
@@ -287,6 +304,8 @@ def validate_query(
                 issues.append(QueryIssue("function_type", "output.measures", "function requires a numeric field"))
             elif expected == "aggregatable" and not field.aggregatable:
                 issues.append(QueryIssue("field_role", "output.measures", "field is not aggregatable"))
+            elif expected == "ordered" and not field.orderable:
+                issues.append(QueryIssue("field_role", "output.measures", "field is not orderable"))
         if output.having is not None:
             for condition in _conditions(output.having):
                 if condition.field_id not in valid_outputs:
@@ -314,11 +333,17 @@ def materialize_query(
     limits: QueryLimits,
 ) -> MaterializedQuery:
     issues: list[QueryIssue] = []
+    current_components: tuple[QueryComponent, ...] = current_filters + ((current_output,) if current_output is not None else ())
     if relationship == "new" and (base_turn_id is not None or retained_component_ids):
         issues.append(QueryIssue("relationship", "relationship", "new queries cannot inherit"))
     if relationship != "new" and base_turn_id is None:
         issues.append(QueryIssue("relationship", "base_turn_id", "follow-ups require one base turn"))
-    current_components: tuple[QueryComponent, ...] = current_filters + ((current_output,) if current_output is not None else ())
+    if relationship == "repeat" and current_components:
+        issues.append(QueryIssue("relationship", "components", "repeat cannot add current components"))
+    if relationship == "repeat" and not retained_component_ids:
+        issues.append(QueryIssue("relationship", "retained_component_ids", "repeat requires retained components"))
+    if len(retained_component_ids) != len(set(retained_component_ids)):
+        issues.append(QueryIssue("duplicate_component", "retained_component_ids", "retained component IDs must be unique"))
     keys = [component.component_key for component in current_components]
     if len(keys) != len(set(keys)):
         issues.append(QueryIssue("duplicate_component", "components", "current component keys must be unique"))

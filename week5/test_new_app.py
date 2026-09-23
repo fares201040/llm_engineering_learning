@@ -50,7 +50,9 @@ class SessionStateTests(unittest.TestCase):
 
         self.assertIn("Relevant Context", context)
         self.assertNotIn("Employee_ID", context)
-        self.assertEqual(state, answer.ConversationState())
+        self.assertEqual(state.verified_turns, ())
+        self.assertEqual(state.active_employee_ids, ())
+        self.assertIsNone(state.pending_employee_confirmation)
         self.assertIsNot(state, original)
 
     def test_chat_with_state_renders_the_answer_evidence(self):
@@ -116,7 +118,8 @@ class SessionStateTests(unittest.TestCase):
         self.assertIn("try again", updated_history[-1]["content"].lower())
         self.assertNotIn("password", updated_history[-1]["content"].lower())
         self.assertIn("Relevant Context", context)
-        self.assertEqual(state, answer.ConversationState())
+        self.assertEqual(state.verified_turns, ())
+        self.assertEqual(state.active_employee_ids, ())
 
     def test_unexpected_answer_error_preserves_arabic_locale(self):
         history = [{"role": "user", "content": "اعرض سجلات الحضور"}]

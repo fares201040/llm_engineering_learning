@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
-from typing import Annotated, Literal
+from typing import Annotated, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -41,8 +41,8 @@ class ReadyPlan(_Strict):
             raise ValueError("follow-ups require one base turn")
         if self.narrative_search is not None and (self.filters or self.output is not None):
             raise ValueError("narrative and structured plans are exclusive")
-        if self.narrative_search is None and self.output is None:
-            raise ValueError("structured plans require one output")
+        if self.narrative_search is None and self.output is None and self.relationship == "new":
+            raise ValueError("new structured plans require one output")
         return self
 
 
@@ -142,18 +142,33 @@ def request_plan(
     )
 
 
-def request_valid_plan(**kwargs) -> PlannerResponse:
-    """One initial semantic call and at most one schema/semantic repair."""
+def request_valid_plan(
+    *,
+    validator: Callable[[PlannerResponse], None] | None = None,
+    **kwargs,
+) -> PlannerResponse:
+    """One initial semantic call and at most one schema or semantic repair."""
 
-    try:
-        return request_plan(**kwargs)
-    except ProviderFailure as first:
-        if first.code != "invalid_schema":
-            raise
-        repaired = dict(kwargs)
-        repaired["repair"] = {"code": first.code, "message": str(first)}
-        repaired["attempt"] = 2
-        return request_plan(**repaired)
+    repair = None
+    for attempt in (1, 2):
+        call_args = dict(kwargs)
+        call_args["attempt"] = attempt
+        if repair is not None:
+            call_args["repair"] = repair
+        try:
+            response = request_plan(**call_args)
+            if validator is not None:
+                validator(response)
+            return response
+        except ProviderFailure as exc:
+            if exc.code != "invalid_schema" or attempt == 2:
+                raise
+            repair = {"code": exc.code, "message": str(exc)}
+        except ValueError as exc:
+            if attempt == 2:
+                raise ProviderFailure("planner", "semantic_validation_failed", str(exc)) from exc
+            repair = {"code": "semantic_validation", "message": str(exc)}
+    raise AssertionError("unreachable")
 
 
 __all__ = [

@@ -16,32 +16,18 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from openpyxl import load_workbook
 import tiktoken
 
-try:
-    from .attendance_schema import METADATA_FIELDS, SEARCHABLE_FIELDS
-    from .chroma_client import create_chroma_client
-    from .config import settings
-    from .ingestion_state import IngestionLedger
-    from .source_ingestion import (
-        RawSourceRow,
-        SourceFile,
-        build_raw_rows,
-        classify_partition,
-        discover_sources,
-        read_partitions,
-    )
-except ImportError:  # Running ingest.py directly from its directory.
-    from attendance_schema import METADATA_FIELDS, SEARCHABLE_FIELDS
-    from chroma_client import create_chroma_client
-    from config import settings
-    from ingestion_state import IngestionLedger
-    from source_ingestion import (
-        RawSourceRow,
-        SourceFile,
-        build_raw_rows,
-        classify_partition,
-        discover_sources,
-        read_partitions,
-    )
+from .attendance_schema import METADATA_FIELDS, SEARCHABLE_FIELDS
+from .chroma_client import create_chroma_client
+from .config import settings
+from .ingestion_state import IngestionLedger
+from .source_ingestion import (
+    RawSourceRow,
+    SourceFile,
+    build_raw_rows,
+    classify_partition,
+    discover_sources,
+    read_partitions,
+)
 
 
 logger = logging.getLogger(__name__)

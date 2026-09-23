@@ -24,7 +24,9 @@
 
 ## Review Focus
 
-- A unique fuzzy candidate must require confirmation; tied candidates must not bind.
+- A unique fuzzy candidate must require confirmation; unresolved written references
+  may use access-scoped Chroma options, but no Chroma candidate may bind without user
+  selection and authoritative PostgreSQL cross-checking.
 - Nested `not`/`any` filters must retain meaning through validation, SQL, and evaluation.
 - Empty or missing employee scope must never compile to broader access.
 - Initial-audit unavailability and final-audit unavailability must have different outcomes.
@@ -56,7 +58,9 @@
 
 **Produces:** `online.provider`, `online.reference`, `online.planner`, and `online.audit`.
 
-- [ ] Write failing tests for exact/prior identity, fuzzy confirmation, ties, one-unit responses, explicit zero retries, bounded repairs, audit policy, and call accounting.
+- [ ] Write failing tests for exact/prior identity, fuzzy confirmation, scoped Chroma
+  fallback options, one-unit responses, explicit zero retries, bounded repairs, audit
+  policy, and call accounting.
 - [ ] Run them and confirm expected RED failures.
 - [ ] Implement the shared provider helper and the reference, planner, and audit boundaries.
 - [ ] Re-run focused suites and the provider-budget suite.

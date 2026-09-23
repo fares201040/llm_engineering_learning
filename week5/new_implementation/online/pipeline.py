@@ -24,7 +24,16 @@ from .execution import (
 from .planner import AmbiguousPlan, ReadyPlan, UnsupportedPlan, request_valid_plan
 from .provider import CallBudget, ProviderFailure, StageEvent, TurnObserver
 from .query import MaterializedQuery, QueryLimits, materialize_query
-from .reference import BoundReferences, Employee, ReferenceResponse, bind_references, request_references
+from .reference import (
+    BoundReferences,
+    Employee,
+    EmployeeOption,
+    PendingEmployeeConfirmation,
+    ReferenceResponse,
+    bind_references,
+    request_references,
+    search_employee_candidates,
+)
 from .state import ConversationState, VerifiedTurn
 
 
@@ -81,6 +90,7 @@ class RuntimeDependencies:
         *,
         reference_writer: Callable[..., ReferenceResponse] = request_references,
         directory_loader: Callable[..., tuple[Employee, ...]] = load_employee_directory,
+        employee_fallback_search: Callable[..., tuple[EmployeeOption, ...]] = search_employee_candidates,
         planner: Callable[..., object] = request_valid_plan,
         executor: Callable[..., object] = execute_postgres,
         narrative_retriever: Callable[..., tuple[Result, ...]] = retrieve_narrative_postgres,
@@ -88,6 +98,7 @@ class RuntimeDependencies:
     ):
         self.reference_writer = reference_writer
         self.directory_loader = directory_loader
+        self.employee_fallback_search = employee_fallback_search
         self.planner = planner
         self.executor = executor
         self.narrative_retriever = narrative_retriever
@@ -128,12 +139,76 @@ def _failed(locale: str) -> str:
     return "تعذر إكمال هذا الطلب بأمان. يرجى المحاولة مرة أخرى." if locale == "ar" else "I couldn't complete that request safely. Please try again."
 
 
-def _confirmation_reply(bound: BoundReferences, locale: str) -> str:
-    pending = bound.confirmation
-    assert pending is not None
+def _confirmation_reply(pending: PendingEmployeeConfirmation, locale: str) -> str:
+    if len(pending.options) > 1:
+        choices = "\n".join(
+            f"{index}. {option.employee_name} ({option.employee_id})"
+            for index, option in enumerate(pending.options, start=1)
+        )
+        if locale == "ar":
+            return f"وجدت عدة موظفين محتملين. اختر رقمًا، أو اكتب الاسم أو الرقم الوظيفي بدقة:\n{choices}"
+        return f"I found several possible employees. Choose a number, or enter the exact name or employee ID:\n{choices}"
+    option = pending.options[0]
     if locale == "ar":
-        return f"هل تقصد {pending.employee_name} ({pending.employee_id})؟"
-    return f"Did you mean {pending.employee_name} ({pending.employee_id})?"
+        return f"هل تقصد {option.employee_name} ({option.employee_id})؟"
+    return f"Did you mean {option.employee_name} ({option.employee_id})?"
+
+
+def _pending_response(
+    response: str,
+    pending: PendingEmployeeConfirmation,
+) -> tuple[Literal["selected", "cancelled", "invalid"], EmployeeOption | None]:
+    normalized = " ".join(response.casefold().split())
+    if normalized in {"no", "n", "cancel", "لا", "غير صحيح", "إلغاء"}:
+        return "cancelled", None
+    if len(pending.options) == 1 and normalized in {"yes", "y", "correct", "confirm", "نعم", "صحيح", "أجل"}:
+        return "selected", pending.options[0]
+    try:
+        index = int(normalized) - 1
+    except ValueError:
+        index = -1
+    if 0 <= index < len(pending.options):
+        return "selected", pending.options[index]
+    matches = [
+        option
+        for option in pending.options
+        if normalized in {option.employee_id.casefold(), " ".join(option.employee_name.casefold().split())}
+    ]
+    if len(matches) == 1:
+        return "selected", matches[0]
+    return "invalid", None
+
+
+def _authorized_directory(
+    directory: tuple[Employee, ...],
+    access: AccessContext | None,
+) -> tuple[tuple[Employee, ...], tuple[str, ...] | None]:
+    if access is None or access.domain != "attendance" or "attendance" not in access.allowed_domains:
+        raise AuthorizationError("attendance access is required")
+    scope = access.attendance_scope
+    if scope is None:
+        raise AuthorizationError("attendance row scope is required")
+    if scope.kind == "all":
+        return directory, None
+    allowed = set(scope.employee_ids)
+    return tuple(employee for employee in directory if employee.employee_id in allowed), scope.employee_ids
+
+
+def _verified_options(
+    options: tuple[EmployeeOption, ...],
+    directory: tuple[Employee, ...],
+) -> tuple[EmployeeOption, ...]:
+    authoritative = {employee.employee_id: employee.name for employee in directory}
+    verified: list[EmployeeOption] = []
+    seen: set[str] = set()
+    for option in options:
+        if option.employee_id in seen or authoritative.get(option.employee_id) != option.employee_name:
+            continue
+        seen.add(option.employee_id)
+        verified.append(option)
+        if len(verified) == 5:
+            break
+    return tuple(verified)
 
 
 def _evidence_from_facts(facts: tuple[GroundedFact, ...]) -> tuple[Result, ...]:
@@ -169,28 +244,37 @@ def run_turn(
     budget = CallBudget()
     question = request.question
     forced_employee_ids: tuple[str, ...] = ()
+    selected_employee: EmployeeOption | None = None
     pending = previous.pending_employee_confirmation
     try:
         if pending is not None:
-            response = " ".join(request.question.casefold().split())
-            if response in {"yes", "y", "correct", "confirm", "نعم", "صحيح", "أجل"}:
+            locale = _locale(pending.original_question)
+            status, selected_employee = _pending_response(request.question, pending)
+            if status == "selected":
+                assert selected_employee is not None
                 question = pending.original_question
-                forced_employee_ids = (pending.employee_id,)
+                forced_employee_ids = (selected_employee.employee_id,)
                 working = previous.model_copy(update={"pending_employee_confirmation": None})
-            elif response in {"no", "n", "لا", "غير صحيح"}:
+            elif status == "cancelled":
                 state = previous.model_copy(update={"pending_employee_confirmation": None})
                 return Clarification(reply=_clarification("ambiguous_reference", locale), state=state, reason="ambiguous_reference")
             else:
-                return Clarification(reply=_confirmation_reply(BoundReferences(employee_ids=(), confirmation=pending), locale), state=previous, reason="employee_confirmation")
+                return Clarification(reply=_confirmation_reply(pending, locale), state=previous, reason="employee_confirmation")
         else:
             working = previous
 
-        directory = deps.directory_loader(
+        loaded_directory = deps.directory_loader(
             dsn=settings.postgres_readonly_dsn,
             table=settings.postgres_attendance_table,
             connect_timeout=settings.postgres_connect_timeout_seconds,
         )
+        directory, allowed_employee_ids = _authorized_directory(loaded_directory, request.access_context)
+        authorized_ids = {employee.employee_id for employee in directory}
         if forced_employee_ids:
+            authoritative = {employee.employee_id: employee for employee in directory}
+            selected = authoritative.get(forced_employee_ids[0])
+            if selected is None or selected_employee is None or selected.name != selected_employee.employee_name:
+                raise AuthorizationError("confirmed employee is outside the authoritative access scope")
             bound_references = BoundReferences(employee_ids=forced_employee_ids)
         else:
             reference = deps.reference_writer(
@@ -206,11 +290,39 @@ def run_turn(
                 question,
                 reference,
                 directory,
-                allowed_prior_ids=working.active_employee_ids,
+                allowed_prior_ids=tuple(
+                    employee_id
+                    for employee_id in working.active_employee_ids
+                    if employee_id in authorized_ids
+                ),
             )
         if bound_references.confirmation is not None:
             state = working.model_copy(update={"pending_employee_confirmation": bound_references.confirmation})
-            return Clarification(reply=_confirmation_reply(bound_references, locale), state=state, reason="employee_confirmation")
+            return Clarification(reply=_confirmation_reply(bound_references.confirmation, locale), state=state, reason="employee_confirmation")
+        if bound_references.ambiguous and bound_references.unresolved_mention is not None:
+            try:
+                options = _verified_options(
+                    deps.employee_fallback_search(
+                        bound_references.unresolved_mention,
+                        directory,
+                        embedding_model=settings.embedding_model,
+                        collection_name=settings.chroma_collection_name,
+                        allowed_employee_ids=allowed_employee_ids,
+                    ),
+                    directory,
+                )
+                _emit(observer, "employee_fallback", "completed", f"candidates={len(options)}")
+            except Exception as exc:
+                _emit(observer, "employee_fallback", "unavailable", type(exc).__name__)
+                options = ()
+            if options:
+                pending = PendingEmployeeConfirmation(
+                    original_question=question,
+                    mention=bound_references.unresolved_mention,
+                    options=options,
+                )
+                state = working.model_copy(update={"pending_employee_confirmation": pending})
+                return Clarification(reply=_confirmation_reply(pending, locale), state=state, reason="employee_confirmation")
         if bound_references.ambiguous:
             return Clarification(reply=_clarification("ambiguous_reference", locale), state=working, reason="ambiguous_reference")
 

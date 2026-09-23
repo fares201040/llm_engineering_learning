@@ -231,7 +231,7 @@ def evaluate_outcome(test: TestQuestion, outcome) -> BehaviorEval:
     expected_clarification = bool(test.expected_clarification_ids or test.expected_clarification_outcome)
     expected_execution = not (expected_unsupported or expected_clarification or test.expected_error)
     pending = outcome.state.pending_employee_confirmation
-    pending_ids = [pending.employee_id] if pending is not None else []
+    pending_ids = [option.employee_id for option in pending.options] if pending is not None else []
     matched_count = len(rows)
     if calculation and calculation.get("operation") == "count" and calculation.get("value") is not None:
         matched_count = calculation["value"]
@@ -278,7 +278,8 @@ def evaluate_behavior(test: TestQuestion) -> BehaviorEval:
         if expected.expected_employee_ids is not None:
             multi_turn_ok = multi_turn_ok and list(state.active_employee_ids) == expected.expected_employee_ids
         if expected.expected_pending_ids is not None:
-            multi_turn_ok = multi_turn_ok and ([pending.employee_id] if pending else []) == expected.expected_pending_ids
+            pending_ids = [option.employee_id for option in pending.options] if pending else []
+            multi_turn_ok = multi_turn_ok and pending_ids == expected.expected_pending_ids
         multi_turn_ok = multi_turn_ok and all(item.casefold() in outcome.reply.casefold() for item in expected.expected_answer_facts)
         history.extend(({"role": "user", "content": expected.user}, {"role": "assistant", "content": outcome.reply}))
     return result.model_copy(update={"multi_turn_ok": multi_turn_ok})

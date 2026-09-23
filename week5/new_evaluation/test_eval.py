@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from week5.new_evaluation.eval import canonical_expression, evaluate_outcome
-from week5.new_evaluation.test import TestQuestion, load_tests
+from week5.new_evaluation.test import TestQuestion, load_tests as load_evaluation_tests
 from week5.new_implementation.online.pipeline import Answered, Clarification, Unsupported
 from week5.new_implementation.online.query import (
     All,
@@ -16,13 +16,13 @@ from week5.new_implementation.online.query import (
     Ordering,
     OutputComponent,
 )
-from week5.new_implementation.online.reference import PendingEmployeeConfirmation
+from week5.new_implementation.online.reference import EmployeeOption, PendingEmployeeConfirmation
 from week5.new_implementation.online.state import ConversationState, VerifiedTurn
 
 
 class EvaluatorTests(unittest.TestCase):
     def test_complete_behavior_corpus_has_311_cases(self):
-        self.assertEqual(len(load_tests()), 311)
+        self.assertEqual(len(load_evaluation_tests()), 311)
 
     def test_nested_all_any_not_is_preserved(self):
         expression = All(
@@ -77,8 +77,7 @@ class EvaluatorTests(unittest.TestCase):
         pending = PendingEmployeeConfirmation(
             original_question="show Fare",
             mention="Fare",
-            employee_id="A1",
-            employee_name="Faris",
+            options=(EmployeeOption(employee_id="A1", employee_name="Faris"),),
         )
         clarification = Clarification(
             reply="Did you mean Faris (A1)?",

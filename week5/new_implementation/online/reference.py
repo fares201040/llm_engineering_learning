@@ -25,6 +25,11 @@ class Employee(_Strict):
     name: str = Field(min_length=1, max_length=256)
 
 
+class EmployeeOption(_Strict):
+    employee_id: str = Field(min_length=1, max_length=64)
+    employee_name: str = Field(min_length=1, max_length=256)
+
+
 class CurrentReference(_Strict):
     kind: Literal["current"] = "current"
     key: str = Field(min_length=1, max_length=64)
@@ -61,14 +66,14 @@ class ReferenceResponse(_Strict):
 class PendingEmployeeConfirmation(_Strict):
     original_question: str = Field(min_length=1, max_length=50000)
     mention: str = Field(min_length=1, max_length=256)
-    employee_id: str = Field(min_length=1, max_length=64)
-    employee_name: str = Field(min_length=1, max_length=256)
+    options: tuple[EmployeeOption, ...] = Field(min_length=1, max_length=5)
 
 
 class BoundReferences(_Strict):
     employee_ids: tuple[str, ...]
     confirmation: PendingEmployeeConfirmation | None = None
     ambiguous: bool = False
+    unresolved_mention: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 _SYSTEM = """You identify employee references in one attendance question.
@@ -176,23 +181,83 @@ def bind_references(
             resolved.append(exact_names[0].employee_id)
             continue
         if len(exact_names) > 1:
-            return BoundReferences(employee_ids=(), ambiguous=True)
+            return BoundReferences(employee_ids=(), ambiguous=True, unresolved_mention=span.text)
         scored = sorted(((_score(span.text, item), item) for item in directory), key=lambda pair: (-pair[0], pair[1].employee_id))
         if not scored or scored[0][0] < threshold:
-            return BoundReferences(employee_ids=(), ambiguous=True)
+            return BoundReferences(employee_ids=(), ambiguous=True, unresolved_mention=span.text)
         best_score, best = scored[0]
         if len(scored) > 1 and round(scored[1][0], 6) == round(best_score, 6):
-            return BoundReferences(employee_ids=(), ambiguous=True)
+            return BoundReferences(employee_ids=(), ambiguous=True, unresolved_mention=span.text)
         return BoundReferences(
             employee_ids=tuple(dict.fromkeys(resolved)),
             confirmation=PendingEmployeeConfirmation(
                 original_question=question,
                 mention=span.text,
-                employee_id=best.employee_id,
-                employee_name=best.name,
+                options=(EmployeeOption(employee_id=best.employee_id, employee_name=best.name),),
             ),
         )
     return BoundReferences(employee_ids=tuple(dict.fromkeys(resolved)))
+
+
+def search_employee_candidates(
+    mention: str,
+    directory: tuple[Employee, ...],
+    *,
+    embedding_model: str,
+    collection_name: str,
+    allowed_employee_ids: tuple[str, ...] | None,
+    limit: int = 5,
+) -> tuple[EmployeeOption, ...]:
+    """Return Chroma candidates only after authoritative directory verification."""
+
+    if not directory or limit < 1:
+        return ()
+
+    from openai import OpenAI
+
+    from ..chroma_client import create_chroma_client
+
+    vector = OpenAI().embeddings.create(
+        model=embedding_model,
+        input=[mention],
+        timeout=30,
+    ).data[0].embedding
+    where: dict[str, object] = {"domain": "attendance"}
+    if allowed_employee_ids is not None:
+        if not allowed_employee_ids:
+            return ()
+        where = {
+            "$and": [
+                {"domain": "attendance"},
+                {"Employee_ID": {"$in": list(allowed_employee_ids)}},
+            ]
+        }
+    collection = create_chroma_client().get_collection(collection_name)
+    result = collection.query(
+        query_embeddings=[vector],
+        n_results=max(limit * 4, limit),
+        where=where,
+        include=["metadatas"],
+    )
+    authoritative = {item.employee_id: item for item in directory}
+    candidates: list[EmployeeOption] = []
+    seen: set[str] = set()
+    metadata_rows = (result.get("metadatas") or [[]])[0]
+    for metadata in metadata_rows:
+        if not isinstance(metadata, dict):
+            continue
+        employee_id = str(metadata.get("Employee_ID") or "")
+        employee = authoritative.get(employee_id)
+        if employee is None or employee_id in seen:
+            continue
+        indexed_name = metadata.get("Name")
+        if indexed_name is not None and _normalize(str(indexed_name)) != _normalize(employee.name):
+            continue
+        seen.add(employee_id)
+        candidates.append(EmployeeOption(employee_id=employee_id, employee_name=employee.name))
+        if len(candidates) == limit:
+            break
+    return tuple(candidates)
 
 
 __all__ = [
@@ -200,6 +265,7 @@ __all__ = [
     "BoundReferences",
     "CurrentReference",
     "Employee",
+    "EmployeeOption",
     "FUZZY_THRESHOLD",
     "PendingEmployeeConfirmation",
     "PriorReference",
@@ -207,4 +273,5 @@ __all__ = [
     "ReferenceResponse",
     "bind_references",
     "request_references",
+    "search_employee_candidates",
 ]

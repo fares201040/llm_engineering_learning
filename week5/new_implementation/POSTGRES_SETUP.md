@@ -94,3 +94,8 @@ LLM_ANSWER_VERIFIER_MODEL=openai/gpt-4.1-nano
 
 The shared active-turn limit is eleven provider calls. Keep
 `POSTGRES_READONLY_DSN` configured independently from the ingestion writer DSN.
+
+Employee lookup uses the authorized PostgreSQL directory first. If a written name or
+ID remains unresolved, the runtime may query the configured Chroma collection and
+show up to five choices. These choices are restricted to the caller's employee scope,
+cross-checked against PostgreSQL, and never trusted until the user confirms one.

@@ -60,11 +60,15 @@ and validates one coherent output.
 
 Employee identity never enters the provider-authored query. Exact authoritative IDs
 and names bind immediately. A single deterministic fuzzy candidate at or above the
-existing 0.62 threshold requires explicit confirmation; ties or no qualifying match
-require an exact ID or name. Trusted prior employee references use opaque IDs.
+existing 0.62 threshold requires explicit confirmation. When a written reference is
+still unresolved, Chroma semantic search is a fallback, not an identity authority.
+It searches only the caller's allowed employee scope and returns at most five options;
+each option must match the current PostgreSQL directory and the user must select it by
+number, exact ID, or exact name. No result falls back to requesting an exact ID or
+name. Trusted prior employee references use opaque IDs.
 
 `ConversationState` contains only the runtime version, session ID, verified turns,
-active employee IDs, and at most one pending confirmation. Incompatible state resets
+active employee IDs, and at most one pending set of employee options. Incompatible state resets
 safely. An answered turn publishes its verified frame and transcript atomically. A
 clarification publishes only pending confirmation state. Unsupported and failed turns
 leave state unchanged.

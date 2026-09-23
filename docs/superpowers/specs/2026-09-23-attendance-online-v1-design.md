@@ -39,48 +39,109 @@ The root facade continues to expose `answer_question`, `answer_question_with_sta
 The staged logical graph is replaced by one flat attendance query:
 
 ```text
+BoundSubject
+|- mode: employees | criteria | union | intersection | all_authorized
+|- employee_ids: authoritative application-owned IDs
+`- criteria_filters: condition | predicate | all | any | not
+
 AttendanceQuery
 |- filters: condition | predicate | all | any | not
-`- output:
-   |- Rows(fields, ordering, limit)
-   `- Aggregate(measures, group_by, having, ordering, limit)
+`- output: Rows(...) | Aggregate(...)
 ```
 
 Supported behavior is limited to filters, projections, aggregates, grouping/HAVING,
 ordering, limits, and narrative retrieval. Derive, compare, join, set, ranking,
 window, macros, multi-source graphs, and multi-unit execution are unsupported.
 
-The semantic writer emits evidence-backed filter components and exactly one output
-or narrative component. A new request is complete. A modify or repeat request may
+The semantic writer converts subject-criteria spans into separate evidence-backed
+criteria filters, emits result filters, and emits exactly one output or narrative
+component. A new request is complete. A modify or repeat request may
 retain explicitly named opaque components from one prior verified turn. The
 materializer starts empty, includes only named components, adds current components,
 and validates one coherent output.
 
+## Generic subject resolution
+
+The reference provider receives the current message, exact-offset guide, and verified
+active subject. It receives no physical schema and no fixed list of department,
+attendance, or hours columns. It returns:
+
+```text
+SubjectReference
+|- mode: employees | criteria | union | intersection | all_authorized
+|- employees: explicit ID/name/identity-claim values with exact spans
+|- criteria: exact natural-language spans describing other employees
+`- scope_cue: exact span required for all_authorized
+```
+
+Examples of criteria spans include `Engineering employees`, `employees absent in
+September`, and `employees who worked more than 8 hours`. The reference provider does
+not translate those phrases into fields, predicates, or SQL. The semantic writer owns
+that translation and may use any compatible field or predicate in the single logical
+catalog. No question phrase, department, status, exception, or hours field receives a
+special code path.
+
+The application requires criteria filters for `criteria`, `union`, and `intersection`;
+forbids them for `employees` and `all_authorized`; and verifies that their evidence is
+contained in the returned criteria spans. It also requires both explicit employees and
+criteria for union/intersection. The audit receives the immutable subject reference and
+checks that the criteria meaning was neither omitted nor duplicated as an ordinary
+result filter. A criterion that cannot be represented by the logical catalog returns a
+precise unsupported outcome; an unclear criterion returns clarification.
+
+Execution always applies authorization as an outer conjunction. It then compiles the
+requested subject as:
+
+```text
+employees:      authorized AND employee_id IN (...)
+criteria:       authorized AND criteria_filters
+union:          authorized AND (employee_id IN (...) OR criteria_filters)
+intersection:   authorized AND (employee_id IN (...) AND criteria_filters)
+all_authorized: authorized
+```
+
+All values remain PostgreSQL parameters. Main, coverage, witness, and narrative
+retrieval compile the same bound subject expression.
+
 ## Identity and state
 
-Employee identity never enters the provider-authored query. Exact authoritative IDs
-and names bind immediately. A single deterministic fuzzy candidate at or above the
+Employee IDs never enter the provider-authored query. Exact authoritative IDs and
+names bind immediately. A single deterministic fuzzy candidate at or above the
 existing 0.62 threshold requires explicit confirmation. When a written reference is
-still unresolved, Chroma semantic search is a fallback, not an identity authority.
-It searches only the caller's allowed employee scope and returns at most five options;
+still unresolved, Chroma semantic search is a fallback, not an identity authority. It
+searches only the caller's allowed employee scope and returns at most five options;
 each option must match the current PostgreSQL directory and the user must select it by
 number, exact ID, or exact name. No result falls back to requesting an exact ID or
-name. Trusted prior employee references use opaque IDs.
+name. Trusted prior subjects use their verified bound form.
+
+The reference provider returns the explicit employee value and exact evidence span,
+not offsets alone. A message containing both a name and ID produces one identity
+claim. The ID is the lookup key and PostgreSQL verifies the name. A matching ID binds
+without confirmation; a mismatch or unknown ID never reaches attendance planning.
+Identity-verification questions receive a deterministic grounded yes/no response.
+Criteria remain symbolic rather than expanding potentially large employee groups into
+conversation-state ID lists. A pending fuzzy employee confirmation retains the subject
+mode and criteria spans, so confirming one employee cannot discard the rest of the
+subject. Authorization is applied independently.
 
 `ConversationState` contains only the runtime version, session ID, verified turns,
-active employee IDs, and at most one pending set of employee options. Incompatible state resets
-safely. An answered turn publishes its verified frame and transcript atomically. A
+the active subject, façade-compatible active employee IDs, and at most one pending set
+of employee options. Incompatible state resets safely. An answered turn publishes its
+verified frame and transcript atomically. A
 clarification publishes only pending confirmation state. Unsupported and failed turns
 leave state unchanged.
 
 ## Safety and failure policy
 
 Application code validates the flat query against one catalog, binds authoritative
-employee scope, and compiles all literals and limits as PostgreSQL parameters. Main,
-coverage, and witness queries reuse the same bound query. Transactions are
+subject scope, and compiles all literals and limits as PostgreSQL parameters. Employee
+plus criteria wording is compiled as an explicit union or intersection. Main,
+coverage, witness, and narrative queries reuse the same bound scope. Transactions are
 repeatable-read and read-only with configured connection, statement, lock, idle, and
 row limits. Narrative retrieval fails closed when identical employee scope cannot be
 enforced.
+Grounded answer facts include the authoritative PostgreSQL employee name whenever an
+employee ID is bound, and answer validation requires that name in the final response.
 
 An unavailable initial semantic audit may retain an already deterministically valid
 candidate. A credible rejection permits one repair. The repair must pass deterministic
@@ -91,6 +152,17 @@ publication.
 All structured model calls set transport retries to zero. The application-level
 ceiling remains eleven calls: reference 2, semantic writer 2, audit/repair 3, and
 answer writer/verifier 4. Retrieval embeddings are measured separately.
+
+The flat runtime intentionally does not turn an aggregate result into a new employee
+set for another query. Direct requests such as grouping employees and applying HAVING
+remain supported. Combining an explicit employee with a cohort defined by an
+aggregate from a different period requires a set/subquery stage and returns a precise
+unsupported result instead of silently changing meaning.
+
+The generic criteria-span reference contract remains valid if a later approved design
+replaces the structured semantic writer with SQL output. That future boundary change
+must still preserve server-owned identity, authorization, parameter validation, and
+read-only execution; it is outside this design change.
 
 ## Observability and evaluation
 

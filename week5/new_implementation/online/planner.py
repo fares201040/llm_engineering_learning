@@ -74,6 +74,11 @@ class UnsupportedPlan(_Strict):
         "function",
         "narrative_scope",
         "complexity",
+        "malformed_identifier",
+        "malformed_value",
+        "reversed_temporal_range",
+        "unsupported_calculation",
+        "unsupported_constraint",
     ]
     detail: str = Field(min_length=1, max_length=500)
 

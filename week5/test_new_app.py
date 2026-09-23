@@ -1,12 +1,8 @@
 import unittest
 from unittest.mock import patch
 
-try:
-    from week5.new_implementation import answer
-    from week5 import new_app
-except ModuleNotFoundError:
-    from new_implementation import answer
-    import new_app
+from week5 import new_app
+from week5.new_implementation import answer
 
 
 class ContextRenderingTests(unittest.TestCase):
@@ -48,40 +44,7 @@ class ContextRenderingTests(unittest.TestCase):
 
 class SessionStateTests(unittest.TestCase):
     def test_reset_conversation_clears_context_and_trusted_state(self):
-        selected = answer.EmployeeCandidate(
-            employee_id="A11017", name="Example Employee Alpha"
-        )
-        original = answer.ConversationState(
-            selected_employees=[selected],
-            referents=[
-                answer.EmployeeReferent(
-                    employee_id="A11017", name="Example Employee Alpha"
-                )
-            ],
-            active_referent_ids=["A11017"],
-            recent_frames=[
-                answer.ConversationTurnFrame(
-                    original_question="worked days",
-                    reply_locale="en",
-                    units=(
-                        answer.AttendanceUnitFrame(
-                            unit_id="unit-1",
-                            source_text="worked days",
-                            result=answer.ResultSnapshot(matched_count=1),
-                        ),
-                    ),
-                )
-            ],
-            pending_request=answer.PendingRequestFrame(
-                original_question="Which employee?", reply_locale="en"
-            ),
-            pending_question="Which employee?",
-            pending_proposal=answer.PlannerProposal(
-                status="unsupported",
-                unsupported_capabilities=["nested_boolean_filters"],
-            ),
-            pending_candidates=[selected],
-        )
+        original = answer.ConversationState(active_employee_ids=("A11017",))
 
         context, state = new_app.reset_conversation(original)
 
@@ -118,26 +81,22 @@ class SessionStateTests(unittest.TestCase):
     def test_chat_with_state_returns_an_independent_updated_session(self):
         first = answer.ConversationState()
         second = answer.ConversationState()
-        selected = answer.EmployeeCandidate(
-            employee_id="A11000", name="Alex Example North"
-        )
-
         with patch.object(
             new_app,
             "answer_question_with_state",
             return_value=(
                 "Selected Alex Example North.",
                 [],
-                answer.ConversationState(selected_employees=[selected]),
+                answer.ConversationState(active_employee_ids=("A11000",)),
             ),
         ):
             _history, _context, updated = new_app.chat_with_state(
                 [{"role": "user", "content": "1"}], first
             )
 
-        self.assertEqual(updated.selected_employees, [selected])
-        self.assertEqual(first.selected_employees, [])
-        self.assertEqual(second.selected_employees, [])
+        self.assertEqual(updated.active_employee_ids, ("A11000",))
+        self.assertEqual(first.active_employee_ids, ())
+        self.assertEqual(second.active_employee_ids, ())
 
     def test_unexpected_answer_error_is_logged_and_rendered_safely(self):
         history = [{"role": "user", "content": "Show attendance"}]

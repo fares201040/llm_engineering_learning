@@ -1,24 +1,14 @@
-import logging
 import html
+import logging
 
 import gradio as gr
 
-if __package__:
-    from .new_implementation.answer import (
-        ConversationState,
-        LOCAL_DEMO_ACCESS,
-        answer_question_with_state,
-    )
-    from .new_implementation.config import settings
-    from .new_implementation.language_understanding import analyze_question_surface
-else:
-    from new_implementation.answer import (
-        ConversationState,
-        LOCAL_DEMO_ACCESS,
-        answer_question_with_state,
-    )
-    from new_implementation.config import settings
-    from new_implementation.language_understanding import analyze_question_surface
+from .new_implementation.answer import (
+    ConversationState,
+    LOCAL_DEMO_ACCESS,
+    answer_question_with_state,
+)
+from .new_implementation.config import settings
 
 
 logger = logging.getLogger(__name__)
@@ -64,7 +54,7 @@ def chat_with_state(history, state):
         logger.error("APDC attendance answer failed safely")
         answer = (
             "تعذر إكمال هذا الطلب بأمان. يرجى المحاولة مرة أخرى."
-            if analyze_question_surface(last_message).reply_locale == "ar"
+            if any("\u0600" <= char <= "\u06ff" for char in last_message)
             else "I couldn't complete that request safely. Please try again."
         )
         context = []

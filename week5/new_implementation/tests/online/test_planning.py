@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import inspect
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from week5.new_implementation.online import answering, planner, reference
 from week5.new_implementation.online.answering import (
@@ -155,21 +155,21 @@ class ReferenceAndPlanningTests(unittest.TestCase):
             "always state its inclusive available_start-to-available_end range",
             writer_prompt,
         )
-        self.assertIn("must not call an aggregate", writer_prompt)
+        self.assertIn("do not call it a sample at all", writer_prompt)
         self.assertIn("matched_count", verifier_prompt)
         self.assertIn("fetched row count", verifier_prompt)
         self.assertIn("date_coverage", writer_prompt)
         self.assertIn("database_date_coverage", writer_prompt)
         self.assertIn("do not infer table coverage from result rows", writer_prompt)
-        self.assertIn("not the full requested period", writer_prompt)
+        self.assertIn("only the available portion is covered", writer_prompt)
         self.assertIn("date_coverage", verifier_prompt)
         self.assertIn("reject an answer that omits", verifier_prompt)
-        self.assertIn("aggregate row a bounded sample", verifier_prompt)
+        self.assertIn("calls the result a sample", verifier_prompt)
         self.assertIn("table-coverage dates", verifier_prompt)
         self.assertIn("filtered result dates", verifier_prompt)
         self.assertIn("do not reject", verifier_prompt)
         self.assertIn("correct every listed rejection code", writer_prompt)
-        self.assertIn("did not request a date interval", writer_prompt)
+        self.assertIn("request_has_date_period", writer_prompt)
         self.assertIn("sole database-result row is authoritative", verifier_prompt)
         reference_prompt = " ".join(reference._SYSTEM.split()).casefold()
         self.assertIn("which employees", reference_prompt)
@@ -206,6 +206,7 @@ class ReferenceAndPlanningTests(unittest.TestCase):
                 "active_employees": [{"employee_id": "A1", "name": "Wail Ali"}]
             },
             active_employees=(Employee(employee_id="A1", name="Wail Ali"),),
+            as_of_date="2026-09-25",
             model="reference-model",
             budget=CallBudget(),
             timeout=1,
@@ -214,6 +215,7 @@ class ReferenceAndPlanningTests(unittest.TestCase):
 
         payload = call.call_args.kwargs["payload"]
         self.assertEqual(payload["current_question"], "what about September?")
+        self.assertEqual(payload["as_of_date"], "2026-09-25")
         self.assertIn("conversation_history", payload)
         self.assertIn("trusted_context", payload)
         self.assertNotIn("database_context", payload)
@@ -258,6 +260,242 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertFalse(bound.ambiguous)
         self.assertEqual(bound.employee_ids, ("A11017",))
         self.assertIn("Faris Nasser Ali (A11017)", bound.updated_request)
+
+    def test_single_active_employee_survives_incorrect_missing_employee_decision(self):
+        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
+        bound = bind_references(
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    locale="en",
+                    reason="missing_employee",
+                    rewritten_request=(
+                        "Show the absence dates for Synthetic Employee One (A11017)."
+                    ),
+                    employee_mention="Synthetic Employee One",
+                )
+            ),
+            (employee,),
+            original_question="Show the absence dates instead.",
+            active_employees=(employee,),
+        )
+
+        self.assertFalse(bound.ambiguous)
+        self.assertEqual(bound.employee_ids, ("A11017",))
+        self.assertIn("Synthetic Employee One (A11017)", bound.updated_request)
+
+    def test_general_scope_does_not_inherit_active_employee(self):
+        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
+        bound = bind_references(
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    locale="en",
+                    reason="missing_employee",
+                    rewritten_request="Which employees were absent?",
+                )
+            ),
+            (employee,),
+            original_question="Which employees were absent?",
+            active_employees=(employee,),
+        )
+
+        self.assertEqual(bound.employee_ids, ())
+        self.assertEqual(bound.subject_relationship, "all_authorized")
+
+    def test_grouped_aggregate_without_person_uses_general_scope(self):
+        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
+        bound = bind_references(
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    locale="en",
+                    reason="ambiguous_reference",
+                    rewritten_request="Group worked hours by department.",
+                )
+            ),
+            (employee,),
+            original_question="Group worked hours by department.",
+            active_employees=(employee,),
+        )
+
+        self.assertFalse(bound.ambiguous)
+        self.assertEqual(bound.employee_ids, ())
+        self.assertEqual(bound.subject_relationship, "all_authorized")
+
+    def test_grouped_aggregate_ignores_person_copied_only_from_history(self):
+        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
+        bound = bind_references(
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    locale="en",
+                    reason="missing_employee",
+                    rewritten_request=(
+                        "Group Synthetic Employee One's worked hours by department."
+                    ),
+                    employee_mention="Synthetic Employee One",
+                )
+            ),
+            (employee,),
+            original_question="Group worked hours by department.",
+            active_employees=(employee,),
+        )
+
+        self.assertEqual(bound.employee_ids, ())
+        self.assertEqual(bound.subject_relationship, "all_authorized")
+        self.assertEqual(
+            bound.updated_request, "Request:\nGroup worked hours by department."
+        )
+
+    def test_grouped_hours_with_person_pronoun_keeps_active_employee(self):
+        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
+        bound = bind_references(
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    locale="en",
+                    reason="missing_employee",
+                    rewritten_request="Group his hours by department.",
+                    employee_mention="Synthetic Employee One",
+                )
+            ),
+            (employee,),
+            original_question="Group his hours by department.",
+            active_employees=(employee,),
+        )
+
+        self.assertEqual(bound.employee_ids, ("A11017",))
+
+    def test_ready_grouping_does_not_inherit_an_unmentioned_person(self):
+        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
+        bound = bind_references(
+            response(
+                rewritten_request="Group Synthetic Employee One's hours by department.",
+                request_relationship="follow_up",
+                employee_names=("Synthetic Employee One",),
+                employee_ids=("A11017",),
+            ),
+            (employee,),
+            original_question="Group worked hours by department.",
+            active_employees=(employee,),
+        )
+
+        self.assertEqual(bound.employee_ids, ())
+        self.assertEqual(bound.subject_relationship, "all_authorized")
+
+    def test_that_follow_up_inherits_latest_general_scope_not_older_person(self):
+        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
+        bound = bind_references(
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    locale="en",
+                    reason="missing_employee",
+                    rewritten_request="Compare Synthetic Employee One with last month.",
+                    employee_mention="Synthetic Employee One",
+                )
+            ),
+            (employee,),
+            original_question="Compare that with last month.",
+            active_employees=(),
+            has_verified_turns=True,
+        )
+
+        self.assertEqual(bound.employee_ids, ())
+        self.assertEqual(bound.request_relationship, "follow_up")
+        self.assertEqual(bound.subject_relationship, "all_authorized")
+        self.assertEqual(
+            bound.updated_request, "Request:\nCompare that with last month."
+        )
+
+    def test_that_is_not_an_employee_mention(self):
+        bound = bind_references(
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    locale="en",
+                    reason="ambiguous_reference",
+                    rewritten_request="The subject of that is unclear.",
+                    employee_mention="that",
+                )
+            ),
+            (),
+            original_question="Compare that with last month.",
+            has_verified_turns=True,
+        )
+
+        self.assertEqual(bound.request_relationship, "follow_up")
+        self.assertEqual(bound.subject_relationship, "all_authorized")
+        self.assertFalse(bound.ambiguous)
+
+    def test_active_employee_fallback_keeps_current_question_polarity(self):
+        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
+        bound = bind_references(
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    locale="en",
+                    reason="missing_employee",
+                    rewritten_request=(
+                        "Show absence dates for Synthetic Employee One (A11017)."
+                    ),
+                    employee_mention="Synthetic Employee One",
+                )
+            ),
+            (employee,),
+            original_question="Show dates that are not absent.",
+            active_employees=(employee,),
+        )
+
+        self.assertEqual(bound.employee_ids, ("A11017",))
+        self.assertIn("Show dates that are not absent.", bound.updated_request)
+        self.assertNotIn("Show absence dates for", bound.updated_request)
+
+    def test_short_follow_up_inherits_single_active_employee_when_model_is_uncertain(
+        self,
+    ):
+        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
+        bound = bind_references(
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    locale="en",
+                    reason="ambiguous_reference",
+                    rewritten_request="Show the absence dates instead.",
+                )
+            ),
+            (employee,),
+            original_question="Show the absence dates instead.",
+            active_employees=(employee,),
+        )
+
+        self.assertEqual(bound.employee_ids, ("A11017",))
+        self.assertEqual(bound.request_relationship, "follow_up")
+
+    def test_short_follow_up_does_not_replace_an_explicit_unknown_name(self):
+        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
+        bound = bind_references(
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    locale="en",
+                    reason="ambiguous_reference",
+                    rewritten_request="Show Faris's dates.",
+                    employee_mention="Faris",
+                )
+            ),
+            (employee,),
+            original_question="Show Faris's dates.",
+            active_employees=(employee,),
+        )
+
+        self.assertTrue(bound.ambiguous)
+
+    def test_short_ready_request_for_active_employee_is_follow_up(self):
+        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
+        bound = bind_references(
+            response(
+                rewritten_request="Show dates that are not absent.",
+                request_relationship="new",
+                employee_names=("Synthetic Employee One",),
+            ),
+            (employee,),
+            original_question="Show dates that are not absent.",
+            active_employees=(employee,),
+        )
+
+        self.assertEqual(bound.request_relationship, "follow_up")
 
     def test_identity_claim_uses_id_first_and_mismatch_requires_confirmation(self):
         bound = bind_references(
@@ -702,14 +940,15 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertNotIn("field_id", bound.model_dump_json())
 
     @patch("week5.new_implementation.chroma_client.create_chroma_client")
-    @patch("openai.OpenAI")
-    def test_chroma_candidates_are_scope_filtered_and_postgres_cross_checked(
-        self, openai, chroma
+    @patch("week5.new_implementation.online.reference.get_embeddings", create=True)
+    @patch("openai.OpenAI", side_effect=AssertionError("paid embedding called"))
+    def test_chroma_candidates_use_local_embeddings_and_authoritative_scope(
+        self, _openai, local_embeddings, chroma
     ):
-        openai.return_value.embeddings.create.return_value.data = [
-            MagicMock(embedding=[0.1])
-        ]
-        collection = chroma.return_value.get_collection.return_value
+        local_embeddings.return_value.embed_documents.return_value = [[0.1] * 384]
+        local_embeddings.return_value.embed_query.return_value = [0.1] * 384
+        collection = chroma.return_value.get_or_create_collection.return_value
+        collection.get.return_value = {"ids": [], "metadatas": []}
         collection.query.return_value = {
             "metadatas": [
                 [
@@ -723,12 +962,18 @@ class ReferenceAndPlanningTests(unittest.TestCase):
             "Fares",
             (Employee(employee_id="A2", name="Faris Hassan"),),
             embedding_model="embedding-test",
+            embedding_provider="huggingface",
             collection_name="docs",
             allowed_employee_ids=("A2",),
         )
 
         self.assertEqual(
             options, (EmployeeOption(employee_id="A2", employee_name="Faris Hassan"),)
+        )
+        local_embeddings.assert_called_with("embedding-test", "huggingface")
+        self.assertEqual(collection.upsert.call_args.kwargs["ids"], ["A2"])
+        self.assertEqual(
+            len(collection.query.call_args.kwargs["query_embeddings"][0]), 384
         )
         self.assertEqual(
             collection.query.call_args.kwargs["where"],
@@ -757,9 +1002,12 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertEqual(sql, call.return_value)
         payload = call.call_args.kwargs["payload"]
         self.assertEqual(payload["current_question"], shared.current_question)
-        self.assertEqual(
-            payload["database_context"],
-            shared.model_payload()["database_context"],
+        expected_database = shared.model_payload()["database_context"]
+        for table in expected_database["tables"]:
+            table.pop("date_coverage", None)
+        self.assertEqual(payload["database_context"], expected_database)
+        self.assertIn(
+            "date_coverage", shared.model_payload()["database_context"]["tables"][0]
         )
         self.assertIn("schema_projection", payload)
 
@@ -948,11 +1196,14 @@ class ReferenceAndPlanningTests(unittest.TestCase):
     @patch("week5.new_implementation.online.answering.call_structured")
     def test_writer_and_verifier_use_same_model_and_shared_base_payload(self, call):
         call.side_effect = [
-            AnswerDraft(answer="Wail Ali worked 8 hours."),
+            AnswerDraft(
+                answer="Wail Ali worked 8 hours. Records are available from 2026-09-01 to 2026-09-07."
+            ),
             VerdictResponse(decision=VerdictPass()),
         ]
         shared = SharedModelContext(
             current_question="Show hours.",
+            as_of_date="2026-09-25",
             updated_request="Resolved employees:\n- Wail Ali (A1)\n\nRequest:\nShow hours.",
             conversation_history=({"role": "user", "content": "attendance for Wail"},),
             database_context=database_context(),
@@ -977,7 +1228,10 @@ class ReferenceAndPlanningTests(unittest.TestCase):
             max_output_tokens=100,
         )
 
-        self.assertEqual(answer, "Wail Ali worked 8 hours.")
+        self.assertEqual(
+            answer,
+            "Wail Ali worked 8 hours. Records are available from 2026-09-01 to 2026-09-07.",
+        )
         self.assertEqual(
             [item.kwargs["model"] for item in call.call_args_list],
             ["answer-model", "answer-model"],
@@ -1003,15 +1257,94 @@ class ReferenceAndPlanningTests(unittest.TestCase):
                 }
             ],
         )
+        self.assertEqual(
+            writer_payload["last_calendar_month_coverage"],
+            [
+                {
+                    "schema_name": "public",
+                    "table_name": "attendance_records",
+                    "fully_available": False,
+                    "available_overlap": None,
+                }
+            ],
+        )
         for key, value in writer_payload.items():
             self.assertEqual(verifier_payload[key], value)
+
+    def test_last_month_overlap_uses_actual_table_bounds(self):
+        shared = SharedModelContext(
+            current_question="Compare last month.",
+            as_of_date="2026-10-25",
+            updated_request="Request:\nCompare last month.",
+            database_context=database_context(),
+        )
+        result = SqlExecutionResult(
+            columns=(),
+            rows=(),
+            coverage=ExecutionCoverage(
+                fetched_rows=0, result_limit=100, response_bytes=2
+            ),
+        )
+        payload = answering._base_payload(
+            shared, sql="SELECT 1", result=result, employees=(), locale="en"
+        )
+
+        self.assertEqual(
+            payload["last_calendar_month_coverage"][0]["available_overlap"],
+            {"start": "2026-09-01", "end": "2026-09-07"},
+        )
+
+    @patch("week5.new_implementation.online.answering.call_structured")
+    def test_aggregate_answer_does_not_call_the_result_a_sample(self, call):
+        call.side_effect = [
+            AnswerDraft(
+                answer="The returned sample is complete. Data available 2026-09-01 to 2026-09-07."
+            ),
+            AnswerDraft(
+                answer="Total hours: 8. Data available 2026-09-01 to 2026-09-07."
+            ),
+            VerdictResponse(decision=VerdictPass()),
+        ]
+        shared = SharedModelContext(
+            current_question="Total hours?",
+            updated_request="Request:\nTotal hours?",
+            database_context=database_context(),
+        )
+        result = SqlExecutionResult(
+            columns=(),
+            rows=({"hours": 8},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=13
+            ),
+        )
+
+        answer = generate_answer(
+            shared_context=shared,
+            sql="SELECT 8 AS hours",
+            result=result,
+            employees=(),
+            locale="en",
+            model="answer-model",
+            budget=CallBudget(),
+            timeout=1,
+            max_output_tokens=100,
+        )
+
+        self.assertEqual(
+            answer, "Total hours: 8. Data available 2026-09-01 to 2026-09-07."
+        )
+        self.assertEqual(len(call.call_args_list), 3)
 
     @patch("week5.new_implementation.online.answering.call_structured")
     def test_one_rejected_answer_is_rewritten_and_reverified(self, call):
         call.side_effect = [
-            AnswerDraft(answer="Wail Ali worked 7 hours."),
+            AnswerDraft(
+                answer="Wail Ali worked 7 hours. Records are available from 2026-09-01 to 2026-09-07."
+            ),
             VerdictResponse(decision=VerdictReject(codes=("wrong_value",))),
-            AnswerDraft(answer="Wail Ali worked 8 hours."),
+            AnswerDraft(
+                answer="Wail Ali worked 8 hours. Records are available from 2026-09-01 to 2026-09-07."
+            ),
             VerdictResponse(decision=VerdictPass()),
         ]
         shared = SharedModelContext(
@@ -1039,8 +1372,89 @@ class ReferenceAndPlanningTests(unittest.TestCase):
             max_output_tokens=100,
         )
 
-        self.assertEqual(answer, "Wail Ali worked 8 hours.")
+        self.assertEqual(
+            answer,
+            "Wail Ali worked 8 hours. Records are available from 2026-09-01 to 2026-09-07.",
+        )
         self.assertEqual(call.call_count, 4)
+
+    @patch("week5.new_implementation.online.answering.call_structured")
+    def test_answer_without_date_request_does_not_invent_requested_period(self, call):
+        call.side_effect = [
+            AnswerDraft(answer="The requested period is 2026-08-03 to 2026-09-06."),
+            AnswerDraft(answer="Available records are from 2026-09-01 to 2026-09-07."),
+            VerdictResponse(decision=VerdictPass()),
+        ]
+        shared = SharedModelContext(
+            current_question="Group worked hours by department.",
+            updated_request="Request:\nGroup worked hours by department.",
+            database_context=database_context(),
+        )
+        result = SqlExecutionResult(
+            columns=(),
+            rows=({"hours": 8},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=13
+            ),
+        )
+
+        answer = generate_answer(
+            shared_context=shared,
+            sql="SELECT 8 AS hours",
+            result=result,
+            employees=(),
+            locale="en",
+            model="answer-model",
+            budget=CallBudget(),
+            timeout=1,
+            max_output_tokens=100,
+        )
+
+        self.assertEqual(answer, "Available records are from 2026-09-01 to 2026-09-07.")
+        self.assertEqual(call.call_count, 3)
+        self.assertEqual(
+            call.call_args_list[1].kwargs["payload"]["rewrite_after_rejection"][
+                "codes"
+            ],
+            ["wrong_coverage"],
+        )
+
+    @patch("week5.new_implementation.online.answering.call_structured")
+    def test_answer_repair_adds_missing_database_coverage_bounds(self, call):
+        call.side_effect = [
+            AnswerDraft(answer="Engineering had 56 hours."),
+            AnswerDraft(
+                answer="Engineering had 56 hours. Records are available from 2026-09-01 to 2026-09-07."
+            ),
+            VerdictResponse(decision=VerdictPass()),
+        ]
+        shared = SharedModelContext(
+            current_question="Group hours by department.",
+            updated_request="Request:\nGroup hours by department.",
+            database_context=database_context(),
+        )
+        result = SqlExecutionResult(
+            columns=(),
+            rows=({"hours": 56},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=14
+            ),
+        )
+
+        answer = generate_answer(
+            shared_context=shared,
+            sql="SELECT 56 AS hours",
+            result=result,
+            employees=(),
+            locale="en",
+            model="answer-model",
+            budget=CallBudget(),
+            timeout=1,
+            max_output_tokens=100,
+        )
+
+        self.assertIn("2026-09-01 to 2026-09-07", answer)
+        self.assertEqual(call.call_count, 3)
 
 
 if __name__ == "__main__":

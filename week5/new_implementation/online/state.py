@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import date
 from typing import Any, Literal
 from uuid import uuid4
 
@@ -25,7 +26,16 @@ class VerifiedTurn(_Strict):
     locale: Literal["en", "ar"]
     employees: tuple[Employee, ...] = Field(default=(), max_length=20)
     executed_sql: str = Field(min_length=1, max_length=100000)
+    date_scope: tuple[str, str] | None = None
     result: dict[str, object] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _valid_date_scope(self):
+        if self.date_scope is not None:
+            start, end = (date.fromisoformat(value) for value in self.date_scope)
+            if start > end:
+                raise ValueError("date scope must be ordered")
+        return self
 
     @property
     def employee_ids(self) -> tuple[str, ...]:
@@ -72,14 +82,16 @@ class ConversationState(_Strict):
                     "turn_id": turn.turn_id,
                     "original_question": turn.original_question,
                     "rewritten_request": turn.rewritten_request,
+                    "executed_sql": turn.executed_sql,
                     "answer": turn.answer,
                     "locale": turn.locale,
                     "employees": [
                         item.model_dump(mode="json") for item in turn.employees
                     ],
                     "result": turn.result,
+                    "date_scope": turn.date_scope,
                 }
-                for turn in self.verified_turns
+                for turn in self.verified_turns[-1:]
             ],
             "active_employees": [
                 item.model_dump(mode="json") for item in self.active_employees

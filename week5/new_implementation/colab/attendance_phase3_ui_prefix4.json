@@ -1,0 +1,596 @@
+{
+  "status": "running",
+  "scenario": "long",
+  "surface": "ui",
+  "total_turns": 8,
+  "completed_turns": 4,
+  "turns": [
+    {
+      "surface": "ui",
+      "turn_number": 1,
+      "question": "How many days did A11017 work during September 2026?",
+      "expected_outcome": "answered",
+      "expected_capability": null,
+      "expected_answer_groups": [
+        [
+          "5"
+        ],
+        [
+          "September 2026"
+        ]
+      ],
+      "expected_result_groups": [
+        [
+          "5"
+        ]
+      ],
+      "expected_result_rows": [],
+      "expected_sql_groups": [
+        [
+          "2026-09-01"
+        ],
+        [
+          "2026-09-30"
+        ]
+      ],
+      "forbidden_sql_terms": [],
+      "expected_row_count": null,
+      "expected_answer_order": [],
+      "expected_result_order": [],
+      "outcome": "answered",
+      "failure_code": null,
+      "capability": null,
+      "reply": "Synthetic Employee One (A11017) worked for 5 days during September 2026.\n\nThe attendance records are available from 2026-08-03 to 2026-09-06. Since the requested period extends beyond the available data, this result covers only the portion of September 2026 for which data exists (September 1, 2026 to September 6, 2026), and not the full requested period.",
+      "result": {
+        "columns": [
+          {
+            "name": "worked_days",
+            "type_code": "20"
+          }
+        ],
+        "rows": [
+          {
+            "worked_days": 5
+          }
+        ],
+        "coverage": {
+          "fetched_rows": 1,
+          "result_limit": 100,
+          "response_bytes": 19,
+          "complete": true
+        }
+      },
+      "verified_turns": 1,
+      "outcome_ok": true,
+      "semantic_ok": true,
+      "locale_ok": true,
+      "missing_answer_facts": [],
+      "missing_result_facts": [],
+      "missing_sql_facts": [],
+      "state_continuity_ok": true,
+      "passed": true
+    },
+    {
+      "surface": "ui",
+      "turn_number": 2,
+      "question": "Show the absence dates instead.",
+      "expected_outcome": "answered",
+      "expected_capability": null,
+      "expected_answer_groups": [
+        [
+          "2026-09-06",
+          "September 6, 2026",
+          "Sep 6, 2026",
+          "Sep 06, 2026"
+        ]
+      ],
+      "expected_result_groups": [
+        [
+          "2026-09-06",
+          "September 6, 2026",
+          "Sep 6, 2026",
+          "Sep 06, 2026"
+        ]
+      ],
+      "expected_result_rows": [],
+      "expected_sql_groups": [
+        [
+          "2026-09-01"
+        ],
+        [
+          "2026-09-30"
+        ]
+      ],
+      "forbidden_sql_terms": [
+        "total_worked_hrs",
+        "day_type"
+      ],
+      "expected_row_count": null,
+      "expected_answer_order": [],
+      "expected_result_order": [],
+      "outcome": "answered",
+      "failure_code": null,
+      "capability": null,
+      "reply": "Synthetic Employee One (A11017) has one absence date in September 2026.\n\nThe attendance records are available from 2026-08-03 to 2026-09-06. Since the requested period extends beyond the available data, this result covers only the portion of September 2026 for which data exists (September 1, 2026 to September 6, 2026), and not the full requested period.\n\nThe specific absence date is:\n- 2026-09-06",
+      "result": {
+        "columns": [
+          {
+            "name": "attendance_date",
+            "type_code": "1082"
+          }
+        ],
+        "rows": [
+          {
+            "attendance_date": "2026-09-06"
+          }
+        ],
+        "coverage": {
+          "fetched_rows": 1,
+          "result_limit": 100,
+          "response_bytes": 34,
+          "complete": true
+        }
+      },
+      "verified_turns": 2,
+      "outcome_ok": true,
+      "semantic_ok": true,
+      "locale_ok": true,
+      "missing_answer_facts": [],
+      "missing_result_facts": [],
+      "missing_sql_facts": [],
+      "state_continuity_ok": true,
+      "passed": true
+    },
+    {
+      "surface": "ui",
+      "turn_number": 3,
+      "question": "Show dates that are not absent.",
+      "expected_outcome": "answered",
+      "expected_capability": null,
+      "expected_answer_groups": [
+        [
+          "2026-09-01",
+          "September 1",
+          "Sep 1"
+        ],
+        [
+          "2026-09-02",
+          "September 2",
+          "Sep 2"
+        ],
+        [
+          "2026-09-03",
+          "September 3",
+          "Sep 3"
+        ],
+        [
+          "2026-09-04",
+          "September 4",
+          "Sep 4"
+        ],
+        [
+          "2026-09-05",
+          "September 5",
+          "Sep 5"
+        ]
+      ],
+      "expected_result_groups": [
+        [
+          "2026-09-01",
+          "September 1",
+          "Sep 1"
+        ],
+        [
+          "2026-09-02",
+          "September 2",
+          "Sep 2"
+        ],
+        [
+          "2026-09-03",
+          "September 3",
+          "Sep 3"
+        ],
+        [
+          "2026-09-04",
+          "September 4",
+          "Sep 4"
+        ],
+        [
+          "2026-09-05",
+          "September 5",
+          "Sep 5"
+        ]
+      ],
+      "expected_result_rows": [],
+      "expected_sql_groups": [
+        [
+          "2026-09-01"
+        ],
+        [
+          "2026-09-30"
+        ]
+      ],
+      "forbidden_sql_terms": [],
+      "expected_row_count": 5,
+      "expected_answer_order": [],
+      "expected_result_order": [],
+      "outcome": "answered",
+      "failure_code": null,
+      "capability": null,
+      "reply": "Synthetic Employee One (A11017) has the following dates that are not absent during September 2026:\n\n- 2026-09-01\n- 2026-09-02\n- 2026-09-03\n- 2026-09-04\n- 2026-09-05\n\nThe attendance records are available from 2026-08-03 to 2026-09-06. Since the requested period extends beyond the available data, this result covers only the portion of September 2026 for which data exists (September 1, 2026 to September 6, 2026), and not the full requested period.",
+      "result": {
+        "columns": [
+          {
+            "name": "attendance_date",
+            "type_code": "1082"
+          }
+        ],
+        "rows": [
+          {
+            "attendance_date": "2026-09-01"
+          },
+          {
+            "attendance_date": "2026-09-02"
+          },
+          {
+            "attendance_date": "2026-09-03"
+          },
+          {
+            "attendance_date": "2026-09-04"
+          },
+          {
+            "attendance_date": "2026-09-05"
+          }
+        ],
+        "coverage": {
+          "fetched_rows": 5,
+          "result_limit": 100,
+          "response_bytes": 166,
+          "complete": true
+        }
+      },
+      "verified_turns": 3,
+      "outcome_ok": true,
+      "semantic_ok": true,
+      "locale_ok": true,
+      "missing_answer_facts": [],
+      "missing_result_facts": [],
+      "missing_sql_facts": [],
+      "state_continuity_ok": true,
+      "passed": true
+    },
+    {
+      "reference_trace": {},
+      "surface": "ui",
+      "turn_number": 4,
+      "question": "Group worked hours by department having total hours over 10.",
+      "expected_outcome": "answered",
+      "expected_capability": null,
+      "expected_answer_groups": [
+        [
+          "Engineering"
+        ],
+        [
+          "56"
+        ],
+        [
+          "Finance"
+        ],
+        [
+          "36"
+        ],
+        [
+          "Operations"
+        ],
+        [
+          "16"
+        ],
+        [
+          "2026-08-03"
+        ],
+        [
+          "2026-09-06"
+        ]
+      ],
+      "expected_result_groups": [
+        [
+          "Engineering"
+        ],
+        [
+          "56"
+        ],
+        [
+          "Finance"
+        ],
+        [
+          "36"
+        ],
+        [
+          "Operations"
+        ],
+        [
+          "16"
+        ]
+      ],
+      "expected_result_rows": [
+        [
+          "Engineering",
+          "56"
+        ],
+        [
+          "Finance",
+          "36"
+        ],
+        [
+          "Operations",
+          "16"
+        ]
+      ],
+      "expected_sql_groups": [],
+      "forbidden_sql_terms": [
+        "employee_id",
+        "attendance_date"
+      ],
+      "forbidden_answer_terms": [
+        "requested period"
+      ],
+      "expected_row_count": null,
+      "expected_answer_order": [],
+      "expected_result_order": [],
+      "outcome": "answered",
+      "failure_code": null,
+      "capability": null,
+      "reply": "The following departments have total worked hours exceeding 10 based on attendance records available from 2026-08-03 to 2026-09-06:\n\n*   **Operations**: 16.0 total hours\n*   **Finance**: 36.0 total hours\n*   **Engineering**: 56.0 total hours\n\nNo specific employees were identified in this query result.",
+      "result": {
+        "columns": [
+          {
+            "name": "department",
+            "type_code": "25"
+          },
+          {
+            "name": "total_hours",
+            "type_code": "1700"
+          }
+        ],
+        "rows": [
+          {
+            "department": "Operations",
+            "total_hours": 16.0
+          },
+          {
+            "department": "Finance",
+            "total_hours": 36.0
+          },
+          {
+            "department": "Engineering",
+            "total_hours": 56.0
+          }
+        ],
+        "coverage": {
+          "fetched_rows": 3,
+          "result_limit": 100,
+          "response_bytes": 140,
+          "complete": true
+        }
+      },
+      "verified_turns": 4,
+      "outcome_ok": true,
+      "semantic_ok": true,
+      "locale_ok": true,
+      "missing_answer_facts": [],
+      "missing_result_facts": [],
+      "missing_sql_facts": [],
+      "state_continuity_ok": true,
+      "passed": true
+    }
+  ],
+  "state": {
+    "runtime_version": "attendance-online/v1",
+    "session_id": "acceptance-long",
+    "verified_turns": [
+      {
+        "turn_id": "77d1f5e003a44c34b5984a2cf0d79d79",
+        "original_question": "How many days did A11017 work during September 2026?",
+        "rewritten_request": "Resolved employees:\n- Synthetic Employee One (A11017)\n\nRequest:\nCount the number of working days for employee A11017 during September 2026.",
+        "answer": "Synthetic Employee One (A11017) worked for 5 days during September 2026.\n\nThe attendance records are available from 2026-08-03 to 2026-09-06. Since the requested period extends beyond the available data, this result covers only the portion of September 2026 for which data exists (September 1, 2026 to September 6, 2026), and not the full requested period.",
+        "locale": "en",
+        "employees": [
+          {
+            "employee_id": "A11017",
+            "name": "Synthetic Employee One"
+          }
+        ],
+        "executed_sql": "SELECT COUNT(DISTINCT attendance_date) AS worked_days\nFROM public.attendance_records\nWHERE employee_id = 'A11017' AND total_worked_hrs > 0 AND attendance_date >= '2026-09-01' AND attendance_date <= '2026-09-30';",
+        "date_scope": [
+          "2026-09-01",
+          "2026-09-30"
+        ],
+        "result": {
+          "columns": [
+            {
+              "name": "worked_days",
+              "type_code": "20"
+            }
+          ],
+          "rows": [
+            {
+              "worked_days": 5
+            }
+          ],
+          "coverage": {
+            "fetched_rows": 1,
+            "result_limit": 100,
+            "response_bytes": 19,
+            "complete": true
+          }
+        }
+      },
+      {
+        "turn_id": "9f345378fb464f71ab2568ec27d6f63d",
+        "original_question": "Show the absence dates instead.",
+        "rewritten_request": "Resolved employees:\n- Synthetic Employee One (A11017)\n\nRequest:\nShow the absence dates instead.",
+        "answer": "Synthetic Employee One (A11017) has one absence date in September 2026.\n\nThe attendance records are available from 2026-08-03 to 2026-09-06. Since the requested period extends beyond the available data, this result covers only the portion of September 2026 for which data exists (September 1, 2026 to September 6, 2026), and not the full requested period.\n\nThe specific absence date is:\n- 2026-09-06",
+        "locale": "en",
+        "employees": [
+          {
+            "employee_id": "A11017",
+            "name": "Synthetic Employee One"
+          }
+        ],
+        "executed_sql": "SELECT attendance_date\nFROM public.attendance_records\nWHERE employee_id = 'A11017'\n  AND attendance_date >= '2026-09-01'\n  AND attendance_date <= '2026-09-30'\n  AND exception = 'Absent';",
+        "date_scope": [
+          "2026-09-01",
+          "2026-09-30"
+        ],
+        "result": {
+          "columns": [
+            {
+              "name": "attendance_date",
+              "type_code": "1082"
+            }
+          ],
+          "rows": [
+            {
+              "attendance_date": "2026-09-06"
+            }
+          ],
+          "coverage": {
+            "fetched_rows": 1,
+            "result_limit": 100,
+            "response_bytes": 34,
+            "complete": true
+          }
+        }
+      },
+      {
+        "turn_id": "fa12477330f842289d10297f776b7da4",
+        "original_question": "Show dates that are not absent.",
+        "rewritten_request": "Resolved employees:\n- Synthetic Employee One (A11017)\n\nRequest:\nShow dates that are not absent.",
+        "answer": "Synthetic Employee One (A11017) has the following dates that are not absent during September 2026:\n\n- 2026-09-01\n- 2026-09-02\n- 2026-09-03\n- 2026-09-04\n- 2026-09-05\n\nThe attendance records are available from 2026-08-03 to 2026-09-06. Since the requested period extends beyond the available data, this result covers only the portion of September 2026 for which data exists (September 1, 2026 to September 6, 2026), and not the full requested period.",
+        "locale": "en",
+        "employees": [
+          {
+            "employee_id": "A11017",
+            "name": "Synthetic Employee One"
+          }
+        ],
+        "executed_sql": "SELECT attendance_date\nFROM public.attendance_records\nWHERE employee_id = 'A11017'\n  AND attendance_date >= '2026-09-01'::date\n  AND attendance_date <= '2026-09-30'::date\n  AND exception IS DISTINCT FROM 'Absent';",
+        "date_scope": [
+          "2026-09-01",
+          "2026-09-30"
+        ],
+        "result": {
+          "columns": [
+            {
+              "name": "attendance_date",
+              "type_code": "1082"
+            }
+          ],
+          "rows": [
+            {
+              "attendance_date": "2026-09-01"
+            },
+            {
+              "attendance_date": "2026-09-02"
+            },
+            {
+              "attendance_date": "2026-09-03"
+            },
+            {
+              "attendance_date": "2026-09-04"
+            },
+            {
+              "attendance_date": "2026-09-05"
+            }
+          ],
+          "coverage": {
+            "fetched_rows": 5,
+            "result_limit": 100,
+            "response_bytes": 166,
+            "complete": true
+          }
+        }
+      },
+      {
+        "turn_id": "2c6045193c554acea18a33b766aa5715",
+        "original_question": "Group worked hours by department having total hours over 10.",
+        "rewritten_request": "Request:\nGroup worked hours by department having total hours over 10.",
+        "answer": "The following departments have total worked hours exceeding 10 based on attendance records available from 2026-08-03 to 2026-09-06:\n\n*   **Operations**: 16.0 total hours\n*   **Finance**: 36.0 total hours\n*   **Engineering**: 56.0 total hours\n\nNo specific employees were identified in this query result.",
+        "locale": "en",
+        "employees": [],
+        "executed_sql": "SELECT department, SUM(total_worked_hrs) AS total_hours\nFROM attendance_records\nGROUP BY department\nHAVING SUM(total_worked_hrs) > 10;",
+        "date_scope": null,
+        "result": {
+          "columns": [
+            {
+              "name": "department",
+              "type_code": "25"
+            },
+            {
+              "name": "total_hours",
+              "type_code": "1700"
+            }
+          ],
+          "rows": [
+            {
+              "department": "Operations",
+              "total_hours": 16.0
+            },
+            {
+              "department": "Finance",
+              "total_hours": 36.0
+            },
+            {
+              "department": "Engineering",
+              "total_hours": 56.0
+            }
+          ],
+          "coverage": {
+            "fetched_rows": 3,
+            "result_limit": 100,
+            "response_bytes": 140,
+            "complete": true
+          }
+        }
+      }
+    ],
+    "active_employee_ids": [],
+    "active_employees": [],
+    "pending_employee_confirmation": null
+  },
+  "history": [
+    {
+      "role": "user",
+      "content": "How many days did A11017 work during September 2026?"
+    },
+    {
+      "role": "assistant",
+      "content": "Synthetic Employee One (A11017) worked for 5 days during September 2026.\n\nThe attendance records are available from 2026-08-03 to 2026-09-06. Since the requested period extends beyond the available data, this result covers only the portion of September 2026 for which data exists (September 1, 2026 to September 6, 2026), and not the full requested period."
+    },
+    {
+      "role": "user",
+      "content": "Show the absence dates instead."
+    },
+    {
+      "role": "assistant",
+      "content": "Synthetic Employee One (A11017) has one absence date in September 2026.\n\nThe attendance records are available from 2026-08-03 to 2026-09-06. Since the requested period extends beyond the available data, this result covers only the portion of September 2026 for which data exists (September 1, 2026 to September 6, 2026), and not the full requested period.\n\nThe specific absence date is:\n- 2026-09-06"
+    },
+    {
+      "role": "user",
+      "content": "Show dates that are not absent."
+    },
+    {
+      "role": "assistant",
+      "content": "Synthetic Employee One (A11017) has the following dates that are not absent during September 2026:\n\n- 2026-09-01\n- 2026-09-02\n- 2026-09-03\n- 2026-09-04\n- 2026-09-05\n\nThe attendance records are available from 2026-08-03 to 2026-09-06. Since the requested period extends beyond the available data, this result covers only the portion of September 2026 for which data exists (September 1, 2026 to September 6, 2026), and not the full requested period."
+    },
+    {
+      "role": "user",
+      "content": "Group worked hours by department having total hours over 10."
+    },
+    {
+      "role": "assistant",
+      "content": "The following departments have total worked hours exceeding 10 based on attendance records available from 2026-08-03 to 2026-09-06:\n\n*   **Operations**: 16.0 total hours\n*   **Finance**: 36.0 total hours\n*   **Engineering**: 56.0 total hours\n\nNo specific employees were identified in this query result."
+    }
+  ],
+  "passed": null
+}

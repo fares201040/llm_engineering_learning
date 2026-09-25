@@ -107,13 +107,40 @@ columns are omitted. The answer writer and verifier receive the current question
 history, trusted context, date-coverage summary, executed SQL, result, and authoritative
 employees, but not the schema.
 
-Employee lookup uses the authorized PostgreSQL directory first. If a written name or
-ID remains unresolved, the runtime may query the configured Chroma collection and
-show up to five choices. These choices are restricted to the caller's employee scope,
+Employee lookup uses the authorized PostgreSQL directory first. A written name that
+does not match exactly gets whole-name trigram candidates, followed by first-name
+token candidates if the whole-name search is empty. These are confirmation choices,
+not automatic identity matches. If no PostgreSQL candidates appear, the runtime may
+query the configured Chroma collection and show up to five choices. All choices are
+restricted to the caller's employee scope,
 cross-checked against PostgreSQL, and never trusted until the user confirms one. The
-existing Chroma fallback obtains query embeddings through the configured OpenAI
-embedding client; local Qwen covers the three conversational roles, but this separate
-fallback may require OpenAI embedding access if it is invoked.
+The default embedding provider is local Hugging Face with
+`EMBEDDING_MODEL=all-MiniLM-L6-v2` (384 dimensions). To select OpenAI, set
+`EMBEDDING_PROVIDER=openai` and `EMBEDDING_MODEL=text-embedding-3-large` (or omit
+the model setting to use that OpenAI default). The OpenAI backend needs
+`OPENAI_API_KEY` and available API credits. Restart the app after changing these
+settings; no Python changes are needed. Both
+employee names and narrative chunks use the selected provider. Chunk splitting uses
+that provider's tokenizer and input limit. Model-specific Chroma collection names
+keep incompatible vectors separate.
+
+After the first switch to OpenAI, build its document collection from the retained
+MiniLM collection while the OpenAI settings are active:
+
+```powershell
+$env:EMBEDDING_PROVIDER = "openai"
+$env:EMBEDDING_MODEL = "text-embedding-3-large"
+uv run python -u -m week5.new_implementation.rebuild_chroma --source-model all-MiniLM-L6-v2
+```
+
+The source collection remains available for switching back. Employee-name vectors
+are built from the authorized PostgreSQL directory when the Chroma fallback is used.
+To return to MiniLM, set `EMBEDDING_PROVIDER=huggingface` and
+`EMBEDDING_MODEL=all-MiniLM-L6-v2`, then restart the app; its existing Chroma
+collections are reused.
+If optional pgvector is enabled, set `PGVECTOR_DIMENSIONS` and use a matching
+`POSTGRES_CHUNKS_TABLE` for the selected model; an existing PostgreSQL `vector(384)`
+column cannot hold OpenAI's default 3072-dimensional vectors.
 
 ## Direct-SQL limitation
 
@@ -147,3 +174,10 @@ continuing. No production DSN, database tunnel, real attendance rows, or externa
 Google credential is needed. The generated test DSN remains in a mode-0600 runtime
 file inside the temporary Colab VM and is not placed in the source archive or a
 repository `.env` file.
+
+The 2026-09-25 synthetic Colab runs confirmed the helper's PostgreSQL fixture and
+Qwen smoke test after adding the Ollama installer's `zstd` prerequisite. Later
+Gradio callback acceptance verified turns 1–4, then stopped at an incorrect grouped
+relative-month comparison on turn 5. The runtime expired, and Colab returned
+`Service Unavailable` when creating a replacement T4. See the Colab sync guide for
+the pending source hash and resume checkpoint before live acceptance continues.

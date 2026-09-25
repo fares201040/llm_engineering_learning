@@ -74,6 +74,7 @@ class Settings:
     app_timezone: str
     max_exact_results: int
     final_k: int
+    embedding_provider: str
     embedding_model: str
     llm_reference_model: str
     llm_reference_timeout_seconds: float
@@ -110,8 +111,6 @@ class Settings:
     allow_empty_snapshot: bool
     allow_invalid_snapshot: bool
     allow_attendance_source_removal: bool
-    embedding_encoding: str
-    embedding_max_tokens: int
     embedding_batch_max_tokens: int
     embedding_batch_max_items: int
     chroma_batch_size: int
@@ -133,6 +132,9 @@ class Settings:
         planner_default_model = global_model or "openai/gpt-4.1-mini"
         answer_default_model = global_model or "openai/gpt-4.1"
         postgres_dsn = _text("POSTGRES_DSN", "")
+        embedding_provider = _text("EMBEDDING_PROVIDER", "huggingface").lower()
+        if embedding_provider not in {"huggingface", "openai"}:
+            raise ValueError("EMBEDDING_PROVIDER must be huggingface or openai")
         return cls(
             postgres_readonly_dsn=_text("POSTGRES_READONLY_DSN", postgres_dsn),
             postgres_connect_timeout_seconds=_integer(
@@ -147,7 +149,13 @@ class Settings:
             app_timezone=_text("APP_TIMEZONE", "Asia/Aden"),
             max_exact_results=_integer("MAX_EXACT_RESULTS", 100, 1),
             final_k=_integer("FINAL_K", 6, 1),
-            embedding_model=_text("EMBEDDING_MODEL", "text-embedding-3-large"),
+            embedding_provider=embedding_provider,
+            embedding_model=_text(
+                "EMBEDDING_MODEL",
+                "text-embedding-3-large"
+                if embedding_provider == "openai"
+                else "all-MiniLM-L6-v2",
+            ),
             llm_reference_model=_text("LLM_REFERENCE_MODEL", reference_default_model),
             llm_reference_timeout_seconds=_number(
                 "LLM_REFERENCE_TIMEOUT_SECONDS", 30.0, 0.1
@@ -200,7 +208,7 @@ class Settings:
             enable_postgres=_boolean("ENABLE_POSTGRES", False),
             postgres_dsn=postgres_dsn,
             enable_pgvector=_boolean("ENABLE_PGVECTOR", False),
-            pgvector_dimensions=_integer("PGVECTOR_DIMENSIONS", 3072, 1),
+            pgvector_dimensions=_integer("PGVECTOR_DIMENSIONS", 384, 1),
             enable_employee_period_chunks=_boolean(
                 "ENABLE_EMPLOYEE_PERIOD_CHUNKS", True
             ),
@@ -209,8 +217,6 @@ class Settings:
             allow_attendance_source_removal=_boolean(
                 "ALLOW_ATTENDANCE_SOURCE_REMOVAL", False
             ),
-            embedding_encoding=_text("EMBEDDING_ENCODING", "cl100k_base"),
-            embedding_max_tokens=_integer("EMBEDDING_MAX_TOKENS", 7500, 1),
             embedding_batch_max_tokens=_integer(
                 "EMBEDDING_BATCH_MAX_TOKENS", 250000, 1
             ),

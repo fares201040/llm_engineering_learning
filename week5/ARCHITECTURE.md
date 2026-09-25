@@ -29,9 +29,13 @@ and labelled trusted conversation state. It returns a complete rewritten request
 typed employee IDs, names and paired identity claims, general employee criteria, and
 their union/intersection relationship. It receives no database schema and produces no
 SQL. Explicit employees are resolved only inside the caller's authorized PostgreSQL
-directory. Exact ID/name resolution is followed by deterministic PostgreSQL fuzzy
-matching and then confirmation-only Chroma candidates that are cross-checked against
+directory. Exact ID/name resolution is followed by whole-name and, when needed,
+first-name token PostgreSQL candidate searches, then confirmation-only Chroma
+candidates that are cross-checked against
 that authorized directory. Unknown standalone IDs receive no suggestions.
+Employee names and narrative chunks use the configured Hugging Face or OpenAI
+embedding provider in separate, model-specific Chroma collections. Narrative text
+is split to the selected model's token limit before embedding.
 
 `online/context.py` builds a frozen physical database context from the configured
 attendance object allowlist. It includes PostgreSQL version, exact table/view and
@@ -148,3 +152,13 @@ That guide is the source of truth for packaging, the SHA-256-pinned Colab upload
 test execution, and optional live acceptance on a synthetic database. The 311-line
 manifest sent to Colab is generated placeholder data and is not the private evaluation
 corpus.
+
+The latest executed snapshot
+`d171a25ed2fe5cb11e3c2277ac10b8765a5fa33f1f7f4adaf571b827244ed60c`
+passed 149 deterministic Colab tests and static checks. The current snapshot is newer
+and remains untested because Colab returned `Service Unavailable` when creating a
+replacement T4 runtime. Synthetic Gradio callback turns 1–4 were verified in the
+long conversation. Turn 5 exposed grouped comparison errors: the planner applied
+the department threshold to August only, and the writer misstated date coverage.
+The acceptance oracle stopped the sequence before turns 6–8. Passing deterministic
+checks does not establish live multi-turn accuracy.

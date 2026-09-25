@@ -226,6 +226,7 @@ def search_employee_directory_postgres(
     table: str,
     allowed_employee_ids: tuple[str, ...] | None,
     threshold: float = 0.62,
+    token_threshold: float = 0.3,
     limit: int = 5,
     connect_timeout: int = 5,
 ):
@@ -262,6 +263,22 @@ def search_employee_directory_postgres(
                 "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
             )
             rows = connection.execute(sql, tuple(params)).fetchall()
+            if not rows:
+                token_sql = (
+                    'SELECT DISTINCT "employee_id", "name", '
+                    "similarity(lower(split_part(\"name\", ' ', 1)), "
+                    "lower(split_part(%s, ' ', 1))) AS match_score "
+                    f"FROM {_identifier(table)} "
+                    'WHERE "employee_id" IS NOT NULL AND "name" IS NOT NULL '
+                    "AND similarity(lower(split_part(\"name\", ' ', 1)), "
+                    "lower(split_part(%s, ' ', 1))) >= %s"
+                    f'{scope_sql} ORDER BY match_score DESC, "employee_id" ASC LIMIT %s'
+                )
+                token_params: list[object] = [mention, mention, token_threshold]
+                if allowed_employee_ids is not None:
+                    token_params.append(list(allowed_employee_ids))
+                token_params.append(limit)
+                rows = connection.execute(token_sql, tuple(token_params)).fetchall()
             connection.rollback()
         except Exception:
             connection.rollback()

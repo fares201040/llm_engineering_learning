@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import subprocess
 import time
 from urllib.error import URLError
@@ -100,31 +101,36 @@ def create_synthetic_database() -> str:
 
 
 def install_ollama() -> None:
-    installer = run(["curl", "-fsSL", "https://ollama.com/install.sh"]).stdout
-    try:
-        run(["bash"], input_text=installer)
-    except subprocess.CalledProcessError as exc:
-        detail = "\n".join(item for item in (exc.stdout, exc.stderr) if item)
-        detail = detail.strip()[-4000:] or "no installer output"
-        raise RuntimeError(f"Official Ollama installer failed: {detail}") from exc
+    if shutil.which("ollama") is None:
+        installer = run(["curl", "-fsSL", "https://ollama.com/install.sh"]).stdout
+        try:
+            run(["bash"], input_text=installer)
+        except subprocess.CalledProcessError as exc:
+            detail = "\n".join(item for item in (exc.stdout, exc.stderr) if item)
+            detail = detail.strip()[-4000:] or "no installer output"
+            raise RuntimeError(f"Official Ollama installer failed: {detail}") from exc
     server_env = os.environ.copy()
     server_env["OLLAMA_HOST"] = "127.0.0.1:11434"
     server_env["OLLAMA_NUM_PARALLEL"] = "1"
     log_handle = OLLAMA_LOG.open("ab")
     try:
-        server = subprocess.Popen(
-            ["ollama", "serve"],
-            env=server_env,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    except Exception:
-        log_handle.close()
-        raise
+        with urlopen("http://127.0.0.1:11434/api/tags", timeout=2):
+            server = None
+    except (OSError, URLError):
+        try:
+            server = subprocess.Popen(
+                ["ollama", "serve"],
+                env=server_env,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except Exception:
+            log_handle.close()
+            raise
 
     for _ in range(60):
-        if server.poll() is not None:
+        if server is not None and server.poll() is not None:
             log_handle.close()
             raise RuntimeError(
                 "Ollama server exited during startup; inspect its Colab log."
@@ -161,7 +167,7 @@ def main() -> None:
         raise RuntimeError("Colab setup needs its standard root notebook kernel.")
 
     run(["apt-get", "update", "-qq"])
-    run(["apt-get", "install", "-y", "postgresql", "postgresql-client"])
+    run(["apt-get", "install", "-y", "postgresql", "postgresql-client", "zstd"])
     run(["service", "postgresql", "start"])
     for _ in range(30):
         probe = subprocess.run(
@@ -173,26 +179,29 @@ def main() -> None:
     else:
         raise RuntimeError("Synthetic PostgreSQL did not start in Colab.")
 
-    dsn = create_synthetic_database()
-    settings = {
-        "ATTENDANCE_PHASE2_SOURCE_ROOT": str(SOURCE_ROOT),
-        "POSTGRES_READONLY_DSN": dsn,
-        "POSTGRES_ATTENDANCE_TABLE": "attendance_records",
-        "LLM_REFERENCE_MODEL": "ollama_chat/qwen3.5:4b",
-        "LLM_PLANNER_MODEL": "ollama_chat/qwen3.5:4b",
-        "LLM_PLANNER_MAX_OUTPUT_TOKENS": "512",
-        "LLM_ANSWER_MODEL": "ollama_chat/qwen3.5:4b",
-        "LLM_REFERENCE_TIMEOUT_SECONDS": "240",
-        "LLM_PLANNER_TIMEOUT_SECONDS": "240",
-        "LLM_ANSWER_TIMEOUT_SECONDS": "240",
-        "OLLAMA_API_BASE": "http://127.0.0.1:11434",
-        "OLLAMA_HOST": "127.0.0.1:11434",
-    }
-    os.environ.update(settings)
-    RUNTIME_CONFIG.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-    RUNTIME_CONFIG.chmod(0o600)
-
     install_ollama()
+    if RUNTIME_CONFIG.is_file():
+        settings = json.loads(RUNTIME_CONFIG.read_text(encoding="utf-8"))
+        dsn = settings["POSTGRES_READONLY_DSN"]
+    else:
+        dsn = create_synthetic_database()
+        settings = {
+            "ATTENDANCE_PHASE2_SOURCE_ROOT": str(SOURCE_ROOT),
+            "POSTGRES_READONLY_DSN": dsn,
+            "POSTGRES_ATTENDANCE_TABLE": "attendance_records",
+            "LLM_REFERENCE_MODEL": "ollama_chat/qwen3.5:4b",
+            "LLM_PLANNER_MODEL": "ollama_chat/qwen3.5:4b",
+            "LLM_PLANNER_MAX_OUTPUT_TOKENS": "512",
+            "LLM_ANSWER_MODEL": "ollama_chat/qwen3.5:4b",
+            "LLM_REFERENCE_TIMEOUT_SECONDS": "240",
+            "LLM_PLANNER_TIMEOUT_SECONDS": "240",
+            "LLM_ANSWER_TIMEOUT_SECONDS": "240",
+            "OLLAMA_API_BASE": "http://127.0.0.1:11434",
+            "OLLAMA_HOST": "127.0.0.1:11434",
+        }
+        RUNTIME_CONFIG.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        RUNTIME_CONFIG.chmod(0o600)
+    os.environ.update(settings)
     import psycopg
 
     with psycopg.connect(dsn) as connection:

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import date, timedelta
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -68,7 +71,16 @@ class SharedModelContext(_Strict):
     """The exact context reused downstream without reconstruction."""
 
     current_question: str = Field(min_length=1, max_length=50000)
+    as_of_date: str = Field(default_factory=lambda: date.today().isoformat())
     updated_request: str = Field(min_length=1, max_length=60000)
+    request_relationship: Literal["new", "follow_up"] = "new"
+    subject_relationship: Literal[
+        "employees", "criteria", "union", "intersection", "all_authorized"
+    ] = "all_authorized"
+    resolved_employee_ids: tuple[str, ...] = ()
+    required_date_scope: tuple[str, str] | None = None
+    request_has_date_period: bool = False
+    attendance_meaning: Literal["explicit_absence", "not_absent"] | None = None
     conversation_history: tuple[dict[str, str], ...] = Field(default=(), max_length=200)
     trusted_context: dict[str, object] = Field(default_factory=dict)
     database_type: str = "PostgreSQL"
@@ -79,9 +91,22 @@ class SharedModelContext(_Strict):
     )
 
     def model_payload(self) -> dict[str, object]:
+        first_current_month = date.fromisoformat(self.as_of_date).replace(day=1)
+        last_previous_month = first_current_month - timedelta(days=1)
         return {
             "current_question": self.current_question,
+            "as_of_date": self.as_of_date,
+            "last_calendar_month": {
+                "start": last_previous_month.replace(day=1).isoformat(),
+                "end": last_previous_month.isoformat(),
+            },
             "updated_request": self.updated_request,
+            "request_relationship": self.request_relationship,
+            "subject_relationship": self.subject_relationship,
+            "resolved_employee_ids": self.resolved_employee_ids,
+            "required_date_scope": self.required_date_scope,
+            "request_has_date_period": self.request_has_date_period,
+            "attendance_meaning": self.attendance_meaning,
             "conversation_history": list(self.conversation_history),
             "trusted_context": self.trusted_context,
             "database_type": self.database_type,

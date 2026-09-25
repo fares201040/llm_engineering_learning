@@ -15,6 +15,7 @@ from week5.new_implementation.online.execution import (
     load_employee_directory,
     search_employee_directory_postgres,
 )
+from week5.new_implementation.online.reference import EmployeeOption
 
 
 class Description:
@@ -165,6 +166,32 @@ class DirectExecutionTests(unittest.TestCase):
         self.assertIn('"employee_id" = ANY(%s)', sql)
         self.assertEqual(params[3], ["A1"])
         self.assertEqual(options[0].employee_id, "A1")
+
+    def test_fuzzy_directory_search_offers_shortened_misspelled_name(self):
+        class CandidateConnection(Connection):
+            def execute(self, sql, params=None):
+                self.calls.append((sql, params))
+                if sql.startswith("BEGIN"):
+                    return Cursor()
+                if "split_part" in sql:
+                    return Cursor(
+                        rows=({"employee_id": "A1", "name": "Faris Synthetic One"},)
+                    )
+                return Cursor()
+
+        connection = CandidateConnection(Cursor())
+        with fake_psycopg(connection):
+            options = search_employee_directory_postgres(
+                "Fares Other",
+                dsn="postgresql://test",
+                table="attendance_records",
+                allowed_employee_ids=("A1",),
+            )
+
+        self.assertEqual(
+            options,
+            (EmployeeOption(employee_id="A1", employee_name="Faris Synthetic One"),),
+        )
 
 
 if __name__ == "__main__":

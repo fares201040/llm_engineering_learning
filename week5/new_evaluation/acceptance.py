@@ -8,9 +8,10 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from unittest.mock import patch
 
 from ..new_implementation.online.execution import LOCAL_DEMO_ACCESS
-from ..new_implementation.online.pipeline import TurnRequest, run_turn
+from ..new_implementation.online.pipeline import TurnRequest, _locale, run_turn
 from ..new_implementation.online.state import ConversationState
 
 
@@ -21,7 +22,13 @@ class AcceptanceStep:
     expected_capability: str | None = None
     expected_answer_groups: tuple[tuple[str, ...], ...] = ()
     expected_result_groups: tuple[tuple[str, ...], ...] = ()
+    expected_result_rows: tuple[tuple[str, ...], ...] = ()
+    expected_sql_groups: tuple[tuple[str, ...], ...] = ()
+    forbidden_sql_terms: tuple[str, ...] = ()
+    forbidden_answer_terms: tuple[str, ...] = ()
+    expected_row_count: int | None = None
     expected_answer_order: tuple[str, ...] = ()
+    expected_result_order: tuple[str, ...] = ()
 
 
 SCENARIOS = {
@@ -63,6 +70,7 @@ SCENARIOS = {
             "answered",
             expected_answer_groups=(("5",), ("September 2026",)),
             expected_result_groups=(("5",),),
+            expected_sql_groups=(("2026-09-01",), ("2026-09-30",)),
         ),
         AcceptanceStep(
             "Show the absence dates instead.",
@@ -78,6 +86,8 @@ SCENARIOS = {
             expected_result_groups=(
                 ("2026-09-06", "September 6, 2026", "Sep 6, 2026", "Sep 06, 2026"),
             ),
+            expected_sql_groups=(("2026-09-01",), ("2026-09-30",)),
+            forbidden_sql_terms=("total_worked_hrs", "day_type"),
         ),
         AcceptanceStep(
             "Show dates that are not absent.",
@@ -96,6 +106,8 @@ SCENARIOS = {
                 ("2026-09-04", "September 4", "Sep 4"),
                 ("2026-09-05", "September 5", "Sep 5"),
             ),
+            expected_row_count=5,
+            expected_sql_groups=(("2026-09-01",), ("2026-09-30",)),
         ),
         AcceptanceStep(
             "Group worked hours by department having total hours over 10.",
@@ -107,6 +119,8 @@ SCENARIOS = {
                 ("36",),
                 ("Operations",),
                 ("16",),
+                ("2026-08-03",),
+                ("2026-09-06",),
             ),
             expected_result_groups=(
                 ("Engineering",),
@@ -116,6 +130,13 @@ SCENARIOS = {
                 ("Operations",),
                 ("16",),
             ),
+            expected_result_rows=(
+                ("Engineering", "56"),
+                ("Finance", "36"),
+                ("Operations", "16"),
+            ),
+            forbidden_sql_terms=("employee_id", "attendance_date"),
+            forbidden_answer_terms=("requested period",),
         ),
         AcceptanceStep(
             "Compare that with last month.",
@@ -123,27 +144,37 @@ SCENARIOS = {
             expected_answer_groups=(
                 ("Engineering",),
                 ("Finance",),
+                ("Operations",),
                 ("August 2026", "August"),
                 ("September 2026", "September"),
+                ("2026-08-31", "August 31"),
                 ("16",),
-                ("56",),
                 ("12",),
-                ("36",),
+                ("8",),
                 ("40",),
                 ("24",),
             ),
             expected_result_groups=(
                 ("Engineering",),
                 ("Finance",),
-                ("2026-08", "August"),
-                ("2026-09", "September"),
+                ("Operations",),
                 ("16",),
-                ("56",),
                 ("12",),
-                ("36",),
+                ("8",),
                 ("40",),
                 ("24",),
             ),
+            expected_result_rows=(
+                ("Engineering", "40", "16"),
+                ("Finance", "24", "12"),
+                ("Operations", "8"),
+            ),
+            expected_sql_groups=(
+                ("2026-08-01",),
+                ("2026-08-31",),
+                ("2026-09-01",),
+            ),
+            forbidden_answer_terms=("Difference: -", "is fully covered", "2026-08-06"),
         ),
         AcceptanceStep("Join attendance to payroll.", "unsupported", "schema"),
         AcceptanceStep(
@@ -165,7 +196,13 @@ SCENARIOS = {
                 ("Operations",),
                 ("16",),
             ),
+            expected_result_rows=(
+                ("Engineering", "56"),
+                ("Finance", "36"),
+                ("Operations", "16"),
+            ),
             expected_answer_order=("Engineering", "Finance", "Operations"),
+            expected_result_order=("Engineering", "Finance", "Operations"),
         ),
         AcceptanceStep(
             "Show a running total over dates.",
@@ -219,6 +256,34 @@ def _semantic_answer_check(
         ):
             missing_result.append(alternatives[0] if alternatives else "result fact")
 
+    rows = result.get("rows", []) if isinstance(result, dict) else []
+    if step.expected_row_count is not None and len(rows) != step.expected_row_count:
+        missing_result.append(f"result row count: {step.expected_row_count}")
+    normalized_rows = [
+        f" {_normalize_answer_fact(json.dumps(row, default=str))} " for row in rows
+    ]
+    for required_row in step.expected_result_rows:
+        if not any(
+            all(f" {_normalize_answer_fact(fact)} " in row for fact in required_row)
+            for row in normalized_rows
+        ):
+            missing_result.append(f"same result row: {', '.join(required_row)}")
+
+    last_row = -1
+    for fact in step.expected_result_order:
+        position = next(
+            (
+                index
+                for index in range(last_row + 1, len(normalized_rows))
+                if f" {_normalize_answer_fact(fact)} " in normalized_rows[index]
+            ),
+            -1,
+        )
+        if position < 0:
+            missing_result.append(f"result order: {fact}")
+            break
+        last_row = position
+
     last_position = -1
     for item in step.expected_answer_order:
         normalized_item = _normalize_answer_fact(item)
@@ -236,6 +301,7 @@ def run_scenario_turn(
     *,
     state: ConversationState | None = None,
     history: tuple[dict[str, str], ...] = (),
+    surface: Literal["pipeline", "ui"] = "pipeline",
 ) -> tuple[dict, ConversationState, tuple[dict[str, str], ...]]:
     if name not in SCENARIOS:
         raise ValueError(f"unknown scenario {name!r}")
@@ -254,14 +320,58 @@ def run_scenario_turn(
         raise ValueError(
             f"scenario {name!r} turn {turn_index + 1} has no semantic answer expectations"
         )
-    outcome = run_turn(
-        TurnRequest(
-            question=step.question,
-            history=history,
-            state=previous,
-            access_context=LOCAL_DEMO_ACCESS,
+    if surface == "ui":
+        from .. import new_app
+        from ..new_implementation import answer
+        from ..new_implementation.online import pipeline, provider
+
+        outcomes = []
+        reference_trace = {}
+        provider_log = provider.log_layer_output
+        pipeline_log = pipeline.log_layer_output
+
+        def trace_provider(layer, output, *, attempt=None):
+            if layer in {"reference", "answer_writer", "answer_verifier"}:
+                reference_trace[f"{layer}_{attempt}"] = output.model_dump(mode="json")
+            provider_log(layer, output, attempt=attempt)
+
+        def trace_pipeline(layer, output, *, attempt=None):
+            if layer in {"employee_resolution", "sql_execution"}:
+                reference_trace[layer] = output.model_dump(mode="json")
+            elif layer == "sql_planner":
+                reference_trace[f"{layer}_{attempt}"] = output
+            pipeline_log(layer, output, attempt=attempt)
+
+        def observe(request):
+            outcome = run_turn(request)
+            outcomes.append(outcome)
+            return outcome
+
+        with (
+            patch.object(answer, "run_turn", side_effect=observe),
+            patch.object(provider, "log_layer_output", side_effect=trace_provider),
+            patch.object(pipeline, "log_layer_output", side_effect=trace_pipeline),
+        ):
+            ui_history, _context, ui_state = new_app.chat_with_state(
+                [*history, {"role": "user", "content": step.question}], previous
+            )
+        if len(outcomes) != 1:
+            raise RuntimeError("Gradio callback did not execute exactly one turn")
+        outcome = outcomes[0]
+        if ui_history[-1] != {"role": "assistant", "content": outcome.reply}:
+            raise RuntimeError("Gradio callback changed the answer")
+        if ui_state != outcome.state:
+            raise RuntimeError("Gradio callback changed conversation state")
+    else:
+        reference_trace = {}
+        outcome = run_turn(
+            TurnRequest(
+                question=step.question,
+                history=history,
+                state=previous,
+                access_context=LOCAL_DEMO_ACCESS,
+            )
         )
-    )
     actual_kind = getattr(outcome, "kind", "failed")
     outcome_ok = actual_kind == step.expected_outcome
     capability = getattr(outcome, "capability", None)
@@ -294,7 +404,48 @@ def run_scenario_turn(
         latest_result,
         capability,
     )
+    missing_answer_facts.extend(
+        f"forbidden answer term: {term}"
+        for term in step.forbidden_answer_terms
+        if term.casefold() in outcome.reply.casefold()
+    )
+    if missing_answer_facts:
+        semantic_ok = False
+    latest_sql = (
+        next_turns[-1].executed_sql
+        if actual_kind == "answered" and len(next_turns) > len(prior_turns)
+        else ""
+    )
+    normalized_sql = f" {_normalize_answer_fact(latest_sql)} "
+    missing_sql_facts = [
+        alternatives[0]
+        for alternatives in step.expected_sql_groups
+        if not any(
+            f" {_normalize_answer_fact(item)} " in normalized_sql
+            for item in alternatives
+        )
+    ]
+    missing_sql_facts.extend(
+        f"forbidden SQL term: {term}"
+        for term in step.forbidden_sql_terms
+        if re.search(rf"\b{re.escape(term)}\b", latest_sql, re.IGNORECASE)
+    )
+    if missing_sql_facts:
+        semantic_ok = False
+    locale_ok = actual_kind != "answered" or (
+        bool(next_turns)
+        and next_turns[-1].locale == _locale(step.question)
+        and (
+            _locale(step.question) != "ar"
+            or any("\u0600" <= char <= "\u06ff" for char in outcome.reply)
+        )
+    )
+    if not locale_ok:
+        missing_answer_facts.append("requested answer language")
+        semantic_ok = False
     record = {
+        "reference_trace": reference_trace if not outcome_ok else {},
+        "surface": surface,
         "turn_number": turn_index + 1,
         "question": step.question,
         "expected_outcome": step.expected_outcome,
@@ -305,16 +456,25 @@ def run_scenario_turn(
         "expected_result_groups": [
             list(group) for group in step.expected_result_groups
         ],
+        "expected_result_rows": [list(row) for row in step.expected_result_rows],
+        "expected_sql_groups": [list(group) for group in step.expected_sql_groups],
+        "forbidden_sql_terms": list(step.forbidden_sql_terms),
+        "forbidden_answer_terms": list(step.forbidden_answer_terms),
+        "expected_row_count": step.expected_row_count,
         "expected_answer_order": list(step.expected_answer_order),
+        "expected_result_order": list(step.expected_result_order),
         "outcome": actual_kind,
+        "failure_code": getattr(outcome, "code", None),
         "capability": capability,
         "reply": outcome.reply,
         "result": latest_result,
         "verified_turns": len(next_turns),
         "outcome_ok": outcome_ok,
         "semantic_ok": semantic_ok,
+        "locale_ok": locale_ok,
         "missing_answer_facts": missing_answer_facts,
         "missing_result_facts": missing_result_facts,
+        "missing_sql_facts": missing_sql_facts,
         "state_continuity_ok": state_continuity_ok,
         "passed": outcome_ok and semantic_ok and state_continuity_ok,
     }
@@ -341,12 +501,16 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("scenario", choices=tuple(SCENARIOS))
     parser.add_argument(
+        "--ui", action="store_true", help="Exercise the Gradio chat callback"
+    )
+    parser.add_argument(
         "--turn", type=int, required=True, help="1-based scenario turn to run"
     )
     parser.add_argument(
         "--output", type=Path, required=True, help="checkpoint JSON path"
     )
     args = parser.parse_args(argv)
+    surface = "ui" if args.ui else "pipeline"
     steps = SCENARIOS[args.scenario]
     if not 1 <= args.turn <= len(steps):
         parser.error(f"--turn must be between 1 and {len(steps)}")
@@ -367,6 +531,7 @@ def main(argv=None) -> int:
             parser.error("checkpoint must contain a JSON object")
         if (
             report.get("scenario") != args.scenario
+            or report.get("surface", "pipeline") != surface
             or report.get("status") != "running"
             or report.get("completed_turns") != args.turn - 1
         ):
@@ -394,6 +559,7 @@ def main(argv=None) -> int:
         report = {
             "status": "running",
             "scenario": args.scenario,
+            "surface": surface,
             "total_turns": len(steps),
             "completed_turns": 0,
             "turns": turns,
@@ -405,6 +571,7 @@ def main(argv=None) -> int:
         args.turn - 1,
         state=state,
         history=history,
+        surface=surface,
     )
     turns.append(record)
     report.update(
@@ -424,7 +591,27 @@ def main(argv=None) -> int:
     else:
         report["status"] = "running"
     _write(args.output, report)
-    print(json.dumps(report, indent=2, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "status": report["status"],
+                "completed_turns": args.turn,
+                "turn": record,
+                "rewritten_request": (
+                    state.verified_turns[-1].rewritten_request
+                    if record["outcome"] == "answered"
+                    else None
+                ),
+                "executed_sql": (
+                    state.verified_turns[-1].executed_sql
+                    if record["outcome"] == "answered"
+                    else None
+                ),
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
     return 0 if record["passed"] else 1
 
 

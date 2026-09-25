@@ -102,6 +102,26 @@ class AcceptanceCliTests(unittest.TestCase):
         self.assertEqual(len(state.verified_turns), 1)
         self.assertEqual(len(history), 2)
 
+    def test_ui_step_uses_gradio_chat_callback_once(self):
+        step = acceptance.AcceptanceStep(
+            "Synthetic acceptance question.",
+            "answered",
+            expected_answer_groups=(("synthetic employee",), ("4 days",)),
+            expected_result_groups=(("4",),),
+        )
+        with (
+            patch.dict(acceptance.SCENARIOS, {"long": (step,)}),
+            patch.object(acceptance, "run_turn", side_effect=answered_for) as run,
+        ):
+            record, state, history = acceptance.run_scenario_turn(
+                "long", 0, surface="ui"
+            )
+
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(record["surface"], "ui")
+        self.assertTrue(record["passed"])
+        self.assertEqual(state.verified_turns[-1].answer, history[-1]["content"])
+
     def test_unexpected_outcome_does_not_pass_a_scenario_turn(self):
         previous = ConversationState(session_id="acceptance-long")
         with patch.object(
@@ -188,6 +208,128 @@ class AcceptanceCliTests(unittest.TestCase):
         self.assertTrue(record["outcome_ok"])
         self.assertFalse(record["semantic_ok"])
         self.assertEqual(record["missing_result_facts"], ["5"])
+        self.assertFalse(record["passed"])
+
+    def test_expected_sql_date_scope_is_checked_separately_from_result(self):
+        step = acceptance.AcceptanceStep(
+            "Count synthetic work days in September 2026.",
+            "answered",
+            expected_answer_groups=(("synthetic employee",), ("4 days",)),
+            expected_result_groups=(("4",),),
+            expected_sql_groups=(("2026-09-01",), ("2026-09-30",)),
+        )
+        with (
+            patch.dict(acceptance.SCENARIOS, {"long": (step,)}),
+            patch.object(acceptance, "run_turn", side_effect=answered_for),
+        ):
+            record, _state, _history = acceptance.run_scenario_turn("long", 0)
+
+        self.assertFalse(record["semantic_ok"])
+        self.assertEqual(record["missing_sql_facts"], ["2026-09-01", "2026-09-30"])
+
+    def test_absence_sql_oracle_rejects_unrequested_worked_hours_filter(self):
+        step = acceptance.AcceptanceStep(
+            "Show absence dates.",
+            "answered",
+            expected_answer_groups=(("synthetic employee",), ("4 days",)),
+            expected_result_groups=(("4",),),
+            forbidden_sql_terms=("total_worked_hrs",),
+        )
+        previous = ConversationState(session_id="acceptance-long")
+        outcome = answered_for(
+            type("Request", (), {"state": previous, "question": step.question})()
+        )
+        turn = outcome.state.verified_turns[-1].model_copy(
+            update={
+                "executed_sql": "SELECT 4 FROM attendance_records "
+                "WHERE exception = 'Absent' OR total_worked_hrs = 0"
+            }
+        )
+        outcome = outcome.model_copy(
+            update={
+                "state": outcome.state.model_copy(update={"verified_turns": (turn,)})
+            }
+        )
+        with (
+            patch.dict(acceptance.SCENARIOS, {"long": (step,)}),
+            patch.object(acceptance, "run_turn", return_value=outcome),
+        ):
+            record, _state, _history = acceptance.run_scenario_turn("long", 0)
+
+        self.assertEqual(
+            record["missing_sql_facts"],
+            ["forbidden SQL term: total_worked_hrs"],
+        )
+        self.assertFalse(record["passed"])
+
+    def test_grouped_result_rejects_swapped_values_and_wrong_order(self):
+        step = acceptance.AcceptanceStep(
+            "Rank departments by worked hours.",
+            "answered",
+            expected_answer_groups=(("Engineering",), ("56",), ("Finance",), ("36",)),
+            expected_result_groups=(("Engineering",), ("56",), ("Finance",), ("36",)),
+            expected_result_rows=(("Engineering", "56"), ("Finance", "36")),
+            expected_result_order=("Engineering", "Finance"),
+        )
+        result = {
+            "rows": [
+                {"department": "Finance", "total": 56},
+                {"department": "Engineering", "total": 36},
+            ]
+        }
+        passed, _missing_answer, missing_result = acceptance._semantic_answer_check(
+            step,
+            "answered",
+            "Engineering 56, Finance 36",
+            result,
+            None,
+        )
+        self.assertFalse(passed)
+        self.assertIn("same result row: Engineering, 56", missing_result)
+        self.assertIn("result order: Finance", missing_result)
+
+    def test_result_rejects_extra_rows_when_exact_count_is_expected(self):
+        step = acceptance.AcceptanceStep(
+            "Show the dates.",
+            "answered",
+            expected_answer_groups=(("2026-09-01",),),
+            expected_result_groups=(("2026-09-01",),),
+            expected_row_count=1,
+        )
+        passed, _missing_answer, missing_result = acceptance._semantic_answer_check(
+            step,
+            "answered",
+            "2026-09-01",
+            {"rows": [{"date": "2026-09-01"}, {"date": "2026-08-03"}]},
+            None,
+        )
+        self.assertFalse(passed)
+        self.assertIn("result row count: 1", missing_result)
+
+    def test_english_question_rejects_wrong_published_locale(self):
+        step = acceptance.AcceptanceStep(
+            "Count synthetic work days.",
+            "answered",
+            expected_answer_groups=(("synthetic employee",), ("4 days",)),
+            expected_result_groups=(("4",),),
+        )
+        previous = ConversationState(session_id="acceptance-long")
+        outcome = answered_for(
+            type("Request", (), {"state": previous, "question": step.question})()
+        )
+        turn = outcome.state.verified_turns[-1].model_copy(update={"locale": "ar"})
+        outcome = outcome.model_copy(
+            update={
+                "state": outcome.state.model_copy(update={"verified_turns": (turn,)})
+            }
+        )
+        with (
+            patch.dict(acceptance.SCENARIOS, {"long": (step,)}),
+            patch.object(acceptance, "run_turn", return_value=outcome),
+        ):
+            record, _state, _history = acceptance.run_scenario_turn("long", 0)
+
+        self.assertFalse(record["locale_ok"])
         self.assertFalse(record["passed"])
 
     def test_answered_turn_without_state_publication_does_not_pass(self):

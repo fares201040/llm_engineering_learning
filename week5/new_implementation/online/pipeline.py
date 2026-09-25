@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 import json
 import math
 import re
@@ -166,7 +166,125 @@ DEPENDENCIES = RuntimeDependencies()
 
 
 def _locale(question: str) -> Literal["en", "ar"]:
+    if re.search(r"بال(?:لغة\s*)?[اإ]نجليز(?:ية|ي)", question):
+        return "en"
+    if re.search(
+        r"\b(?:answer|reply|respond|write)\s+(?:to\s+me\s+)?(?:in\s+)?arabic\b",
+        question,
+        flags=re.IGNORECASE,
+    ):
+        return "ar"
     return "ar" if any("\u0600" <= char <= "\u06ff" for char in question) else "en"
+
+
+def _attendance_meaning(
+    question: str,
+) -> Literal["explicit_absence", "not_absent"] | None:
+    if re.search(r"\bnot\s+absent\b", question, flags=re.IGNORECASE):
+        return "not_absent"
+    if re.search(r"\babsen(?:t|ce)\b", question, flags=re.IGNORECASE):
+        return "explicit_absence"
+    return None
+
+
+def _sql_semantic_issue(question: str, sql: str) -> str | None:
+    meaning = _attendance_meaning(question)
+    if meaning == "not_absent" and not re.search(
+        r"\bexception\s+IS\s+DISTINCT\s+FROM\s+'Absent'", sql, flags=re.IGNORECASE
+    ):
+        return "wrong_absence_polarity"
+    if meaning == "explicit_absence":
+        if not re.search(r"\bexception\s*=\s*'Absent'", sql, re.IGNORECASE):
+            return "wrong_absence_semantics"
+        where = re.search(
+            r"\bWHERE\b(.*?)(?:\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b|$)",
+            sql,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        filters = where.group(1) if where else ""
+        if not re.search(r"\b(?:hours?|work(?:ed|ing)?)\b", question, re.IGNORECASE):
+            if re.search(r"\btotal_worked_hrs\b", filters, re.IGNORECASE):
+                return "wrong_absence_semantics"
+        if not re.search(
+            r"\b(?:schedul(?:e|ed)|working\s+day)\b", question, re.IGNORECASE
+        ):
+            if re.search(r"\bday_type\b", filters, re.IGNORECASE):
+                return "wrong_absence_semantics"
+    return None
+
+
+def _mentions_time_period(question: str) -> bool:
+    folded = question.casefold()
+    if re.search(r"\b(?:19|20)\d{2}\b", folded):
+        return True
+    if any(re.search(rf"\b{month}\b", folded) for month in _MONTH_NUMBERS):
+        return True
+    if re.search(
+        r"\b(?:today|yesterday|tomorrow|this|last|previous|next)\s+"
+        r"(?:day|week|month|year|quarter)\b",
+        folded,
+    ):
+        return True
+    return any(
+        word in question
+        for word in ("اليوم", "أمس", "امس", "أسبوع", "اسبوع", "شهر", "سنة")
+    )
+
+
+def _sql_date_scope(sql: str) -> tuple[str, str] | None:
+    where = re.search(
+        r"\bWHERE\b(.*?)(?=\bGROUP\s+BY\b|\bHAVING\b|\bORDER\s+BY\b|\bLIMIT\b|$)",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if where is None:
+        return None
+    filters = where.group(1)
+    field = r'\battendance_date"?'
+    literal = r"(?:DATE\s*)?'(\d{4}-\d{2}-\d{2})'"
+    between = re.search(
+        rf"{field}\s+BETWEEN\s+{literal}\s+AND\s+{literal}",
+        filters,
+        flags=re.IGNORECASE,
+    )
+    if between:
+        start_text, end_text = between.groups()
+    else:
+        lower = re.search(
+            rf"{field}\s*(>=|>)\s*{literal}", filters, flags=re.IGNORECASE
+        )
+        upper = re.search(
+            rf"{field}\s*(<=|<)\s*{literal}", filters, flags=re.IGNORECASE
+        )
+        if lower is None or upper is None:
+            return None
+        start_text = lower.group(2)
+        end_text = upper.group(2)
+        try:
+            start = date.fromisoformat(start_text) + timedelta(
+                days=1 if lower.group(1) == ">" else 0
+            )
+            end = date.fromisoformat(end_text) - timedelta(
+                days=1 if upper.group(1) == "<" else 0
+            )
+        except ValueError:
+            return None
+        start_text, end_text = start.isoformat(), end.isoformat()
+    try:
+        if date.fromisoformat(start_text) > date.fromisoformat(end_text):
+            return None
+    except ValueError:
+        return None
+    return start_text, end_text
+
+
+def _previous_having(sql: str) -> str:
+    match = re.search(
+        r"\bHAVING\b\s+(.+?)(?=\bORDER\s+BY\b|\bLIMIT\b|;|$)",
+        sql,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return "HAVING " + match.group(1).strip() if match else "none"
 
 
 def _clarification(reason: str, locale: str) -> str:
@@ -373,6 +491,7 @@ def run_turn(
     locale = _locale(request.question)
     budget = CallBudget(limit=settings.llm_turn_provider_call_limit)
     question = request.question
+    as_of_date = date.today().isoformat()
     try:
         loaded_directory = deps.directory_loader(
             dsn=settings.postgres_readonly_dsn,
@@ -455,18 +574,17 @@ def run_turn(
                     state=previous,
                     capability=request_issue,
                 )
-            active = previous.active_employees
-            if not active and previous.active_employee_ids:
-                active = tuple(
-                    authoritative[item]
-                    for item in previous.active_employee_ids
-                    if item in authoritative
-                )
+            active = tuple(
+                authoritative[item]
+                for item in previous.active_employee_ids
+                if item in authoritative
+            )
             reference = deps.reference_writer(
                 question,
-                history=request.history,
+                history=request.history[-2:],
                 trusted_context=previous.trusted_context(),
                 active_employees=active,
+                as_of_date=as_of_date,
                 model=settings.llm_reference_model,
                 budget=budget,
                 timeout=settings.llm_reference_timeout_seconds,
@@ -490,7 +608,11 @@ def run_turn(
                 reference,
                 directory,
                 original_question=question,
+                active_employees=active,
+                has_verified_turns=bool(previous.verified_turns),
             )
+
+        bound = bound.model_copy(update={"locale": _locale(question)})
 
         log_layer_output("employee_resolution", bound)
 
@@ -551,6 +673,7 @@ def run_turn(
                     bound.unresolved_mention,
                     directory,
                     embedding_model=settings.embedding_model,
+                    embedding_provider=settings.embedding_provider,
                     collection_name=settings.chroma_collection_name,
                     allowed_employee_ids=allowed_employee_ids,
                 )
@@ -607,17 +730,54 @@ def run_turn(
                 reason=bound.reason,
             )
 
+        required_date_scope = (
+            previous.verified_turns[-1].date_scope
+            if bound.request_relationship == "follow_up"
+            and previous.verified_turns
+            and not _mentions_time_period(question)
+            else None
+        )
         database_context = deps.context_loader(
             dsn=settings.postgres_readonly_dsn,
             attendance_objects=(settings.postgres_attendance_table,),
             connect_timeout=settings.postgres_connect_timeout_seconds,
         )
         log_layer_output("database_context", database_context)
+        downstream_history = (
+            tuple(item for item in request.history[-2:] if item.get("role") == "user")
+            if bound.request_relationship == "follow_up"
+            else ()
+        )
+        downstream_trusted_context = (
+            previous.trusted_context()
+            if bound.request_relationship == "follow_up"
+            else {}
+        )
         shared_context = SharedModelContext(
             current_question=question,
-            updated_request=bound.updated_request,
-            conversation_history=request.history,
-            trusted_context=previous.trusted_context(),
+            as_of_date=as_of_date,
+            updated_request=(
+                "Immediately previous verified request:\n"
+                f"{previous.verified_turns[-1].rewritten_request}\n"
+                "Its verified SQL defines the grouping and eligibility:\n"
+                f"{previous.verified_turns[-1].executed_sql}\n"
+                "Previous HAVING clause, if still applicable:\n"
+                f"{_previous_having(previous.verified_turns[-1].executed_sql)}\n"
+                "Current follow-up change:\n"
+                f"{bound.updated_request}"
+                if bound.request_relationship == "follow_up" and previous.verified_turns
+                else bound.updated_request
+            ),
+            request_relationship=bound.request_relationship,
+            subject_relationship=bound.subject_relationship,
+            resolved_employee_ids=bound.employee_ids,
+            required_date_scope=required_date_scope,
+            request_has_date_period=(
+                _mentions_time_period(question) or required_date_scope is not None
+            ),
+            attendance_meaning=_attendance_meaning(question),
+            conversation_history=downstream_history,
+            trusted_context=downstream_trusted_context,
             database_context=database_context,
         )
         sql_execution_failure: dict[str, object] | None = None
@@ -663,6 +823,14 @@ def run_turn(
                     attempt=attempt,
                 )
         log_layer_output("sql_execution", result)
+        semantic_issue = _sql_semantic_issue(question, sql)
+        if semantic_issue is not None:
+            raise ProviderFailure("sql_semantics", semantic_issue, semantic_issue)
+        date_scope = _sql_date_scope(sql)
+        if required_date_scope is not None and date_scope != required_date_scope:
+            raise ProviderFailure(
+                "sql_semantics", "date_scope_mismatch", "date_scope_mismatch"
+            )
         unsupported_reason = _unsupported_schema_reason(result)
         if unsupported_reason is not None:
             log_layer_output(
@@ -695,6 +863,7 @@ def run_turn(
             locale=bound.locale,
             employees=bound.employees,
             executed_sql=sql,
+            date_scope=date_scope,
             result=result.model_dump(mode="json"),
         )
         new_state = previous.model_copy(

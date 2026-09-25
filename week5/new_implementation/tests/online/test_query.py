@@ -237,7 +237,15 @@ class DatabaseContextTests(unittest.TestCase):
             set(shared.model_payload()),
             {
                 "current_question",
+                "as_of_date",
+                "last_calendar_month",
                 "updated_request",
+                "request_relationship",
+                "subject_relationship",
+                "resolved_employee_ids",
+                "required_date_scope",
+                "request_has_date_period",
+                "attendance_meaning",
                 "conversation_history",
                 "trusted_context",
                 "database_type",
@@ -248,6 +256,11 @@ class DatabaseContextTests(unittest.TestCase):
         serialized = json.dumps(shared.model_payload())
         self.assertEqual(
             shared.model_payload()["current_question"], "Show total hours."
+        )
+        september = shared.model_copy(update={"as_of_date": "2026-09-25"})
+        self.assertEqual(
+            september.model_payload()["last_calendar_month"],
+            {"start": "2026-08-01", "end": "2026-08-31"},
         )
         self.assertEqual(
             shared.model_payload()["conversation_history"],

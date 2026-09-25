@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 
@@ -21,18 +22,37 @@ def main() -> int:
     source_root = Path(os.environ["ATTENDANCE_PHASE2_SOURCE_ROOT"])
     if not source_root.joinpath("week5/new_evaluation/acceptance.py").is_file():
         raise FileNotFoundError("The sanitized attendance source is not extracted.")
-    sys.path.insert(0, str(source_root))
-    os.chdir(source_root)
-
     scenario = os.environ.get("ACCEPTANCE_SCENARIO", "long")
     turn = os.environ.get("ACCEPTANCE_TURN")
     if turn is None:
         raise ValueError("Set ACCEPTANCE_TURN for one 1-based turn at a time.")
 
-    from week5.new_evaluation.acceptance import main as acceptance_main
-
-    return acceptance_main([scenario, "--turn", turn, "--output", str(CHECKPOINT)])
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "week5.new_evaluation.acceptance",
+            scenario,
+            *(["--ui"] if os.environ.get("ACCEPTANCE_UI") == "1" else []),
+            "--turn",
+            turn,
+            "--output",
+            str(CHECKPOINT),
+        ],
+        cwd=source_root,
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    print(completed.stdout)
+    if completed.returncode:
+        for line in completed.stderr.splitlines():
+            if "attendance_layer layer=" in line:
+                print(line)
+    return completed.returncode
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    if main():
+        raise RuntimeError("Acceptance turn failed; inspect its synthetic checkpoint.")

@@ -167,6 +167,26 @@ This index is for the later synthetic Colab comparison. The active chatbot still
 answers attendance questions with direct PostgreSQL SQL; Chroma fallback currently
 serves uncertain employee-name confirmation only.
 
+For a local comparison after the MiniLM row index and at least part of the separate
+field index are built, run:
+
+```powershell
+$env:EMBEDDING_PROVIDER = "huggingface"
+$env:EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+uv run python -m week5.new_implementation.compare_field_row_local
+```
+
+The comparison makes 60 grounded semantic searches across employee-name/date,
+employee-ID/date, and distinctive field-value questions. It compares only records
+whose field chunks are complete in the current database and applies the same record
+filter to the row search. It prints aggregate metrics only. Case-level questions and
+results stay in the ignored private file
+`week5/new_evaluation/results/field_row_local_semantic_partial_comparison.json`;
+never commit or upload that file to Colab. The row search also excludes
+employee-period and other knowledge chunks. The field search uses the separate
+`CHROMA_FIELD_DB_PATH` database. Label a comparison against an interrupted field
+build as partial-data evidence; it does not score the full attendance population.
+
 ## Direct-SQL limitation
 
 The online runtime executes the model's SQL directly. It does not yet parse an AST,

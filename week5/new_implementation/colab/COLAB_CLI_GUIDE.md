@@ -128,6 +128,14 @@ colab --auth=adc new --session attendance-phase2-3 --gpu T4
 colab --auth=adc sessions
 ```
 
+From PowerShell, the equivalent session-creation command is:
+
+```powershell
+wsl.exe -d Ubuntu-24.04 -- /home/faris/.local/bin/colab --auth=adc new --session attendance-phase2-3 --gpu T4
+```
+
+Use it only when `attendance-phase2-3` is absent.
+
 T4 availability depends on the Google account's Colab plan and current accelerator availability. The Phase 2 deterministic tests below mock model/database boundaries and do not use the GPU. The T4 is selected for the already-approved synthetic live acceptance described in `LOCAL_COLAB_SYNC_GUIDE.md`.
 
 ## 6. Upload the sanitized source and run the Phase 2/3 deterministic notebook

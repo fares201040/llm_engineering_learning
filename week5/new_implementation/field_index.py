@@ -63,9 +63,7 @@ def create_field_chunks(documents: Sequence[dict]) -> list[Result]:
         employee_id = str(record["Employee_ID"])
         attendance_date = str(record["Date"])
         shift = (
-            _plain_value(record.get("Shift"))
-            if _populated(record.get("Shift"))
-            else ""
+            _plain_value(record.get("Shift")) if _populated(record.get("Shift")) else ""
         )
         shift_sentence = f"had shift {shift}" if shift else "had no recorded shift"
 

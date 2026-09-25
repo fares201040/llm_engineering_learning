@@ -142,6 +142,31 @@ If optional pgvector is enabled, set `PGVECTOR_DIMENSIONS` and use a matching
 `POSTGRES_CHUNKS_TABLE` for the selected model; an existing PostgreSQL `vector(384)`
 column cannot hold OpenAI's default 3072-dimensional vectors.
 
+## Experimental field-level Chroma index
+
+The normal ingestion keeps its existing attendance-record chunks in
+`CHROMA_DB_PATH`. To build a separate experimental index with one logical chunk per
+populated attendance field, first complete normal ingestion, then run:
+
+```powershell
+uv run python -m week5.new_implementation.field_index
+```
+
+The builder reads the existing validated attendance JSONL projection and refuses a
+missing, stale, invalid, or empty snapshot. It does not refresh source files or write
+PostgreSQL. Each field chunk is readable text containing the employee ID, date, shift,
+field name, and value. Empty values are skipped; zero and false are retained. Long
+field text may be split into embedding-sized parts while retaining one logical field
+identity. Repeated runs update changed chunks and remove stale ones incrementally.
+
+The field index uses `CHROMA_FIELD_DB_PATH`, which defaults to the sibling directory
+`week5/new_preprocessed_db_fields`. It has its own model-specific collection and
+never replaces the row-level database. It uses the selected `EMBEDDING_PROVIDER` and
+`EMBEDDING_MODEL`; switching models creates another collection in that directory.
+This index is for the later synthetic Colab comparison. The active chatbot still
+answers attendance questions with direct PostgreSQL SQL; Chroma fallback currently
+serves uncertain employee-name confirmation only.
+
 ## Direct-SQL limitation
 
 The online runtime executes the model's SQL directly. It does not yet parse an AST,

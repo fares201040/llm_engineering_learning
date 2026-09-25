@@ -1600,7 +1600,16 @@ def _embed_items(items, stats):
     return vectors_by_id
 
 
-def sync_embeddings_to_chroma(chunks, stats=None, ledger=None, generation=None):
+def sync_embeddings_to_chroma(
+    chunks,
+    stats=None,
+    ledger=None,
+    generation=None,
+    *,
+    client=None,
+    collection_name=None,
+    checkpoint_stage="chroma",
+):
     """
     Improvements 8-12:
     - stable IDs
@@ -1614,8 +1623,8 @@ def sync_embeddings_to_chroma(chunks, stats=None, ledger=None, generation=None):
         stats = IngestionStats()
 
     items = _prepare_embedding_items(chunks)
-    chroma = create_chroma_client()
-    collection = chroma.get_or_create_collection(COLLECTION_NAME)
+    chroma = client if client is not None else create_chroma_client()
+    collection = chroma.get_or_create_collection(collection_name or COLLECTION_NAME)
     existing_state = _existing_chroma_state(collection)
 
     current_by_record = defaultdict(list)
@@ -1699,7 +1708,7 @@ def sync_embeddings_to_chroma(chunks, stats=None, ledger=None, generation=None):
             ledger is not None
             and generation is not None
             and ledger.is_checkpoint_complete(
-                "chroma",
+                checkpoint_stage,
                 checkpoint_key,
                 generation,
                 payload_hash=(
@@ -1759,7 +1768,7 @@ def sync_embeddings_to_chroma(chunks, stats=None, ledger=None, generation=None):
         if ledger is not None and generation is not None:
             with ledger.writer() as writer:
                 writer.checkpoint(
-                    "chroma", checkpoint_key, generation, payload_hash=payload_hash
+                    checkpoint_stage, checkpoint_key, generation, payload_hash=payload_hash
                 )
 
     # Remove stale records and superseded split parts only after replacement

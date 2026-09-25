@@ -203,6 +203,12 @@ version resets safely.
 
 ## Verification record (2026-09-25)
 
+The optional `field_index.py` builder creates a separate field-level attendance
+Chroma database for a later synthetic retrieval comparison. It is not called by the
+online direct-SQL pipeline or by normal ingestion. See `POSTGRES_SETUP.md` for the
+build command and `CHROMA_FIELD_DB_PATH` setting. The existing row-level index stays
+intact, and no field-versus-row Colab evaluation has been run yet.
+
 The current sanitized archive SHA-256 is
 `fccad7a9e9ea23cb3e0c70c80e4734258a9072f0811584b269606adfe1f1a19d`.
 The [executed Colab notebook](colab/attendance_phase2_tests_output.ipynb) validated

@@ -936,8 +936,8 @@ def convert_sources_to_jsonl(ledger=None):
     )
 
 
-def _documents_from_jsonl(*, strict=False):
-    """Read the current projection; strict callers reject invalid rows safely."""
+def _documents_from_jsonl():
+    """Read and validate the current attendance projection without mutating it."""
     documents = []
 
     with open(JSONL_OUTPUT_PATH, "r", encoding="utf-8") as f:
@@ -975,10 +975,6 @@ def _documents_from_jsonl(*, strict=False):
             try:
                 business_record = validate_attendance_record(business_record)
             except (ValidationError, ValueError, TypeError) as exc:
-                if strict:
-                    raise ValueError(
-                        f"Invalid attendance record at JSONL line {line_number}."
-                    ) from None
                 logger.warning(
                     "Skipping invalid JSONL record line=%s error=%s",
                     line_number,
@@ -1604,16 +1600,7 @@ def _embed_items(items, stats):
     return vectors_by_id
 
 
-def sync_embeddings_to_chroma(
-    chunks,
-    stats=None,
-    ledger=None,
-    generation=None,
-    *,
-    client=None,
-    collection_name=None,
-    checkpoint_stage="chroma",
-):
+def sync_embeddings_to_chroma(chunks, stats=None, ledger=None, generation=None):
     """
     Improvements 8-12:
     - stable IDs
@@ -1627,8 +1614,8 @@ def sync_embeddings_to_chroma(
         stats = IngestionStats()
 
     items = _prepare_embedding_items(chunks)
-    chroma = client if client is not None else create_chroma_client()
-    collection = chroma.get_or_create_collection(collection_name or COLLECTION_NAME)
+    chroma = create_chroma_client()
+    collection = chroma.get_or_create_collection(COLLECTION_NAME)
     existing_state = _existing_chroma_state(collection)
 
     current_by_record = defaultdict(list)
@@ -1712,7 +1699,7 @@ def sync_embeddings_to_chroma(
             ledger is not None
             and generation is not None
             and ledger.is_checkpoint_complete(
-                checkpoint_stage,
+                "chroma",
                 checkpoint_key,
                 generation,
                 payload_hash=(
@@ -1772,7 +1759,7 @@ def sync_embeddings_to_chroma(
         if ledger is not None and generation is not None:
             with ledger.writer() as writer:
                 writer.checkpoint(
-                    checkpoint_stage, checkpoint_key, generation, payload_hash=payload_hash
+                    "chroma", checkpoint_key, generation, payload_hash=payload_hash
                 )
 
     # Remove stale records and superseded split parts only after replacement

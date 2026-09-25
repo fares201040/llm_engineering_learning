@@ -14,14 +14,12 @@ installed in Ubuntu 24.04 under WSL2 and ADC is already available there.
 - ADC and the official CLI work in WSL. The previous T4 runtime expired and its
   `/content` directory became inaccessible. Attempts to create a replacement T4
   returned Colab `Service Unavailable`; retry session creation when service resumes.
-- The latest executed notebook validated snapshot
+- The latest row-only executed notebook validated snapshot
   `d171a25ed2fe5cb11e3c2277ac10b8765a5fa33f1f7f4adaf571b827244ed60c`:
   149 tests, Ruff lint, formatting for 19 files, and compilation passed. The current
   ZIP and input notebook pin are
-  `c97e0080032b8c15beb4d1ef5fcb0db62ed809b89ac504ac4031385420060212`;
-  this 40-file snapshot includes the separate field-index comparison runner. It ran
-  in a CPU Colab session on 2026-09-25: 156 deterministic tests and the 20-case
-  synthetic retrieval comparison completed. See the comparison report below.
+  `c08bdb54382b375f5ee5e3fe97bc6107a2d604579468fd5af3be598e889f3e5c`;
+  this newer snapshot has not run in Colab.
 - A separate local Gradio reproduction of “who is fares hasan” found that
   PostgreSQL whole-name similarity returned no options and the former OpenAI
   embedding fallback returned HTTP 429 (`credit_balance_exhausted`). PostgreSQL
@@ -198,52 +196,6 @@ If you intentionally edit a file inside Colab to investigate a problem, copy the
 reviewed change back into the local checkout yourself, inspect the local diff, rebuild
 the archive, and rerun the notebook. Colab-side edits are temporary and are not the
 canonical source.
-
-## Synthetic row-versus-field Chroma comparison
-
-After the deterministic notebook validates and extracts the current source ZIP, run
-the standalone retrieval comparison. It generates its own synthetic attendance rows,
-uses local Hugging Face `all-MiniLM-L6-v2`, and creates two separate Chroma databases
-under `/content`. It does not read local attendance exports, the private evaluation
-corpus, or a PostgreSQL DSN. It measures retrieval; it does not change the direct-SQL
-chatbot.
-
-```bash
-colab --auth=adc exec \
-  --session attendance-phase2-3 \
-  --file "$REPO/week5/new_implementation/colab/compare_field_row_retrieval.py" \
-  --timeout 1800
-```
-
-The runner writes the full synthetic case report, including any exception details,
-to `/content/attendance-field-row-comparison.json`. Download it before stopping the
-runtime:
-
-```bash
-colab --auth=adc download \
-  --session attendance-phase2-3 \
-  /content/attendance-field-row-comparison.json \
-  "$REPO/week5/new_implementation/colab/attendance_field_row_comparison_synthetic.json"
-```
-
-Review each question's expected parent record, row and field top-five hits, and
-field-specific rank. Compare parent hit rates at 1/3/5 and MRR at 5 only after both
-indexes finish. Record setup, dependency, runtime, Chroma storage, fixture, and oracle
-issues separately in
-`docs/superpowers/reports/2026-09-25-attendance-field-row-colab-comparison.md`.
-Do not treat a failed or partial run as an embedding comparison result.
-
-If T4 assignment returns `ColabRequestError: Service Unavailable`, the standalone
-MiniLM comparison can use a CPU session. The 2026-09-25 comparison used:
-
-```bash
-colab --auth=adc new --session attendance-embedding-compare
-```
-
-Use `attendance-embedding-compare` in the upload, notebook, comparison, download,
-and stop commands above for that fallback. Keep the T4 session for the separate
-Qwen/PostgreSQL live acceptance. The saved comparison and provisioning details are
-in `docs/superpowers/reports/2026-09-25-attendance-field-row-colab-comparison.md`.
 
 ## 7. Run the optional live long-conversation acceptance
 

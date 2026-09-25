@@ -93,7 +93,6 @@ class Settings:
 
     # Offline ingestion. These retain their previous behavior and names.
     chroma_db_path: Path
-    chroma_field_db_path: Path
     chroma_collection_name: str
     chroma_anonymized_telemetry: bool
     knowledge_base_path: Path
@@ -136,9 +135,6 @@ class Settings:
         embedding_provider = _text("EMBEDDING_PROVIDER", "huggingface").lower()
         if embedding_provider not in {"huggingface", "openai"}:
             raise ValueError("EMBEDDING_PROVIDER must be huggingface or openai")
-        chroma_db_path = _path(
-            "CHROMA_DB_PATH", PROJECT_ROOT / "week5" / "new_preprocessed_db"
-        )
         return cls(
             postgres_readonly_dsn=_text("POSTGRES_READONLY_DSN", postgres_dsn),
             postgres_connect_timeout_seconds=_integer(
@@ -188,10 +184,8 @@ class Settings:
             ),
             max_sql_result_bytes=_integer("MAX_SQL_RESULT_BYTES", 1000000, 1024),
             log_level=_text("LOG_LEVEL", "INFO").upper(),
-            chroma_db_path=chroma_db_path,
-            chroma_field_db_path=_path(
-                "CHROMA_FIELD_DB_PATH",
-                chroma_db_path.with_name(f"{chroma_db_path.name}_fields"),
+            chroma_db_path=_path(
+                "CHROMA_DB_PATH", PROJECT_ROOT / "week5" / "new_preprocessed_db"
             ),
             chroma_collection_name=_text("CHROMA_COLLECTION_NAME", "docs"),
             chroma_anonymized_telemetry=_boolean("CHROMA_ANONYMIZED_TELEMETRY", False),

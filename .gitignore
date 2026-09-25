@@ -207,7 +207,6 @@ week5/vector_db/
 # APDC local source data, ingestion state, and generated vector indexes.
 week5/new-knowledge-base/
 week5/new_preprocessed_db/
-week5/new_preprocessed_db_fields/
 week5/new_evaluation/tests.jsonl
 week5/new_evaluation/dataset_manifest.json
 # Private 311-case evaluation outputs may contain question/answer details.

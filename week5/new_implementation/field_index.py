@@ -176,7 +176,7 @@ def _load_current_documents() -> list[dict]:
         source_lines = sum(1 for line in handle if line.strip())
     if source_lines == 0:
         raise RuntimeError("canonical attendance projection is empty")
-    documents = _documents_from_jsonl()
+    documents = _documents_from_jsonl(strict=True)
     if len(documents) != source_lines:
         raise RuntimeError("canonical attendance projection contains invalid rows")
     return documents

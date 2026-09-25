@@ -936,8 +936,8 @@ def convert_sources_to_jsonl(ledger=None):
     )
 
 
-def _documents_from_jsonl():
-    """Read and validate the current attendance projection without mutating it."""
+def _documents_from_jsonl(*, strict=False):
+    """Read the current projection; strict callers reject invalid rows safely."""
     documents = []
 
     with open(JSONL_OUTPUT_PATH, "r", encoding="utf-8") as f:
@@ -975,6 +975,10 @@ def _documents_from_jsonl():
             try:
                 business_record = validate_attendance_record(business_record)
             except (ValidationError, ValueError, TypeError) as exc:
+                if strict:
+                    raise ValueError(
+                        f"Invalid attendance record at JSONL line {line_number}."
+                    ) from None
                 logger.warning(
                     "Skipping invalid JSONL record line=%s error=%s",
                     line_number,

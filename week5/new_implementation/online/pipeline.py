@@ -48,7 +48,7 @@ from .reference import (
 from .state import ConversationState, VerifiedTurn
 
 
-SQL_EXECUTION_ATTEMPT_LIMIT = 2
+SQL_EXECUTION_ATTEMPT_LIMIT = 3
 _MONTH_NUMBERS = {
     month.casefold(): number
     for number, month in enumerate(

@@ -2,7 +2,7 @@
 
 `attendance-online/v1` is the only online attendance runtime. It preserves the small
 application facade and offline ingestion while executing one initial PostgreSQL query
-per turn, with at most one eligible retry after a PostgreSQL programming or data error.
+per turn, with at most two eligible retries after PostgreSQL programming or data errors.
 
 ## Active modules
 
@@ -160,14 +160,14 @@ the serialized response size, records column type codes and row coverage, and ro
 back on both success and failure. Database/provider/size/timeout failures return a safe
 failed outcome and preserve the exact prior trusted state.
 
-A PostgreSQL `ProgrammingError` or `DataError` triggers at most one repair retry after
-the initial query: no more than two database execution attempts. The retry receives
+A PostgreSQL `ProgrammingError` or `DataError` triggers at most two repair retries after
+the initial query: no more than three database execution attempts. Each retry receives
 the failed SQL, error type, database error text capped at 4,000 characters, retry
 number, and the same `SharedModelContext` with the same projected schema. Connection,
 timeout, result-bound, authorization, provider, and answer failures do not trigger SQL
-repair. A second eligible rejection fails safely without publishing conversation
-state. The maximum provider-call budget is 8: up to two reference attempts, two
-planner attempts, and four answer writer/verifier attempts.
+repair. A third eligible rejection fails safely without publishing conversation
+state. The maximum provider-call budget remains 8; a third planner call consumes one
+of the calls otherwise available for answer writing or verification.
 
 Malformed employee identifier shapes and recognized impossible dates or
 non-finite/malformed numeric comparisons are rejected before planning. An unknown

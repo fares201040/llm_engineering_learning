@@ -18,8 +18,12 @@ installed in Ubuntu 24.04 under WSL2 and ADC is already available there.
   `d171a25ed2fe5cb11e3c2277ac10b8765a5fa33f1f7f4adaf571b827244ed60c`:
   149 tests, Ruff lint, formatting for 19 files, and compilation passed. The current
   ZIP and input notebook pin are
-  `c08bdb54382b375f5ee5e3fe97bc6107a2d604579468fd5af3be598e889f3e5c`;
+  `6a1853bd6bbc79a7cd01feb98b6c521bee66eeb547c86de8fb3e39dc8d26ad88`;
   this newer snapshot has not run in Colab.
+- The current source permits three SQL planner/execution attempts when the first
+  two PostgreSQL queries fail with programming or data errors. The local attendance
+  online/evaluator/acceptance/UI suite passed 153 tests and 3 subtests. Colab T4
+  allocation still returned `Service Unavailable` after this change.
 - A separate local Gradio reproduction of “who is fares hasan” found that
   PostgreSQL whole-name similarity returned no options and the former OpenAI
   embedding fallback returned HTTP 429 (`credit_balance_exhausted`). PostgreSQL

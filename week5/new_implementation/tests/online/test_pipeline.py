@@ -514,7 +514,39 @@ class PipelineTests(unittest.TestCase):
             outcome.state.verified_turns[-1].executed_sql, "SELECT attempt_2"
         )
 
-    def test_second_postgres_query_rejection_fails_without_publishing_state(self):
+    def test_two_postgres_query_rejections_allow_third_planner_attempt(self):
+        dependencies = self.dependencies()
+        planner_calls = []
+        execution_calls = []
+
+        def planner(**kwargs):
+            planner_calls.append(kwargs)
+            return f"SELECT attempt_{len(planner_calls)}"
+
+        def executor(sql, **_kwargs):
+            execution_calls.append(sql)
+            if len(execution_calls) < 3:
+                raise psycopg.errors.UndefinedColumn("column does not exist")
+            return sql_result()
+
+        dependencies.planner = planner
+        dependencies.executor = executor
+
+        outcome = run_turn(
+            TurnRequest(
+                question="show A1 dates",
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(execution_calls, ["SELECT attempt_1", "SELECT attempt_2", "SELECT attempt_3"])
+        self.assertEqual(planner_calls[2]["sql_execution_failure"]["retry_number"], 2)
+        self.assertEqual(planner_calls[2]["sql_execution_failure"]["failed_sql"], "SELECT attempt_2")
+        self.assertEqual(outcome.state.verified_turns[-1].executed_sql, "SELECT attempt_3")
+
+    def test_third_postgres_query_rejection_fails_without_publishing_state(self):
         state = ConversationState()
         dependencies = self.dependencies()
         planner_calls = []
@@ -542,8 +574,8 @@ class PipelineTests(unittest.TestCase):
 
         self.assertIsInstance(outcome, Failed)
         self.assertEqual(outcome.state, state)
-        self.assertEqual(len(planner_calls), 2)
-        self.assertEqual(len(execution_calls), 2)
+        self.assertEqual(len(planner_calls), 3)
+        self.assertEqual(len(execution_calls), 3)
 
     def test_missing_access_fails_before_planning_and_preserves_state(self):
         dependencies = self.dependencies()

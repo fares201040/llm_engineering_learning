@@ -12,8 +12,8 @@ Status: Local implementation and embedding-switch checks pass. Phase 3 Gradio ac
 - The online path rewrites references, resolves employees within the authorized
   PostgreSQL directory, plans read-only SQL, executes bounded queries, writes and
   verifies an answer, then publishes verified conversation state. The question and
-  history reach the model stages. The SQL retry policy is one initial execution and
-  at most one retry for `psycopg.ProgrammingError` or `psycopg.DataError`.
+  history reach the model stages. The current SQL retry policy is one initial execution
+  and at most two retries for `psycopg.ProgrammingError` or `psycopg.DataError`.
 - The default embedding provider is local `all-MiniLM-L6-v2`; set
   `EMBEDDING_PROVIDER=openai` and `EMBEDDING_MODEL=text-embedding-3-large` to
   select OpenAI without code changes. `embedding.py` uses the selected provider's
@@ -28,10 +28,10 @@ Status: Local implementation and embedding-switch checks pass. Phase 3 Gradio ac
   “Hassan”; the semantic top five alone did not include A11017. The PostgreSQL
   first-name candidate path supplied the option. It does not silently bind a
   fuzzy name to an employee.
-- Current local verification: 102 online tests and 38 ingestion, configuration,
-  rebuild, and UI tests passed; Ruff, formatting, compilation, and `git diff
-  --check` passed. The source ZIP and input notebook match SHA-256
-  `29c97100195a91d7edfa9d4a2ee27a9cb0e907e0666b9739b971b27925446ae2`.
+- Current local verification: 153 online, evaluator, acceptance, and UI tests plus
+  3 subtests passed after adding a third eligible SQL planner attempt. The source
+  ZIP and input notebook match SHA-256
+  `6a1853bd6bbc79a7cd01feb98b6c521bee66eeb547c86de8fb3e39dc8d26ad88`.
   This exact snapshot has not run in Colab. OpenAI embedding construction was
   checked without a paid API request; a live OpenAI rebuild was not run because
   the configured account previously returned `credit_balance_exhausted`.
@@ -46,7 +46,7 @@ Status: Local implementation and embedding-switch checks pass. Phase 3 Gradio ac
   modify, or commit it. The saved `attendance_phase3*.json` checkpoints are
   generated synthetic data.
 
-## Latest update — 2026-09-25
+## Earlier update — 2026-09-25
 
 The last executed Colab source snapshot was
 `d171a25ed2fe5cb11e3c2277ac10b8765a5fa33f1f7f4adaf571b827244ed60c`:

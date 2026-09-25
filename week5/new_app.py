@@ -3,12 +3,20 @@ import logging
 
 import gradio as gr
 
-from .new_implementation.answer import (
-    ConversationState,
-    LOCAL_DEMO_ACCESS,
-    answer_question_with_state,
-)
-from .new_implementation.config import settings
+if __package__:
+    from .new_implementation.answer import (
+        ConversationState,
+        LOCAL_DEMO_ACCESS,
+        answer_question_with_state,
+    )
+    from .new_implementation.config import settings
+else:
+    from new_implementation.answer import (
+        ConversationState,
+        LOCAL_DEMO_ACCESS,
+        answer_question_with_state,
+    )
+    from new_implementation.config import settings
 
 
 logger = logging.getLogger(__name__)

@@ -1,8 +1,33 @@
+from pathlib import Path
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
 from week5 import new_app
 from week5.new_implementation import answer
+
+
+class LaunchModeTests(unittest.TestCase):
+    def test_new_app_imports_when_executed_as_a_standalone_script(self):
+        week5_directory = Path(__file__).resolve().parent
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import runpy; "
+                    "runpy.run_path('new_app.py', run_name='new_app_import_test')"
+                ),
+            ],
+            cwd=week5_directory,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
 
 class ContextRenderingTests(unittest.TestCase):

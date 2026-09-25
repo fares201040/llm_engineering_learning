@@ -81,13 +81,13 @@ class Settings:
     llm_planner_model: str
     llm_planner_timeout_seconds: float
     llm_planner_max_output_tokens: int
-    llm_plan_audit_model: str
-    llm_plan_audit_timeout_seconds: float
-    llm_plan_audit_max_output_tokens: int
     llm_answer_model: str
-    llm_answer_verifier_model: str
     llm_answer_timeout_seconds: float
     llm_answer_max_output_tokens: int
+    postgres_statement_timeout_ms: int
+    postgres_lock_timeout_ms: int
+    postgres_idle_transaction_timeout_ms: int
+    max_sql_result_bytes: int
     log_level: str
 
     # Offline ingestion. These retain their previous behavior and names.
@@ -118,43 +118,81 @@ class Settings:
 
     @property
     def llm_turn_provider_call_limit(self) -> int:
-        return 11
+        return 8
 
     @classmethod
     def from_environment(cls) -> "Settings":
-        knowledge = _path("KNOWLEDGE_BASE_PATH", PROJECT_ROOT / "week5" / "new-knowledge-base")
-        default_model = _text("LLM_MODEL", "openai/gpt-4.1-nano")
+        knowledge = _path(
+            "KNOWLEDGE_BASE_PATH", PROJECT_ROOT / "week5" / "new-knowledge-base"
+        )
+        global_model = os.getenv("LLM_MODEL")
+        global_model = (
+            global_model.strip() if global_model and global_model.strip() else None
+        )
+        reference_default_model = global_model or "openai/gpt-4.1-mini"
+        planner_default_model = global_model or "openai/gpt-4.1-mini"
+        answer_default_model = global_model or "openai/gpt-4.1"
         postgres_dsn = _text("POSTGRES_DSN", "")
         return cls(
             postgres_readonly_dsn=_text("POSTGRES_READONLY_DSN", postgres_dsn),
-            postgres_connect_timeout_seconds=_integer("POSTGRES_CONNECT_TIMEOUT_SECONDS", 5, 1),
-            postgres_attendance_table=_identifier("POSTGRES_ATTENDANCE_TABLE", "attendance_records"),
-            postgres_chunks_table=_identifier("POSTGRES_CHUNKS_TABLE", "knowledge_chunks"),
+            postgres_connect_timeout_seconds=_integer(
+                "POSTGRES_CONNECT_TIMEOUT_SECONDS", 5, 1
+            ),
+            postgres_attendance_table=_identifier(
+                "POSTGRES_ATTENDANCE_TABLE", "attendance_records"
+            ),
+            postgres_chunks_table=_identifier(
+                "POSTGRES_CHUNKS_TABLE", "knowledge_chunks"
+            ),
             app_timezone=_text("APP_TIMEZONE", "Asia/Aden"),
             max_exact_results=_integer("MAX_EXACT_RESULTS", 100, 1),
             final_k=_integer("FINAL_K", 6, 1),
             embedding_model=_text("EMBEDDING_MODEL", "text-embedding-3-large"),
-            llm_reference_model=_text("LLM_REFERENCE_MODEL", default_model),
-            llm_reference_timeout_seconds=_number("LLM_REFERENCE_TIMEOUT_SECONDS", 30.0, 0.1),
-            llm_reference_max_output_tokens=_integer("LLM_REFERENCE_MAX_OUTPUT_TOKENS", 3000, 128),
-            llm_planner_model=_text("LLM_PLANNER_MODEL", default_model),
-            llm_planner_timeout_seconds=_number("LLM_PLANNER_TIMEOUT_SECONDS", 30.0, 0.1),
-            llm_planner_max_output_tokens=_integer("LLM_PLANNER_MAX_OUTPUT_TOKENS", 6000, 256),
-            llm_plan_audit_model=_text("LLM_PLAN_AUDIT_MODEL", default_model),
-            llm_plan_audit_timeout_seconds=_number("LLM_PLAN_AUDIT_TIMEOUT_SECONDS", 30.0, 0.1),
-            llm_plan_audit_max_output_tokens=_integer("LLM_PLAN_AUDIT_MAX_OUTPUT_TOKENS", 1000, 128),
-            llm_answer_model=_text("LLM_ANSWER_MODEL", default_model),
-            llm_answer_verifier_model=_text("LLM_ANSWER_VERIFIER_MODEL", default_model),
+            llm_reference_model=_text("LLM_REFERENCE_MODEL", reference_default_model),
+            llm_reference_timeout_seconds=_number(
+                "LLM_REFERENCE_TIMEOUT_SECONDS", 30.0, 0.1
+            ),
+            llm_reference_max_output_tokens=_integer(
+                "LLM_REFERENCE_MAX_OUTPUT_TOKENS", 3000, 128
+            ),
+            llm_planner_model=_text("LLM_PLANNER_MODEL", planner_default_model),
+            llm_planner_timeout_seconds=_number(
+                "LLM_PLANNER_TIMEOUT_SECONDS", 30.0, 0.1
+            ),
+            llm_planner_max_output_tokens=_integer(
+                "LLM_PLANNER_MAX_OUTPUT_TOKENS", 6000, 256
+            ),
+            llm_answer_model=_text("LLM_ANSWER_MODEL", answer_default_model),
             llm_answer_timeout_seconds=_number("LLM_ANSWER_TIMEOUT_SECONDS", 60.0, 0.1),
-            llm_answer_max_output_tokens=_integer("LLM_ANSWER_MAX_OUTPUT_TOKENS", 3000, 128),
+            llm_answer_max_output_tokens=_integer(
+                "LLM_ANSWER_MAX_OUTPUT_TOKENS", 3000, 128
+            ),
+            postgres_statement_timeout_ms=_integer(
+                "POSTGRES_STATEMENT_TIMEOUT_MS", 30000, 1
+            ),
+            postgres_lock_timeout_ms=_integer("POSTGRES_LOCK_TIMEOUT_MS", 3000, 1),
+            postgres_idle_transaction_timeout_ms=_integer(
+                "POSTGRES_IDLE_TRANSACTION_TIMEOUT_MS", 30000, 1
+            ),
+            max_sql_result_bytes=_integer("MAX_SQL_RESULT_BYTES", 1000000, 1024),
             log_level=_text("LOG_LEVEL", "INFO").upper(),
-            chroma_db_path=_path("CHROMA_DB_PATH", PROJECT_ROOT / "week5" / "new_preprocessed_db"),
+            chroma_db_path=_path(
+                "CHROMA_DB_PATH", PROJECT_ROOT / "week5" / "new_preprocessed_db"
+            ),
             chroma_collection_name=_text("CHROMA_COLLECTION_NAME", "docs"),
             chroma_anonymized_telemetry=_boolean("CHROMA_ANONYMIZED_TELEMETRY", False),
             knowledge_base_path=knowledge,
-            jsonl_output_path=_path("JSONL_OUTPUT_PATH", knowledge / "attendance" / "attendance.jsonl"),
-            invalid_jsonl_path=_path("INVALID_JSONL_PATH", knowledge / "attendance" / "attendance.invalid.jsonl"),
-            ingestion_state_path=_path("INGESTION_STATE_PATH", knowledge / "attendance" / "ingestion_state.sqlite3"),
+            jsonl_output_path=_path(
+                "JSONL_OUTPUT_PATH", knowledge / "attendance" / "attendance.jsonl"
+            ),
+            invalid_jsonl_path=_path(
+                "INVALID_JSONL_PATH",
+                knowledge / "attendance" / "attendance.invalid.jsonl",
+            ),
+            ingestion_state_path=_path(
+                "INGESTION_STATE_PATH",
+                knowledge / "attendance" / "ingestion_state.sqlite3",
+            ),
             index_schema_version=_integer("INDEX_SCHEMA_VERSION", 2, 1),
             ingestion_format_version=_integer("INGESTION_FORMAT_VERSION", 3, 1),
             source_xlsx_glob=_text("SOURCE_XLSX_GLOB", "*.xlsx"),
@@ -163,13 +201,19 @@ class Settings:
             postgres_dsn=postgres_dsn,
             enable_pgvector=_boolean("ENABLE_PGVECTOR", False),
             pgvector_dimensions=_integer("PGVECTOR_DIMENSIONS", 3072, 1),
-            enable_employee_period_chunks=_boolean("ENABLE_EMPLOYEE_PERIOD_CHUNKS", True),
+            enable_employee_period_chunks=_boolean(
+                "ENABLE_EMPLOYEE_PERIOD_CHUNKS", True
+            ),
             allow_empty_snapshot=_boolean("ALLOW_EMPTY_SNAPSHOT", False),
             allow_invalid_snapshot=_boolean("ALLOW_INVALID_SNAPSHOT", False),
-            allow_attendance_source_removal=_boolean("ALLOW_ATTENDANCE_SOURCE_REMOVAL", False),
+            allow_attendance_source_removal=_boolean(
+                "ALLOW_ATTENDANCE_SOURCE_REMOVAL", False
+            ),
             embedding_encoding=_text("EMBEDDING_ENCODING", "cl100k_base"),
             embedding_max_tokens=_integer("EMBEDDING_MAX_TOKENS", 7500, 1),
-            embedding_batch_max_tokens=_integer("EMBEDDING_BATCH_MAX_TOKENS", 250000, 1),
+            embedding_batch_max_tokens=_integer(
+                "EMBEDDING_BATCH_MAX_TOKENS", 250000, 1
+            ),
             embedding_batch_max_items=_integer("EMBEDDING_BATCH_MAX_ITEMS", 256, 1),
             chroma_batch_size=_integer("CHROMA_BATCH_SIZE", 500, 1),
         )

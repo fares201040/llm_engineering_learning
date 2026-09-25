@@ -116,9 +116,11 @@ name. Trusted prior subjects use their verified bound form.
 
 The reference provider returns the explicit employee value and exact evidence span,
 not offsets alone. A message containing both a name and ID produces one identity
-claim. The ID is the lookup key and PostgreSQL verifies the name. A matching ID binds
-without confirmation; a mismatch or unknown ID never reaches attendance planning.
-Identity-verification questions receive a deterministic grounded yes/no response.
+claim. The ID is the lookup key and PostgreSQL verifies the name. A matching pair binds
+without confirmation. A mismatched pair or a claim with an unknown ID uses the supplied
+name for PostgreSQL fuzzy matching and then Chroma fallback; every option requires
+confirmation. An unknown standalone ID returns no options. Identity-verification
+questions receive a deterministic grounded response.
 Criteria remain symbolic rather than expanding potentially large employee groups into
 conversation-state ID lists. A pending fuzzy employee confirmation retains the subject
 mode and criteria spans, so confirming one employee cannot discard the rest of the
@@ -153,11 +155,11 @@ All structured model calls set transport retries to zero. The application-level
 ceiling remains eleven calls: reference 2, semantic writer 2, audit/repair 3, and
 answer writer/verifier 4. Retrieval embeddings are measured separately.
 
-The flat runtime intentionally does not turn an aggregate result into a new employee
-set for another query. Direct requests such as grouping employees and applying HAVING
-remain supported. Combining an explicit employee with a cohort defined by an
-aggregate from a different period requires a set/subquery stage and returns a precise
-unsupported result instead of silently changing meaning.
+The flat runtime intentionally does not turn rows or an aggregate result into a new
+employee set for another query. Direct criteria that constrain the same rows as the
+requested output remain supported, as do grouping and HAVING. Selecting employees from
+different rows or a different period and then querying their rows requires a set/subquery
+stage and returns a precise unsupported result instead of silently changing meaning.
 
 The generic criteria-span reference contract remains valid if a later approved design
 replaces the structured semantic writer with SQL output. That future boundary change

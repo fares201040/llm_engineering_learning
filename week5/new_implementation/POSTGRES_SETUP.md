@@ -14,9 +14,15 @@ GRANT USAGE ON SCHEMA public TO attendance_reader;
 GRANT SELECT ON TABLE attendance_records, knowledge_chunks TO attendance_reader;
 ```
 
+Install deterministic fuzzy-name matching once as an administrator:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+```
+
 The application also starts every attendance read in `REPEATABLE READ READ ONLY` and
-applies local statement, lock, and idle-transaction timeouts. The database role remains
-required so a code defect cannot turn the planner connection into a writer.
+applies local statement, lock, idle-transaction, row-count, and response-size bounds.
+The database role remains required so model-produced SQL cannot write data.
 Configure its connection separately as `POSTGRES_READONLY_DSN`; keep the ingestion
 writer connection in `POSTGRES_DSN`.
 
@@ -80,22 +86,64 @@ database.
 ## Online runtime configuration
 
 `attendance-online/v1` is the only runtime and state version. Provider boundary
-versions are implementation details, not deployment settings. The decision stages
-default to `openai/gpt-4.1-nano`; useful overrides are:
+versions are implementation details, not deployment settings. For the current Phase 2
+local run, configure all three model roles as follows:
 
 ```env
-LLM_PLAN_AUDIT_MODEL=openai/gpt-4.1-nano
-LLM_PLAN_AUDIT_TIMEOUT_SECONDS=30
-LLM_PLAN_AUDIT_MAX_OUTPUT_TOKENS=1000
-LLM_REFERENCE_MODEL=openai/gpt-4.1-nano
-LLM_ANSWER_MODEL=openai/gpt-4.1-nano
-LLM_ANSWER_VERIFIER_MODEL=openai/gpt-4.1-nano
+LLM_REFERENCE_MODEL=ollama_chat/qwen3.5:4b
+LLM_PLANNER_MODEL=ollama_chat/qwen3.5:4b
+LLM_ANSWER_MODEL=ollama_chat/qwen3.5:4b
+LLM_PLANNER_MAX_OUTPUT_TOKENS=512
 ```
 
-The shared active-turn limit is eleven provider calls. Keep
+For these local Ollama calls, the provider sets `reasoning_effort="none"`,
+`temperature=0`, and `num_ctx=8192`. The answer model is used for separate writer and
+verifier calls. The maximum provider-call budget is eight. Keep
 `POSTGRES_READONLY_DSN` configured independently from the ingestion writer DSN.
+
+The SQL planner receives the complete typed column catalog and descriptions plus a
+request-specific projection of JSON-only fields. JSON fallbacks duplicated by typed
+columns are omitted. The answer writer and verifier receive the current question,
+history, trusted context, date-coverage summary, executed SQL, result, and authoritative
+employees, but not the schema.
 
 Employee lookup uses the authorized PostgreSQL directory first. If a written name or
 ID remains unresolved, the runtime may query the configured Chroma collection and
 show up to five choices. These choices are restricted to the caller's employee scope,
-cross-checked against PostgreSQL, and never trusted until the user confirms one.
+cross-checked against PostgreSQL, and never trusted until the user confirms one. The
+existing Chroma fallback obtains query embeddings through the configured OpenAI
+embedding client; local Qwen covers the three conversational roles, but this separate
+fallback may require OpenAI embedding access if it is invoked.
+
+## Direct-SQL limitation
+
+The online runtime executes the model's SQL directly. It does not yet parse an AST,
+enforce one read-only statement structurally, validate returned identifiers/functions/
+operators/joins, inject row authorization, inject limits, or parameterize model
+literals. Read-only permissions prevent writes but do not prevent unauthorized reads
+within the granted objects, expensive valid SQL, or prompt-injected SQL. Grant the
+reader role only the minimum attendance objects and use the configured timeouts and
+bounds. The structural safeguards are explicitly deferred future work.
+
+## Colab test workflow
+
+Use [`colab/LOCAL_COLAB_SYNC_GUIDE.md`](colab/LOCAL_COLAB_SYNC_GUIDE.md) for the
+complete WSL2/official CLI upload, hash verification, test, live synthetic acceptance,
+and shutdown instructions. It is the canonical local-to-Colab workflow.
+
+The deterministic Phase 2/3 notebook is
+[`colab/attendance_phase2_tests.ipynb`](colab/attendance_phase2_tests.ipynb). Its
+paired source archive contains an explicit 32-file allowlist, test helpers, and a
+generated count-only placeholder manifest. It excludes `.env` files, credentials,
+attendance rows, the private evaluation corpus, and result artifacts. The notebook
+uses mocked model/database boundaries; it does not call an LLM or connect to
+PostgreSQL.
+
+For an approved live long-conversation acceptance, run
+`colab/prepare_synthetic_runtime.py` first. It provisions a temporary read-only local
+PostgreSQL database with synthetic rows and installs Qwen 3.5 4B in the Colab T4 VM.
+Then call `colab/run_acceptance_turn.py` once per turn and inspect each result before
+continuing. No production DSN, database tunnel, real attendance rows, or external
+Google credential is needed. The generated test DSN remains in a mode-0600 runtime
+file inside the temporary Colab VM and is not placed in the source archive or a
+repository `.env` file.

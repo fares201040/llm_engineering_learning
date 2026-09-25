@@ -1,83 +1,448 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from unittest.mock import call, patch
 
-from week5.new_evaluation.eval import canonical_expression, evaluate_outcome
+from week5.new_evaluation.eval import _answer_fact_matches, _write, evaluate_outcome
 from week5.new_evaluation.test import TestQuestion, load_tests as load_evaluation_tests
-from week5.new_implementation.online.pipeline import Answered, Clarification, Unsupported
-from week5.new_implementation.online.query import (
-    All,
-    AggregateMeasure,
-    AggregateOutput,
-    Any,
-    Condition,
-    EvidenceSpan,
-    Not,
-    Ordering,
-    OutputComponent,
+from week5.new_implementation.online.execution import ExecutionCoverage
+from week5.new_implementation.online.pipeline import (
+    Answered,
+    Clarification,
+    Unsupported,
 )
-from week5.new_implementation.online.reference import EmployeeOption, PendingEmployeeConfirmation
+from week5.new_implementation.online.reference import (
+    EmployeeOption,
+    PendingEmployeeConfirmation,
+    PendingResolution,
+)
 from week5.new_implementation.online.state import ConversationState, VerifiedTurn
 
 
 class EvaluatorTests(unittest.TestCase):
+    def test_evaluation_record_model_is_not_collected_as_a_pytest_test_class(self):
+        self.assertFalse(getattr(TestQuestion, "__test__", True))
+
+    def test_answer_fact_date_range_accepts_equivalent_same_month_wording(self):
+        answer = (
+            "Available data covers September 1 to September 7, 2026, "
+            "not the full requested period."
+        )
+
+        self.assertTrue(_answer_fact_matches(answer, "September 1-7, 2026"))
+        self.assertTrue(_answer_fact_matches(answer, "not the full requested period"))
+
+    def test_answer_facts_accept_equivalent_business_wording_but_not_wrong_value(self):
+        answer = (
+            "A11017 was absent for 1 day. The available data covers September 1 "
+            "to September 7, 2026 and does not encompass the entire month."
+        )
+
+        self.assertTrue(_answer_fact_matches(answer, "1 recorded absent day"))
+        self.assertTrue(_answer_fact_matches(answer, "September 1-7, 2026"))
+        self.assertTrue(_answer_fact_matches(answer, "not the full requested period"))
+        self.assertFalse(_answer_fact_matches(answer, "2 recorded absent days"))
+
+    def test_answer_fact_accepts_thousands_separator_without_changing_value(self):
+        self.assertTrue(
+            _answer_fact_matches(
+                "There are 1,076 matching attendance records.",
+                "1076",
+            )
+        )
+        self.assertFalse(
+            _answer_fact_matches(
+                "There are 1,075 matching attendance records.",
+                "1076",
+            )
+        )
+
+    def test_answer_fact_date_range_accepts_iso_coverage_dates(self):
+        answer = (
+            "The table covers 2026-09-01 to 2026-09-07, not the full requested period."
+        )
+
+        self.assertTrue(_answer_fact_matches(answer, "September 1-7, 2026"))
+
+    def test_answer_fact_recognizes_working_day_as_scheduled_day(self):
+        answer = "A11017 did not attend work on 1 working day."
+
+        self.assertTrue(
+            _answer_fact_matches(answer, "1 scheduled working day was not attended")
+        )
+
+    def test_plan_filter_matches_null_safe_coalesce_comparison(self):
+        turn = VerifiedTurn(
+            turn_id="zero-hours",
+            original_question="zero worked hours",
+            rewritten_request="Request:\nzero worked hours",
+            answer="3 days",
+            locale="en",
+            executed_sql=(
+                "SELECT COUNT(DISTINCT attendance_date) AS zero_days "
+                "FROM attendance_records "
+                "WHERE COALESCE(total_worked_hrs, 0) <= 0"
+            ),
+            result={"columns": [], "rows": [{"zero_days": 3}], "coverage": {}},
+        )
+        case = TestQuestion(
+            question="zero worked hours",
+            keywords=[],
+            reference_answer="3 days",
+            category="zero_hours",
+            expected_plan={
+                "required_filter": {
+                    "field": "Total_Worked_Hrs",
+                    "operator": "lte",
+                    "value": 0.0,
+                }
+            },
+        )
+
+        result = evaluate_outcome(
+            case,
+            Answered(reply="3 days", state=ConversationState(verified_turns=(turn,))),
+        )
+
+        self.assertTrue(result.plan_ok)
+
+    def test_plan_filter_accepts_equivalent_exclusive_date_end(self):
+        turn = VerifiedTurn(
+            turn_id="month-range",
+            original_question="September records",
+            rewritten_request="Request:\nSeptember records",
+            answer="7 records",
+            locale="en",
+            executed_sql=(
+                "SELECT COUNT(*) FROM attendance_records "
+                "WHERE attendance_date >= '2026-09-01' "
+                "AND attendance_date < DATE '2026-10-01'"
+            ),
+            result={"columns": [], "rows": [{"count": 7}], "coverage": {}},
+        )
+        case = TestQuestion(
+            question="September records",
+            keywords=[],
+            reference_answer="7 records",
+            category="date_range",
+            expected_plan={
+                "required_filter": {
+                    "field": "Date",
+                    "operator": "lte",
+                    "value": "2026-09-30",
+                }
+            },
+        )
+
+        result = evaluate_outcome(
+            case,
+            Answered(
+                reply="7 records", state=ConversationState(verified_turns=(turn,))
+            ),
+        )
+
+        self.assertTrue(result.plan_ok)
+
+    def test_report_write_falls_back_when_windows_denies_atomic_replace(self):
+        output = Path("report.json")
+        temporary = Path("report.json.tmp")
+        with (
+            patch.object(Path, "write_text") as write_text,
+            patch.object(Path, "replace", side_effect=PermissionError),
+            patch.object(Path, "unlink") as unlink,
+        ):
+            _write(output, {"status": "running"})
+
+        serialized = '{\n  "status": "running"\n}\n'
+        self.assertEqual(
+            write_text.call_args_list,
+            [
+                call(serialized, encoding="utf-8"),
+                call(serialized, encoding="utf-8"),
+            ],
+        )
+        unlink.assert_called_once_with(missing_ok=True)
+        self.assertEqual(temporary.suffix, ".tmp")
+
     def test_complete_behavior_corpus_has_311_cases(self):
         self.assertEqual(len(load_evaluation_tests()), 311)
 
-    def test_nested_all_any_not_is_preserved(self):
-        expression = All(
-            items=(
-                Condition(field_id="date", operator="gte", value="2026-09-01"),
-                Any(
-                    items=(
-                        Condition(field_id="status", operator="eq", value="Authorized"),
-                        Not(item=Condition(field_id="exception", operator="eq", value="Absent")),
-                    )
-                ),
-            )
+    def test_physical_sql_and_typed_rows_are_scored(self):
+        coverage = ExecutionCoverage(
+            fetched_rows=1, result_limit=100, response_bytes=40
         )
-        rendered = canonical_expression(expression)
-        self.assertEqual(rendered["items"][1]["items"][1]["kind"], "not")
-
-    def test_grouped_values_and_record_ids_are_scored(self):
         turn = VerifiedTurn(
             turn_id="t1",
-            question="show records",
-            answer="Engineering",
+            original_question="show totals",
+            rewritten_request="Request:\nShow totals.",
+            answer="Engineering: 8",
             locale="en",
-            components=(
-                OutputComponent(
-                    component_key="rows",
-                    evidence=EvidenceSpan(start=0, end=4, text="show"),
-                    output=AggregateOutput(
-                        measures=(AggregateMeasure(output_id="records", function="count"),),
-                        group_by=("department",),
-                        ordering=(Ordering(output_id="records", direction="desc"),),
-                        limit=10,
-                    ),
-                ),
-            ),
-            result={"rows": [{"department": "Engineering", "record_id": "r1"}]},
+            executed_sql="SELECT department, SUM(total_worked_hrs) FROM attendance_records GROUP BY department",
+            result={
+                "columns": [],
+                "rows": [{"department": "Engineering", "hours": 8, "record_id": "r1"}],
+                "coverage": coverage.model_dump(mode="json"),
+            },
         )
-        state = ConversationState(verified_turns=(turn,))
-        outcome = Answered(reply="Engineering", state=state)
+        outcome = Answered(
+            reply="Engineering: 8", state=ConversationState(verified_turns=(turn,))
+        )
         case = TestQuestion(
-            question="show records",
+            question="show totals",
             keywords=[],
-            reference_answer="Engineering",
-            category="rows",
+            reference_answer="Engineering: 8",
+            category="aggregate",
+            expected_plan={
+                "aggregation": "sum",
+                "aggregation_field": "Total_Worked_Hrs",
+                "group_by": ["Department"],
+            },
             expected_record_ids=["r1"],
-            expected_group_values=[{"department": "Engineering", "record_id": "r1"}],
+            expected_group_values=[
+                {"department": "Engineering", "hours": 8, "record_id": "r1"}
+            ],
         )
         result = evaluate_outcome(case, outcome)
+        self.assertTrue(result.plan_ok)
         self.assertTrue(result.record_ids_ok)
         self.assertTrue(result.group_values_ok)
 
-    def test_confirmation_and_unsupported_capability_are_explicit(self):
+    def test_percentage_result_does_not_require_unrequested_intermediate_counts(self):
+        turn = VerifiedTurn(
+            turn_id="percentage",
+            original_question="percentage authorized",
+            rewritten_request="Request:\npercentage authorized",
+            answer="19.55%",
+            locale="en",
+            executed_sql=(
+                "SELECT (COUNT(CASE WHEN status = 'Authorized' THEN 1 END) "
+                "* 100.0) / COUNT(*) AS percentage FROM attendance_records"
+            ),
+            result={
+                "columns": [],
+                "rows": [{"percentage": 19.55095862764884}],
+                "coverage": {},
+            },
+        )
+        case = TestQuestion(
+            question="percentage authorized",
+            keywords=[],
+            reference_answer="19.55%",
+            category="percentage",
+            expected_plan={"aggregation": "percentage"},
+            expected_calculation={
+                "operation": "percentage",
+                "field": "attendance_records",
+                "numerator": 775,
+                "denominator": 3964,
+                "value": 19.55,
+            },
+        )
+
+        result = evaluate_outcome(
+            case,
+            Answered(reply="19.55%", state=ConversationState(verified_turns=(turn,))),
+        )
+
+        self.assertTrue(result.calculation_ok)
+        self.assertTrue(result.plan_ok)
+
+    def test_calculation_ignores_non_observable_expectation_metadata(self):
+        turn = VerifiedTurn(
+            turn_id="worked-days",
+            original_question="How many days did A11017 work?",
+            rewritten_request="Request:\nHow many days did A11017 work?",
+            answer="4 days",
+            locale="en",
+            executed_sql=(
+                "SELECT COUNT(DISTINCT attendance_date) AS worked_days "
+                "FROM attendance_records WHERE employee_id = 'A11017' "
+                "AND attendance_date BETWEEN '2026-09-01' AND '2026-09-30' "
+                "AND total_worked_hrs > 0"
+            ),
+            result={
+                "columns": [],
+                "rows": [{"worked_days": 4}],
+                "coverage": {},
+            },
+        )
+        case = TestQuestion(
+            question="How many days did A11017 work?",
+            keywords=[],
+            reference_answer="4 days",
+            category="worked_days",
+            expected_plan={
+                "business_predicates": ["worked"],
+                "required_filter": {
+                    "field": "Total_Worked_Hrs",
+                    "operator": "gt",
+                    "value": 0.0,
+                },
+                "required_filters": [
+                    {
+                        "field": "Date",
+                        "operator": "gte",
+                        "value": "2026-09-01",
+                    },
+                    {
+                        "field": "Date",
+                        "operator": "lte",
+                        "value": "2026-09-30",
+                    },
+                ],
+            },
+            expected_calculation={
+                "operation": "count_distinct",
+                "field": "Date",
+                "value": 4,
+                "measure": "days",
+                "business_predicates": ["worked"],
+                "coverage": {"start": "2026-09-01", "end": "2026-09-30"},
+            },
+        )
+
+        result = evaluate_outcome(
+            case,
+            Answered(reply="4 days", state=ConversationState(verified_turns=(turn,))),
+        )
+
+        self.assertTrue(result.calculation_ok)
+        self.assertTrue(result.plan_ok)
+
+    def test_plan_filter_matches_all_values_in_sql_in_list(self):
+        turn = VerifiedTurn(
+            turn_id="off-days",
+            original_question="How many off days?",
+            rewritten_request="Request:\nHow many off days?",
+            answer="2 off days",
+            locale="en",
+            executed_sql=(
+                "SELECT COUNT(DISTINCT attendance_date) AS off_days "
+                "FROM attendance_records "
+                "WHERE day_type IN ('OFF Day', 'OFF Day (ZAS)')"
+            ),
+            result={"columns": [], "rows": [{"off_days": 2}], "coverage": {}},
+        )
+        case = TestQuestion(
+            question="How many off days?",
+            keywords=[],
+            reference_answer="2 off days",
+            category="off_days",
+            expected_plan={
+                "required_filter": {
+                    "field": "Day_Type",
+                    "operator": "in",
+                    "value": ["OFF Day", "OFF Day (ZAS)"],
+                }
+            },
+        )
+
+        result = evaluate_outcome(
+            case,
+            Answered(
+                reply="2 off days", state=ConversationState(verified_turns=(turn,))
+            ),
+        )
+
+        self.assertTrue(result.plan_ok)
+
+    def test_window_total_is_used_as_matched_count_for_bounded_detail_rows(self):
+        turn = VerifiedTurn(
+            turn_id="bounded-list",
+            original_question="show attendance before date",
+            rewritten_request="Request:\nshow attendance before date",
+            answer="Showing a bounded sample of 2260 matching records.",
+            locale="en",
+            executed_sql=(
+                "SELECT record_id, COUNT(*) OVER() AS matched_count "
+                "FROM attendance_records WHERE attendance_date < '2026-09-05' LIMIT 100"
+            ),
+            result={
+                "columns": [],
+                "rows": [{"record_id": "r1", "matched_count": 2260}],
+                "coverage": {},
+            },
+        )
+        case = TestQuestion(
+            question="show attendance before date",
+            keywords=[],
+            reference_answer="2260 matches",
+            category="date_filter",
+            expected_plan={"aggregation": "none"},
+            expected_matched_count=2260,
+        )
+
+        result = evaluate_outcome(
+            case,
+            Answered(
+                reply="Showing a bounded sample of 2260 matching records.",
+                state=ConversationState(verified_turns=(turn,)),
+            ),
+        )
+
+        self.assertTrue(result.matched_count_ok)
+        self.assertTrue(result.plan_ok)
+
+    def test_grouped_sql_rows_are_normalized_and_compared_with_rounding_tolerance(self):
+        turn = VerifiedTurn(
+            turn_id="grouped",
+            original_question="average lateness by department",
+            rewritten_request="Request:\naverage lateness by department",
+            answer="Engineering: 0.916071",
+            locale="en",
+            executed_sql=(
+                "SELECT department, AVG (lateness_hrs) AS average_lateness "
+                "FROM attendance_records GROUP BY department"
+            ),
+            result={
+                "columns": [],
+                "rows": [{"department": "Engineering", "average_lateness": 0.9160714}],
+                "coverage": {},
+            },
+        )
+        case = TestQuestion(
+            question="average lateness by department",
+            keywords=[],
+            reference_answer="Engineering: 0.916071",
+            category="grouped_aggregate",
+            expected_plan={
+                "aggregation": "average",
+                "aggregation_field": "Lateness_Hrs",
+                "group_by": ["Department"],
+            },
+            expected_calculation={
+                "operation": "average",
+                "field": "Lateness_Hrs",
+                "group_by": ["Department"],
+                "total_groups": 1,
+            },
+            expected_group_values=[{"group": ["Engineering"], "value": 0.916071}],
+        )
+
+        result = evaluate_outcome(
+            case,
+            Answered(
+                reply="Engineering: 0.916071",
+                state=ConversationState(verified_turns=(turn,)),
+            ),
+        )
+
+        self.assertTrue(result.plan_ok)
+        self.assertTrue(result.calculation_ok)
+        self.assertTrue(result.group_values_ok)
+
+    def test_confirmation_and_unsupported_outcomes_remain_explicit(self):
         pending = PendingEmployeeConfirmation(
             original_question="show Fare",
             mention="Fare",
             options=(EmployeeOption(employee_id="A1", employee_name="Faris"),),
+            resolution=PendingResolution(
+                rewritten_request="Show Fare attendance.",
+                locale="en",
+                request_relationship="new",
+                subject_relationship="employees",
+            ),
         )
         clarification = Clarification(
             reply="Did you mean Faris (A1)?",
@@ -93,18 +458,76 @@ class EvaluatorTests(unittest.TestCase):
         )
         self.assertTrue(evaluate_outcome(clarify_case, clarification).clarification_ok)
         unsupported = Unsupported(
-            reply="unsupported",
-            state=ConversationState(),
-            capability="window",
+            reply="unsupported", state=ConversationState(), capability="field"
         )
         unsupported_case = TestQuestion(
-            question="running total",
+            question="unsupported concept",
             keywords=[],
             reference_answer="",
             category="unsupported",
-            expected_unsupported_capabilities=["window"],
+            expected_unsupported_capabilities=["field"],
         )
-        self.assertTrue(evaluate_outcome(unsupported_case, unsupported).unsupported_capabilities_ok)
+        unsupported_result = evaluate_outcome(unsupported_case, unsupported)
+        self.assertTrue(unsupported_result.outcome_ok)
+        self.assertTrue(unsupported_result.unsupported_capabilities_ok)
+
+    def test_legacy_safe_stop_expectation_accepts_explicit_unsupported_outcome(self):
+        outcome = Unsupported(
+            reply="The request contains an invalid value.",
+            state=ConversationState(),
+            capability="malformed_value",
+        )
+        case = TestQuestion(
+            question="Show lateness greater than NaN hours.",
+            keywords=[],
+            reference_answer="Reject non-finite numeric input.",
+            category="malformed_input",
+            expected_error="finite number",
+            expected_exception_type="PlanValidationError",
+        )
+
+        result = evaluate_outcome(case, outcome)
+
+        self.assertTrue(result.outcome_ok)
+        self.assertTrue(result.clarification_ok)
+        self.assertTrue(result.unsupported_capabilities_ok)
+
+    def test_unsupported_constraint_expectation_accepts_safe_clarification(self):
+        outcome = Clarification(
+            reply="Please clarify the date constraint.",
+            state=ConversationState(),
+            reason="ambiguous_reference",
+        )
+        case = TestQuestion(
+            question="Show records from not-a-date to tomorrow.",
+            keywords=[],
+            reference_answer="Clarify the date constraint.",
+            category="malformed_input",
+            expected_unsupported_capabilities=["unsupported_constraint"],
+        )
+
+        result = evaluate_outcome(case, outcome)
+
+        self.assertTrue(result.outcome_ok)
+        self.assertTrue(result.clarification_ok)
+        self.assertTrue(result.unsupported_capabilities_ok)
+
+    def test_expected_unsupported_capability_does_not_pass_as_answered(self):
+        case = TestQuestion(
+            question="Show attendance on an impossible date.",
+            keywords=[],
+            reference_answer="Reject the invalid date.",
+            category="malformed_input",
+            expected_unsupported_capabilities=["malformed_value"],
+        )
+
+        result = evaluate_outcome(
+            case,
+            Answered(reply="There were no records.", state=ConversationState()),
+        )
+
+        self.assertFalse(result.outcome_ok)
+        self.assertFalse(result.unsupported_capabilities_ok)
 
 
 if __name__ == "__main__":

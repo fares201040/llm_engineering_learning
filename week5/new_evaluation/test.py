@@ -22,6 +22,8 @@ class TurnExpectation(BaseModel):
 class TestQuestion(BaseModel):
     """An APDC attendance case with optional deterministic expectations."""
 
+    __test__ = False
+
     question: str = Field(description="The question to ask the RAG system")
     keywords: list[str] = Field(
         description="Keywords that must appear in retrieved context"

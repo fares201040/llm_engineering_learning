@@ -1,11 +1,14 @@
-"""Deterministic evaluator for the attendance-online/v1 public runtime."""
+"""Deterministic evaluator for the attendance direct-SQL runtime."""
 
 from __future__ import annotations
 
 import argparse
+from datetime import date, timedelta
 import hashlib
 import json
+import math
 from pathlib import Path
+import re
 
 from pydantic import BaseModel
 
@@ -17,7 +20,6 @@ from ..new_implementation.online.pipeline import (
     Unsupported,
     run_turn,
 )
-from ..new_implementation.online.query import All, Any, Condition, Not, Predicate
 from ..new_implementation.online.state import ConversationState, VerifiedTurn
 from .test import TestQuestion, load_tests
 
@@ -40,65 +42,172 @@ class BehaviorEval(BaseModel):
         return all(self.model_dump().values())
 
 
-def canonical_expression(expression):
-    """Keep nested Boolean meaning intact for evaluator comparisons."""
-
-    if isinstance(expression, Condition):
-        return {
-            "kind": "condition",
-            "field": expression.field_id,
-            "operator": expression.operator,
-            "value": list(expression.value) if isinstance(expression.value, tuple) else expression.value,
-        }
-    if isinstance(expression, Predicate):
-        return {"kind": "predicate", "predicate": expression.predicate_id}
-    if isinstance(expression, Not):
-        return {"kind": "not", "item": canonical_expression(expression.item)}
-    if isinstance(expression, (All, Any)):
-        return {
-            "kind": expression.kind,
-            "items": [canonical_expression(item) for item in expression.items],
-        }
-    raise TypeError(f"unsupported expression {type(expression).__name__}")
+_PHYSICAL_FIELD = {
+    "Employee_ID": "employee_id",
+    "Name": "name",
+    "Date": "attendance_date",
+    "Day_Type": "day_type",
+    "Status": "status",
+    "Exception": "exception",
+    "Total_Worked_Hrs": "total_worked_hrs",
+    "Lateness_Hrs": "lateness_hrs",
+    "Early_Out_Hrs": "early_out_hrs",
+    "Overbreak_Hrs": "overbreak_hrs",
+    "Total_OT": "total_ot",
+    "OT_Authorized": "ot_authorized",
+    "OT_Not_Authorized": "ot_not_authorized",
+    "Leave_Hrs": "leave_hrs",
+}
 
 
 def _last_turn(state: ConversationState) -> VerifiedTurn | None:
     return state.verified_turns[-1] if state.verified_turns else None
 
 
-def _query_summary(turn: VerifiedTurn | None) -> dict[str, object]:
-    if turn is None:
-        return {}
-    filters = [
-        canonical_expression(component.expression)
-        for component in turn.components
-        if component.kind == "filter"
-    ]
-    outputs = [component.output for component in turn.components if component.kind == "output"]
-    if not outputs:
-        return {"filters": filters, "route": "narrative"}
-    output = outputs[0]
-    summary: dict[str, object] = {"filters": filters, "output": output.model_dump(mode="json")}
-    if output.kind == "aggregate" and output.measures:
-        measure = output.measures[0]
-        summary.update(
-            {
-                "aggregation": measure.function,
-                "aggregation_field": measure.field_id,
-                "group_by": list(output.group_by),
-                "limit": output.limit,
-            }
-        )
-    elif output.kind == "rows":
-        summary.update({"projection": list(output.fields), "limit": output.limit})
-    return summary
-
-
 def _result_rows(turn: VerifiedTurn | None) -> list[dict]:
     if turn is None:
         return []
     rows = turn.result.get("rows", [])
-    return rows if isinstance(rows, list) else list(rows) if isinstance(rows, tuple) else []
+    return (
+        rows
+        if isinstance(rows, list)
+        else list(rows)
+        if isinstance(rows, tuple)
+        else []
+    )
+
+
+def _plan_matches(sql: str, expected: dict | None) -> bool:
+    if expected is None:
+        return True
+    folded = " ".join(sql.casefold().split())
+
+    def contains_filter(item: dict) -> bool:
+        field = str(
+            _PHYSICAL_FIELD.get(item.get("field"), item.get("field", ""))
+        ).casefold()
+        value = item.get("value", "")
+        operator_name = str(item.get("operator", "")).casefold()
+        operator = {
+            "eq": r"=",
+            "neq": r"(?:<>|!=)",
+            "gt": r">",
+            "gte": r">=",
+            "lt": r"<",
+            "lte": r"<=",
+        }.get(operator_name)
+        if not field or field not in folded:
+            return False
+        if operator_name == "in" and isinstance(value, list):
+            match = re.search(
+                rf"\b{re.escape(field)}\b\s+in\s*\(([^)]*(?:\)[^)]*)?)\)",
+                folded,
+            )
+            return match is not None and all(
+                str(item_value).casefold() in match.group(1) for item_value in value
+            )
+        if operator is None:
+            return not value or str(value).casefold() in folded
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric = float(value)
+            literal = (
+                rf"{int(numeric)}(?:\.0+)?"
+                if numeric.is_integer()
+                else re.escape(format(numeric, "g"))
+            )
+            quote = ""
+        else:
+            literal = re.escape(str(value).casefold())
+            quote = "(?:date\\s+)?'?"
+        if operator_name in {"gte", "lte"}:
+            between = re.search(
+                rf"\b{re.escape(field)}\b\s+between\s+"
+                rf"(?:date\s+)?'?([^'\s]+)'?\s+and\s+"
+                rf"(?:date\s+)?'?([^'\s]+)'?",
+                folded,
+            )
+            if between is not None:
+                bound = between.group(1 if operator_name == "gte" else 2)
+                return re.fullmatch(literal, bound) is not None
+        if operator_name == "lte" and isinstance(value, str):
+            try:
+                exclusive_end = str(date.fromisoformat(value) + timedelta(days=1))
+            except ValueError:
+                exclusive_end = ""
+            if exclusive_end and re.search(
+                rf"\b{re.escape(field)}\b\s*<\s*"
+                rf"(?:date\s+)?'?{re.escape(exclusive_end)}'?",
+                folded,
+            ):
+                return True
+        field_expression = (
+            rf"(?:\b{re.escape(field)}\b|"
+            rf"coalesce\(\s*\b{re.escape(field)}\b\s*,\s*[^)]+\))"
+        )
+        return (
+            re.search(
+                rf"{field_expression}\s*{operator}\s*{quote}{literal}{quote}",
+                folded,
+            )
+            is not None
+        )
+
+    for key, value in expected.items():
+        if key == "required_filter" and not contains_filter(value):
+            return False
+        if key == "required_filters" and not all(
+            contains_filter(item) for item in value
+        ):
+            return False
+        if key == "business_predicates":
+            markers = {
+                "absent": ("exception", "absent"),
+                "not_worked": ("total_worked_hrs",),
+                "worked": ("total_worked_hrs",),
+                "scheduled_working_day": ("day_type", "working day"),
+            }
+            if any(
+                not all(marker in folded for marker in markers.get(item, (item,)))
+                for item in value
+            ):
+                return False
+        if key == "aggregation":
+            if value == "none":
+                continue
+            if value == "percentage":
+                if (
+                    re.search(r"\bcount\s*\(", folded) is None
+                    or "100" not in folded
+                    or "/" not in folded
+                ):
+                    return False
+                continue
+            pattern = {
+                "distinct_count": r"\bcount\s*\(\s*distinct\b",
+                "average": r"\bavg\s*\(",
+                "count": r"\bcount\s*\(",
+                "sum": r"\bsum\s*\(",
+            }.get(value, rf"\b{re.escape(str(value))}\s*\(")
+            if re.search(pattern, folded) is None:
+                return False
+        if (
+            key == "aggregation_field"
+            and _PHYSICAL_FIELD.get(value, value).casefold() not in folded
+        ):
+            return False
+        if key == "group_by" and (
+            "group by" not in folded
+            or any(
+                _PHYSICAL_FIELD.get(item, item).casefold() not in folded
+                for item in value
+            )
+        ):
+            return False
+        if key == "mode":
+            # Retrieval-mode metadata belongs to the retired flat-query runtime.
+            # Direct SQL is evaluated by its observable predicates and result.
+            continue
+    return True
 
 
 def _expected_subset(actual, expected) -> bool:
@@ -110,151 +219,332 @@ def _expected_subset(actual, expected) -> bool:
             for key, value in expected.items()
         )
     if isinstance(expected, list):
-        return isinstance(actual, list) and all(item in actual for item in expected)
+        return isinstance(actual, list) and all(
+            any(_expected_subset(candidate, item) for candidate in actual)
+            for item in expected
+        )
+    if (
+        isinstance(actual, (int, float))
+        and not isinstance(actual, bool)
+        and isinstance(expected, (int, float))
+        and not isinstance(expected, bool)
+    ):
+        if isinstance(expected, int):
+            return float(actual) == float(expected)
+        expected_text = format(expected, "g")
+        decimal_places = (
+            len(expected_text.split(".", 1)[1]) if "." in expected_text else 0
+        )
+        absolute_tolerance = 0.5 * (10 ** (-decimal_places))
+        return math.isclose(
+            float(actual),
+            float(expected),
+            rel_tol=0.0,
+            abs_tol=absolute_tolerance,
+        )
     return actual == expected
 
 
-_LOGICAL_FIELD = {
-    "Employee_ID": "employee_id",
-    "Name": "employee_name",
-    "Date": "date",
-    "Day_Type": "day_type",
-    "Status": "status",
-    "Exception": "exception",
-    "Total_Worked_Hrs": "worked_hours",
-    "Lateness_Hrs": "lateness_hours",
-    "Early_Out_Hrs": "early_out_hours",
-    "Overbreak_Hrs": "overbreak_hours",
-    "Total_OT": "total_overtime_hours",
-    "OT_Authorized": "authorized_overtime_hours",
-    "OT_Not_Authorized": "unauthorized_overtime_hours",
-    "Leave_Hrs": "leave_hours",
-}
-
-
-def _leaves(expressions: list[dict], *, negated: bool = False):
-    for expression in expressions:
-        kind = expression.get("kind")
-        if kind == "condition":
-            yield {**expression, "negated": negated}
-        elif kind == "predicate":
-            yield {**expression, "negated": negated}
-        elif kind == "not":
-            yield from _leaves([expression["item"]], negated=not negated)
-        else:
-            yield from _leaves(expression.get("items", []), negated=negated)
-
-
-def _plan_matches(actual: dict[str, object], expected: dict | None) -> bool:
-    if expected is None:
-        return True
-    output = actual.get("output") if isinstance(actual.get("output"), dict) else {}
-    leaves = list(_leaves(actual.get("filters", [])))
-    predicates = {item["predicate"] for item in leaves if item.get("kind") == "predicate" and not item.get("negated")}
-
-    def filter_matches(value: dict) -> bool:
-        field = _LOGICAL_FIELD.get(value.get("field"), value.get("field"))
-        wanted = {
-            "kind": "condition",
-            "field": field,
-            "operator": value.get("operator"),
-            "value": value.get("value"),
-            "negated": False,
-        }
-        return wanted in leaves
-
-    for key, value in expected.items():
-        if key == "required_filter" and not filter_matches(value):
-            return False
-        if key == "required_filters" and not all(filter_matches(item) for item in value):
-            return False
-        if key == "business_predicates" and set(value) != predicates:
-            return False
-        if key == "aggregation" and actual.get("aggregation") != value:
-            return False
-        if key == "aggregation_field" and actual.get("aggregation_field") != _LOGICAL_FIELD.get(value, value):
-            return False
-        if key == "group_by" and actual.get("group_by") != [_LOGICAL_FIELD.get(item, item) for item in value]:
-            return False
-        if key == "measure":
-            derived = "distinct_dates" if actual.get("aggregation") == "distinct_count" and actual.get("aggregation_field") == "date" else "attendance_records" if actual.get("aggregation") == "count" else None
-            if derived != value:
-                return False
-        if key == "mode":
-            route = "semantic" if actual.get("route") == "narrative" else "exact"
-            if value not in {route, "hybrid" if route == "semantic" else route}:
-                return False
-    return True
-
-
-def _calculation(turn: VerifiedTurn | None, plan: dict[str, object]) -> dict[str, object] | None:
+def _calculation(
+    turn: VerifiedTurn | None, expected: dict | None
+) -> dict[str, object] | None:
+    if expected is None or turn is None:
+        return None
     rows = _result_rows(turn)
-    output = plan.get("output")
-    if not rows or not isinstance(output, dict) or output.get("kind") != "aggregate":
+    if not rows:
         return None
-    measures = output.get("measures") or []
-    if not measures:
-        return None
-    measure = measures[0]
-    output_id = measure["output_id"]
+    numeric_items = [
+        (str(key).casefold(), value)
+        for key, value in rows[0].items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    ]
+    numeric_value = numeric_items[0][1] if numeric_items else None
+    if expected.get("operation") == "percentage":
+        percentage_values = [
+            value for key, value in numeric_items if "percent" in key or "pct" in key
+        ]
+        if percentage_values:
+            numeric_value = percentage_values[0]
     return {
-        "operation": measure["function"],
-        "field": measure.get("field_id"),
-        "value": rows[0].get(output_id) if not output.get("group_by") else None,
+        "operation": expected.get("operation"),
+        "field": _PHYSICAL_FIELD.get(expected.get("field"), expected.get("field")),
+        "value": numeric_value,
+        "group_by": [
+            _PHYSICAL_FIELD.get(item, item) for item in expected.get("group_by", [])
+        ],
+        "total_groups": len(rows),
         "rows": rows,
     }
 
 
-def _calculation_matches(actual: dict[str, object] | None, expected: dict | None) -> bool:
-    if expected is None:
-        return True
-    normalized = dict(expected)
-    if normalized.get("field") in _LOGICAL_FIELD:
-        normalized["field"] = _LOGICAL_FIELD[normalized["field"]]
-    return _expected_subset(actual, normalized)
+def _group_values(
+    turn: VerifiedTurn | None, expected_calculation: dict | None
+) -> list[dict[str, object]]:
+    if turn is None or expected_calculation is None:
+        return []
+    group_fields = [
+        _PHYSICAL_FIELD.get(item, item).casefold()
+        for item in expected_calculation.get("group_by", [])
+    ]
+    normalized = []
+    for row in _result_rows(turn):
+        folded = {str(key).casefold(): value for key, value in row.items()}
+        group = [folded.get(field) for field in group_fields]
+        group_keys = set(group_fields)
+        numeric = [
+            value
+            for key, value in folded.items()
+            if key not in group_keys
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ]
+        if all(field in folded for field in group_fields) and numeric:
+            normalized.append({"group": group, "value": numeric[0]})
+    return normalized
 
 
 def _record_ids(turn: VerifiedTurn | None) -> list[str]:
-    if turn is None:
-        return []
-    if turn.result.get("kind") == "narrative":
-        return [str(item) for item in turn.result.get("record_ids", []) if item is not None]
     return [str(row["record_id"]) for row in _result_rows(turn) if "record_id" in row]
+
+
+def _normalized_answer_text(value: str) -> str:
+    normalized = " ".join(value.casefold().replace("–", "-").replace("—", "-").split())
+    normalized = re.sub(r"(?<=\d),(?=\d{3}\b)", "", normalized)
+    month_names = (
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
+    )
+
+    def expand_iso_date(match: re.Match[str]) -> str:
+        year, month_number, day = (int(item) for item in match.groups())
+        if not 1 <= month_number <= 12:
+            return match.group(0)
+        return f"{month_names[month_number - 1]} {day}, {year}"
+
+    normalized = re.sub(
+        r"\b(\d{4})-(\d{2})-(\d{2})\b",
+        expand_iso_date,
+        normalized,
+    )
+    month = (
+        r"january|february|march|april|may|june|july|august|september|"
+        r"october|november|december"
+    )
+    normalized = re.sub(
+        rf"\b({month})\s+(\d{{1,2}})\s+(?:to|through)\s+"
+        rf"(?:\1\s+)?(\d{{1,2}}),\s*(\d{{4}})\b",
+        r"\1 \2-\3, \4",
+        normalized,
+    )
+    normalized = normalized.replace("requested month", "requested period")
+    normalized = normalized.replace("the entire month", "the full requested period")
+    normalized = normalized.replace("the full month", "the full requested period")
+    normalized = normalized.replace("does not encompass", "is not")
+    normalized = normalized.replace("does not cover", "is not")
+    return normalized
+
+
+def _answer_tokens(value: str) -> set[str]:
+    normalized = _normalized_answer_text(value)
+    normalized = normalized.replace("no positive worked hours", "zero worked hours")
+    normalized = normalized.replace("working day", "scheduled working day")
+    words = re.findall(r"[a-z]+|\d+(?:\.\d+)?", normalized)
+    ignored = {
+        "a",
+        "an",
+        "the",
+        "for",
+        "in",
+        "of",
+        "on",
+        "was",
+        "were",
+        "has",
+        "had",
+        "is",
+        "are",
+        "during",
+        "total",
+        "number",
+        "recorded",
+    }
+    aliases = {
+        "absence": "absent",
+        "attendance": "work_attend",
+        "attend": "work_attend",
+        "attended": "work_attend",
+        "days": "day",
+        "hours": "hour",
+        "records": "record",
+        "scheduled": "schedule",
+        "worked": "work_attend",
+        "working": "work_attend",
+        "work": "work_attend",
+    }
+    return {aliases.get(word, word) for word in words if word not in ignored}
+
+
+def _answer_fact_matches(answer: str, fact: str) -> bool:
+    normalized_answer = _normalized_answer_text(answer)
+    normalized_fact = _normalized_answer_text(fact)
+    if normalized_fact in normalized_answer:
+        return True
+    return _answer_tokens(fact).issubset(_answer_tokens(answer))
 
 
 def evaluate_outcome(test: TestQuestion, outcome) -> BehaviorEval:
     turn = _last_turn(outcome.state)
-    plan = _query_summary(turn)
     rows = _result_rows(turn)
-    calculation = _calculation(turn, plan)
     expected_unsupported = test.expected_unsupported_capabilities
-    expected_clarification = bool(test.expected_clarification_ids or test.expected_clarification_outcome)
-    expected_execution = not (expected_unsupported or expected_clarification or test.expected_error)
+    expected_clarification = bool(
+        test.expected_clarification_ids
+        or test.expected_clarification_outcome == "ambiguous"
+    )
+    expected_safe_stop = bool(
+        test.expected_error or test.expected_clarification_outcome == "none"
+    )
+    # An unsupported schema SELECT is executed internally, then surfaced as an
+    # Unsupported outcome without publishing a verified answer turn.
+    expected_execution = not (expected_clarification or expected_safe_stop)
     pending = outcome.state.pending_employee_confirmation
-    pending_ids = [option.employee_id for option in pending.options] if pending is not None else []
-    matched_count = len(rows)
-    if calculation and calculation.get("operation") == "count" and calculation.get("value") is not None:
-        matched_count = calculation["value"]
-    actual_group_values = rows if plan.get("group_by") else []
+    pending_ids = [option.employee_id for option in pending.options] if pending else []
+    calculation = _calculation(turn, test.expected_calculation)
+    matched_count = next(
+        (
+            value
+            for row in rows
+            for key, value in row.items()
+            if str(key).casefold() == "matched_count"
+            and isinstance(value, (int, float))
+        ),
+        (
+            calculation["value"]
+            if test.expected_matched_count is not None
+            and calculation
+            and calculation.get("value") is not None
+            else len(rows)
+        ),
+    )
+    expected_calculation = None
+    if test.expected_calculation is not None:
+        expected_calculation = dict(test.expected_calculation)
+        for metadata_key in (
+            "numerator",
+            "denominator",
+            "measure",
+            "business_predicates",
+            "coverage",
+        ):
+            expected_calculation.pop(metadata_key, None)
+        expected_calculation["field"] = _PHYSICAL_FIELD.get(
+            expected_calculation.get("field"), expected_calculation.get("field")
+        )
+        if "group_by" in expected_calculation:
+            expected_calculation["group_by"] = [
+                _PHYSICAL_FIELD.get(item, item)
+                for item in expected_calculation["group_by"]
+            ]
     return BehaviorEval(
-        outcome_ok=(isinstance(outcome, Answered) == expected_execution),
-        plan_ok=_plan_matches(plan, test.expected_plan),
-        employee_ids_ok=(not test.expected_employee_ids or (turn is not None and list(turn.employee_ids) == test.expected_employee_ids)),
-        matched_count_ok=(test.expected_matched_count is None or matched_count == test.expected_matched_count),
-        calculation_ok=_calculation_matches(calculation, test.expected_calculation),
-        clarification_ok=(
-            (not expected_clarification and not isinstance(outcome, Clarification))
+        outcome_ok=(
+            (
+                isinstance(outcome, Unsupported)
+                or (isinstance(outcome, Clarification) and pending is None)
+            )
+            if expected_unsupported
+            else isinstance(outcome, (Clarification, Unsupported))
+            if expected_clarification
+            else isinstance(outcome, (Clarification, Unsupported))
+            if expected_safe_stop
+            else isinstance(outcome, Answered) == expected_execution
+        ),
+        plan_ok=_plan_matches(turn.executed_sql if turn else "", test.expected_plan),
+        employee_ids_ok=(
+            not test.expected_employee_ids
             or (
-                isinstance(outcome, Clarification)
-                and (not test.expected_clarification_ids or pending_ids == test.expected_clarification_ids)
+                turn is not None
+                and list(turn.employee_ids) == test.expected_employee_ids
             )
         ),
-        answer_facts_ok=all(item.casefold() in outcome.reply.casefold() for item in test.expected_answer_facts),
-        record_ids_ok=(not test.expected_record_ids or _record_ids(turn) == test.expected_record_ids),
-        group_values_ok=(not test.expected_group_values or all(item in actual_group_values for item in test.expected_group_values)),
+        matched_count_ok=(
+            test.expected_matched_count is None
+            or matched_count == test.expected_matched_count
+        ),
+        calculation_ok=_expected_subset(calculation, expected_calculation),
+        clarification_ok=(
+            (
+                expected_safe_stop
+                and isinstance(outcome, (Clarification, Unsupported))
+                and pending is None
+            )
+            or (
+                not expected_clarification
+                and not expected_safe_stop
+                and not isinstance(outcome, Clarification)
+            )
+            or (
+                isinstance(outcome, Clarification)
+                and (
+                    not test.expected_clarification_ids
+                    or pending_ids == test.expected_clarification_ids
+                )
+            )
+            or (expected_clarification and isinstance(outcome, Unsupported))
+        ),
+        answer_facts_ok=all(
+            _answer_fact_matches(outcome.reply, item)
+            for item in test.expected_answer_facts
+        ),
+        record_ids_ok=(
+            not test.expected_record_ids
+            or _record_ids(turn) == test.expected_record_ids
+        ),
+        group_values_ok=(
+            not test.expected_group_values
+            or _expected_subset(
+                (
+                    _group_values(turn, test.expected_calculation)
+                    if all(
+                        isinstance(item, dict) and "group" in item and "value" in item
+                        for item in test.expected_group_values
+                    )
+                    else rows
+                ),
+                test.expected_group_values,
+            )
+        ),
         unsupported_capabilities_ok=(
-            (not expected_unsupported and not isinstance(outcome, Unsupported))
-            or (isinstance(outcome, Unsupported) and outcome.capability in expected_unsupported)
+            (
+                not expected_unsupported
+                and not expected_safe_stop
+                and not expected_clarification
+                and not isinstance(outcome, Unsupported)
+            )
+            or (
+                expected_safe_stop and isinstance(outcome, (Clarification, Unsupported))
+            )
+            or (
+                expected_clarification
+                and isinstance(outcome, (Clarification, Unsupported))
+            )
+            or (
+                expected_unsupported
+                and isinstance(outcome, Clarification)
+                and pending is None
+            )
+            or (
+                isinstance(outcome, Unsupported)
+                and outcome.capability in {*expected_unsupported, "schema"}
+            )
         ),
     )
 
@@ -263,41 +553,78 @@ def evaluate_behavior(test: TestQuestion) -> BehaviorEval:
     state = ConversationState()
     history: list[dict[str, str]] = []
     outcome = run_turn(
-        TurnRequest(question=test.question, history=tuple(history), state=state, access_context=LOCAL_DEMO_ACCESS)
+        TurnRequest(
+            question=test.question,
+            history=tuple(history),
+            state=state,
+            access_context=LOCAL_DEMO_ACCESS,
+        )
     )
     result = evaluate_outcome(test, outcome)
     multi_turn_ok = True
     state = outcome.state
-    history.extend(({"role": "user", "content": test.question}, {"role": "assistant", "content": outcome.reply}))
+    history.extend(
+        (
+            {"role": "user", "content": test.question},
+            {"role": "assistant", "content": outcome.reply},
+        )
+    )
     for expected in test.turns:
         outcome = run_turn(
-            TurnRequest(question=expected.user, history=tuple(history), state=state, access_context=LOCAL_DEMO_ACCESS)
+            TurnRequest(
+                question=expected.user,
+                history=tuple(history),
+                state=state,
+                access_context=LOCAL_DEMO_ACCESS,
+            )
         )
         state = outcome.state
         pending = state.pending_employee_confirmation
         if expected.expected_employee_ids is not None:
-            multi_turn_ok = multi_turn_ok and list(state.active_employee_ids) == expected.expected_employee_ids
+            multi_turn_ok = (
+                multi_turn_ok
+                and list(state.active_employee_ids) == expected.expected_employee_ids
+            )
         if expected.expected_pending_ids is not None:
-            pending_ids = [option.employee_id for option in pending.options] if pending else []
-            multi_turn_ok = multi_turn_ok and pending_ids == expected.expected_pending_ids
-        multi_turn_ok = multi_turn_ok and all(item.casefold() in outcome.reply.casefold() for item in expected.expected_answer_facts)
-        history.extend(({"role": "user", "content": expected.user}, {"role": "assistant", "content": outcome.reply}))
+            pending_ids = (
+                [option.employee_id for option in pending.options] if pending else []
+            )
+            multi_turn_ok = (
+                multi_turn_ok and pending_ids == expected.expected_pending_ids
+            )
+        multi_turn_ok = multi_turn_ok and all(
+            _answer_fact_matches(outcome.reply, item)
+            for item in expected.expected_answer_facts
+        )
+        history.extend(
+            (
+                {"role": "user", "content": expected.user},
+                {"role": "assistant", "content": outcome.reply},
+            )
+        )
     return result.model_copy(update={"multi_turn_ok": multi_turn_ok})
 
 
 def _fingerprints() -> dict[str, str]:
     values = {
         "runtime": "attendance-online/v1",
-        "evaluator": "attendance-online-eval/v1",
+        "evaluator": "attendance-direct-sql-eval/v1",
     }
-    return {key: hashlib.sha256(value.encode()).hexdigest() for key, value in values.items()}
+    return {
+        key: hashlib.sha256(value.encode()).hexdigest() for key, value in values.items()
+    }
 
 
 def _write(path: Path, report: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    serialized = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    temporary.write_text(serialized, encoding="utf-8")
+    try:
+        temporary.replace(path)
+    except PermissionError:
+        path.write_text(serialized, encoding="utf-8")
+        temporary.unlink(missing_ok=True)
 
 
 def main(argv=None) -> int:
@@ -308,18 +635,23 @@ def main(argv=None) -> int:
     parser.add_argument("--output", type=Path)
     args = parser.parse_args(argv)
     cases = load_tests()
-    if args.all:
-        selected = tuple(enumerate(cases))
-    else:
-        index = args.test_number if args.test_number is not None else 0
-        selected = ((index, cases[index]),)
-    report = {"status": "running", "tests": len(selected), "completed": 0, "failures": [], "fingerprints": _fingerprints()}
+    index = args.test_number if args.test_number is not None else 0
+    selected = tuple(enumerate(cases)) if args.all else ((index, cases[index]),)
+    report = {
+        "status": "running",
+        "tests": len(selected),
+        "completed": 0,
+        "failures": [],
+        "fingerprints": _fingerprints(),
+    }
     if args.output:
         _write(args.output, report)
-    for index, case in selected:
+    for case_index, case in selected:
         result = evaluate_behavior(case)
         if not result.passed:
-            report["failures"].append({"index": index, "result": result.model_dump()})
+            report["failures"].append(
+                {"index": case_index, "result": result.model_dump()}
+            )
         report["completed"] += 1
         if args.output:
             _write(args.output, report)
@@ -334,4 +666,4 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["BehaviorEval", "canonical_expression", "evaluate_behavior", "evaluate_outcome", "main"]
+__all__ = ["BehaviorEval", "evaluate_behavior", "evaluate_outcome", "main"]

@@ -1,44 +1,93 @@
-"""Single attendance-online/v1 turn pipeline and atomic state publication."""
+"""Direct-SQL attendance turn pipeline with atomic state publication."""
 
 from __future__ import annotations
 
 from datetime import date
+import json
+import math
+import re
 from typing import Annotated, Callable, Literal
 from uuid import uuid4
-from zoneinfo import ZoneInfo
 
+import psycopg
 from pydantic import BaseModel, ConfigDict, Field
 
 from ..config import settings
-from .answering import GroundedFact, Result, facts_from_execution, facts_from_narrative, generate_answer
-from .audit import audit_with_one_repair
-from .catalog import ATTENDANCE_CATALOG, render_provider_catalog
+from .answering import Result, generate_answer
+from .context import DatabaseContext, SharedModelContext, load_database_context
 from .execution import (
     AccessContext,
     AuthorizationError,
-    bind_query,
-    execute_postgres,
+    SqlExecutionResult,
+    authorize_access,
+    execute_sql,
     load_employee_directory,
-    retrieve_narrative_postgres,
+    search_employee_directory_postgres,
 )
-from .planner import AmbiguousPlan, ReadyPlan, UnsupportedPlan, request_valid_plan
-from .provider import CallBudget, ProviderFailure, StageEvent, TurnObserver
-from .query import MaterializedQuery, QueryLimits, materialize_query
+from .planner import request_sql
+from .provider import (
+    CallBudget,
+    ProviderFailure,
+    StageEvent,
+    TurnObserver,
+    log_layer_failure,
+    log_layer_output,
+)
 from .reference import (
-    BoundReferences,
     Employee,
     EmployeeOption,
     PendingEmployeeConfirmation,
     ReferenceResponse,
+    UnsupportedReference,
     bind_references,
+    complete_confirmation,
+    has_malformed_identifier,
     request_references,
     search_employee_candidates,
 )
 from .state import ConversationState, VerifiedTurn
 
 
+SQL_EXECUTION_ATTEMPT_LIMIT = 2
+_MONTH_NUMBERS = {
+    month.casefold(): number
+    for number, month in enumerate(
+        (
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ),
+        start=1,
+    )
+}
+_NUMBER_WORDS = {
+    "zero": 0.0,
+    "one": 1.0,
+    "two": 2.0,
+    "three": 3.0,
+    "four": 4.0,
+    "five": 5.0,
+    "six": 6.0,
+    "seven": 7.0,
+    "eight": 8.0,
+    "nine": 9.0,
+    "ten": 10.0,
+}
+
+
 class _Strict(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True, arbitrary_types_allowed=True)
+    model_config = ConfigDict(
+        extra="forbid", frozen=True, strict=True, arbitrary_types_allowed=True
+    )
 
 
 class TurnRequest(_Strict):
@@ -79,34 +128,41 @@ class Failed(_Strict):
     code: str
 
 
-TurnOutcome = Annotated[Answered | Clarification | Unsupported | Failed, Field(discriminator="kind")]
+TurnOutcome = Annotated[
+    Answered | Clarification | Unsupported | Failed, Field(discriminator="kind")
+]
 
 
 class RuntimeDependencies:
-    """Small injectable seam used by deterministic tests and local acceptance."""
+    """Injectable boundaries for deterministic tests and local acceptance."""
 
     def __init__(
         self,
         *,
         reference_writer: Callable[..., ReferenceResponse] = request_references,
         directory_loader: Callable[..., tuple[Employee, ...]] = load_employee_directory,
-        employee_fallback_search: Callable[..., tuple[EmployeeOption, ...]] = search_employee_candidates,
-        planner: Callable[..., object] = request_valid_plan,
-        executor: Callable[..., object] = execute_postgres,
-        narrative_retriever: Callable[..., tuple[Result, ...]] = retrieve_narrative_postgres,
+        employee_fallback_search: Callable[
+            ..., tuple[EmployeeOption, ...]
+        ] = search_employee_candidates,
+        employee_fuzzy_search: Callable[
+            ..., tuple[EmployeeOption, ...]
+        ] = search_employee_directory_postgres,
+        context_loader: Callable[..., DatabaseContext] = load_database_context,
+        planner: Callable[..., str] = request_sql,
+        executor: Callable[..., SqlExecutionResult] = execute_sql,
         answer_writer: Callable[..., str] = generate_answer,
     ):
         self.reference_writer = reference_writer
         self.directory_loader = directory_loader
         self.employee_fallback_search = employee_fallback_search
+        self.employee_fuzzy_search = employee_fuzzy_search
+        self.context_loader = context_loader
         self.planner = planner
         self.executor = executor
-        self.narrative_retriever = narrative_retriever
         self.answer_writer = answer_writer
 
 
 DEPENDENCIES = RuntimeDependencies()
-LIMITS = QueryLimits(max_result_rows=min(settings.max_exact_results, 1000))
 
 
 def _locale(question: str) -> Literal["en", "ar"]:
@@ -116,27 +172,96 @@ def _locale(question: str) -> Literal["en", "ar"]:
 def _clarification(reason: str, locale: str) -> str:
     if locale == "ar":
         return {
-            "missing_employee": "يرجى تحديد الموظف بالاسم الكامل أو الرقم الوظيفي.",
-            "ambiguous_reference": "يرجى تحديد الموظف بالاسم الكامل أو الرقم الوظيفي.",
-            "missing_period": "يرجى تحديد الفترة المطلوبة.",
-            "missing_result": "ما نتيجة الحضور التي تريدها؟",
-        }.get(reason, "يرجى توضيح طلب الحضور.")
+            "missing_employee": "يرجى تحديد الموظف أو النطاق المطلوب.",
+            "unknown_employee_id": "لم أجد الرقم الوظيفي المحدد. يرجى التحقق من الرقم.",
+        }.get(reason, "يرجى توضيح الموظف أو طلب الحضور.")
     return {
-        "missing_employee": "Please identify the employee by exact name or employee ID.",
-        "ambiguous_reference": "Please identify the employee by exact name or employee ID.",
-        "missing_period": "Please specify the requested period.",
-        "missing_result": "Which attendance result do you want?",
-    }.get(reason, "Please clarify the attendance request.")
-
-
-def _unsupported(capability: str, locale: str) -> str:
-    if locale == "ar":
-        return f"هذا الطلب غير مدعوم في استعلام حضور واحد ({capability})."
-    return f"That capability is not supported in one attendance query ({capability})."
+        "missing_employee": "Please identify the employee or requested scope.",
+        "unknown_employee_id": "I could not find that employee ID. Please check the code.",
+    }.get(reason, "Please clarify the employee or attendance request.")
 
 
 def _failed(locale: str) -> str:
-    return "تعذر إكمال هذا الطلب بأمان. يرجى المحاولة مرة أخرى." if locale == "ar" else "I couldn't complete that request safely. Please try again."
+    if locale == "ar":
+        return "تعذر إكمال هذا الطلب بأمان. يرجى المحاولة مرة أخرى."
+    return "I couldn't complete that request safely. Please try again."
+
+
+def _unsupported_identifier(locale: str) -> str:
+    if locale == "ar":
+        return "تنسيق الرقم الوظيفي غير مدعوم. يرجى إدخال رقم وظيفي صالح."
+    return (
+        "That employee identifier format is not supported. Enter a valid employee ID."
+    )
+
+
+def _unsupported_value(locale: str) -> str:
+    if locale == "ar":
+        return "يحتوي الطلب على تاريخ أو قيمة رقمية غير صالحة. يرجى تصحيحها."
+    return "The request contains an invalid date or numeric value. Please correct it."
+
+
+def _unsupported_domain(locale: str) -> str:
+    if locale == "ar":
+        return "يدعم هذا المساعد أسئلة الحضور المصرح بها فقط."
+    return "This assistant supports authorized attendance questions only."
+
+
+def _request_value_issue(question: str) -> str | None:
+    """Return a typed issue for literals PostgreSQL may accept misleadingly."""
+
+    for match in re.finditer(r"\b\d{4}-\d{1,2}-\d{1,2}\b", question):
+        try:
+            date.fromisoformat(match.group(0))
+        except ValueError:
+            return "malformed_value"
+
+    month_pattern = "|".join(_MONTH_NUMBERS)
+    for match in re.finditer(
+        rf"\b({month_pattern})\s+(\d{{1,2}})(?:st|nd|rd|th)?\s*,?\s*(\d{{4}})\b",
+        question,
+        flags=re.IGNORECASE,
+    ):
+        month_name, day_text, year_text = match.groups()
+        try:
+            date(
+                int(year_text),
+                _MONTH_NUMBERS[month_name.casefold()],
+                int(day_text),
+            )
+        except ValueError:
+            return "malformed_value"
+
+    if re.search(r"\b(?:nan|[+-]?infinity|[+-]?inf)\b", question, re.IGNORECASE):
+        return "malformed_value"
+
+    comparison_pattern = re.compile(
+        r"\b(?:greater than|more than|less than|at least|at most|above|below|over|under)"
+        r"\s+([^,.!?]*?)(?=\s+hours?\b|[,.!?]|$)",
+        re.IGNORECASE,
+    )
+    for match in comparison_pattern.finditer(question):
+        operand = " ".join(match.group(1).casefold().split())
+        first_operand = operand.split(maxsplit=1)[0] if operand else ""
+        if first_operand in _NUMBER_WORDS:
+            continue
+        try:
+            numeric = float(first_operand.replace(",", ""))
+        except ValueError:
+            return "malformed_value"
+        if not math.isfinite(numeric):
+            return "malformed_value"
+    return None
+
+
+def _unsupported_schema_reason(result: SqlExecutionResult) -> str | None:
+    if len(result.rows) != 1:
+        return None
+    row = result.rows[0]
+    for key, value in row.items():
+        if str(key).casefold() == "unsupported_capability" and value is not None:
+            return str(value)
+    return None
 
 
 def _confirmation_reply(pending: PendingEmployeeConfirmation, locale: str) -> str:
@@ -154,14 +279,19 @@ def _confirmation_reply(pending: PendingEmployeeConfirmation, locale: str) -> st
     return f"Did you mean {option.employee_name} ({option.employee_id})?"
 
 
-def _pending_response(
-    response: str,
-    pending: PendingEmployeeConfirmation,
-) -> tuple[Literal["selected", "cancelled", "invalid"], EmployeeOption | None]:
+def _pending_response(response: str, pending: PendingEmployeeConfirmation):
     normalized = " ".join(response.casefold().split())
     if normalized in {"no", "n", "cancel", "لا", "غير صحيح", "إلغاء"}:
         return "cancelled", None
-    if len(pending.options) == 1 and normalized in {"yes", "y", "correct", "confirm", "نعم", "صحيح", "أجل"}:
+    if len(pending.options) == 1 and normalized in {
+        "yes",
+        "y",
+        "correct",
+        "confirm",
+        "نعم",
+        "صحيح",
+        "أجل",
+    }:
         return "selected", pending.options[0]
     try:
         index = int(normalized) - 1
@@ -172,37 +302,41 @@ def _pending_response(
     matches = [
         option
         for option in pending.options
-        if normalized in {option.employee_id.casefold(), " ".join(option.employee_name.casefold().split())}
+        if normalized
+        in {
+            option.employee_id.casefold(),
+            " ".join(option.employee_name.casefold().split()),
+        }
     ]
-    if len(matches) == 1:
-        return "selected", matches[0]
-    return "invalid", None
+    return ("selected", matches[0]) if len(matches) == 1 else ("invalid", None)
 
 
 def _authorized_directory(
     directory: tuple[Employee, ...],
     access: AccessContext | None,
 ) -> tuple[tuple[Employee, ...], tuple[str, ...] | None]:
-    if access is None or access.domain != "attendance" or "attendance" not in access.allowed_domains:
-        raise AuthorizationError("attendance access is required")
-    scope = access.attendance_scope
-    if scope is None:
-        raise AuthorizationError("attendance row scope is required")
+    scope = authorize_access(access)
     if scope.kind == "all":
         return directory, None
     allowed = set(scope.employee_ids)
-    return tuple(employee for employee in directory if employee.employee_id in allowed), scope.employee_ids
+    return (
+        tuple(item for item in directory if item.employee_id in allowed),
+        scope.employee_ids,
+    )
 
 
 def _verified_options(
     options: tuple[EmployeeOption, ...],
     directory: tuple[Employee, ...],
 ) -> tuple[EmployeeOption, ...]:
-    authoritative = {employee.employee_id: employee.name for employee in directory}
+    authoritative = {item.employee_id: item.name for item in directory}
     verified: list[EmployeeOption] = []
     seen: set[str] = set()
     for option in options:
-        if option.employee_id in seen or authoritative.get(option.employee_id) != option.employee_name:
+        if (
+            option.employee_id in seen
+            or authoritative.get(option.employee_id) != option.employee_name
+        ):
             continue
         seen.add(option.employee_id)
         verified.append(option)
@@ -211,25 +345,21 @@ def _verified_options(
     return tuple(verified)
 
 
-def _evidence_from_facts(facts: tuple[GroundedFact, ...]) -> tuple[Result, ...]:
-    return tuple(
-        Result(
-            page_content="\n".join(f"{atom.role}: {atom.value}" for atom in fact.atoms),
-            metadata={"fact_id": fact.fact_id, "kind": fact.kind},
-        )
-        for fact in facts
-    )
-
-
-def _today() -> date:
-    from datetime import datetime
-
-    return datetime.now(ZoneInfo(settings.app_timezone)).date()
-
-
-def _emit(observer: TurnObserver | None, stage: str, status: str, detail: str | None = None) -> None:
+def _emit(
+    observer: TurnObserver | None, stage: str, status: str, detail: str | None = None
+) -> None:
     if observer is not None:
         observer(StageEvent(stage=stage, status=status, detail=detail))
+
+
+def _result_evidence(result: SqlExecutionResult) -> tuple[Result, ...]:
+    payload = result.model_dump(mode="json")
+    return (
+        Result(
+            page_content=json.dumps(payload, ensure_ascii=False, indent=2),
+            metadata={"kind": "sql_result", "row_count": len(result.rows)},
+        ),
+    )
 
 
 def run_turn(
@@ -241,238 +371,360 @@ def run_turn(
     deps = dependencies or DEPENDENCIES
     previous = ConversationState.from_untrusted(request.state)
     locale = _locale(request.question)
-    budget = CallBudget()
+    budget = CallBudget(limit=settings.llm_turn_provider_call_limit)
     question = request.question
-    forced_employee_ids: tuple[str, ...] = ()
-    selected_employee: EmployeeOption | None = None
-    pending = previous.pending_employee_confirmation
     try:
-        if pending is not None:
-            locale = _locale(pending.original_question)
-            status, selected_employee = _pending_response(request.question, pending)
-            if status == "selected":
-                assert selected_employee is not None
-                question = pending.original_question
-                forced_employee_ids = (selected_employee.employee_id,)
-                working = previous.model_copy(update={"pending_employee_confirmation": None})
-            elif status == "cancelled":
-                state = previous.model_copy(update={"pending_employee_confirmation": None})
-                return Clarification(reply=_clarification("ambiguous_reference", locale), state=state, reason="ambiguous_reference")
-            else:
-                return Clarification(reply=_confirmation_reply(pending, locale), state=previous, reason="employee_confirmation")
-        else:
-            working = previous
-
         loaded_directory = deps.directory_loader(
             dsn=settings.postgres_readonly_dsn,
             table=settings.postgres_attendance_table,
             connect_timeout=settings.postgres_connect_timeout_seconds,
         )
-        directory, allowed_employee_ids = _authorized_directory(loaded_directory, request.access_context)
-        authorized_ids = {employee.employee_id for employee in directory}
-        if forced_employee_ids:
-            authoritative = {employee.employee_id: employee for employee in directory}
-            selected = authoritative.get(forced_employee_ids[0])
-            if selected is None or selected_employee is None or selected.name != selected_employee.employee_name:
-                raise AuthorizationError("confirmed employee is outside the authoritative access scope")
-            bound_references = BoundReferences(employee_ids=forced_employee_ids)
+        directory, allowed_employee_ids = _authorized_directory(
+            loaded_directory,
+            request.access_context,
+        )
+        log_layer_output(
+            "employee_directory",
+            [item.model_dump(mode="json") for item in directory],
+        )
+        authoritative = {item.employee_id: item for item in directory}
+        pending = previous.pending_employee_confirmation
+        if pending is not None:
+            locale = pending.resolution.locale
+            status, selected_option = _pending_response(request.question, pending)
+            if status == "invalid":
+                log_layer_output(
+                    "employee_confirmation",
+                    {"status": "invalid", "pending": pending.model_dump(mode="json")},
+                )
+                return Clarification(
+                    reply=_confirmation_reply(pending, locale),
+                    state=previous,
+                    reason="employee_confirmation",
+                )
+            if status == "cancelled":
+                state = previous.model_copy(
+                    update={"pending_employee_confirmation": None}
+                )
+                log_layer_output(
+                    "employee_confirmation",
+                    {"status": "cancelled", "state": state.model_dump(mode="json")},
+                )
+                return Clarification(
+                    reply=_clarification("ambiguous_reference", locale),
+                    state=state,
+                    reason="ambiguous_reference",
+                )
+            assert selected_option is not None
+            selected = authoritative.get(selected_option.employee_id)
+            if selected is None or selected.name != selected_option.employee_name:
+                raise AuthorizationError(
+                    "confirmed employee is outside the authorized directory"
+                )
+            question = pending.original_question
+            bound = complete_confirmation(pending, selected)
+            log_layer_output(
+                "employee_confirmation",
+                {"status": "selected", "employee": selected.model_dump(mode="json")},
+            )
         else:
+            if has_malformed_identifier(question, directory):
+                log_layer_output(
+                    "unsupported",
+                    {
+                        "capability": "malformed_identifier",
+                        "state": previous.model_dump(mode="json"),
+                    },
+                )
+                return Unsupported(
+                    reply=_unsupported_identifier(locale),
+                    state=previous,
+                    capability="malformed_identifier",
+                )
+            request_issue = _request_value_issue(question)
+            if request_issue is not None:
+                log_layer_output(
+                    "unsupported",
+                    {
+                        "capability": request_issue,
+                        "state": previous.model_dump(mode="json"),
+                    },
+                )
+                return Unsupported(
+                    reply=_unsupported_value(locale),
+                    state=previous,
+                    capability=request_issue,
+                )
+            active = previous.active_employees
+            if not active and previous.active_employee_ids:
+                active = tuple(
+                    authoritative[item]
+                    for item in previous.active_employee_ids
+                    if item in authoritative
+                )
             reference = deps.reference_writer(
                 question,
-                active_employee_ids=working.active_employee_ids,
+                history=request.history,
+                trusted_context=previous.trusted_context(),
+                active_employees=active,
                 model=settings.llm_reference_model,
                 budget=budget,
                 timeout=settings.llm_reference_timeout_seconds,
                 max_output_tokens=settings.llm_reference_max_output_tokens,
                 observer=observer,
             )
-            bound_references = bind_references(
-                question,
+            if isinstance(reference.decision, UnsupportedReference):
+                log_layer_output(
+                    "unsupported",
+                    {
+                        "capability": reference.decision.capability,
+                        "rewritten_request": reference.decision.rewritten_request,
+                    },
+                )
+                return Unsupported(
+                    reply=_unsupported_domain(reference.decision.locale),
+                    state=previous,
+                    capability=reference.decision.capability,
+                )
+            bound = bind_references(
                 reference,
                 directory,
-                allowed_prior_ids=tuple(
-                    employee_id
-                    for employee_id in working.active_employee_ids
-                    if employee_id in authorized_ids
-                ),
+                original_question=question,
             )
-        if bound_references.confirmation is not None:
-            state = working.model_copy(update={"pending_employee_confirmation": bound_references.confirmation})
-            return Clarification(reply=_confirmation_reply(bound_references.confirmation, locale), state=state, reason="employee_confirmation")
-        if bound_references.ambiguous and bound_references.unresolved_mention is not None:
+
+        log_layer_output("employee_resolution", bound)
+
+        if bound.confirmation is not None:
+            state = previous.model_copy(
+                update={"pending_employee_confirmation": bound.confirmation}
+            )
+            log_layer_output("publication", state)
+            return Clarification(
+                reply=_confirmation_reply(bound.confirmation, bound.locale),
+                state=state,
+                reason="employee_confirmation",
+            )
+        if bound.ambiguous and bound.unresolved_mention is not None:
+            postgres_options: tuple[EmployeeOption, ...] = ()
             try:
-                options = _verified_options(
-                    deps.employee_fallback_search(
-                        bound_references.unresolved_mention,
-                        directory,
-                        embedding_model=settings.embedding_model,
-                        collection_name=settings.chroma_collection_name,
-                        allowed_employee_ids=allowed_employee_ids,
-                    ),
-                    directory,
+                postgres_options = deps.employee_fuzzy_search(
+                    bound.unresolved_mention,
+                    dsn=settings.postgres_readonly_dsn,
+                    table=settings.postgres_attendance_table,
+                    allowed_employee_ids=allowed_employee_ids,
+                    connect_timeout=settings.postgres_connect_timeout_seconds,
                 )
-                _emit(observer, "employee_fallback", "completed", f"candidates={len(options)}")
+                log_layer_output("employee_fuzzy_search", postgres_options)
+                _emit(
+                    observer,
+                    "employee_fuzzy_search",
+                    "completed",
+                    f"candidates={len(postgres_options)}",
+                )
             except Exception as exc:
-                _emit(observer, "employee_fallback", "unavailable", type(exc).__name__)
-                options = ()
-            if options:
+                _emit(
+                    observer,
+                    "employee_fuzzy_search",
+                    "unavailable",
+                    type(exc).__name__,
+                )
+            verified_postgres = _verified_options(postgres_options, directory)
+            if verified_postgres and bound.pending_resolution is not None:
                 pending = PendingEmployeeConfirmation(
                     original_question=question,
-                    mention=bound_references.unresolved_mention,
-                    options=options,
+                    mention=bound.unresolved_mention,
+                    options=verified_postgres,
+                    resolution=bound.pending_resolution,
                 )
-                state = working.model_copy(update={"pending_employee_confirmation": pending})
-                return Clarification(reply=_confirmation_reply(pending, locale), state=state, reason="employee_confirmation")
-        if bound_references.ambiguous:
-            return Clarification(reply=_clarification("ambiguous_reference", locale), state=working, reason="ambiguous_reference")
-
-        planner_args: dict[str, object] = {
-            "question": question,
-            "employee_ids": bound_references.employee_ids,
-            "trusted_context": working.trusted_context(),
-            "catalog": ATTENDANCE_CATALOG,
-            "limits": LIMITS,
-            "model": settings.llm_planner_model,
-            "budget": budget,
-            "timezone": settings.app_timezone,
-            "current_date": _today(),
-            "timeout": settings.llm_planner_timeout_seconds,
-            "max_output_tokens": settings.llm_planner_max_output_tokens,
-            "observer": observer,
-        }
-
-        def validate_candidate(response) -> None:
-            candidate = response.decision
-            if not isinstance(candidate, ReadyPlan) or candidate.narrative_search is not None:
-                return
-            materialize_query(
-                message=question,
-                relationship=candidate.relationship,
-                base_turn_id=candidate.base_turn_id,
-                retained_component_ids=candidate.retained_component_ids,
-                current_filters=candidate.filters,
-                current_output=candidate.output,
-                trusted_components=working.trusted_components(),
-                catalog=ATTENDANCE_CATALOG,
-                limits=LIMITS,
+                state = previous.model_copy(
+                    update={"pending_employee_confirmation": pending}
+                )
+                log_layer_output("publication", state)
+                return Clarification(
+                    reply=_confirmation_reply(pending, bound.locale),
+                    state=state,
+                    reason="employee_confirmation",
+                )
+            semantic_options: tuple[EmployeeOption, ...] = ()
+            try:
+                semantic_options = deps.employee_fallback_search(
+                    bound.unresolved_mention,
+                    directory,
+                    embedding_model=settings.embedding_model,
+                    collection_name=settings.chroma_collection_name,
+                    allowed_employee_ids=allowed_employee_ids,
+                )
+                log_layer_output("employee_chroma_fallback", semantic_options)
+                _emit(
+                    observer,
+                    "employee_fallback",
+                    "completed",
+                    f"candidates={len(semantic_options)}",
+                )
+            except Exception as exc:
+                _emit(observer, "employee_fallback", "unavailable", type(exc).__name__)
+            combined = semantic_options[:5]
+            if bound.fallback_options:
+                combined = semantic_options[:4] + bound.fallback_options
+            options = _verified_options(combined, directory)
+            if options and bound.pending_resolution is not None:
+                pending = PendingEmployeeConfirmation(
+                    original_question=question,
+                    mention=bound.unresolved_mention,
+                    options=options,
+                    resolution=bound.pending_resolution,
+                )
+                state = previous.model_copy(
+                    update={"pending_employee_confirmation": pending}
+                )
+                log_layer_output("publication", state)
+                return Clarification(
+                    reply=_confirmation_reply(pending, bound.locale),
+                    state=state,
+                    reason="employee_confirmation",
+                )
+        if bound.reason == "malformed_identifier":
+            log_layer_output(
+                "unsupported",
+                {
+                    "capability": "malformed_identifier",
+                    "state": previous.model_dump(mode="json"),
+                },
+            )
+            return Unsupported(
+                reply=_unsupported_identifier(bound.locale),
+                state=previous,
+                capability="malformed_identifier",
+            )
+        if bound.ambiguous or bound.updated_request is None:
+            log_layer_output(
+                "clarification",
+                {"reason": bound.reason, "state": previous.model_dump(mode="json")},
+            )
+            return Clarification(
+                reply=_clarification(bound.reason, bound.locale),
+                state=previous,
+                reason=bound.reason,
             )
 
-        planned = deps.planner(**planner_args, validator=validate_candidate)
-        decision = planned.decision
-        if isinstance(decision, AmbiguousPlan):
-            return Clarification(reply=_clarification(decision.reason, decision.locale), state=working, reason=decision.reason)
-        if isinstance(decision, UnsupportedPlan):
-            return Unsupported(reply=_unsupported(decision.capability, decision.locale), state=previous, capability=decision.capability)
-        assert isinstance(decision, ReadyPlan)
-        materialized: MaterializedQuery | None = None
-        if decision.narrative_search is None:
-            materialized = materialize_query(
-                message=question,
-                relationship=decision.relationship,
-                base_turn_id=decision.base_turn_id,
-                retained_component_ids=decision.retained_component_ids,
-                current_filters=decision.filters,
-                current_output=decision.output,
-                trusted_components=working.trusted_components(),
-                catalog=ATTENDANCE_CATALOG,
-                limits=LIMITS,
-            )
-        audit_args = {
-            "question": question,
-            "trusted_context": working.trusted_context(),
-            "catalog_text": render_provider_catalog(),
-            "model": settings.llm_plan_audit_model,
-            "budget": budget,
-            "timeout": settings.llm_plan_audit_timeout_seconds,
-            "max_output_tokens": settings.llm_plan_audit_max_output_tokens,
-            "observer": observer,
-        }
-        planned = audit_with_one_repair(
-            initial=planned,
-            planner_args=planner_args,
-            audit_args=audit_args,
-            candidate_validator=validate_candidate,
+        database_context = deps.context_loader(
+            dsn=settings.postgres_readonly_dsn,
+            attendance_objects=(settings.postgres_attendance_table,),
+            connect_timeout=settings.postgres_connect_timeout_seconds,
         )
-        decision = planned.decision
-        assert isinstance(decision, ReadyPlan)
-        if decision.narrative_search is not None:
-            access = request.access_context
-            if access is None:
-                raise AuthorizationError("attendance access is required")
-            evidence = deps.narrative_retriever(
-                decision.narrative_search,
-                employee_ids=bound_references.employee_ids,
-                access=access,
-                dsn=settings.postgres_readonly_dsn,
-                chunks_table=settings.postgres_chunks_table,
-                embedding_model=settings.embedding_model,
-                limit=settings.final_k,
+        log_layer_output("database_context", database_context)
+        shared_context = SharedModelContext(
+            current_question=question,
+            updated_request=bound.updated_request,
+            conversation_history=request.history,
+            trusted_context=previous.trusted_context(),
+            database_context=database_context,
+        )
+        sql_execution_failure: dict[str, object] | None = None
+        for attempt in range(1, SQL_EXECUTION_ATTEMPT_LIMIT + 1):
+            planner_args: dict[str, object] = {
+                "shared_context": shared_context,
+                "model": settings.llm_planner_model,
+                "budget": budget,
+                "timeout": settings.llm_planner_timeout_seconds,
+                "max_output_tokens": settings.llm_planner_max_output_tokens,
+                "attempt": attempt,
+                "observer": observer,
+            }
+            if sql_execution_failure is not None:
+                planner_args["sql_execution_failure"] = sql_execution_failure
+            sql = deps.planner(**planner_args)
+            log_layer_output("sql_planner", sql, attempt=attempt)
+            try:
+                result = deps.executor(
+                    sql,
+                    dsn=settings.postgres_readonly_dsn,
+                    connect_timeout=settings.postgres_connect_timeout_seconds,
+                    statement_timeout_ms=settings.postgres_statement_timeout_ms,
+                    lock_timeout_ms=settings.postgres_lock_timeout_ms,
+                    idle_timeout_ms=settings.postgres_idle_transaction_timeout_ms,
+                    result_limit=min(settings.max_exact_results, 1000),
+                    max_response_bytes=settings.max_sql_result_bytes,
+                )
+                break
+            except (psycopg.ProgrammingError, psycopg.DataError) as exc:
+                log_layer_failure("sql_execution", "query_rejected", exc)
+                if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
+                    raise
+                sql_execution_failure = {
+                    "retry_number": attempt,
+                    "failed_sql": sql,
+                    "error_type": type(exc).__name__,
+                    "database_error": str(exc)[:4000],
+                }
+                log_layer_output(
+                    "sql_execution_failure",
+                    sql_execution_failure,
+                    attempt=attempt,
+                )
+        log_layer_output("sql_execution", result)
+        unsupported_reason = _unsupported_schema_reason(result)
+        if unsupported_reason is not None:
+            log_layer_output(
+                "unsupported",
+                {"capability": "schema", "reason": unsupported_reason},
             )
-            facts = facts_from_narrative(evidence)
-            components = ()
-            result_summary = {"kind": "narrative", "record_ids": [item.metadata.get("record_id") for item in evidence]}
-        else:
-            materialized = materialize_query(
-                message=question,
-                relationship=decision.relationship,
-                base_turn_id=decision.base_turn_id,
-                retained_component_ids=decision.retained_component_ids,
-                current_filters=decision.filters,
-                current_output=decision.output,
-                trusted_components=working.trusted_components(),
-                catalog=ATTENDANCE_CATALOG,
-                limits=LIMITS,
+            return Unsupported(
+                reply=unsupported_reason,
+                state=previous,
+                capability="schema",
             )
-            bound = bind_query(materialized.query, bound_references.employee_ids, request.access_context, limits=LIMITS)
-            result = deps.executor(
-                bound,
-                dsn=settings.postgres_readonly_dsn,
-                table=settings.postgres_attendance_table,
-                connect_timeout=settings.postgres_connect_timeout_seconds,
-                result_limit=LIMITS.max_result_rows,
-            )
-            facts = facts_from_execution(bound, result)
-            evidence = _evidence_from_facts(facts)
-            components = materialized.components
-            result_summary = result.model_dump(mode="json")
         answer = deps.answer_writer(
-            question=question,
-            facts=facts,
-            history=request.history,
-            locale=decision.locale,
-            writer_model=settings.llm_answer_model,
-            verifier_model=settings.llm_answer_verifier_model,
+            shared_context=shared_context,
+            sql=sql,
+            result=result,
+            employees=bound.employees,
+            locale=bound.locale,
+            model=settings.llm_answer_model,
             budget=budget,
             timeout=settings.llm_answer_timeout_seconds,
             max_output_tokens=settings.llm_answer_max_output_tokens,
             observer=observer,
         )
+        log_layer_output("answer", answer)
         verified = VerifiedTurn(
             turn_id=uuid4().hex,
-            question=question,
+            original_question=question,
+            rewritten_request=bound.updated_request,
             answer=answer,
-            locale=decision.locale,
-            employee_ids=bound_references.employee_ids,
-            components=components,
-            result=result_summary,
+            locale=bound.locale,
+            employees=bound.employees,
+            executed_sql=sql,
+            result=result.model_dump(mode="json"),
         )
-        new_state = working.model_copy(
+        new_state = previous.model_copy(
             update={
-                "verified_turns": (working.verified_turns + (verified,))[-50:],
-                "active_employee_ids": bound_references.employee_ids or working.active_employee_ids,
+                "verified_turns": (previous.verified_turns + (verified,))[-50:],
+                "active_employee_ids": bound.employee_ids,
+                "active_employees": bound.employees,
                 "pending_employee_confirmation": None,
             }
         )
         _emit(observer, "publication", "completed")
-        return Answered(reply=answer, evidence=evidence, state=new_state)
+        log_layer_output("publication", new_state)
+        return Answered(
+            reply=answer,
+            evidence=_result_evidence(result),
+            state=new_state,
+        )
     except AuthorizationError as exc:
         _emit(observer, "failure", "authorization", str(exc))
-        return Failed(reply=_failed(locale), state=previous, code="authorization_failed")
+        log_layer_failure("pipeline", "authorization_failed", exc)
+        return Failed(
+            reply=_failed(locale), state=previous, code="authorization_failed"
+        )
     except ProviderFailure as exc:
         _emit(observer, "failure", exc.code, str(exc))
+        log_layer_failure(exc.stage, exc.code, exc)
         return Failed(reply=_failed(locale), state=previous, code=exc.code)
     except Exception as exc:
         _emit(observer, "failure", "internal_error", type(exc).__name__)
+        log_layer_failure("pipeline", "internal_error", exc)
         return Failed(reply=_failed(locale), state=previous, code="internal_error")
 
 

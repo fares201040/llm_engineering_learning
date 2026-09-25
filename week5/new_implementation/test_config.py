@@ -1,11 +1,44 @@
 import unittest
+from unittest.mock import patch
 
-from week5.new_implementation.config import settings
+from week5.new_implementation.config import Settings, settings
 
 
 class ConfigTests(unittest.TestCase):
     def test_online_runtime_has_one_fixed_call_ceiling(self):
-        self.assertEqual(settings.llm_turn_provider_call_limit, 11)
+        self.assertEqual(settings.llm_turn_provider_call_limit, 8)
+
+    def test_default_models_use_stronger_planning_and_answer_roles(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "LLM_MODEL": "",
+                "LLM_REFERENCE_MODEL": "",
+                "LLM_PLANNER_MODEL": "",
+                "LLM_ANSWER_MODEL": "",
+            },
+        ):
+            configured = Settings.from_environment()
+
+        self.assertEqual(configured.llm_reference_model, "openai/gpt-4.1-mini")
+        self.assertEqual(configured.llm_planner_model, "openai/gpt-4.1-mini")
+        self.assertEqual(configured.llm_answer_model, "openai/gpt-4.1")
+
+    def test_global_model_remains_an_explicit_all_role_override(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "LLM_MODEL": "openai/custom-model",
+                "LLM_REFERENCE_MODEL": "",
+                "LLM_PLANNER_MODEL": "",
+                "LLM_ANSWER_MODEL": "",
+            },
+        ):
+            configured = Settings.from_environment()
+
+        self.assertEqual(configured.llm_reference_model, "openai/custom-model")
+        self.assertEqual(configured.llm_planner_model, "openai/custom-model")
+        self.assertEqual(configured.llm_answer_model, "openai/custom-model")
 
     def test_sql_table_names_are_validated_at_load_time(self):
         self.assertRegex(

@@ -27,6 +27,11 @@
 - A unique fuzzy candidate must require confirmation; unresolved written references
   may use access-scoped Chroma options, but no Chroma candidate may bind without user
   selection and authoritative PostgreSQL cross-checking.
+- A supplied name and ID must be one identity claim. The ID is primary, the name is
+  checked against PostgreSQL, and mismatched pairs never reach query planning.
+- The first reference boundary owns employees, criteria spans, union/intersection, explicit
+  all-authorized intent, and reuse of a verified prior subject. Authorization remains
+  a separate server-owned intersection.
 - Nested `not`/`any` filters must retain meaning through validation, SQL, and evaluation.
 - Empty or missing employee scope must never compile to broader access.
 - Initial-audit unavailability and final-audit unavailability must have different outcomes.
@@ -63,6 +68,9 @@
   policy, and call accounting.
 - [ ] Run them and confirm expected RED failures.
 - [ ] Implement the shared provider helper and the reference, planner, and audit boundaries.
+- [ ] Give every system prompt a concise role/task statement; return explicit employee
+  and generic criteria spans, preserve subject union/intersection, and validate
+  name-and-ID claims deterministically.
 - [ ] Re-run focused suites and the provider-budget suite.
 - [ ] Commit `refactor: replace attendance planning boundaries`.
 

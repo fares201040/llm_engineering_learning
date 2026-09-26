@@ -22,6 +22,7 @@ from week5.new_implementation.online.context import (
 )
 from week5.new_implementation.online.execution import (
     ExecutionCoverage,
+    ResultColumn,
     SqlExecutionResult,
 )
 from week5.new_implementation.online.provider import CallBudget, ProviderFailure
@@ -736,6 +737,58 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertEqual(bound.subject_relationship, "all_authorized")
         self.assertIsNotNone(bound.updated_request)
 
+    def test_general_pattern_question_ignores_model_generated_employee_mention(self):
+        bound = bind_references(
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    locale="en",
+                    reason="missing_employee",
+                    rewritten_request="Find unusual attendance patterns.",
+                    employee_mention="unusual attendance patterns",
+                )
+            ),
+            (Employee(employee_id="A1", name="Wail Ali"),),
+            original_question="Which employees show unusual attendance patterns?",
+        )
+
+        self.assertFalse(bound.ambiguous)
+        self.assertEqual(bound.subject_relationship, "all_authorized")
+        self.assertIsNotNone(bound.updated_request)
+
+    def test_partial_name_shared_by_multiple_employees_requires_confirmation(self):
+        bound = bind_references(
+            response(
+                employee_names=("Mukhtar Ahmed Meer",),
+                identity_claims=(
+                    IdentityClaim(employee_id="A2", employee_name="Mukhtar Ahmed Meer"),
+                ),
+            ),
+            (
+                Employee(employee_id="A1", name="Mukhtar Ahmed Ali"),
+                Employee(employee_id="A2", name="Mukhtar Ahmed Meer"),
+            ),
+            original_question="Count Mukhtar Ahmed's attendance records.",
+        )
+
+        self.assertTrue(bound.ambiguous)
+        self.assertEqual(
+            tuple(option.employee_id for option in bound.fallback_options),
+            ("A1", "A2"),
+        )
+
+    def test_unknown_written_person_is_not_converted_to_general_record_scope(self):
+        bound = bind_references(
+            response(
+                subject_relationship="criteria",
+                employee_criteria=("authorized records for Unknown Human",),
+            ),
+            (Employee(employee_id="A1", name="Wail Ali"),),
+            original_question="Count authorized records for Unknown Human.",
+        )
+
+        self.assertTrue(bound.ambiguous)
+        self.assertEqual(bound.unresolved_mention, "Unknown Human")
+
     def test_unusual_attendance_criteria_override_model_missing_employee(self):
         bound = bind_references(
             ReferenceResponse(
@@ -941,6 +994,15 @@ class ReferenceAndPlanningTests(unittest.TestCase):
 
                 self.assertTrue(bound.ambiguous)
                 self.assertEqual(bound.reason, "malformed_identifier")
+
+    def test_punctuated_unknown_identifier_is_rejected_before_model_resolution(self):
+        directory = (Employee(employee_id="A10029", name="Suhail Mustafa Yousuf"),)
+
+        self.assertTrue(
+            reference.has_malformed_identifier(
+                "Show attendance for NOBODY-123.", directory
+            )
+        )
 
     def test_general_criteria_remain_natural_language(self):
         bound = bind_references(
@@ -1260,6 +1322,8 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         verifier_payload = call.call_args_list[1].kwargs["payload"]
         self.assertNotIn("database_context", writer_payload)
         self.assertNotIn("database_context", verifier_payload)
+        self.assertNotIn("as_of_date", writer_payload)
+        self.assertNotIn("as_of_date", verifier_payload)
         self.assertEqual(writer_payload["current_question"], "Show hours.")
         self.assertEqual(
             writer_payload["conversation_history"],
@@ -1438,6 +1502,276 @@ class ReferenceAndPlanningTests(unittest.TestCase):
             ],
             ["wrong_coverage"],
         )
+
+    @patch("week5.new_implementation.online.answering.call_structured")
+    def test_answer_without_date_request_rejects_unrequested_as_of_date(self, call):
+        call.side_effect = [
+            AnswerDraft(
+                answer=(
+                    "Wail Ali's total overtime as of 2026-09-26 is 0.0. "
+                    "Records are available from 2026-09-01 to 2026-09-07."
+                )
+            ),
+            AnswerDraft(
+                answer=(
+                    "Wail Ali's total overtime is 0.0. "
+                    "Records are available from 2026-09-01 to 2026-09-07."
+                )
+            ),
+            VerdictResponse(decision=VerdictPass()),
+        ]
+        shared = SharedModelContext(
+            current_question="What was total overtime for A1?",
+            as_of_date="2026-09-26",
+            updated_request="Request:\nWhat was total overtime for A1?",
+            database_context=database_context(),
+        )
+        result = SqlExecutionResult(
+            columns=(),
+            rows=({"total_overtime": 0.0},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=25
+            ),
+        )
+
+        answer = generate_answer(
+            shared_context=shared,
+            sql="SELECT SUM(overtime) AS total_overtime FROM attendance_records",
+            result=result,
+            employees=(Employee(employee_id="A1", name="Wail Ali"),),
+            locale="en",
+            model="answer-model",
+            budget=CallBudget(),
+            timeout=1,
+            max_output_tokens=100,
+        )
+
+        self.assertEqual(
+            answer,
+            "Wail Ali's total overtime is 0.0. Records are available from "
+            "2026-09-01 to 2026-09-07.",
+        )
+        repair = call.call_args_list[1].kwargs["payload"]["rewrite_after_rejection"]
+        self.assertEqual(repair["codes"], ["wrong_date"])
+        self.assertIn("2026-09-26", repair["detail"])
+
+    @patch("week5.new_implementation.online.answering.call_structured")
+    def test_complete_scalar_answer_is_rendered_without_model_calls(self, call):
+        shared = SharedModelContext(
+            current_question="How many days did A1 work?",
+            updated_request="Request:\nHow many days did A1 work?",
+            database_context=database_context(),
+        )
+        result = SqlExecutionResult(
+            columns=(ResultColumn(name="worked_days", type_code="20"),),
+            rows=({"worked_days": 5},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=20
+            ),
+        )
+
+        answer = generate_answer(
+            shared_context=shared,
+            sql="SELECT COUNT(DISTINCT attendance_date) AS worked_days",
+            result=result,
+            employees=(Employee(employee_id="A1", name="Wail Ali"),),
+            locale="en",
+            model="answer-model",
+            budget=CallBudget(),
+            timeout=1,
+            max_output_tokens=100,
+        )
+
+        self.assertEqual(
+            answer,
+            "Wail Ali (A1) — worked days: 5. Attendance records are available "
+            "from 2026-09-01 to 2026-09-07.",
+        )
+        call.assert_not_called()
+
+    @patch("week5.new_implementation.online.answering.call_structured")
+    def test_month_scalar_explicitly_reports_partial_table_coverage(self, call):
+        shared = SharedModelContext(
+            current_question=("How many days did A1 work during September 2026?"),
+            updated_request="Request:\nCount worked days for A1 in September 2026.",
+            request_has_date_period=True,
+            database_context=database_context(),
+        )
+        result = SqlExecutionResult(
+            columns=(ResultColumn(name="matched_count", type_code="20"),),
+            rows=({"matched_count": 5},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=20
+            ),
+        )
+
+        answer = generate_answer(
+            shared_context=shared,
+            sql="SELECT COUNT(DISTINCT attendance_date) AS matched_count",
+            result=result,
+            employees=(Employee(employee_id="A1", name="Wail Ali"),),
+            locale="en",
+            model="answer-model",
+            budget=CallBudget(),
+            timeout=1,
+            max_output_tokens=100,
+        )
+
+        self.assertIn("not the full requested period", answer)
+        self.assertIn("September 1-7, 2026", answer)
+        call.assert_not_called()
+
+    @patch("week5.new_implementation.online.answering.call_structured")
+    def test_scalar_matched_count_uses_the_question_as_its_metric(self, call):
+        shared = SharedModelContext(
+            current_question="On how many dates did A1 have positive worked hours?",
+            updated_request="Request:\nCount positive worked dates for A1.",
+            database_context=database_context(),
+        )
+        result = SqlExecutionResult(
+            columns=(ResultColumn(name="matched_count", type_code="20"),),
+            rows=({"matched_count": 5},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=20
+            ),
+        )
+
+        answer = generate_answer(
+            shared_context=shared,
+            sql="SELECT COUNT(DISTINCT attendance_date) AS matched_count",
+            result=result,
+            employees=(Employee(employee_id="A1", name="Wail Ali"),),
+            locale="en",
+            model="answer-model",
+            budget=CallBudget(),
+            timeout=1,
+            max_output_tokens=100,
+        )
+
+        self.assertEqual(
+            answer,
+            "Wail Ali (A1) — On how many dates did A1 have positive worked hours: "
+            "5. Attendance records are available from 2026-09-01 to 2026-09-07.",
+        )
+        call.assert_not_called()
+
+    @patch("week5.new_implementation.online.answering.call_structured")
+    def test_bounded_record_details_are_rendered_without_model_calls(self, call):
+        shared = SharedModelContext(
+            current_question="Show attendance for A1.",
+            updated_request="Request:\nShow attendance for A1.",
+            database_context=database_context(),
+        )
+        result = SqlExecutionResult(
+            columns=(
+                ResultColumn(name="record_id", type_code="25"),
+                ResultColumn(name="matched_count", type_code="20"),
+            ),
+            rows=(
+                {"record_id": "attendance:a1:one", "matched_count": 2},
+                {"record_id": "attendance:a1:two", "matched_count": 2},
+            ),
+            coverage=ExecutionCoverage(
+                fetched_rows=2, result_limit=100, response_bytes=100
+            ),
+        )
+
+        answer = generate_answer(
+            shared_context=shared,
+            sql="SELECT record_id, COUNT(*) OVER() AS matched_count LIMIT 100",
+            result=result,
+            employees=(Employee(employee_id="A1", name="Wail Ali"),),
+            locale="en",
+            model="answer-model",
+            budget=CallBudget(),
+            timeout=1,
+            max_output_tokens=100,
+        )
+
+        self.assertEqual(
+            answer,
+            "Wail Ali (A1) — 2 matching attendance records; returned 2 record IDs: "
+            "attendance:a1:one, attendance:a1:two. Attendance records are available "
+            "from 2026-09-01 to 2026-09-07.",
+        )
+        call.assert_not_called()
+
+    @patch("week5.new_implementation.online.answering.call_structured")
+    def test_complete_record_rows_without_window_count_are_rendered_locally(self, call):
+        shared = SharedModelContext(
+            current_question="Which A1 records look abnormal?",
+            updated_request="Request:\nWhich A1 records look abnormal?",
+            database_context=database_context(),
+        )
+        result = SqlExecutionResult(
+            columns=(
+                ResultColumn(name="record_id", type_code="25"),
+                ResultColumn(name="attendance_date", type_code="1082"),
+                ResultColumn(name="exception", type_code="25"),
+            ),
+            rows=(
+                {
+                    "record_id": "attendance:a1:one",
+                    "attendance_date": "2026-09-01",
+                    "exception": "Lateness",
+                },
+            ),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=100
+            ),
+        )
+
+        answer = generate_answer(
+            shared_context=shared,
+            sql="SELECT record_id, attendance_date, exception FROM attendance_records",
+            result=result,
+            employees=(Employee(employee_id="A1", name="Wail Ali"),),
+            locale="en",
+            model="answer-model",
+            budget=CallBudget(),
+            timeout=1,
+            max_output_tokens=100,
+        )
+
+        self.assertIn("Wail Ali (A1)", answer)
+        self.assertIn("attendance:a1:one", answer)
+        self.assertIn("attendance date=2026-09-01", answer)
+        self.assertIn("exception=Lateness", answer)
+        call.assert_not_called()
+
+    @patch("week5.new_implementation.online.answering.call_structured")
+    def test_complete_multi_metric_row_is_rendered_locally(self, call):
+        shared = SharedModelContext(
+            current_question="Find concerning overtime behavior for A1.",
+            updated_request="Request:\nFind concerning overtime behavior for A1.",
+            database_context=database_context(),
+        )
+        result = SqlExecutionResult(
+            columns=(
+                ResultColumn(name="concerning_days", type_code="20"),
+                ResultColumn(name="total_concerning_hours", type_code="701"),
+            ),
+            rows=(({"concerning_days": 5, "total_concerning_hours": 45.03}),),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=80
+            ),
+        )
+
+        answer = generate_answer(
+            shared_context=shared,
+            sql="SELECT 5 AS concerning_days, 45.03 AS total_concerning_hours",
+            result=result,
+            employees=(Employee(employee_id="A1", name="Wail Ali"),),
+            locale="en",
+            model="answer-model",
+            budget=CallBudget(),
+            timeout=1,
+            max_output_tokens=100,
+        )
+
+        self.assertIn("concerning days=5", answer)
+        self.assertIn("total concerning hours=45.03", answer)
+        call.assert_not_called()
 
     @patch("week5.new_implementation.online.answering.call_structured")
     def test_answer_repair_adds_missing_database_coverage_bounds(self, call):

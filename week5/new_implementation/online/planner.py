@@ -56,7 +56,11 @@ CONSTRUCTION ORDER
    relationships, and values.
 3. Choose the output shape requested by the user: one scalar aggregate, grouped
    aggregate rows, or bounded detail rows. Output shape never depends on how much data
-   matches.
+   matches. When the message contains multiple compatible questions or requests,
+   answer every clause in the same statement using multiple selected expressions,
+   conditional aggregates, or CTEs as appropriate. Never silently answer only one
+   clause. Preserve a detail request when it is combined with a summary request by
+   returning bounded detail rows plus window aggregates that answer the summary.
 4. Map each requested business term to the described column and add only the predicates
    required by the request. Add a WHERE predicate only when the current question
    requires it and a column description justifies it. Do not combine plausible but
@@ -105,6 +109,25 @@ Use exactly the predicate for the requested meaning. Do not combine plausible sc
 workflow, exception, leave, holiday, or worked-hours predicates into a stricter meaning.
 Never OR absence, leave, exception, workflow, holiday, or schedule predicates into the
 positive worked-day test.
+
+QUALITATIVE ATTENDANCE REQUESTS
+- High-level requests about unusual, abnormal, problematic, concerning, irregular, or
+  anomalous attendance are supported requests for observable attendance indicators;
+  they are not unsupported schema concepts and must not trigger unsupported_capability.
+- Do not claim that a person is problematic or make an HR judgment. Report the
+  observable records or grouped counts that support review: a nonblank exception,
+  positive lateness_hrs, early_out_hrs, overbreak_hrs, or ot_not_authorized.
+- "Repeated" or "chronic lateness" means group by employee and count rows where
+  lateness_hrs > 0; repeated requires more than one such row. "Incomplete clocking"
+  means exception values that explicitly identify Missing In or Missing Out. "Early
+  departures" means early_out_hrs > 0. "Absence issues" means exception = 'Absent'.
+  Overtime behavior must use the supplied overtime columns, preferring
+  ot_not_authorized when the wording is concerning or suspicious.
+- For broad summaries, group by the concrete indicator (normally exception) and count
+  records. For "which employees", group by employee_id and name. For "which records"
+  or "show/find records", return bounded detail rows with record_id and matched_count.
+  State the concrete indicators through the selected columns; never hide the
+  operational interpretation.
 
 OUTPUT SHAPES
 - "how many days" means one aggregate row using

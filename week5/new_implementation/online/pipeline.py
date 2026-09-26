@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import calendar
 from datetime import date, timedelta
 import json
 import math
@@ -41,6 +42,7 @@ from .provider import (
     log_layer_output,
 )
 from .reference import (
+    AmbiguousReference,
     BoundReferences,
     Employee,
     EmployeeOption,
@@ -194,6 +196,14 @@ def _locale(question: str) -> Literal["en", "ar"]:
 def _attendance_meaning(
     question: str,
 ) -> Literal["explicit_absence", "not_absent"] | None:
+    if re.search(
+        r"\bexception\s+equal\s+to\s+[\"“][^\"”]+[\"”]",
+        question,
+        flags=re.IGNORECASE,
+    ):
+        # The quoted text is an exact schema value, not a request to reinterpret
+        # every value containing the word "absence" as the canonical Absent state.
+        return None
     if re.search(r"\bnot\s+absent\b", question, flags=re.IGNORECASE):
         return "not_absent"
     if re.search(r"\babsen(?:t|ce)\b", question, flags=re.IGNORECASE):
@@ -202,6 +212,29 @@ def _attendance_meaning(
 
 
 def _sql_semantic_issue(question: str, sql: str) -> str | None:
+    folded = question.casefold()
+    detail_noun = re.search(
+        r"\b(?:attendance|details?|entries|records?|rows?)\b", folded
+    )
+    detail_verb = re.search(r"\b(?:display|give|list|show)\b", folded)
+    aggregate_intent = re.search(
+        r"\b(?:average|avg|count|how many|maximum|max|minimum|min|sum|total)\b",
+        folded,
+    )
+    select = re.search(r"\bSELECT\b(.*?)\bFROM\b", sql, re.IGNORECASE | re.DOTALL)
+    select_list = select.group(1) if select else ""
+    scalar_aggregate = bool(
+        re.search(r"\b(?:AVG|COUNT|MAX|MIN|SUM)\s*\(", select_list, re.IGNORECASE)
+        and not re.search(r"\bOVER\s*\(", select_list, re.IGNORECASE)
+    )
+    if (
+        detail_noun
+        and detail_verb
+        and not aggregate_intent
+        and scalar_aggregate
+        and not re.search(r"\brecord_id\b", select_list, re.IGNORECASE)
+    ):
+        return "detail_request_requires_rows"
     meaning = _attendance_meaning(question)
     if meaning == "not_absent" and not re.search(
         r"\bexception\s+IS\s+DISTINCT\s+FROM\s+'Absent'", sql, flags=re.IGNORECASE
@@ -386,7 +419,9 @@ def _missing_join_target(question: str, database_context: DatabaseContext) -> bo
 
 
 def _schema_grounded_analytic_question(
-    question: str, database_context: DatabaseContext
+    question: str,
+    database_context: DatabaseContext,
+    employees: tuple[Employee, ...] = (),
 ) -> bool:
     """Confirm an independent aggregate request uses only known schema concepts."""
 
@@ -396,7 +431,7 @@ def _schema_grounded_analytic_question(
             "hour"
             if word in {"hours", "hrs"}
             else word[:-1]
-            if word.endswith("s")
+            if len(word) > 1 and word.endswith("s")
             else word
             for word in words
         }
@@ -421,17 +456,35 @@ def _schema_grounded_analytic_question(
         "a",
         "an",
         "and",
+        "are",
         "by",
+        "did",
+        "do",
+        "does",
         "each",
         "for",
+        "had",
+        "has",
+        "have",
+        "is",
         "of",
         "per",
         "please",
+        "s",
         "show",
         "the",
+        "was",
+        "were",
+        "what",
         "with",
     }
-    concepts = words - analytic_words - grammar_words
+    employee_words = {
+        word
+        for employee in employees
+        for value in (employee.employee_id, employee.name)
+        for word in normalized_words(value)
+    }
+    concepts = words - analytic_words - grammar_words - employee_words
     if len(concepts) < 2:
         return False
     schema_words: set[str] = set()
@@ -442,6 +495,409 @@ def _schema_grounded_analytic_question(
     return concepts <= schema_words
 
 
+def _attendance_semantic_question(question: str) -> bool:
+    """Recognize high-level attendance analysis without treating it as a person."""
+
+    folded = " ".join(re.findall(r"[a-z0-9]+", question.casefold()))
+    if re.search(
+        r"\b(?:incomplete clocking|repeated lateness|chronic lateness|"
+        r"early departures?|absence issues?|overtime behavior|"
+        r"unscheduled deviation|hr review)\b",
+        folded,
+    ):
+        return True
+    qualifier = re.search(
+        r"\b(?:unusual|problematic|abnormal|suspicious|concerning|irregular|"
+        r"anomal(?:y|ies|ous)|issues?|incomplete|repeated|chronic|unscheduled|"
+        r"deviation|concerns?)\b",
+        folded,
+    )
+    attendance_concept = re.search(
+        r"\b(?:attendance|timekeeping|clocking|lateness|late|early departures?|"
+        r"overtime|absence|absent|records?|employees?|behavior|patterns?|"
+        r"summaries)\b",
+        folded,
+    )
+    return qualifier is not None and attendance_concept is not None
+
+
+def _grouped_schema_calculation_syntax(question: str) -> bool:
+    return (
+        re.fullmatch(
+            r"\s*(?:what is\s+(?:the\s+)?)?(?:average|avg|sum)\s+(?:of\s+)?"
+            r"[A-Za-z_]+\s+by\s+[A-Za-z_]+[?.]?\s*",
+            question,
+            flags=re.IGNORECASE,
+        )
+        is not None
+    )
+
+
+def _requested_month_scope(question: str) -> tuple[str, str] | None:
+    month_pattern = "|".join(_MONTH_NUMBERS)
+    match = re.search(
+        rf"\b({month_pattern})\s+(\d{{4}})\b", question, flags=re.IGNORECASE
+    )
+    if match is None:
+        return None
+    month_name, year_text = match.groups()
+    year = int(year_text)
+    month = _MONTH_NUMBERS[month_name.casefold()]
+    return (
+        date(year, month, 1).isoformat(),
+        date(year, month, calendar.monthrange(year, month)[1]).isoformat(),
+    )
+
+
+def _build_native_employee_day_count_sql(
+    question: str,
+    database_context: DatabaseContext,
+    employees: tuple[Employee, ...],
+) -> str | None:
+    """Build stable scalar counts for common employee/date attendance measures."""
+
+    if not employees or not re.search(r"\bhow many\b", question, re.IGNORECASE):
+        return None
+    month_scope = _requested_month_scope(question)
+    if month_scope is None:
+        return None
+    table = next(
+        (
+            item
+            for item in database_context.tables
+            if item.table_name.casefold().endswith("attendance_records")
+        ),
+        database_context.tables[0],
+    )
+    if not re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]*", table.schema_name
+    ) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table.table_name):
+        return None
+    columns = {column.name.casefold(): column.name for column in table.columns}
+    required = {"employee_id", "attendance_date", "total_worked_hrs"}
+    if not required <= set(columns):
+        return None
+    relation = f'"{table.schema_name}"."{table.table_name}"'
+    ids = ", ".join(
+        "'" + employee.employee_id.replace("'", "''") + "'" for employee in employees
+    )
+    start, end = month_scope
+    filters = [
+        f"employee_id IN ({ids})",
+        f"attendance_date >= '{start}'",
+        f"attendance_date <= '{end}'",
+    ]
+    folded = " ".join(question.casefold().split())
+    aggregate = "COUNT(DISTINCT attendance_date)"
+    alias = "matched_count"
+    if "attendance records" in folded:
+        aggregate = "COUNT(*)"
+    elif re.search(r"\boff days?\b", folded):
+        if "day_type" not in columns:
+            return None
+        filters.append("day_type IN ('OFF Day', 'OFF Day (ZAS)')")
+    elif re.search(r"\babsent\b", folded):
+        if "exception" not in columns:
+            return None
+        filters.append("exception = 'Absent'")
+    elif "zero worked hours" in folded:
+        filters.append("COALESCE(total_worked_hrs, 0) <= 0")
+    elif "did not attend" in folded or re.search(r"\bnot work\b", folded):
+        if "day_type" not in columns:
+            return None
+        filters.extend(
+            (
+                "day_type = 'Working Day'",
+                "COALESCE(total_worked_hrs, 0) <= 0",
+            )
+        )
+    elif re.search(r"\b(?:attend|worked?|work)\b", folded):
+        filters.append("COALESCE(total_worked_hrs, 0) > 0")
+    else:
+        return None
+    return f"SELECT {aggregate} AS {alias} FROM {relation} WHERE " + " AND ".join(
+        filters
+    )
+
+
+def _build_native_schema_aggregate_sql(
+    question: str,
+    database_context: DatabaseContext,
+    employees: tuple[Employee, ...],
+) -> str | None:
+    """Build deterministic SQL for explicit schema counts, percentages, and groups."""
+
+    table = next(
+        (
+            item
+            for item in database_context.tables
+            if item.table_name.casefold().endswith("attendance_records")
+        ),
+        database_context.tables[0],
+    )
+    if not re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]*", table.schema_name
+    ) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table.table_name):
+        return None
+    relation = f'"{table.schema_name}"."{table.table_name}"'
+    columns = {
+        re.sub(r"[^a-z0-9]", "", column.name.casefold()): column.name
+        for column in table.columns
+    }
+
+    def column_for(label: str) -> str | None:
+        return columns.get(re.sub(r"[^a-z0-9]", "", label.casefold()))
+
+    scope = ""
+    if employees:
+        ids = ", ".join(
+            "'" + employee.employee_id.replace("'", "''") + "'"
+            for employee in employees
+        )
+        scope = f"employee_id IN ({ids})"
+
+    exact = re.fullmatch(
+        r"\s*(how many|what percentage of all) attendance records have "
+        r"([A-Za-z_ ]+?) equal to [\"“](.+?)[\"”]\?\s*",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if exact is not None:
+        operation, field_label, value = exact.groups()
+        field = column_for(field_label)
+        if field is None:
+            return None
+        literal = value.replace("'", "''")
+        predicate = f"{field} = '{literal}'"
+        if operation.casefold() == "how many":
+            filters = " AND ".join(item for item in (scope, predicate) if item)
+            return f"SELECT COUNT(*) AS matched_count FROM {relation} WHERE {filters}"
+        where = f" WHERE {scope}" if scope else ""
+        return (
+            "SELECT ROUND((100.0 * COUNT(*) FILTER (WHERE "
+            f"{predicate}) / NULLIF(COUNT(*), 0))::numeric, 2)::double precision "
+            f"AS percentage FROM {relation}{where}"
+        )
+
+    employee_status_count = re.fullmatch(
+        r"\s*how many (authorized|draft) attendance records([^?]*)\?\s*",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if employee_status_count is not None:
+        status_field = column_for("Status")
+        trailing_scope = employee_status_count.group(2).strip()
+        if status_field is None or (trailing_scope and not scope):
+            return None
+        status = employee_status_count.group(1).title()
+        filters = " AND ".join(
+            item for item in (scope, f"{status_field} = '{status}'") if item
+        )
+        return f"SELECT COUNT(*) AS matched_count FROM {relation} WHERE {filters}"
+
+    distinct_status_employees = re.fullmatch(
+        r"\s*count distinct employees with (authorized|draft) attendance records\.?\s*",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if distinct_status_employees is not None:
+        employee_field = column_for("Employee_ID")
+        status_field = column_for("Status")
+        if employee_field is None or status_field is None:
+            return None
+        status = distinct_status_employees.group(1).title()
+        filters = " AND ".join(
+            item for item in (scope, f"{status_field} = '{status}'") if item
+        )
+        return (
+            f"SELECT COUNT(DISTINCT {employee_field}) AS matched_count "
+            f"FROM {relation} WHERE {filters}"
+        )
+
+    threshold = re.fullmatch(
+        r"\s*how many attendance records have ([A-Za-z_ ]+?) "
+        r"(greater than|more than|less than|at least|at most|above|below) "
+        r"([-+]?(?:\d+(?:\.\d*)?|\.\d+))\?\s*",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if threshold is not None:
+        field_label, comparison, value = threshold.groups()
+        field = column_for(field_label)
+        if field is None:
+            return None
+        operator = {
+            "greater than": ">",
+            "more than": ">",
+            "above": ">",
+            "less than": "<",
+            "below": "<",
+            "at least": ">=",
+            "at most": "<=",
+        }[comparison.casefold()]
+        predicate = f"{field} {operator} {value}"
+        filters = " AND ".join(item for item in (scope, predicate) if item)
+        return f"SELECT COUNT(*) AS matched_count FROM {relation} WHERE {filters}"
+
+    grouped = re.fullmatch(
+        r"\s*(?:what is\s+(?:the\s+)?)?(average|avg|sum)\s+"
+        r"(?:of\s+)?([A-Za-z_]+)\s+by\s+"
+        r"([A-Za-z_]+)[?.]?\s*",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if grouped is None:
+        return None
+    operation, metric_label, group_label = grouped.groups()
+    metric = column_for(metric_label)
+    group = column_for(group_label)
+    if metric is None or group is None:
+        return None
+    function = "AVG" if operation.casefold() in {"average", "avg"} else "SUM"
+    alias_prefix = "average" if function == "AVG" else "total"
+    where = f" WHERE {scope}" if scope else ""
+    return (
+        f"SELECT {group}, {function}({metric}) AS {alias_prefix}_{metric}, "
+        f"COUNT(*) OVER() AS matched_count FROM {relation}{where} "
+        f"GROUP BY {group} ORDER BY {group} LIMIT 100"
+    )
+
+
+def _build_native_attendance_observation_sql(
+    question: str,
+    database_context: DatabaseContext,
+    employees: tuple[Employee, ...],
+) -> str | None:
+    """Build stable SQL for qualitative attendance observations and simple statuses."""
+
+    folded = " ".join(question.casefold().split())
+    semantic = _attendance_semantic_question(question)
+    status_match = re.search(
+        r"\b(authorized|draft)(?:\s+attendance)?\s+records?\b", folded
+    )
+    month_scope = _requested_month_scope(question)
+    general_date_detail = bool(
+        month_scope
+        and re.search(r"\b(?:show|list|give|display)\b", folded)
+        and re.search(r"\battendance\b", folded)
+    )
+    if not semantic and status_match is None and not general_date_detail:
+        return None
+    table = database_context.tables[0]
+    for candidate in database_context.tables:
+        if candidate.table_name.casefold().endswith("attendance_records"):
+            table = candidate
+            break
+    if not re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_]*", table.schema_name
+    ) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table.table_name):
+        return None
+    relation = f'"{table.schema_name}"."{table.table_name}"'
+
+    filters: list[str] = []
+    if employees:
+        literals = ", ".join(
+            "'" + employee.employee_id.replace("'", "''") + "'"
+            for employee in employees
+        )
+        filters.append(f"employee_id IN ({literals})")
+    if month_scope is not None:
+        filters.extend(
+            (
+                f"attendance_date >= '{month_scope[0]}'",
+                f"attendance_date <= '{month_scope[1]}'",
+            )
+        )
+    iso_date = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", question)
+    if iso_date is not None:
+        filters.append(f"attendance_date = '{iso_date.group(1)}'")
+    if status_match is not None:
+        status = "Authorized" if status_match.group(1) == "authorized" else "Draft"
+        filters.append(f"status = '{status}'")
+    if "working day" in folded:
+        filters.append("day_type = 'Working Day'")
+
+    threshold = re.search(
+        r"\b(?:more than|greater than|above)\s+(\d+(?:\.\d+)?)\s+"
+        r"lateness\s+hours?\b",
+        folded,
+    )
+    if threshold is not None:
+        filters.append(f"lateness_hrs > {threshold.group(1)}")
+    elif "repeated lateness" in folded or "chronic lateness" in folded:
+        filters.append("COALESCE(lateness_hrs, 0) > 0")
+    elif "incomplete clocking" in folded:
+        filters.append(
+            "(exception ILIKE '%Missing In%' OR exception ILIKE '%Missing Out%')"
+        )
+    elif "early departure" in folded or "early departures" in folded:
+        filters.append("COALESCE(early_out_hrs, 0) > 0")
+    elif "absence" in folded or "absent" in folded:
+        filters.append("exception = 'Absent'")
+    elif "overtime" in folded:
+        filters.append("COALESCE(ot_not_authorized, 0) > 0")
+    elif semantic:
+        filters.append(
+            "(NULLIF(BTRIM(exception), '') IS NOT NULL "
+            "OR COALESCE(lateness_hrs, 0) > 0 "
+            "OR COALESCE(early_out_hrs, 0) > 0 "
+            "OR COALESCE(overbreak_hrs, 0) > 0 "
+            "OR COALESCE(ot_not_authorized, 0) > 0)"
+        )
+    where = " WHERE " + " AND ".join(filters) if filters else ""
+
+    detail_request = bool(
+        re.search(r"\b(?:records?|rows?|details?|entries)\b", folded)
+        or (iso_date is not None and re.search(r"\b(?:show|find|which)\b", folded))
+        or status_match is not None
+        or general_date_detail
+    )
+    if detail_request:
+        return (
+            "SELECT record_id, employee_id, name, attendance_date, day_type, status, "
+            "exception, total_worked_hrs, lateness_hrs, early_out_hrs, overbreak_hrs, "
+            "total_ot, ot_authorized, ot_not_authorized, leave_type, leave_hrs, "
+            f"COUNT(*) OVER() AS matched_count FROM {relation}{where} "
+            "ORDER BY attendance_date, employee_id, record_id LIMIT 100"
+        )
+
+    employee_summary = bool(
+        re.search(r"\bemployees?\b", folded)
+        or "repeated lateness" in folded
+        or "chronic lateness" in folded
+        or "early departure" in folded
+        or employees
+    )
+    if employee_summary:
+        having = (
+            " HAVING COUNT(*) > 1"
+            if "repeated lateness" in folded or "chronic lateness" in folded
+            else ""
+        )
+        return (
+            "SELECT employee_id, name, COUNT(*) AS indicator_records, "
+            "SUM(COALESCE(lateness_hrs, 0)) AS lateness_hours, "
+            "SUM(COALESCE(early_out_hrs, 0)) AS early_out_hours, "
+            "SUM(COALESCE(overbreak_hrs, 0)) AS overbreak_hours, "
+            "SUM(COALESCE(ot_not_authorized, 0)) AS unauthorized_overtime_hours, "
+            f"COUNT(*) OVER() AS matched_count FROM {relation}{where} "
+            f"GROUP BY employee_id, name{having} "
+            "ORDER BY indicator_records DESC, employee_id LIMIT 100"
+        )
+
+    indicator = (
+        "CASE WHEN NULLIF(BTRIM(exception), '') IS NOT NULL "
+        "AND UPPER(BTRIM(exception)) <> 'OK' THEN exception "
+        "ELSE 'Metric indicator' END"
+    )
+    return (
+        f"SELECT {indicator} AS attendance_indicator, "
+        f"COUNT(*) AS occurrence_count, COUNT(*) OVER() AS matched_count "
+        f"FROM {relation}{where} GROUP BY {indicator} "
+        "ORDER BY occurrence_count DESC, attendance_indicator LIMIT 100"
+    )
+
+
 def _request_value_issue(question: str) -> str | None:
     """Return a typed issue for literals PostgreSQL may accept misleadingly."""
 
@@ -450,6 +906,17 @@ def _request_value_issue(question: str) -> str | None:
             date.fromisoformat(match.group(0))
         except ValueError:
             return "malformed_value"
+
+    iso_range = re.search(
+        r"\b(?:between|from)\s+(\d{4}-\d{2}-\d{2})\s+"
+        r"(?:and|to)\s+(\d{4}-\d{2}-\d{2})\b",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if iso_range is not None and date.fromisoformat(
+        iso_range.group(1)
+    ) > date.fromisoformat(iso_range.group(2)):
+        return "reversed_temporal_range"
 
     month_pattern = "|".join(_MONTH_NUMBERS)
     for match in re.finditer(
@@ -467,20 +934,53 @@ def _request_value_issue(question: str) -> str | None:
         except ValueError:
             return "malformed_value"
 
+    natural_range = re.search(
+        rf"\b(?:between|from)\s+({month_pattern})\s+(\d{{1,2}})"
+        rf"(?:st|nd|rd|th)?\s+(?:and|to)\s+({month_pattern})\s+(\d{{1,2}})"
+        rf"(?:st|nd|rd|th)?\b",
+        question,
+        flags=re.IGNORECASE,
+    )
+    if natural_range is not None:
+        start_month, start_day, end_month, end_day = natural_range.groups()
+        if start_month.casefold() == end_month.casefold() and int(start_day) > int(
+            end_day
+        ):
+            return "reversed_temporal_range"
+
+    if re.search(
+        r"\b(?:between|from)\s+(?:not[- ]a[- ]date|invalid(?:\s+date)?|\?+)",
+        question,
+        re.IGNORECASE,
+    ):
+        return "unsupported_constraint"
+
+    if re.search(
+        r"\b(?:greater than|more than|less than|at least|at most|above|below|over|under)"
+        r"\s*(?:\?+|_+|not[- ]a[- ]number)\s*\.?\s*hours?\b",
+        question,
+        re.IGNORECASE,
+    ):
+        return "malformed_value"
+
     if re.search(r"\b(?:nan|[+-]?infinity|[+-]?inf)\b", question, re.IGNORECASE):
         return "malformed_value"
 
     comparison_pattern = re.compile(
-        r"\b(?:greater than|more than|less than|at least|at most|above|below|over|under)"
+        r"\b(greater than|more than|less than|at least|at most|above|below|over|under)"
         r"\s+([^,.!?]*?)(?=\s+hours?\b|[,.!?]|$)",
         re.IGNORECASE,
     )
     for match in comparison_pattern.finditer(question):
-        operand = " ".join(match.group(1).casefold().split())
+        comparator = match.group(1).casefold()
+        operand = " ".join(match.group(2).casefold().split())
         first_operand = operand.split(maxsplit=1)[0] if operand else ""
         if first_operand in _NUMBER_WORDS:
             continue
-        if not re.match(r"\s+hours?\b", question[match.end() :], re.IGNORECASE):
+        has_hours = bool(
+            re.match(r"\s+hours?\b", question[match.end() :], re.IGNORECASE)
+        )
+        if comparator in {"over", "under"} and not has_hours:
             continue
         try:
             numeric = float(first_operand.replace(",", ""))
@@ -614,6 +1114,9 @@ def run_turn(
     try:
         native_comparison = None
         native_running_total = None
+        native_attendance_observation = None
+        native_employee_day_count = None
+        native_schema_aggregate = None
         database_context = None
         loaded_directory = deps.directory_loader(
             dsn=settings.postgres_readonly_dsn,
@@ -696,6 +1199,28 @@ def run_turn(
                     state=previous,
                     capability=request_issue,
                 )
+            if _grouped_schema_calculation_syntax(question):
+                database_context = deps.context_loader(
+                    dsn=settings.postgres_readonly_dsn,
+                    attendance_objects=(settings.postgres_attendance_table,),
+                    connect_timeout=settings.postgres_connect_timeout_seconds,
+                )
+                if (
+                    _build_native_schema_aggregate_sql(question, database_context, ())
+                    is None
+                ):
+                    log_layer_output(
+                        "unsupported",
+                        {
+                            "capability": "unsupported_calculation",
+                            "reason": "unknown_schema_metric_or_group",
+                        },
+                    )
+                    return Unsupported(
+                        reply=_unsupported_value(locale),
+                        state=previous,
+                        capability="unsupported_calculation",
+                    )
             if re.match(r"\s*join\b", question, flags=re.IGNORECASE):
                 database_context = deps.context_loader(
                     dsn=settings.postgres_readonly_dsn,
@@ -784,7 +1309,44 @@ def run_turn(
                         attendance_objects=(settings.postgres_attendance_table,),
                         connect_timeout=settings.postgres_connect_timeout_seconds,
                     )
-                    if _schema_grounded_analytic_question(question, database_context):
+                    explicit_schema_aggregate = (
+                        _build_native_schema_aggregate_sql(
+                            question, database_context, ()
+                        )
+                        is not None
+                    )
+                    deterministic = bind_references(
+                        ReferenceResponse(
+                            decision=AmbiguousReference(
+                                rewritten_request=question,
+                                locale=reference.decision.locale,
+                                reason="missing_employee",
+                            )
+                        ),
+                        directory,
+                        original_question=question,
+                        active_employees=active,
+                        has_verified_turns=bool(previous.verified_turns),
+                    )
+                    if deterministic.employees and (
+                        _build_native_schema_aggregate_sql(
+                            question, database_context, deterministic.employees
+                        )
+                        is not None
+                        or _schema_grounded_analytic_question(
+                            question, database_context, deterministic.employees
+                        )
+                        or _attendance_semantic_question(question)
+                    ):
+                        bound = deterministic
+                        log_layer_output("schema_grounded_reference", question)
+                    elif (
+                        explicit_schema_aggregate
+                        or _schema_grounded_analytic_question(
+                            question, database_context
+                        )
+                        or _attendance_semantic_question(question)
+                    ):
                         bound = BoundReferences(
                             rewritten_request=question,
                             updated_request=attach_resolved_employees(question, ()),
@@ -816,6 +1378,32 @@ def run_turn(
                     )
 
         bound = bound.model_copy(update={"locale": _locale(question)})
+
+        if bound.ambiguous:
+            if database_context is None:
+                database_context = deps.context_loader(
+                    dsn=settings.postgres_readonly_dsn,
+                    attendance_objects=(settings.postgres_attendance_table,),
+                    connect_timeout=settings.postgres_connect_timeout_seconds,
+                )
+            native_general_observation = _build_native_attendance_observation_sql(
+                question, database_context, ()
+            )
+            if _build_native_schema_aggregate_sql(
+                question, database_context, ()
+            ) is not None or (
+                bound.reason == "missing_employee"
+                and bound.unresolved_mention is None
+                and native_general_observation is not None
+            ):
+                bound = BoundReferences(
+                    rewritten_request=question,
+                    updated_request=attach_resolved_employees(question, ()),
+                    locale=bound.locale,
+                    request_relationship="new",
+                    subject_relationship="all_authorized",
+                )
+                log_layer_output("schema_grounded_reference", question)
 
         log_layer_output("employee_resolution", bound)
 
@@ -933,6 +1521,20 @@ def run_turn(
                 reason=bound.reason,
             )
 
+        if bound.request_relationship == "new" and not _mentions_time_period(question):
+            # The reference model may resolve a nonexistent relative date against
+            # today. For an independent request with no time expression, preserve
+            # the user's scope verbatim while retaining only authoritative identity
+            # resolution.
+            bound = bound.model_copy(
+                update={
+                    "rewritten_request": question,
+                    "updated_request": attach_resolved_employees(
+                        question, bound.employees
+                    ),
+                }
+            )
+
         required_date_scope = (
             previous.verified_turns[-1].date_scope
             if bound.request_relationship == "follow_up"
@@ -984,6 +1586,32 @@ def run_turn(
             trusted_context=downstream_trusted_context,
             database_context=database_context,
         )
+        native_attendance_observation = _build_native_attendance_observation_sql(
+            question,
+            database_context,
+            bound.employees,
+        )
+        native_employee_day_count = _build_native_employee_day_count_sql(
+            question,
+            database_context,
+            bound.employees,
+        )
+        native_schema_aggregate = _build_native_schema_aggregate_sql(
+            question,
+            database_context,
+            bound.employees,
+        )
+        if native_schema_aggregate is not None:
+            log_layer_output("native_schema_aggregate_plan", native_schema_aggregate)
+        if native_employee_day_count is not None:
+            log_layer_output(
+                "native_employee_day_count_plan", native_employee_day_count
+            )
+        if native_attendance_observation is not None:
+            log_layer_output(
+                "native_attendance_observation_plan",
+                native_attendance_observation,
+            )
         sql_execution_failure: dict[str, object] | None = None
         for attempt in range(1, SQL_EXECUTION_ATTEMPT_LIMIT + 1):
             planner_args: dict[str, object] = {
@@ -1002,6 +1630,12 @@ def run_turn(
                 if native_comparison is not None and attempt == 1
                 else native_running_total.sql
                 if native_running_total is not None and attempt == 1
+                else native_schema_aggregate
+                if native_schema_aggregate is not None and attempt == 1
+                else native_employee_day_count
+                if native_employee_day_count is not None and attempt == 1
+                else native_attendance_observation
+                if native_attendance_observation is not None and attempt == 1
                 else deps.planner(**planner_args)
             )
             log_layer_output("sql_planner", sql, attempt=attempt)
@@ -1020,6 +1654,29 @@ def run_turn(
                         "attendance_date. Remove the invented date restriction and "
                         "answer over all authorized rows."
                     ),
+                }
+                log_layer_output(
+                    "sql_execution_failure", sql_execution_failure, attempt=attempt
+                )
+                continue
+            semantic_issue = _sql_semantic_issue(question, sql)
+            if semantic_issue == "detail_request_requires_rows":
+                if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
+                    raise ProviderFailure(
+                        "sql_semantics", semantic_issue, semantic_issue
+                    )
+                database_error = semantic_issue
+                if semantic_issue == "detail_request_requires_rows":
+                    database_error = (
+                        "The user requested attendance detail rows, but this SQL "
+                        "returns only an aggregate. Return bounded matching rows with "
+                        "record_id and COUNT(*) OVER() AS matched_count."
+                    )
+                sql_execution_failure = {
+                    "retry_number": attempt,
+                    "failed_sql": sql,
+                    "error_type": "sql_semantics",
+                    "database_error": database_error,
                 }
                 log_layer_output(
                     "sql_execution_failure", sql_execution_failure, attempt=attempt

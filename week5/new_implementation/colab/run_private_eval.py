@@ -13,6 +13,24 @@ RUNTIME_CONFIG = Path("/content/.attendance_private_runtime.json")
 PRIVATE_REPORT = Path("/content/attendance-private-eval.json")
 
 
+def consume_restart_flag(environment: dict[str, str]) -> bool:
+    """Read and remove the one-shot flag from a persistent Colab kernel."""
+
+    return environment.pop("PRIVATE_EVAL_RESTART", "").casefold() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def prepare_report(report: Path, *, restart: bool) -> bool:
+    """Reset an obsolete checkpoint only when the caller explicitly requests it."""
+
+    if restart:
+        report.unlink(missing_ok=True)
+    return report.is_file()
+
+
 def evaluator_command(
     *,
     source: Path,
@@ -47,13 +65,15 @@ def main() -> int:
         raise ValueError("PRIVATE_EVAL_BATCH_SIZE must be between 1 and 50")
     environment = os.environ.copy()
     environment.update(settings)
+    restart = consume_restart_flag(os.environ)
+    resume = prepare_report(PRIVATE_REPORT, restart=restart)
     completed = subprocess.run(
         evaluator_command(
             source=source,
             cases=cases,
             report=PRIVATE_REPORT,
             batch_size=batch_size,
-            resume=PRIVATE_REPORT.is_file(),
+            resume=resume,
         ),
         cwd=source,
         env=environment,

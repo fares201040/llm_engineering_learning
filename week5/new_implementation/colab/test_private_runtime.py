@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import runpy
+import subprocess
+import sys
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
@@ -14,16 +15,35 @@ from week5.new_implementation.colab.prepare_private_runtime import (
     validate_import_facts,
     write_runtime_config,
 )
-from week5.new_implementation.colab.run_private_eval import evaluator_command
+from week5.new_implementation.colab.run_private_eval import (
+    consume_restart_flag,
+    evaluator_command,
+    prepare_report,
+)
 
 
 class PrivateRuntimeTests(unittest.TestCase):
     def test_private_preparer_imports_as_a_standalone_colab_script(self):
         script = Path(__file__).with_name("prepare_private_runtime.py")
+        repository_root = Path(__file__).resolve().parents[3]
+        environment = os.environ.copy()
+        environment["ATTENDANCE_PHASE2_SOURCE_ROOT"] = str(repository_root)
+        environment["PYTHONPATH"] = ""
+        with TemporaryDirectory() as directory:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    f"import runpy; runpy.run_path({str(script)!r}, run_name='colab_private_prepare')",
+                ],
+                cwd=directory,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
 
-        namespace = runpy.run_path(script, run_name="colab_private_prepare")
-
-        self.assertIn("main", namespace)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_prepare_validates_payload_before_database_mutation(self):
         from week5.new_implementation.colab import prepare_private_runtime
@@ -110,6 +130,24 @@ class PrivateRuntimeTests(unittest.TestCase):
         self.assertIn("--all", command)
         self.assertEqual(command[-3:], ["--batch-size", "12", "--resume"])
         self.assertIn("/content/attendance_private_payload/tests.jsonl", command)
+
+    def test_runner_can_explicitly_restart_after_runtime_logic_changes(self):
+        with TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            report.write_text('{"completed": 50}', encoding="utf-8")
+
+            self.assertFalse(prepare_report(report, restart=True))
+            self.assertFalse(report.exists())
+            report.write_text('{"completed": 50}', encoding="utf-8")
+            self.assertTrue(prepare_report(report, restart=False))
+            self.assertTrue(report.exists())
+
+    def test_restart_flag_is_consumed_from_persistent_colab_environment(self):
+        environment = {"PRIVATE_EVAL_RESTART": "true", "KEEP": "yes"}
+
+        self.assertTrue(consume_restart_flag(environment))
+        self.assertNotIn("PRIVATE_EVAL_RESTART", environment)
+        self.assertEqual(environment["KEEP"], "yes")
 
     def test_cleanup_is_idempotent_and_removes_only_fixed_private_artifacts(self):
         with TemporaryDirectory() as directory:

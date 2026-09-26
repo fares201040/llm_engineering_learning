@@ -3,21 +3,27 @@
 from __future__ import annotations
 
 import base64
+from importlib import import_module
 import json
 import os
 from pathlib import Path
 import secrets
 import shutil
 import subprocess
+import sys
 from zipfile import ZipFile
 
-from week5.new_implementation.colab.private_payload import (
-    EXPECTED_FACTS,
-    validate_payload_archive,
+SOURCE_ROOT = Path(
+    os.environ.get("ATTENDANCE_PHASE2_SOURCE_ROOT", "/content/attendance_phase2_source")
 )
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
+
+_private_payload = import_module("week5.new_implementation.colab.private_payload")
+EXPECTED_FACTS = _private_payload.EXPECTED_FACTS
+validate_payload_archive = _private_payload.validate_payload_archive
 
 
-SOURCE_ROOT = Path("/content/attendance_phase2_source")
 PRIVATE_PAYLOAD = Path("/content/attendance_private_payload.zip")
 PRIVATE_DIRECTORY = Path("/content/attendance_private_payload")
 RUNTIME_CONFIG = Path("/content/.attendance_private_runtime.json")

@@ -11,10 +11,13 @@ installed in Ubuntu 24.04 under WSL2 and ADC is already available there.
 
 ## Current handoff status (2026-09-26)
 
-- The sanitized 42-file ZIP and executed notebook match SHA-256
-  `98a304a5dae85c965b65f0999ef88528effebd9f67d4d4f0fce93202c1322f7d`.
-  The T4 notebook passed 187 deterministic tests, Ruff lint and formatting for 23
+- The sanitized 48-file ZIP and executed notebook match SHA-256
+  `4bdca6e1f88225563d09e333f3aef46afecccd720688976136cbf5f5cc8ac164`.
+  The A100 notebook passed 239 deterministic tests, Ruff lint and formatting for 29
   files, and Python compilation.
+- The authorized private evaluator completed all 311 cases on the same runtime and
+  evaluator fingerprints with zero failures. The separate 25-case regression replay,
+  including its employee-confirmation follow-up, also completed with no failures.
 - The synthetic 16-row PostgreSQL fixture and Qwen 3.5 4B ran on T4. The UI long
   conversation passed turns 1–7 on the preceding snapshot. Turn 8 was rerun on
   this exact snapshot from the verified seven-turn checkpoint and passed all
@@ -25,9 +28,10 @@ installed in Ubuntu 24.04 under WSL2 and ADC is already available there.
   initially failed because the SQL planner invented September/August filters for a
   date-unbounded question. A SQL predicate scope guard now rejects that plan
   before execution and uses the three-attempt planner retry path.
-- Only synthetic data was uploaded. The private 311-case corpus and ignored
-  `.env.postgres` were excluded. The 311-case run is a separate next phase.
-- The exact T4 session creation command is below. Check session status before
+- The private payload remained separate from the sanitized source ZIP and the ignored
+  `.env.postgres` was never uploaded. The private database, role, runtime settings,
+  payload, and reports are removed by the cleanup command after reports are downloaded.
+- The exact T4 and A100 session creation commands are below. Check session status before
   reuse; Colab runtimes can expire. Do not ask for ADC sign-in unless the CLI
   reports an authentication failure. Never print runtime credentials.
 
@@ -317,6 +321,10 @@ database, and creates a generated role with only `CONNECT`, schema `USAGE`, and 
 Run one bounded batch at a time. The default is 10 cases; set a value from 1 to 50.
 Every completed case is checkpointed atomically, and later calls resume only when the
 corpus, runtime/evaluator fingerprints, and selected indices match.
+After changing runtime answer logic, explicitly start a new checkpoint by adding
+`--env PRIVATE_EVAL_RESTART=true` to the first batch command. Omit it thereafter so
+later batches resume. This flag deletes only the fixed remote evaluation report; it
+does not alter the payload or private database.
 
 ```powershell
 wsl.exe -d Ubuntu-24.04 -- /home/faris/.local/bin/colab --auth=adc exec --session attendance-phase2-3 --file /mnt/d/projects/llm_engineering_ed_donner/llm_engineering/week5/new_implementation/colab/run_private_eval.py --env PRIVATE_EVAL_BATCH_SIZE=10 --timeout 3600

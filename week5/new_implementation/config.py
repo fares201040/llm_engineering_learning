@@ -1,110 +1,97 @@
-"""Shared, environment-backed configuration for the attendance application.
+"""Environment-backed settings shared by offline ingestion and online querying."""
 
-The module is deliberately dependency-light so it can be imported both when
-the implementation is used as a package and when ``ingest.py`` is executed as
-an individual script.
-"""
+from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-import math
 import os
+from pathlib import Path
 import re
 
 from dotenv import load_dotenv
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=False)
-load_dotenv(
-    dotenv_path=Path(__file__).with_name(".env.postgres"),
-    override=False,
-)
+load_dotenv(PROJECT_ROOT / ".env", override=False)
+load_dotenv(Path(__file__).with_name(".env.postgres"), override=False)
 
 
-def env_str(name: str, default: str) -> str:
+def _text(name: str, default: str) -> str:
     value = os.getenv(name)
-    return default if value is None or not value.strip() else value.strip()
+    return value.strip() if value and value.strip() else default
 
 
-def env_int(name: str, default: int, minimum: int | None = None) -> int:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        value = default
-    else:
-        try:
-            value = int(raw.strip())
-        except ValueError as exc:
-            raise ValueError(f"{name} must be an integer; got {raw!r}.") from exc
-
-    if minimum is not None and value < minimum:
-        raise ValueError(f"{name} must be at least {minimum}; got {value}.")
+def _integer(name: str, default: int, minimum: int = 0) -> int:
+    raw = _text(name, str(default))
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
     return value
 
 
-def env_float(
-    name: str,
-    default: float,
-    minimum: float | None = None,
-) -> float:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        value = default
-    else:
-        try:
-            value = float(raw.strip())
-        except ValueError as exc:
-            raise ValueError(f"{name} must be a number; got {raw!r}.") from exc
-
-    if not math.isfinite(value):
-        raise ValueError(f"{name} must be finite; got {raw!r}.")
-    if minimum is not None and value < minimum:
-        raise ValueError(f"{name} must be at least {minimum}; got {value}.")
+def _number(name: str, default: float, minimum: float = 0.0) -> float:
+    raw = _text(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
     return value
 
 
-def env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-
-    normalized = raw.strip().casefold()
-    if normalized in {"1", "true", "yes", "on"}:
+def _boolean(name: str, default: bool = False) -> bool:
+    value = _text(name, str(default)).casefold()
+    if value in {"true", "yes", "1", "on"}:
         return True
-    if normalized in {"0", "false", "no", "off"}:
+    if value in {"false", "no", "0", "off"}:
         return False
-
-    raise ValueError(f"{name} must be one of true/false, yes/no, or 1/0; got {raw!r}.")
-
-
-def env_path(name: str, default: Path) -> Path:
-    raw = os.getenv(name)
-    path = Path(raw.strip()) if raw and raw.strip() else default
-    if not path.is_absolute():
-        path = PROJECT_ROOT / path
-    return path
+    raise ValueError(f"{name} must be true or false")
 
 
-def env_identifier(name: str, default: str) -> str:
-    """Read a plain or schema-qualified SQL identifier safely."""
-    value = env_str(name, default)
+def _path(name: str, default: Path) -> Path:
+    value = Path(_text(name, str(default)))
+    return value if value.is_absolute() else PROJECT_ROOT / value
+
+
+def _identifier(name: str, default: str) -> str:
+    value = _text(name, default)
     identifier = r"[A-Za-z_][A-Za-z0-9_]*"
     if not re.fullmatch(rf"{identifier}(?:\.{identifier})?", value):
-        raise ValueError(
-            f"{name} must be a plain or schema-qualified SQL identifier; got {value!r}."
-        )
+        raise ValueError(f"{name} must be a plain or schema-qualified SQL identifier")
     return value
 
 
 @dataclass(frozen=True)
 class Settings:
-    rag_model: str
+    # Online runtime.
+    postgres_readonly_dsn: str
+    postgres_connect_timeout_seconds: int
+    postgres_attendance_table: str
+    postgres_chunks_table: str
+    app_timezone: str
+    max_exact_results: int
+    final_k: int
+    embedding_provider: str
     embedding_model: str
-    embedding_encoding: str
-    embedding_max_tokens: int
-    embedding_batch_max_tokens: int
-    embedding_batch_max_items: int
-    chroma_batch_size: int
+    llm_reference_model: str
+    llm_reference_timeout_seconds: float
+    llm_reference_max_output_tokens: int
+    llm_planner_model: str
+    llm_planner_timeout_seconds: float
+    llm_planner_max_output_tokens: int
+    llm_answer_model: str
+    llm_answer_timeout_seconds: float
+    llm_answer_max_output_tokens: int
+    postgres_statement_timeout_ms: int
+    postgres_lock_timeout_ms: int
+    postgres_idle_transaction_timeout_ms: int
+    max_sql_result_bytes: int
+    log_level: str
+
+    # Offline ingestion. These retain their previous behavior and names.
     chroma_db_path: Path
     chroma_collection_name: str
     chroma_anonymized_telemetry: bool
@@ -118,212 +105,127 @@ class Settings:
     source_csv_glob: str
     enable_postgres: bool
     postgres_dsn: str
-    postgres_attendance_table: str
-    postgres_chunks_table: str
     enable_pgvector: bool
     pgvector_dimensions: int
     enable_employee_period_chunks: bool
     allow_empty_snapshot: bool
     allow_invalid_snapshot: bool
     allow_attendance_source_removal: bool
-    app_timezone: str
-    semantic_k: int
-    final_k: int
-    max_exact_results: int
-    max_exact_context_records: int
-    rerank_preview_chars: int
-    final_record_max_chars: int
-    fuzzy_name_threshold: float
-    auto_match_threshold: float
-    constraint_candidate_limit: int
-    evidence_sample_size: int
-    max_groups: int
-    planner_timeout_seconds: float
-    final_answer_timeout_seconds: float
-    redact_pii: bool
-    log_format: str
-    benchmark_warmups: int
-    benchmark_runs: int
-    log_level: str
-    conversation_model: str = ""
-    conversation_timeout_seconds: float = 8.0
-    conversation_max_input_chars: int = 16000
-    conversation_max_output_tokens: int = 1200
-    conversation_recent_frame_limit: int = 8
-    conversation_referent_limit: int = 24
-    conversation_unit_limit: int = 8
-    conversation_compiled_plan_limit: int = 12
-    conversation_employee_binding_limit: int = 20
-    max_derived_group_rows: int = 400
+    embedding_batch_max_tokens: int
+    embedding_batch_max_items: int
+    chroma_batch_size: int
 
-    def __post_init__(self):
-        if not self.conversation_model.strip():
-            object.__setattr__(self, "conversation_model", self.rag_model)
+    @property
+    def llm_turn_provider_call_limit(self) -> int:
+        return 8
 
     @classmethod
     def from_environment(cls) -> "Settings":
-        knowledge_base_path = env_path(
-            "KNOWLEDGE_BASE_PATH",
-            PROJECT_ROOT / "week5" / "new-knowledge-base",
+        knowledge = _path(
+            "KNOWLEDGE_BASE_PATH", PROJECT_ROOT / "week5" / "new-knowledge-base"
         )
-        rag_model = env_str("RAG_MODEL", "openai/gpt-4.1-nano")
+        global_model = os.getenv("LLM_MODEL")
+        global_model = (
+            global_model.strip() if global_model and global_model.strip() else None
+        )
+        reference_default_model = global_model or "openai/gpt-4.1-mini"
+        planner_default_model = global_model or "openai/gpt-4.1-mini"
+        answer_default_model = global_model or "openai/gpt-4.1"
+        postgres_dsn = _text("POSTGRES_DSN", "")
+        embedding_provider = _text("EMBEDDING_PROVIDER", "huggingface").lower()
+        if embedding_provider not in {"huggingface", "openai"}:
+            raise ValueError("EMBEDDING_PROVIDER must be huggingface or openai")
         return cls(
-            rag_model=rag_model,
-            conversation_model=env_str("CONVERSATION_MODEL", rag_model),
-            conversation_timeout_seconds=env_float(
-                "CONVERSATION_TIMEOUT_SECONDS", 8.0, minimum=0.1
+            postgres_readonly_dsn=_text("POSTGRES_READONLY_DSN", postgres_dsn),
+            postgres_connect_timeout_seconds=_integer(
+                "POSTGRES_CONNECT_TIMEOUT_SECONDS", 5, 1
             ),
-            conversation_max_input_chars=env_int(
-                "CONVERSATION_MAX_INPUT_CHARS", 16000, minimum=1
-            ),
-            conversation_max_output_tokens=env_int(
-                "CONVERSATION_MAX_OUTPUT_TOKENS", 1200, minimum=1
-            ),
-            conversation_recent_frame_limit=env_int(
-                "CONVERSATION_RECENT_FRAME_LIMIT", 8, minimum=1
-            ),
-            conversation_referent_limit=env_int(
-                "CONVERSATION_REFERENT_LIMIT", 24, minimum=1
-            ),
-            conversation_unit_limit=env_int("CONVERSATION_UNIT_LIMIT", 8, minimum=1),
-            conversation_compiled_plan_limit=env_int(
-                "CONVERSATION_COMPILED_PLAN_LIMIT", 12, minimum=1
-            ),
-            conversation_employee_binding_limit=env_int(
-                "CONVERSATION_EMPLOYEE_BINDING_LIMIT", 20, minimum=1
-            ),
-            max_derived_group_rows=env_int("MAX_DERIVED_GROUP_ROWS", 400, minimum=1),
-            embedding_model=env_str(
-                "EMBEDDING_MODEL",
-                "text-embedding-3-large",
-            ),
-            embedding_encoding=env_str(
-                "EMBEDDING_ENCODING",
-                "cl100k_base",
-            ),
-            embedding_max_tokens=env_int(
-                "EMBEDDING_MAX_TOKENS",
-                7500,
-                minimum=1,
-            ),
-            embedding_batch_max_tokens=env_int(
-                "EMBEDDING_BATCH_MAX_TOKENS",
-                250000,
-                minimum=1,
-            ),
-            embedding_batch_max_items=env_int(
-                "EMBEDDING_BATCH_MAX_ITEMS",
-                256,
-                minimum=1,
-            ),
-            chroma_batch_size=env_int(
-                "CHROMA_BATCH_SIZE",
-                500,
-                minimum=1,
-            ),
-            chroma_db_path=env_path(
-                "CHROMA_DB_PATH",
-                PROJECT_ROOT / "week5" / "new_preprocessed_db",
-            ),
-            chroma_collection_name=env_str(
-                "CHROMA_COLLECTION_NAME",
-                "docs",
-            ),
-            chroma_anonymized_telemetry=env_bool(
-                "CHROMA_ANONYMIZED_TELEMETRY",
-                False,
-            ),
-            knowledge_base_path=knowledge_base_path,
-            jsonl_output_path=env_path(
-                "JSONL_OUTPUT_PATH",
-                knowledge_base_path / "attendance" / "attendance.jsonl",
-            ),
-            invalid_jsonl_path=env_path(
-                "INVALID_JSONL_PATH",
-                knowledge_base_path / "attendance" / "attendance.invalid.jsonl",
-            ),
-            ingestion_state_path=env_path(
-                "INGESTION_STATE_PATH",
-                knowledge_base_path / "attendance" / "ingestion_state.sqlite3",
-            ),
-            index_schema_version=env_int("INDEX_SCHEMA_VERSION", 2, minimum=1),
-            ingestion_format_version=env_int(
-                "INGESTION_FORMAT_VERSION",
-                3,
-                minimum=1,
-            ),
-            source_xlsx_glob=env_str("SOURCE_XLSX_GLOB", "*.xlsx"),
-            source_csv_glob=env_str("SOURCE_CSV_GLOB", "*.csv"),
-            enable_postgres=env_bool("ENABLE_POSTGRES", False),
-            postgres_dsn=env_str("POSTGRES_DSN", ""),
-            postgres_attendance_table=env_identifier(
+            postgres_attendance_table=_identifier(
                 "POSTGRES_ATTENDANCE_TABLE", "attendance_records"
             ),
-            postgres_chunks_table=env_identifier(
+            postgres_chunks_table=_identifier(
                 "POSTGRES_CHUNKS_TABLE", "knowledge_chunks"
             ),
-            enable_pgvector=env_bool("ENABLE_PGVECTOR", False),
-            pgvector_dimensions=env_int(
-                "PGVECTOR_DIMENSIONS",
-                3072,
-                minimum=1,
+            app_timezone=_text("APP_TIMEZONE", "Asia/Aden"),
+            max_exact_results=_integer("MAX_EXACT_RESULTS", 100, 1),
+            final_k=_integer("FINAL_K", 6, 1),
+            embedding_provider=embedding_provider,
+            embedding_model=_text(
+                "EMBEDDING_MODEL",
+                "text-embedding-3-large"
+                if embedding_provider == "openai"
+                else "all-MiniLM-L6-v2",
             ),
-            enable_employee_period_chunks=env_bool(
-                "ENABLE_EMPLOYEE_PERIOD_CHUNKS",
-                True,
+            llm_reference_model=_text("LLM_REFERENCE_MODEL", reference_default_model),
+            llm_reference_timeout_seconds=_number(
+                "LLM_REFERENCE_TIMEOUT_SECONDS", 30.0, 0.1
             ),
-            allow_empty_snapshot=env_bool("ALLOW_EMPTY_SNAPSHOT", False),
-            allow_invalid_snapshot=env_bool("ALLOW_INVALID_SNAPSHOT", False),
-            allow_attendance_source_removal=env_bool(
-                "ALLOW_ATTENDANCE_SOURCE_REMOVAL",
-                False,
+            llm_reference_max_output_tokens=_integer(
+                "LLM_REFERENCE_MAX_OUTPUT_TOKENS", 3000, 128
             ),
-            app_timezone=env_str("APP_TIMEZONE", "Asia/Aden"),
-            semantic_k=env_int("RETRIEVAL_K", 12, minimum=1),
-            final_k=env_int("FINAL_K", 6, minimum=1),
-            max_exact_results=env_int(
-                "MAX_EXACT_RESULTS",
-                500,
-                minimum=1,
+            llm_planner_model=_text("LLM_PLANNER_MODEL", planner_default_model),
+            llm_planner_timeout_seconds=_number(
+                "LLM_PLANNER_TIMEOUT_SECONDS", 30.0, 0.1
             ),
-            max_exact_context_records=env_int(
-                "MAX_EXACT_CONTEXT_RECORDS",
-                100,
-                minimum=1,
+            llm_planner_max_output_tokens=_integer(
+                "LLM_PLANNER_MAX_OUTPUT_TOKENS", 6000, 256
             ),
-            rerank_preview_chars=env_int(
-                "RERANK_PREVIEW_CHARS",
-                2500,
-                minimum=1,
+            llm_answer_model=_text("LLM_ANSWER_MODEL", answer_default_model),
+            llm_answer_timeout_seconds=_number("LLM_ANSWER_TIMEOUT_SECONDS", 60.0, 0.1),
+            llm_answer_max_output_tokens=_integer(
+                "LLM_ANSWER_MAX_OUTPUT_TOKENS", 3000, 128
             ),
-            final_record_max_chars=env_int(
-                "FINAL_RECORD_MAX_CHARS",
-                10000,
-                minimum=1,
+            postgres_statement_timeout_ms=_integer(
+                "POSTGRES_STATEMENT_TIMEOUT_MS", 30000, 1
             ),
-            fuzzy_name_threshold=env_float(
-                "FUZZY_NAME_THRESHOLD",
-                0.62,
-                minimum=0.0,
+            postgres_lock_timeout_ms=_integer("POSTGRES_LOCK_TIMEOUT_MS", 3000, 1),
+            postgres_idle_transaction_timeout_ms=_integer(
+                "POSTGRES_IDLE_TRANSACTION_TIMEOUT_MS", 30000, 1
             ),
-            auto_match_threshold=env_float("AUTO_MATCH_THRESHOLD", 0.9, minimum=0.0),
-            constraint_candidate_limit=env_int(
-                "CONSTRAINT_CANDIDATE_LIMIT", 10, minimum=1
+            max_sql_result_bytes=_integer("MAX_SQL_RESULT_BYTES", 1000000, 1024),
+            log_level=_text("LOG_LEVEL", "INFO").upper(),
+            chroma_db_path=_path(
+                "CHROMA_DB_PATH", PROJECT_ROOT / "week5" / "new_preprocessed_db"
             ),
-            evidence_sample_size=env_int("EVIDENCE_SAMPLE_SIZE", 20, minimum=1),
-            max_groups=env_int("MAX_GROUPS", 50, minimum=1),
-            planner_timeout_seconds=env_float(
-                "PLANNER_TIMEOUT_SECONDS", 30.0, minimum=0.1
+            chroma_collection_name=_text("CHROMA_COLLECTION_NAME", "docs"),
+            chroma_anonymized_telemetry=_boolean("CHROMA_ANONYMIZED_TELEMETRY", False),
+            knowledge_base_path=knowledge,
+            jsonl_output_path=_path(
+                "JSONL_OUTPUT_PATH", knowledge / "attendance" / "attendance.jsonl"
             ),
-            final_answer_timeout_seconds=env_float(
-                "FINAL_ANSWER_TIMEOUT_SECONDS", 60.0, minimum=0.1
+            invalid_jsonl_path=_path(
+                "INVALID_JSONL_PATH",
+                knowledge / "attendance" / "attendance.invalid.jsonl",
             ),
-            redact_pii=env_bool("REDACT_PII", True),
-            log_format=env_str("LOG_FORMAT", "text").lower(),
-            benchmark_warmups=env_int("BENCHMARK_WARMUPS", 2, minimum=0),
-            benchmark_runs=env_int("BENCHMARK_RUNS", 10, minimum=1),
-            log_level=env_str("LOG_LEVEL", "INFO").upper(),
+            ingestion_state_path=_path(
+                "INGESTION_STATE_PATH",
+                knowledge / "attendance" / "ingestion_state.sqlite3",
+            ),
+            index_schema_version=_integer("INDEX_SCHEMA_VERSION", 2, 1),
+            ingestion_format_version=_integer("INGESTION_FORMAT_VERSION", 3, 1),
+            source_xlsx_glob=_text("SOURCE_XLSX_GLOB", "*.xlsx"),
+            source_csv_glob=_text("SOURCE_CSV_GLOB", "*.csv"),
+            enable_postgres=_boolean("ENABLE_POSTGRES", False),
+            postgres_dsn=postgres_dsn,
+            enable_pgvector=_boolean("ENABLE_PGVECTOR", False),
+            pgvector_dimensions=_integer("PGVECTOR_DIMENSIONS", 384, 1),
+            enable_employee_period_chunks=_boolean(
+                "ENABLE_EMPLOYEE_PERIOD_CHUNKS", True
+            ),
+            allow_empty_snapshot=_boolean("ALLOW_EMPTY_SNAPSHOT", False),
+            allow_invalid_snapshot=_boolean("ALLOW_INVALID_SNAPSHOT", False),
+            allow_attendance_source_removal=_boolean(
+                "ALLOW_ATTENDANCE_SOURCE_REMOVAL", False
+            ),
+            embedding_batch_max_tokens=_integer(
+                "EMBEDDING_BATCH_MAX_TOKENS", 250000, 1
+            ),
+            embedding_batch_max_items=_integer("EMBEDDING_BATCH_MAX_ITEMS", 256, 1),
+            chroma_batch_size=_integer("CHROMA_BATCH_SIZE", 500, 1),
         )
 
 
 settings = Settings.from_environment()
+
+
+__all__ = ["PROJECT_ROOT", "Settings", "settings"]

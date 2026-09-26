@@ -1,9 +1,6 @@
 """Central construction point for the local Chroma client."""
 
-try:
-    from .config import settings
-except ImportError:  # Running modules directly from their directory.
-    from config import settings
+from .config import settings
 
 
 def create_chroma_client():

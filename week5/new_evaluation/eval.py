@@ -1,1144 +1,769 @@
-import sys
+"""Deterministic evaluator for the attendance direct-SQL runtime."""
+
+from __future__ import annotations
+
 import argparse
+from datetime import date, timedelta
 import hashlib
 import json
 import math
 from pathlib import Path
-from typing import Literal
+import re
 
-from pydantic import BaseModel, ConfigDict, Field
-from litellm import completion
+from pydantic import BaseModel
+from sqlglot import exp, parse
+from sqlglot.errors import ParseError
 
-if __package__ and __package__.startswith("week5."):
-    from .test import TestQuestion, load_tests
-    from ..new_implementation.answer import (
-        POSTGRES_ATTENDANCE_TABLE,
-        POSTGRES_DSN,
-        ConversationState,
-        EmployeeClarificationRequired,
-        MissingIntentRequired,
-        PlanValidationError,
-        PlanningClarificationRequired,
-        QueryPlan,
-        SemanticPlanValidationError,
-        SurfaceMeaningClarificationRequired,
-        _import_psycopg,
-        answer_question,
-        answer_question_with_state,
-        fetch_context,
-        _format_aggregation_answer,
-        _answer_question_with_evaluation_trace,
-    )
-    from ..new_implementation.config import settings
-elif __package__ == "new_evaluation":
-    from .test import TestQuestion, load_tests
-    from new_implementation.answer import (
-        POSTGRES_ATTENDANCE_TABLE,
-        POSTGRES_DSN,
-        ConversationState,
-        EmployeeClarificationRequired,
-        MissingIntentRequired,
-        PlanValidationError,
-        PlanningClarificationRequired,
-        QueryPlan,
-        SemanticPlanValidationError,
-        SurfaceMeaningClarificationRequired,
-        _import_psycopg,
-        answer_question,
-        answer_question_with_state,
-        fetch_context,
-        _format_aggregation_answer,
-        _answer_question_with_evaluation_trace,
-    )
-    from new_implementation.config import settings
-else:
-    # ``python eval.py`` places only this directory on sys.path. Add the
-    # week5 package root so the evaluator uses the new implementation and its
-    # own test set rather than the legacy evaluation package.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from new_evaluation.test import TestQuestion, load_tests
-    from new_implementation.answer import (
-        POSTGRES_ATTENDANCE_TABLE,
-        POSTGRES_DSN,
-        ConversationState,
-        EmployeeClarificationRequired,
-        MissingIntentRequired,
-        PlanValidationError,
-        PlanningClarificationRequired,
-        QueryPlan,
-        SemanticPlanValidationError,
-        SurfaceMeaningClarificationRequired,
-        _import_psycopg,
-        answer_question,
-        answer_question_with_state,
-        fetch_context,
-        _format_aggregation_answer,
-        _answer_question_with_evaluation_trace,
-    )
-    from new_implementation.config import settings
-
-
-MODEL = settings.rag_model
-DATASET_MANIFEST_PATH = Path(__file__).with_name("dataset_manifest.json")
-
-
-def _retrieved_documents(context_result):
-    """Normalize the shared retrieval result to a document list."""
-    if isinstance(context_result, tuple):
-        return context_result[0]
-    return context_result
-
-
-class RetrievalEval(BaseModel):
-    """Evaluation metrics for retrieval performance."""
-
-    mrr: float = Field(description="Mean Reciprocal Rank - average across all keywords")
-    ndcg: float = Field(
-        description="Normalized Discounted Cumulative Gain (binary relevance)"
-    )
-    keywords_found: int = Field(description="Number of keywords found in top-k results")
-    total_keywords: int = Field(description="Total number of keywords to find")
-    keyword_coverage: float = Field(description="Percentage of keywords found")
-
-
-class AnswerEval(BaseModel):
-    """LLM-as-a-judge evaluation of answer quality."""
-
-    feedback: str = Field(
-        description="Concise feedback on the answer quality, comparing it to the reference answer and evaluating based on the retrieved context"
-    )
-    accuracy: float = Field(
-        description="How factually correct is the answer compared to the reference answer? 1 (wrong. any wrong answer must score 1) to 5 (ideal - perfectly accurate). An acceptable answer would score 3."
-    )
-    completeness: float = Field(
-        description="How complete is the answer in addressing all aspects of the question? 1 (very poor - missing key information) to 5 (ideal - all the information from the reference answer is provided completely). Only answer 5 if ALL information from the reference answer is included."
-    )
-    relevance: float = Field(
-        description="How relevant is the answer to the specific question asked? 1 (very poor - off-topic) to 5 (ideal - directly addresses question and gives no additional information). Only answer 5 if the answer is completely relevant to the question and gives no additional information."
-    )
+from ..new_implementation.online.execution import LOCAL_DEMO_ACCESS
+from ..new_implementation.online.pipeline import (
+    Answered,
+    Clarification,
+    TurnRequest,
+    Unsupported,
+    run_turn,
+)
+from ..new_implementation.online.state import ConversationState, VerifiedTurn
+from .test import TEST_FILE, TestQuestion, load_tests
 
 
 class BehaviorEval(BaseModel):
-    plan_ok: bool
-    employee_ids_ok: bool
-    matched_count_ok: bool
-    calculation_ok: bool
-    clarification_ok: bool
+    outcome_ok: bool = True
+    plan_ok: bool = True
+    employee_ids_ok: bool = True
+    matched_count_ok: bool = True
+    calculation_ok: bool = True
+    clarification_ok: bool = True
     answer_facts_ok: bool = True
-    normalized_result_ok: bool = True
-    multi_turn_ok: bool = True
-    expected_error_ok: bool = True
     record_ids_ok: bool = True
     group_values_ok: bool = True
-    violation_codes_ok: bool = True
-    answer_contract_ok: bool = True
     unsupported_capabilities_ok: bool = True
+    multi_turn_ok: bool = True
+
+    @property
+    def passed(self) -> bool:
+        return all(self.model_dump().values())
 
 
-class BirdCaseEval(BaseModel):
-    """Privacy-safe BIRD-style execution verdict for one APDC case."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    status: Literal["evaluated", "skipped"]
-    execution_accuracy: float | None = Field(default=None, ge=0, le=1)
-    components: dict[str, bool] = Field(default_factory=dict)
-    reason: (
-        Literal[
-            "controlled_nonexecution",
-            "no_verified_output_contract",
-            "unsupported_nonexecution_case",
-        ]
-        | None
-    ) = None
-
-
-_BIRD_OUTPUT_CONTRACTS = (
-    ("matched_count", "expected_matched_count", "matched_count_ok"),
-    ("calculation", "expected_calculation", "calculation_ok"),
-    ("normalized_result", "expected_normalized_result", "normalized_result_ok"),
-    ("record_ids", "expected_record_ids", "record_ids_ok"),
-    ("group_values", "expected_group_values", "group_values_ok"),
-)
+_PHYSICAL_FIELD = {
+    "Employee_ID": "employee_id",
+    "Name": "name",
+    "Date": "attendance_date",
+    "Day_Type": "day_type",
+    "Status": "status",
+    "Exception": "exception",
+    "Total_Worked_Hrs": "total_worked_hrs",
+    "Lateness_Hrs": "lateness_hrs",
+    "Early_Out_Hrs": "early_out_hrs",
+    "Overbreak_Hrs": "overbreak_hrs",
+    "Total_OT": "total_ot",
+    "OT_Authorized": "ot_authorized",
+    "OT_Not_Authorized": "ot_not_authorized",
+    "Leave_Hrs": "leave_hrs",
+}
 
 
-def _bird_has_output_expectation(test: TestQuestion, expectation_name: str) -> bool:
-    expectation = getattr(test, expectation_name)
-    if expectation_name == "expected_matched_count":
-        return expectation is not None
-    if expectation_name in {"expected_calculation", "expected_normalized_result"}:
-        return bool(expectation)
-    return expectation_name in test.model_fields_set
+def _last_turn(state: ConversationState) -> VerifiedTurn | None:
+    return state.verified_turns[-1] if state.verified_turns else None
 
 
-def _bird_applicable_checks(test: TestQuestion):
-    applicable = []
-    for component, expectation_name, check_name in _BIRD_OUTPUT_CONTRACTS:
-        if _bird_has_output_expectation(test, expectation_name):
-            applicable.append((component, check_name))
-    return applicable
-
-
-def _bird_values_match(actual, expected, *, key=None) -> bool:
-    if isinstance(actual, bool) or isinstance(expected, bool):
-        return type(actual) is type(expected) and actual == expected
-    if isinstance(expected, float) and isinstance(actual, (int, float)):
-        return math.isclose(actual, expected, abs_tol=0.005)
-    if isinstance(expected, dict):
-        return isinstance(actual, dict) and all(
-            field in actual and _bird_values_match(actual[field], value, key=field)
-            for field, value in expected.items()
-        )
-    if isinstance(expected, list):
-        if key == "business_predicates":
-            return isinstance(actual, list) and set(actual) == set(expected)
-        return (
-            isinstance(actual, list)
-            and len(actual) == len(expected)
-            and all(
-                _bird_values_match(actual_item, expected_item)
-                for actual_item, expected_item in zip(actual, expected)
-            )
-        )
-    return actual == expected
-
-
-def _bird_group_identity_matches(actual, expected) -> bool:
-    if type(actual) is not type(expected):
-        return False
-    if isinstance(expected, list):
-        return len(actual) == len(expected) and all(
-            _bird_group_identity_matches(actual_item, expected_item)
-            for actual_item, expected_item in zip(actual, expected)
-        )
-    return actual == expected
-
-
-def _bird_group_values_match(actual: dict | None, expected: list[dict]) -> bool:
-    rows = actual.get("rows") if isinstance(actual, dict) else None
-    if not expected:
-        return isinstance(rows, list) and not rows
-    if not isinstance(rows, list) or len(rows) != len(expected):
-        return False
-    if any(
-        _bird_group_identity_matches(row.get("group", []), other.get("group", []))
-        for index, row in enumerate(rows)
-        for other in rows[index + 1 :]
-    ):
-        return False
-    if any(
-        _bird_group_identity_matches(row.get("group", []), other.get("group", []))
-        for index, row in enumerate(expected)
-        for other in expected[index + 1 :]
-    ):
-        return False
-    return all(
-        any(
-            _bird_group_identity_matches(
-                actual_row.get("group", []), expected_row.get("group", [])
-            )
-            and _bird_values_match(actual_row.get("value"), expected_row.get("value"))
-            for actual_row in rows
-        )
-        for expected_row in expected
+def _result_rows(turn: VerifiedTurn | None) -> list[dict]:
+    if turn is None:
+        return []
+    rows = turn.result.get("rows", [])
+    return (
+        rows
+        if isinstance(rows, list)
+        else list(rows)
+        if isinstance(rows, tuple)
+        else []
     )
 
 
-def _bird_is_nonexecution_case(test: TestQuestion) -> bool:
-    return bool(
-        test.expected_error
-        or test.expected_exception_type
-        or test.expected_clarification_ids
-        or test.expected_clarification_outcome == "ambiguous"
-        or test.expected_violation_codes
-        or test.expected_unsupported_capabilities
-        or test.turns
-    )
-
-
-def evaluate_bird_case(test: TestQuestion) -> BirdCaseEval:
-    """Score verified outputs from one successful grounded execution.
-
-    This is an APDC adaptation of BIRD Execution Accuracy. It does not claim
-    official BIRD R-VES because this corpus has no gold SQL timing contract.
-    """
-    applicable = _bird_applicable_checks(test)
-    if not applicable:
-        return BirdCaseEval(
-            status="skipped",
-            reason="no_verified_output_contract",
-        )
-    if _bird_is_nonexecution_case(test):
-        return BirdCaseEval(
-            status="skipped",
-            reason="unsupported_nonexecution_case",
-        )
-
+def _plan_matches(sql: str, expected: dict | None) -> bool:
+    if expected is None:
+        return True
+    folded = " ".join(sql.casefold().split())
     try:
-        chunks, plan, calculation, matched_count = fetch_context(test.question)
-    except (
-        PlanningClarificationRequired,
-        MissingIntentRequired,
-        SurfaceMeaningClarificationRequired,
-        SemanticPlanValidationError,
-        PlanValidationError,
-    ):
-        return BirdCaseEval(
-            status="evaluated",
-            execution_accuracy=0.0,
-            components={component: False for component, _check in applicable},
-            reason="controlled_nonexecution",
-        )
-    actual_record_ids = {
-        str(chunk.metadata.get("record_id"))
-        for chunk in chunks
-        if chunk.metadata.get("record_id") is not None
-    }
-    normalized_actual = {
-        "plan": plan.model_dump(),
-        "calculation": calculation,
-        "matched_count": matched_count,
-    }
-    checks = {
-        "matched_count_ok": _bird_values_match(
-            matched_count, test.expected_matched_count
-        ),
-        "calculation_ok": _bird_values_match(calculation, test.expected_calculation),
-        "normalized_result_ok": _bird_values_match(
-            normalized_actual, test.expected_normalized_result
-        ),
-        "record_ids_ok": actual_record_ids == set(test.expected_record_ids),
-        "group_values_ok": _bird_group_values_match(
-            calculation, test.expected_group_values
-        ),
-    }
-    components = {component: checks[check_name] for component, check_name in applicable}
-    return BirdCaseEval(
-        status="evaluated",
-        execution_accuracy=float(all(components.values())),
-        components=components,
+        statements = parse(sql, read="postgres")
+    except ParseError:
+        statements = []
+    predicate_scope = " ".join(
+        node.sql(dialect="postgres").casefold()
+        for statement in statements
+        if statement is not None
+        for node in statement.find_all(exp.Where, exp.Having)
     )
 
-
-class AnswerExecutionTrace(BaseModel):
-    """Non-sensitive structure captured from the exact answer execution."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    outcome: Literal["executed", "controlled_nonexecution"] = "executed"
-    plan: QueryPlan | None
-    calculation: dict | None
-    matched_count: int | None
-
-
-FailureCause = Literal[
-    "provider_structural_failure",
-    "unsupported_provider_decision",
-    "missing_deterministic_fact",
-    "excess_or_ungrounded_fact",
-    "unsupported_plan_shape",
-    "answer_contract_mismatch",
-    "retrieval_or_calculation_mismatch",
-    "renderer_incomplete",
-    "irrelevant_evidence",
-    "session_state_failure",
-    "evaluator_expectation_drift",
-    "execution_plan_mismatch",
-]
-DiagnosticStage = Literal[
-    "provider_response_validation",
-    "semantic_validation",
-    "result_validation",
-    "answer_rendering",
-    "session_state",
-    "answer_judging",
-]
-
-
-def classify_case_diagnostic(
-    *,
-    stage: DiagnosticStage,
-    violation_codes: tuple[str, ...] = (),
-    unsupported_capabilities: tuple[str, ...] = (),
-    failed_checks: tuple[str, ...] = (),
-    sub_five_dimensions: tuple[str, ...] = (),
-    evidence_count: int | None = None,
-) -> FailureCause:
-    """Classify one failure using controlled, non-sensitive structure only."""
-    if stage == "provider_response_validation":
-        return "provider_structural_failure"
-    if unsupported_capabilities:
-        return "unsupported_plan_shape"
-    if "uncovered_fact" in violation_codes:
-        return "missing_deterministic_fact"
-    if "ungrounded_constraint" in violation_codes:
-        return "excess_or_ungrounded_fact"
-    if "answer_contract_mismatch" in violation_codes:
-        return "answer_contract_mismatch"
-    if "answer_contract_ok" in failed_checks:
-        return "answer_contract_mismatch"
-    if {
-        "violation_codes_ok",
-        "unsupported_capabilities_ok",
-    }.intersection(failed_checks):
-        return "unsupported_plan_shape"
-    if stage == "session_state" or {
-        "clarification_ok",
-        "multi_turn_ok",
-        "employee_ids_ok",
-    }.intersection(failed_checks):
-        return "session_state_failure"
-    if stage == "result_validation" or {
-        "matched_count_ok",
-        "calculation_ok",
-        "normalized_result_ok",
-        "record_ids_ok",
-        "group_values_ok",
-    }.intersection(failed_checks):
-        return "retrieval_or_calculation_mismatch"
-    if "plan_ok" in failed_checks:
-        return "execution_plan_mismatch"
-    if stage == "answer_rendering" or "answer_facts_ok" in failed_checks:
-        return "renderer_incomplete"
-    if violation_codes:
-        return "unsupported_provider_decision"
-    return "evaluator_expectation_drift"
-
-
-class CaseDiagnostic(BaseModel):
-    """Privacy-safe structural classification for one corpus case."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    index: int = Field(ge=0)
-    category: str = Field(min_length=1)
-    stage: DiagnosticStage
-    cause: FailureCause
-    violation_codes: tuple[str, ...] = ()
-    unsupported_capabilities: tuple[str, ...] = ()
-    failed_checks: tuple[str, ...] = ()
-    sub_five_dimensions: tuple[str, ...] = ()
-    fact_kind_counts: dict[str, int] = Field(default_factory=dict)
-    evidence_count: int | None = Field(default=None, ge=0)
-
-    @classmethod
-    def from_failure(
-        cls,
-        *,
-        index: int,
-        category: str,
-        stage: DiagnosticStage,
-        violation_codes: tuple[str, ...] = (),
-        unsupported_capabilities: tuple[str, ...] = (),
-        failed_checks: tuple[str, ...] = (),
-        sub_five_dimensions: tuple[str, ...] = (),
-        fact_kind_counts: dict[str, int] | None = None,
-        evidence_count: int | None = None,
-    ) -> "CaseDiagnostic":
-        cause = classify_case_diagnostic(
-            stage=stage,
-            violation_codes=violation_codes,
-            unsupported_capabilities=unsupported_capabilities,
-            failed_checks=failed_checks,
-            sub_five_dimensions=sub_five_dimensions,
-            evidence_count=evidence_count,
-        )
-        return cls(
-            index=index,
-            category=category,
-            stage=stage,
-            cause=cause,
-            violation_codes=tuple(sorted(set(violation_codes))),
-            unsupported_capabilities=tuple(sorted(set(unsupported_capabilities))),
-            failed_checks=tuple(sorted(set(failed_checks))),
-            sub_five_dimensions=tuple(sorted(set(sub_five_dimensions))),
-            fact_kind_counts=dict(sorted((fact_kind_counts or {}).items())),
-            evidence_count=evidence_count,
-        )
-
-
-def diagnose_behavior_result(
-    *, index: int, category: str, result: BehaviorEval
-) -> CaseDiagnostic | None:
-    """Convert failed deterministic checks into one privacy-safe diagnosis."""
-    failed_checks = tuple(
-        name for name, value in result.model_dump().items() if not value
-    )
-    if not failed_checks:
-        return None
-    if {"violation_codes_ok", "unsupported_capabilities_ok"}.intersection(
-        failed_checks
-    ):
-        stage: DiagnosticStage = "semantic_validation"
-    elif {"clarification_ok", "multi_turn_ok", "employee_ids_ok"}.intersection(
-        failed_checks
-    ):
-        stage = "session_state"
-    elif {
-        "matched_count_ok",
-        "calculation_ok",
-        "normalized_result_ok",
-        "record_ids_ok",
-        "group_values_ok",
-    }.intersection(failed_checks):
-        stage = "result_validation"
-    elif "answer_facts_ok" in failed_checks:
-        stage = "answer_rendering"
-    else:
-        stage = "semantic_validation"
-    return CaseDiagnostic.from_failure(
-        index=index,
-        category=category,
-        stage=stage,
-        failed_checks=failed_checks,
-    )
-
-
-def evaluate_answer_with_diagnostic(
-    test: TestQuestion, *, index: int
-) -> tuple[AnswerEval, CaseDiagnostic | None]:
-    """Judge one answer and classify sub-perfect scores from that same run."""
-    result, generated_answer, documents, trace = evaluate_answer_execution(test)
-    dimensions = tuple(
-        name
-        for name in ("accuracy", "completeness", "relevance")
-        if getattr(result, name) < 5
-    )
-    if not dimensions:
-        return result, None
-    diagnostic = None
-    if trace.plan is not None:
-        behavior = _evaluate_successful_behavior(
-            test,
-            documents,
-            trace.plan,
-            trace.calculation,
-            trace.matched_count,
-            generated_answer=generated_answer,
-        )
-        diagnostic = diagnose_behavior_result(
-            index=index, category=test.category, result=behavior
-        )
-    elif not (
-        test.expected_error
-        or test.expected_violation_codes
-        or test.expected_unsupported_capabilities
-        or test.expected_clarification_ids
-        or test.expected_clarification_outcome
-    ):
-        diagnostic = CaseDiagnostic.from_failure(
-            index=index,
-            category=test.category,
-            stage="session_state",
-            failed_checks=("clarification_ok",),
-        )
-    if diagnostic is None:
-        missing_keywords = any(
-            not any(
-                keyword.casefold() in document.page_content.casefold()
-                for document in documents
-            )
-            for keyword in test.keywords
-        )
-        diagnostic = CaseDiagnostic.from_failure(
-            index=index,
-            category=test.category,
-            stage="answer_judging",
-            sub_five_dimensions=dimensions,
-            evidence_count=(0 if missing_keywords else None),
-        )
-        if missing_keywords:
-            diagnostic = diagnostic.model_copy(update={"cause": "irrelevant_evidence"})
-    diagnostic = diagnostic.model_copy(
-        update={
-            "sub_five_dimensions": tuple(sorted(set(dimensions))),
-            "evidence_count": len(documents),
-        }
-    )
-    return result, diagnostic
-
-
-def _expected_subset(actual: dict | None, expected: dict | None):
-    if not expected:
-        return True
-    if actual is None:
-        return False
-
-    def matches(key, actual_value, expected_value):
-        if key == "business_predicates" and isinstance(actual_value, list):
-            return set(actual_value) == set(expected_value)
-        if isinstance(expected_value, float) and isinstance(actual_value, (int, float)):
-            return math.isclose(actual_value, expected_value, abs_tol=0.005)
-        return actual_value == expected_value
-
-    return all(matches(key, actual.get(key), value) for key, value in expected.items())
-
-
-def _expected_group_values_match(actual: dict | None, expected: list[dict]):
-    if not expected:
-        return True
-    if not actual or not isinstance(actual.get("rows"), list):
-        return False
-    actual_by_group = {
-        tuple(row.get("group", [])): row.get("value") for row in actual["rows"]
-    }
-    for expected_row in expected:
-        actual_value = actual_by_group.get(tuple(expected_row.get("group", [])))
-        expected_value = expected_row.get("value")
-        if isinstance(expected_value, (int, float)) and isinstance(
-            actual_value, (int, float)
-        ):
-            if not math.isclose(actual_value, expected_value, abs_tol=0.005):
-                return False
-        elif actual_value != expected_value:
+    def contains_filter(item: dict) -> bool:
+        field = str(
+            _PHYSICAL_FIELD.get(item.get("field"), item.get("field", ""))
+        ).casefold()
+        value = item.get("value", "")
+        operator_name = str(item.get("operator", "")).casefold()
+        operator = {
+            "eq": r"=",
+            "neq": r"(?:<>|!=)",
+            "gt": r">",
+            "gte": r">=",
+            "lt": r"<",
+            "lte": r"<=",
+        }.get(operator_name)
+        if not field or field not in predicate_scope:
             return False
+        if operator_name == "in" and isinstance(value, list):
+            match = re.search(
+                rf"\b{re.escape(field)}\b\s+in\s*\(([^)]*(?:\)[^)]*)?)\)",
+                predicate_scope,
+            )
+            return match is not None and all(
+                str(item_value).casefold() in match.group(1) for item_value in value
+            )
+        if operator is None:
+            return not value or str(value).casefold() in predicate_scope
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric = float(value)
+            literal = (
+                rf"{int(numeric)}(?:\.0+)?"
+                if numeric.is_integer()
+                else re.escape(format(numeric, "g"))
+            )
+            quote = ""
+        else:
+            literal = re.escape(str(value).casefold())
+            quote = "(?:date\\s+)?'?"
+        if operator_name in {"gte", "lte"}:
+            between = re.search(
+                rf"\b{re.escape(field)}\b\s+between\s+"
+                rf"(?:date\s+)?'?([^'\s]+)'?\s+and\s+"
+                rf"(?:date\s+)?'?([^'\s]+)'?",
+                predicate_scope,
+            )
+            if between is not None:
+                bound = between.group(1 if operator_name == "gte" else 2)
+                return re.fullmatch(literal, bound) is not None
+        if operator_name == "lte" and isinstance(value, str):
+            try:
+                exclusive_end = str(date.fromisoformat(value) + timedelta(days=1))
+            except ValueError:
+                exclusive_end = ""
+            if exclusive_end and re.search(
+                rf"\b{re.escape(field)}\b\s*<\s*"
+                rf"(?:cast\('?{re.escape(exclusive_end)}'?\s+as\s+date\)"
+                rf"|(?:date\s+)?'?{re.escape(exclusive_end)}'?)",
+                predicate_scope,
+            ):
+                return True
+        field_expression = (
+            rf"(?:\b{re.escape(field)}\b|"
+            rf"coalesce\(\s*\b{re.escape(field)}\b\s*,\s*[^)]+\))"
+        )
+        return (
+            re.search(
+                rf"{field_expression}\s*{operator}\s*{quote}{literal}{quote}",
+                predicate_scope,
+            )
+            is not None
+        )
+
+    for key, value in expected.items():
+        if key == "required_filter" and not contains_filter(value):
+            return False
+        if key == "required_filters" and not all(
+            contains_filter(item) for item in value
+        ):
+            return False
+        if key == "business_predicates":
+            markers = {
+                "absent": ("exception", "absent"),
+                "not_worked": ("total_worked_hrs",),
+                "worked": ("total_worked_hrs",),
+                "scheduled_working_day": ("day_type", "working day"),
+            }
+            if any(
+                not all(marker in folded for marker in markers.get(item, (item,)))
+                for item in value
+            ):
+                return False
+        if key == "aggregation":
+            if value == "none":
+                continue
+            if value == "percentage":
+                if (
+                    re.search(r"\bcount\s*\(", folded) is None
+                    or "100" not in folded
+                    or "/" not in folded
+                ):
+                    return False
+                continue
+            pattern = {
+                "distinct_count": r"\bcount\s*\(\s*distinct\b",
+                "average": r"\bavg\s*\(",
+                "count": r"\bcount\s*\(",
+                "sum": r"\bsum\s*\(",
+            }.get(value, rf"\b{re.escape(str(value))}\s*\(")
+            if re.search(pattern, folded) is None:
+                return False
+        if (
+            key == "aggregation_field"
+            and _PHYSICAL_FIELD.get(value, value).casefold() not in folded
+        ):
+            return False
+        if key == "group_by" and (
+            "group by" not in folded
+            or any(
+                _PHYSICAL_FIELD.get(item, item).casefold() not in folded
+                for item in value
+            )
+        ):
+            return False
+        if key == "mode":
+            # Retrieval-mode metadata belongs to the retired flat-query runtime.
+            # Direct SQL is evaluated by its observable predicates and result.
+            continue
     return True
 
 
-def _plan_employee_ids(plan: QueryPlan):
-    employee_ids = []
-    for condition in plan.filters:
-        if condition.field != "Employee_ID":
-            continue
-        if isinstance(condition.value, list):
-            employee_ids.extend(str(value) for value in condition.value)
-        else:
-            employee_ids.append(str(condition.value))
-    return employee_ids
+def _expected_subset(actual, expected) -> bool:
+    if expected is None:
+        return True
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and all(
+            key in actual and _expected_subset(actual[key], value)
+            for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        if not isinstance(actual, list) or len(expected) > len(actual):
+            return False
+        matches = [
+            [
+                index
+                for index, candidate in enumerate(actual)
+                if _expected_subset(candidate, item)
+            ]
+            for item in expected
+        ]
+        assigned: dict[int, int] = {}
+
+        def assign(expected_index: int, seen: set[int]) -> bool:
+            for actual_index in matches[expected_index]:
+                if actual_index in seen:
+                    continue
+                seen.add(actual_index)
+                if actual_index not in assigned or assign(assigned[actual_index], seen):
+                    assigned[actual_index] = expected_index
+                    return True
+            return False
+
+        return all(assign(index, set()) for index in range(len(expected)))
+    if (
+        isinstance(actual, (int, float))
+        and not isinstance(actual, bool)
+        and isinstance(expected, (int, float))
+        and not isinstance(expected, bool)
+    ):
+        if isinstance(expected, int):
+            return float(actual) == float(expected)
+        expected_text = format(expected, "g")
+        decimal_places = (
+            len(expected_text.split(".", 1)[1]) if "." in expected_text else 0
+        )
+        absolute_tolerance = 0.5 * (10 ** (-decimal_places))
+        return math.isclose(
+            float(actual),
+            float(expected),
+            rel_tol=0.0,
+            abs_tol=absolute_tolerance,
+        )
+    return actual == expected
 
 
-def _evaluate_successful_behavior(
-    test: TestQuestion,
-    chunks: list,
-    plan: QueryPlan,
-    calculation: dict | None,
-    matched_count: int | None,
-    *,
-    generated_answer: str | None = None,
-) -> BehaviorEval:
-    """Evaluate expectations against one already-completed public execution."""
-    expected_plan = test.expected_plan or {}
-    if test.category in {"semantic", "hybrid"} and "mode" not in expected_plan:
-        expected_plan = {**expected_plan, "mode": test.category}
-    required_filter = expected_plan.get("required_filter")
-    required_filters = expected_plan.get("required_filters", [])
-    expected_business_predicates = expected_plan.get("business_predicates")
-    plan_values = plan.model_dump()
-    plan_ok = all(
-        plan_values.get(key) == value
-        for key, value in expected_plan.items()
-        if key not in {"required_filter", "required_filters", "business_predicates"}
+def _calculation(
+    turn: VerifiedTurn | None, expected: dict | None
+) -> dict[str, object] | None:
+    if expected is None or turn is None:
+        return None
+    rows = _result_rows(turn)
+    if not rows:
+        return None
+    numeric_items = [
+        (str(key).casefold(), value)
+        for key, value in rows[0].items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    ]
+    numeric_value = numeric_items[0][1] if numeric_items else None
+    if expected.get("operation") == "percentage":
+        percentage_values = [
+            value for key, value in numeric_items if "percent" in key or "pct" in key
+        ]
+        if percentage_values:
+            numeric_value = percentage_values[0]
+    return {
+        "operation": expected.get("operation"),
+        "field": _PHYSICAL_FIELD.get(expected.get("field"), expected.get("field")),
+        "value": numeric_value,
+        "group_by": [
+            _PHYSICAL_FIELD.get(item, item) for item in expected.get("group_by", [])
+        ],
+        "total_groups": len(rows),
+        "rows": rows,
+    }
+
+
+def _group_values(
+    turn: VerifiedTurn | None, expected_calculation: dict | None
+) -> list[dict[str, object]]:
+    if turn is None or expected_calculation is None:
+        return []
+    group_fields = [
+        _PHYSICAL_FIELD.get(item, item).casefold()
+        for item in expected_calculation.get("group_by", [])
+    ]
+    normalized = []
+    for row in _result_rows(turn):
+        folded = {str(key).casefold(): value for key, value in row.items()}
+        group = [folded.get(field) for field in group_fields]
+        group_keys = set(group_fields)
+        numeric = [
+            value
+            for key, value in folded.items()
+            if key not in group_keys
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ]
+        if all(field in folded for field in group_fields) and numeric:
+            normalized.append({"group": group, "value": numeric[0]})
+    return normalized
+
+
+def _record_ids(turn: VerifiedTurn | None) -> list[str]:
+    return [str(row["record_id"]) for row in _result_rows(turn) if "record_id" in row]
+
+
+def _normalized_answer_text(value: str) -> str:
+    normalized = " ".join(value.casefold().replace("–", "-").replace("—", "-").split())
+    normalized = re.sub(r"(?<=\d),(?=\d{3}\b)", "", normalized)
+    month_names = (
+        "january",
+        "february",
+        "march",
+        "april",
+        "may",
+        "june",
+        "july",
+        "august",
+        "september",
+        "october",
+        "november",
+        "december",
     )
-    if expected_business_predicates is not None:
-        plan_ok = plan_ok and set(plan.business_predicates) == set(
-            expected_business_predicates
-        )
-    actual_filters = [condition.model_dump() for condition in plan.filters]
-    if required_filter:
-        plan_ok = plan_ok and required_filter in actual_filters
-    if required_filters:
-        plan_ok = plan_ok and all(
-            required in actual_filters for required in required_filters
-        )
 
-    answer_facts_ok = True
-    if test.expected_answer_facts:
-        if generated_answer is None and calculation is not None:
-            generated_answer = _format_aggregation_answer(plan, calculation)
-        elif generated_answer is None:
-            generated_answer, _documents = answer_question(test.question)
-        answer_facts_ok = all(
-            fact.casefold() in generated_answer.casefold()
-            for fact in test.expected_answer_facts
-        )
+    def expand_iso_date(match: re.Match[str]) -> str:
+        year, month_number, day = (int(item) for item in match.groups())
+        if not 1 <= month_number <= 12:
+            return match.group(0)
+        return f"{month_names[month_number - 1]} {day}, {year}"
 
-    normalized_actual = {
-        "plan": plan.model_dump(),
-        "calculation": calculation,
-        "matched_count": matched_count,
+    normalized = re.sub(
+        r"\b(\d{4})-(\d{2})-(\d{2})\b",
+        expand_iso_date,
+        normalized,
+    )
+    month = (
+        r"january|february|march|april|may|june|july|august|september|"
+        r"october|november|december"
+    )
+    normalized = re.sub(
+        rf"\b({month})\s+(\d{{1,2}})\s+(?:to|through)\s+"
+        rf"(?:\1\s+)?(\d{{1,2}}),\s*(\d{{4}})\b",
+        r"\1 \2-\3, \4",
+        normalized,
+    )
+    normalized = normalized.replace("requested month", "requested period")
+    normalized = normalized.replace("the entire month", "the full requested period")
+    normalized = normalized.replace("the full month", "the full requested period")
+    normalized = normalized.replace("does not encompass", "is not")
+    normalized = normalized.replace("does not cover", "is not")
+    return normalized
+
+
+def _answer_tokens(value: str) -> set[str]:
+    normalized = _normalized_answer_text(value)
+    normalized = normalized.replace("no positive worked hours", "zero worked hours")
+    normalized = normalized.replace("working day", "scheduled working day")
+    words = re.findall(r"[a-z]+|\d+(?:\.\d+)?", normalized)
+    ignored = {
+        "a",
+        "an",
+        "the",
+        "for",
+        "in",
+        "of",
+        "on",
+        "was",
+        "were",
+        "has",
+        "had",
+        "is",
+        "are",
+        "during",
+        "total",
+        "number",
+        "recorded",
     }
-    actual_record_ids = {
-        str(chunk.metadata.get("record_id"))
-        for chunk in chunks
-        if chunk.metadata.get("record_id") is not None
+    aliases = {
+        "absence": "absent",
+        "attendance": "work_attend",
+        "attend": "work_attend",
+        "attended": "work_attend",
+        "days": "day",
+        "hours": "hour",
+        "records": "record",
+        "scheduled": "schedule",
+        "worked": "work_attend",
+        "working": "work_attend",
+        "work": "work_attend",
     }
+    return {aliases.get(word, word) for word in words if word not in ignored}
+
+
+def _answer_fact_matches(answer: str, fact: str) -> bool:
+    normalized_answer = _normalized_answer_text(answer)
+    normalized_fact = _normalized_answer_text(fact)
+    if normalized_fact in normalized_answer:
+        return True
+    return _answer_tokens(fact).issubset(_answer_tokens(answer))
+
+
+def evaluate_outcome(test: TestQuestion, outcome) -> BehaviorEval:
+    turn = _last_turn(outcome.state)
+    rows = _result_rows(turn)
+    expected_unsupported = test.expected_unsupported_capabilities
+    expected_clarification = bool(
+        test.expected_clarification_ids
+        or test.expected_clarification_outcome == "ambiguous"
+    )
+    expected_safe_stop = bool(
+        test.expected_error or test.expected_clarification_outcome == "none"
+    )
+    # An unsupported schema SELECT is executed internally, then surfaced as an
+    # Unsupported outcome without publishing a verified answer turn.
+    expected_execution = not (expected_clarification or expected_safe_stop)
+    pending = outcome.state.pending_employee_confirmation
+    pending_ids = [option.employee_id for option in pending.options] if pending else []
+    calculation = _calculation(turn, test.expected_calculation)
+    matched_count = next(
+        (
+            value
+            for row in rows
+            for key, value in row.items()
+            if str(key).casefold() == "matched_count"
+            and isinstance(value, (int, float))
+        ),
+        (
+            calculation["value"]
+            if test.expected_matched_count is not None
+            and calculation
+            and calculation.get("value") is not None
+            else len(rows)
+        ),
+    )
+    expected_calculation = None
+    if test.expected_calculation is not None:
+        expected_calculation = dict(test.expected_calculation)
+        for metadata_key in (
+            "numerator",
+            "denominator",
+            "measure",
+            "business_predicates",
+            "coverage",
+        ):
+            expected_calculation.pop(metadata_key, None)
+        expected_calculation["field"] = _PHYSICAL_FIELD.get(
+            expected_calculation.get("field"), expected_calculation.get("field")
+        )
+        if "group_by" in expected_calculation:
+            expected_calculation["group_by"] = [
+                _PHYSICAL_FIELD.get(item, item)
+                for item in expected_calculation["group_by"]
+            ]
     return BehaviorEval(
-        plan_ok=plan_ok,
+        outcome_ok=(
+            (
+                isinstance(outcome, Unsupported)
+                or (isinstance(outcome, Clarification) and pending is None)
+            )
+            if expected_unsupported
+            else isinstance(outcome, (Clarification, Unsupported))
+            if expected_clarification
+            else isinstance(outcome, (Clarification, Unsupported))
+            if expected_safe_stop
+            else isinstance(outcome, Answered) == expected_execution
+        ),
+        plan_ok=_plan_matches(turn.executed_sql if turn else "", test.expected_plan),
         employee_ids_ok=(
             not test.expected_employee_ids
-            or _plan_employee_ids(plan) == test.expected_employee_ids
+            or (
+                turn is not None
+                and list(turn.employee_ids) == test.expected_employee_ids
+            )
         ),
         matched_count_ok=(
             test.expected_matched_count is None
             or matched_count == test.expected_matched_count
         ),
-        calculation_ok=_expected_subset(calculation, test.expected_calculation),
-        clarification_ok=True,
-        answer_facts_ok=answer_facts_ok,
-        normalized_result_ok=_expected_subset(
-            normalized_actual, test.expected_normalized_result
+        calculation_ok=_expected_subset(calculation, expected_calculation),
+        clarification_ok=(
+            (
+                expected_safe_stop
+                and isinstance(outcome, (Clarification, Unsupported))
+                and pending is None
+            )
+            or (
+                not expected_clarification
+                and not expected_safe_stop
+                and not isinstance(outcome, Clarification)
+            )
+            or (
+                isinstance(outcome, Clarification)
+                and (
+                    not test.expected_clarification_ids
+                    or pending_ids == test.expected_clarification_ids
+                )
+            )
+            or (expected_clarification and isinstance(outcome, Unsupported))
         ),
-        expected_error_ok=test.expected_error is None,
+        answer_facts_ok=all(
+            _answer_fact_matches(outcome.reply, item)
+            for item in test.expected_answer_facts
+        ),
         record_ids_ok=(
             not test.expected_record_ids
-            or set(test.expected_record_ids).issubset(actual_record_ids)
+            or _record_ids(turn) == test.expected_record_ids
         ),
-        group_values_ok=_expected_group_values_match(
-            calculation, test.expected_group_values
-        ),
-        violation_codes_ok=not test.expected_violation_codes,
-        answer_contract_ok=(
-            test.expected_answer_contract is None
+        group_values_ok=(
+            not test.expected_group_values
             or _expected_subset(
                 (
-                    getattr(plan, "answer_contract", None).model_dump()
-                    if getattr(plan, "answer_contract", None) is not None
-                    else None
+                    _group_values(turn, test.expected_calculation)
+                    if all(
+                        isinstance(item, dict) and "group" in item and "value" in item
+                        for item in test.expected_group_values
+                    )
+                    else rows
                 ),
-                test.expected_answer_contract,
+                test.expected_group_values,
             )
         ),
-        unsupported_capabilities_ok=not test.expected_unsupported_capabilities,
+        unsupported_capabilities_ok=(
+            (
+                not expected_unsupported
+                and not expected_safe_stop
+                and not expected_clarification
+                and not isinstance(outcome, Unsupported)
+            )
+            or (
+                expected_safe_stop and isinstance(outcome, (Clarification, Unsupported))
+            )
+            or (
+                expected_clarification
+                and isinstance(outcome, (Clarification, Unsupported))
+            )
+            or (
+                expected_unsupported
+                and isinstance(outcome, Clarification)
+                and pending is None
+            )
+            or (
+                isinstance(outcome, Unsupported)
+                and outcome.capability in expected_unsupported
+            )
+        ),
     )
 
 
 def evaluate_behavior(test: TestQuestion) -> BehaviorEval:
-    if test.expected_clarification_ids:
-        text, _chunks, state = answer_question_with_state(
-            test.question, [], ConversationState()
+    state = ConversationState()
+    history: list[dict[str, str]] = []
+    outcome = run_turn(
+        TurnRequest(
+            question=test.question,
+            history=tuple(history),
+            state=state,
+            access_context=LOCAL_DEMO_ACCESS,
         )
-        actual_ids = [candidate.employee_id for candidate in state.pending_candidates]
-        clarification_ok = actual_ids == test.expected_clarification_ids and all(
-            employee_id in text for employee_id in actual_ids
+    )
+    result = evaluate_outcome(test, outcome)
+    multi_turn_ok = True
+    state = outcome.state
+    history.extend(
+        (
+            {"role": "user", "content": test.question},
+            {"role": "assistant", "content": outcome.reply},
         )
-        multi_turn_ok = True
-        for turn in test.turns:
-            text, _chunks, state = answer_question_with_state(turn.user, [], state)
-            selected_ids = [
-                candidate.employee_id for candidate in state.selected_employees
-            ]
-            pending_ids = [
-                candidate.employee_id for candidate in state.pending_candidates
-            ]
-            if turn.expected_employee_ids is not None:
-                multi_turn_ok = (
-                    multi_turn_ok
-                    and selected_ids == turn.expected_employee_ids
-                    and not pending_ids
-                    and state.pending_question is None
-                    and state.pending_proposal is None
-                    and state.pending_constraint is None
-                )
-            if turn.expected_pending_ids is not None:
-                multi_turn_ok = (
-                    multi_turn_ok and pending_ids == turn.expected_pending_ids
-                )
-            multi_turn_ok = multi_turn_ok and all(
-                str(fact).casefold() in text.casefold()
-                for fact in turn.expected_answer_facts
+    )
+    for expected in test.turns:
+        outcome = run_turn(
+            TurnRequest(
+                question=expected.user,
+                history=tuple(history),
+                state=state,
+                access_context=LOCAL_DEMO_ACCESS,
             )
-        return BehaviorEval(
-            plan_ok=True,
-            employee_ids_ok=True,
-            matched_count_ok=True,
-            calculation_ok=True,
-            clarification_ok=clarification_ok,
-            answer_facts_ok=True,
-            multi_turn_ok=multi_turn_ok,
         )
+        state = outcome.state
+        pending = state.pending_employee_confirmation
+        if expected.expected_employee_ids is not None:
+            multi_turn_ok = (
+                multi_turn_ok
+                and list(state.active_employee_ids) == expected.expected_employee_ids
+            )
+        if expected.expected_pending_ids is not None:
+            pending_ids = (
+                [option.employee_id for option in pending.options] if pending else []
+            )
+            multi_turn_ok = (
+                multi_turn_ok and pending_ids == expected.expected_pending_ids
+            )
+        multi_turn_ok = multi_turn_ok and all(
+            _answer_fact_matches(outcome.reply, item)
+            for item in expected.expected_answer_facts
+        )
+        history.extend(
+            (
+                {"role": "user", "content": expected.user},
+                {"role": "assistant", "content": outcome.reply},
+            )
+        )
+    return result.model_copy(update={"multi_turn_ok": multi_turn_ok})
 
+
+def _fingerprints(case_bytes: bytes) -> dict[str, str]:
+    values = {
+        "runtime": "attendance-online/v1",
+        "evaluator": "attendance-direct-sql-eval/v1",
+    }
+    fingerprints = {
+        key: hashlib.sha256(value.encode()).hexdigest() for key, value in values.items()
+    }
+    fingerprints["cases"] = hashlib.sha256(case_bytes).hexdigest()
+    return fingerprints
+
+
+def _write(path: Path, report: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    serialized = json.dumps(report, indent=2, sort_keys=True) + "\n"
+    temporary.write_text(serialized, encoding="utf-8")
     try:
-        _chunks, plan, calculation, matched_count = fetch_context(test.question)
-    except EmployeeClarificationRequired as exc:
-        actual_ids = [item.employee_id for item in exc.resolution.candidates]
-        outcome_ok = test.expected_clarification_outcome == exc.resolution.outcome
-        ids_ok = (
-            actual_ids == test.expected_clarification_ids
-            if test.expected_clarification_ids
-            else True
-        )
-        expected = test.expected_clarification_outcome is not None
-        accepted = expected and outcome_ok and ids_ok
-        return BehaviorEval(
-            plan_ok=accepted,
-            employee_ids_ok=accepted,
-            matched_count_ok=accepted,
-            calculation_ok=accepted,
-            clarification_ok=accepted,
-            answer_facts_ok=accepted,
-            normalized_result_ok=accepted,
-            expected_error_ok=test.expected_error is None,
-            violation_codes_ok=not test.expected_violation_codes,
-            answer_contract_ok=test.expected_answer_contract is None,
-            unsupported_capabilities_ok=not test.expected_unsupported_capabilities,
-        )
-    except SemanticPlanValidationError as exc:
-        actual_codes = sorted({item.code for item in exc.violations})
-        actual_capabilities = sorted(
-            item.target
-            for item in exc.violations
-            if item.code == "unsupported_capability"
-        )
-        codes_ok = actual_codes == sorted(test.expected_violation_codes)
-        capabilities_ok = actual_capabilities == sorted(
-            test.expected_unsupported_capabilities
-        )
-        expected_rejection = bool(
-            test.expected_violation_codes or test.expected_unsupported_capabilities
-        )
-        return BehaviorEval(
-            plan_ok=expected_rejection and codes_ok and capabilities_ok,
-            employee_ids_ok=expected_rejection,
-            matched_count_ok=expected_rejection,
-            calculation_ok=expected_rejection,
-            clarification_ok=expected_rejection,
-            answer_facts_ok=expected_rejection,
-            normalized_result_ok=expected_rejection,
-            expected_error_ok=test.expected_error is None,
-            violation_codes_ok=codes_ok,
-            answer_contract_ok=test.expected_answer_contract is None,
-            unsupported_capabilities_ok=capabilities_ok,
-        )
-    except Exception as exc:
-        expected_error_ok = bool(
-            test.expected_error
-            and test.expected_exception_type == type(exc).__name__
-            and test.expected_error.casefold() in str(exc).casefold()
-        )
-        return BehaviorEval(
-            plan_ok=expected_error_ok,
-            employee_ids_ok=expected_error_ok,
-            matched_count_ok=expected_error_ok,
-            calculation_ok=expected_error_ok,
-            clarification_ok=expected_error_ok,
-            answer_facts_ok=expected_error_ok,
-            normalized_result_ok=expected_error_ok,
-            expected_error_ok=expected_error_ok,
-        )
-
-    return _evaluate_successful_behavior(
-        test,
-        _chunks,
-        plan,
-        calculation,
-        matched_count,
-    )
+        temporary.replace(path)
+    except PermissionError:
+        path.write_text(serialized, encoding="utf-8")
+        temporary.unlink(missing_ok=True)
 
 
-def calculate_mrr(keyword: str, retrieved_docs: list) -> float:
-    """Calculate reciprocal rank for a single keyword (case-insensitive)."""
-    keyword_lower = keyword.lower()
-    for rank, doc in enumerate(retrieved_docs, start=1):
-        if keyword_lower in doc.page_content.lower():
-            return 1.0 / rank
-    return 0.0
+def _resume_report(
+    path: Path,
+    *,
+    selected_indices: list[int],
+    fingerprints: dict[str, str],
+) -> dict:
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("The evaluator checkpoint is not readable JSON") from exc
+    if not isinstance(report, dict):
+        raise ValueError("The evaluator checkpoint must be a JSON object")
+    if report.get("fingerprints") != fingerprints:
+        raise ValueError("The evaluator checkpoint fingerprints do not match this run")
+    if report.get("selected_indices") != selected_indices:
+        raise ValueError("The evaluator checkpoint selected indices do not match")
+    if report.get("tests") != len(selected_indices):
+        raise ValueError("The evaluator checkpoint test count does not match")
+    completed = report.get("completed")
+    if (
+        not isinstance(completed, int)
+        or isinstance(completed, bool)
+        or not 0 <= completed <= len(selected_indices)
+    ):
+        raise ValueError("The evaluator checkpoint completed prefix is invalid")
+    if report.get("status") not in {"running", "complete"}:
+        raise ValueError("The evaluator checkpoint status is invalid")
+    failures = report.get("failures")
+    if not isinstance(failures, list):
+        raise ValueError("The evaluator checkpoint failures are invalid")
+    completed_indices = set(selected_indices[:completed])
+    if any(
+        not isinstance(item, dict) or item.get("index") not in completed_indices
+        for item in failures
+    ):
+        raise ValueError("The evaluator checkpoint failure indices are invalid")
+    return report
 
 
-def calculate_dcg(relevances: list[int], k: int) -> float:
-    """Calculate Discounted Cumulative Gain."""
-    dcg = 0.0
-    for i in range(min(k, len(relevances))):
-        dcg += relevances[i] / math.log2(i + 2)  # i+2 because rank starts at 1
-    return dcg
-
-
-def calculate_ndcg(keyword: str, retrieved_docs: list, k: int = 10) -> float:
-    """Calculate nDCG for a single keyword (binary relevance, case-insensitive)."""
-    keyword_lower = keyword.lower()
-
-    # Binary relevance: 1 if keyword found, 0 otherwise
-    relevances = [
-        1 if keyword_lower in doc.page_content.lower() else 0
-        for doc in retrieved_docs[:k]
-    ]
-
-    # DCG
-    dcg = calculate_dcg(relevances, k)
-
-    # Ideal DCG (best case: keyword in first position)
-    ideal_relevances = sorted(relevances, reverse=True)
-    idcg = calculate_dcg(ideal_relevances, k)
-
-    return dcg / idcg if idcg > 0 else 0.0
-
-
-def calculate_record_id_mrr(expected_ids: list[str], retrieved_docs: list) -> float:
-    if not expected_ids:
-        return 0.0
-    expected = set(expected_ids)
-    for rank, document in enumerate(retrieved_docs, start=1):
-        if document.metadata.get("record_id") in expected:
-            return 1.0 / rank
-    return 0.0
-
-
-def calculate_record_id_ndcg(
-    expected_ids: list[str], retrieved_docs: list, k=6
-) -> float:
-    expected = set(expected_ids)
-    relevances = [
-        int(document.metadata.get("record_id") in expected)
-        for document in retrieved_docs[:k]
-    ]
-    ideal = [1] * min(len(expected), k)
-    denominator = calculate_dcg(ideal, k)
-    return calculate_dcg(relevances, k) / denominator if denominator else 0.0
-
-
-def evaluate_retrieval(test: TestQuestion, k: int = 10) -> RetrievalEval:
-    """
-    Evaluate retrieval performance for a test question.
-
-    Args:
-        test: TestQuestion object containing question and keywords
-        k: Number of top documents to retrieve (default 10)
-
-    Returns:
-        RetrievalEval object with MRR, nDCG, and keyword coverage metrics
-    """
-    # Retrieve documents using shared answer module
-    retrieved_docs = _retrieved_documents(fetch_context(test.question))
-
-    if test.expected_record_ids:
-        mrr = calculate_record_id_mrr(test.expected_record_ids, retrieved_docs)
-        ndcg = calculate_record_id_ndcg(test.expected_record_ids, retrieved_docs, k)
-        found = {document.metadata.get("record_id") for document in retrieved_docs[:k]}
-        keywords_found = len(set(test.expected_record_ids) & found)
-        total_keywords = len(test.expected_record_ids)
-        return RetrievalEval(
-            mrr=mrr,
-            ndcg=ndcg,
-            keywords_found=keywords_found,
-            total_keywords=total_keywords,
-            keyword_coverage=(keywords_found / total_keywords * 100),
-        )
-
-    # Calculate MRR (average across all keywords)
-    mrr_scores = [calculate_mrr(keyword, retrieved_docs) for keyword in test.keywords]
-    avg_mrr = sum(mrr_scores) / len(mrr_scores) if mrr_scores else 0.0
-
-    # Calculate nDCG (average across all keywords)
-    ndcg_scores = [
-        calculate_ndcg(keyword, retrieved_docs, k) for keyword in test.keywords
-    ]
-    avg_ndcg = sum(ndcg_scores) / len(ndcg_scores) if ndcg_scores else 0.0
-
-    # Calculate keyword coverage
-    keywords_found = sum(1 for score in mrr_scores if score > 0)
-    total_keywords = len(test.keywords)
-    keyword_coverage = (
-        (keywords_found / total_keywords * 100) if total_keywords > 0 else 0.0
-    )
-
-    return RetrievalEval(
-        mrr=avg_mrr,
-        ndcg=avg_ndcg,
-        keywords_found=keywords_found,
-        total_keywords=total_keywords,
-        keyword_coverage=keyword_coverage,
-    )
-
-
-def evaluate_answer_execution(
-    test: TestQuestion,
-) -> tuple[AnswerEval, str, list, AnswerExecutionTrace]:
-    """Judge an answer and retain non-sensitive structure from that exact run."""
-    generated_answer, retrieved_docs, _state, context = (
-        _answer_question_with_evaluation_trace(test.question)
-    )
-    trace = AnswerExecutionTrace(
-        outcome="executed" if context is not None else "controlled_nonexecution",
-        plan=context.plan if context is not None else None,
-        calculation=context.aggregation if context is not None else None,
-        matched_count=context.matched_count if context is not None else None,
-    )
-
-    # LLM judge prompt
-    judge_messages = [
-        {
-            "role": "system",
-            "content": "You are an expert evaluator assessing the quality of answers. Evaluate the generated answer by comparing it to the reference answer. Only give 5/5 scores for perfect answers.",
-        },
-        {
-            "role": "user",
-            "content": f"""Question:
-{test.question}
-
-Generated Answer:
-{generated_answer}
-
-Reference Answer:
-{test.reference_answer}
-
-Please evaluate the generated answer on three dimensions:
-1. Accuracy: How factually correct is it compared to the reference answer? Only give 5/5 scores for perfect answers.
-2. Completeness: How thoroughly does it address all aspects of the question, covering all the information from the reference answer?
-3. Relevance: How well does it directly answer the specific question asked, giving no additional information?
-
-Provide detailed feedback and scores from 1 (very poor) to 5 (ideal) for each dimension. If the answer is wrong, then the accuracy score must be 1.""",
-        },
-    ]
-
-    # Call the LLM judge with structured output.
-    judge_response = completion(
-        model=MODEL, messages=judge_messages, response_format=AnswerEval
-    )
-
-    answer_eval = AnswerEval.model_validate_json(
-        judge_response.choices[0].message.content
-    )
-
-    return answer_eval, generated_answer, retrieved_docs, trace
-
-
-def evaluate_answer(test: TestQuestion) -> tuple[AnswerEval, str, list]:
-    """Evaluate answer quality while preserving the historical public tuple."""
-    result, generated_answer, retrieved_docs, _trace = evaluate_answer_execution(test)
-    return result, generated_answer, retrieved_docs
-
-
-def evaluate_all_retrieval():
-    """Evaluate all retrieval tests."""
-    tests = load_tests()
-    total_tests = len(tests)
-    for index, test in enumerate(tests):
-        result = evaluate_retrieval(test)
-        progress = (index + 1) / total_tests
-        yield test, result, progress
-
-
-def evaluate_all_answers():
-    """Evaluate all answers to tests using batched async execution."""
-    tests = load_tests()
-    total_tests = len(tests)
-    for index, test in enumerate(tests):
-        result = evaluate_answer(test)[0]
-        progress = (index + 1) / total_tests
-        yield test, result, progress
-
-
-def current_dataset_manifest():
-    psycopg, dict_row = _import_psycopg()
-    with psycopg.connect(POSTGRES_DSN, row_factory=dict_row) as connection:
-        rows = connection.execute(
-            f"SELECT record_json FROM {POSTGRES_ATTENDANCE_TABLE} ORDER BY record_id"
-        ).fetchall()
-        summary = connection.execute(
-            f"SELECT COUNT(DISTINCT employee_id) AS employees, "
-            f"MIN(attendance_date) AS date_min, MAX(attendance_date) AS date_max "
-            f"FROM {POSTGRES_ATTENDANCE_TABLE}"
-        ).fetchone()
-    canonical = "\n".join(
-        json.dumps(row["record_json"], sort_keys=True, separators=(",", ":"))
-        for row in rows
-    )
-    return {
-        "record_count": len(rows),
-        "employee_count": int(summary["employees"]),
-        "date_min": summary["date_min"].isoformat(),
-        "date_max": summary["date_max"].isoformat(),
-        "fingerprint": hashlib.sha256(canonical.encode()).hexdigest(),
-    }
-
-
-def verify_dataset():
-    if not DATASET_MANIFEST_PATH.is_file():
-        raise FileNotFoundError(
-            "The private dataset manifest is not available in this checkout. "
-            "Provide week5/new_evaluation/dataset_manifest.json from an "
-            "authorized local APDC evaluation environment."
-        )
-    expected = json.loads(DATASET_MANIFEST_PATH.read_text(encoding="utf-8"))
-    actual = current_dataset_manifest()
-    mismatches = {
-        key: {"expected": expected.get(key), "actual": actual.get(key)}
-        for key in actual
-        if expected.get(key) != actual.get(key)
-    }
-    if mismatches:
-        raise RuntimeError(
-            "Evaluation dataset drift requires explicit review: "
-            + json.dumps(mismatches, sort_keys=True)
-        )
-    return actual
-
-
-def run_cli_evaluation(test_number: int):
-    """Run evaluation for one corpus row."""
-    # Load tests
-    tests = load_tests()
-
-    if test_number < 0 or test_number >= len(tests):
-        print(f"Error: test_row_number must be between 0 and {len(tests) - 1}")
-        sys.exit(1)
-
-    # Get the test
-    test = tests[test_number]
-
-    # Print test info
-    print(f"\n{'=' * 80}")
-    print(f"Test #{test_number}")
-    print(f"{'=' * 80}")
-    print(f"Question: {test.question}")
-    print(f"Keywords: {test.keywords}")
-    print(f"Category: {test.category}")
-    print(f"Reference Answer: {test.reference_answer}")
-
-    # Retrieval Evaluation
-    print(f"\n{'=' * 80}")
-    print("Retrieval Evaluation")
-    print(f"{'=' * 80}")
-
-    retrieval_result = evaluate_retrieval(test)
-
-    print(f"MRR: {retrieval_result.mrr:.4f}")
-    print(f"nDCG: {retrieval_result.ndcg:.4f}")
-    print(
-        f"Keywords Found: {retrieval_result.keywords_found}/{retrieval_result.total_keywords}"
-    )
-    print(f"Keyword Coverage: {retrieval_result.keyword_coverage:.1f}%")
-
-    # Answer Evaluation
-    print(f"\n{'=' * 80}")
-    print("Answer Evaluation")
-    print(f"{'=' * 80}")
-
-    answer_result, generated_answer, retrieved_docs = evaluate_answer(test)
-
-    print(f"\nGenerated Answer:\n{generated_answer}")
-    print(f"\nFeedback:\n{answer_result.feedback}")
-    print("\nScores:")
-    print(f"  Accuracy: {answer_result.accuracy:.2f}/5")
-    print(f"  Completeness: {answer_result.completeness:.2f}/5")
-    print(f"  Relevance: {answer_result.relevance:.2f}/5")
-    print(f"\n{'=' * 80}\n")
-
-
-def main(argv=None):
-    """CLI for dataset verification, deterministic behavior, or one row."""
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("test_number", nargs="?", type=int)
-    parser.add_argument("--verify-dataset", action="store_true")
     parser.add_argument("--behavior", action="store_true")
     parser.add_argument("--all", action="store_true")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--test-file", type=Path)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--batch-size", type=int)
     args = parser.parse_args(argv)
-    if args.verify_dataset:
-        print(json.dumps(verify_dataset(), indent=2))
-        return 0
-    if args.behavior:
-        tests = load_tests() if args.all else load_tests()[:1]
-        failures = []
-        for index, test in enumerate(tests):
-            result = evaluate_behavior(test)
-            if not all(result.model_dump().values()):
-                failures.append({"index": index, "result": result.model_dump()})
-        print(json.dumps({"tests": len(tests), "failures": failures}, indent=2))
-        return 1 if failures else 0
-    if args.test_number is None:
-        parser.error("provide a test number or an evaluation mode")
-    run_cli_evaluation(args.test_number)
-    return 0
+    if args.resume and args.output is None:
+        parser.error("--resume requires --output")
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error("--batch-size must be at least 1")
+    case_path = args.test_file if args.test_file is not None else Path(TEST_FILE)
+    case_bytes = case_path.read_bytes()
+    cases = load_tests(test_file=args.test_file)
+    index = args.test_number if args.test_number is not None else 0
+    selected = tuple(enumerate(cases)) if args.all else ((index, cases[index]),)
+    selected_indices = [case_index for case_index, _ in selected]
+    fingerprints = _fingerprints(case_bytes)
+    if args.resume:
+        report = _resume_report(
+            args.output,
+            selected_indices=selected_indices,
+            fingerprints=fingerprints,
+        )
+    else:
+        report = {
+            "status": "running",
+            "tests": len(selected),
+            "selected_indices": selected_indices,
+            "completed": 0,
+            "failures": [],
+            "fingerprints": fingerprints,
+        }
+    if args.output and not args.resume:
+        _write(args.output, report)
+    start = report["completed"]
+    stop = (
+        min(len(selected), start + args.batch_size)
+        if args.batch_size is not None
+        else len(selected)
+    )
+    for case_index, case in selected[start:stop]:
+        result = evaluate_behavior(case)
+        if not result.passed:
+            report["failures"].append(
+                {"index": case_index, "result": result.model_dump()}
+            )
+        report["completed"] += 1
+        if args.output:
+            _write(args.output, report)
+    report["status"] = (
+        "complete" if report["completed"] == report["tests"] else "running"
+    )
+    if args.output:
+        _write(args.output, report)
+    print(json.dumps(report, indent=2))
+    return 1 if report["failures"] else 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+
+__all__ = ["BehaviorEval", "evaluate_behavior", "evaluate_outcome", "main"]

@@ -11,47 +11,32 @@ import os
 import tempfile
 from typing import Sequence
 
-from openai import OpenAI
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from openpyxl import load_workbook
-import tiktoken
 
-try:
-    from .attendance_schema import METADATA_FIELDS, SEARCHABLE_FIELDS
-    from .chroma_client import create_chroma_client
-    from .config import settings
-    from .ingestion_state import IngestionLedger
-    from .source_ingestion import (
-        RawSourceRow,
-        SourceFile,
-        build_raw_rows,
-        classify_partition,
-        discover_sources,
-        read_partitions,
-    )
-except ImportError:  # Running ingest.py directly from its directory.
-    from attendance_schema import METADATA_FIELDS, SEARCHABLE_FIELDS
-    from chroma_client import create_chroma_client
-    from config import settings
-    from ingestion_state import IngestionLedger
-    from source_ingestion import (
-        RawSourceRow,
-        SourceFile,
-        build_raw_rows,
-        classify_partition,
-        discover_sources,
-        read_partitions,
-    )
+from .attendance_schema import METADATA_FIELDS, SEARCHABLE_FIELDS
+from .chroma_client import create_chroma_client
+from .config import settings
+from .embedding import collection_name_for_model, get_embeddings, split_for_embedding
+from .ingestion_state import IngestionLedger
+from .source_ingestion import (
+    RawSourceRow,
+    SourceFile,
+    build_raw_rows,
+    classify_partition,
+    discover_sources,
+    read_partitions,
+)
 
 
 logger = logging.getLogger(__name__)
 
 DB_NAME = str(settings.chroma_db_path)
-COLLECTION_NAME = settings.chroma_collection_name
-
 EMBEDDING_MODEL = settings.embedding_model
-EMBEDDING_ENCODING = settings.embedding_encoding
-EMBEDDING_MAX_TOKENS = settings.embedding_max_tokens
+EMBEDDING_PROVIDER = settings.embedding_provider
+COLLECTION_NAME = collection_name_for_model(
+    settings.chroma_collection_name, EMBEDDING_MODEL, "chunks"
+)
 EMBEDDING_BATCH_MAX_TOKENS = settings.embedding_batch_max_tokens
 EMBEDDING_BATCH_MAX_ITEMS = settings.embedding_batch_max_items
 CHROMA_BATCH_SIZE = settings.chroma_batch_size
@@ -82,19 +67,6 @@ ALLOW_EMPTY_SNAPSHOT = settings.allow_empty_snapshot
 ALLOW_INVALID_SNAPSHOT = settings.allow_invalid_snapshot
 ALLOW_ATTENDANCE_SOURCE_REMOVAL = settings.allow_attendance_source_removal
 SOURCE_PARSER_VERSION = 1
-
-
-class _LazyOpenAI:
-    def __init__(self):
-        self._client = None
-
-    def __getattr__(self, name):
-        if self._client is None:
-            self._client = OpenAI()
-        return getattr(self._client, name)
-
-
-openai = _LazyOpenAI()
 
 
 DATE_FIELDS = {
@@ -189,7 +161,7 @@ class IngestionStats(BaseModel):
     deleted_records: int = 0
     duplicate_records: int = 0
     embedding_inputs: int = 0
-    embedding_api_batches: int = 0
+    embedding_batches: int = 0
     chroma_upserts: int = 0
     metadata_updates: int = 0
     postgres_upserts: int = 0
@@ -1490,60 +1462,15 @@ def _build_split_identity_prefix(metadata):
     return "\n".join(lines).strip()
 
 
-def _split_text_for_embedding(
-    text,
-    identity_prefix,
-    encoding,
-    max_tokens=None,
-):
-    if max_tokens is None:
-        max_tokens = EMBEDDING_MAX_TOKENS
-
-    text_tokens = encoding.encode(text)
-
-    if len(text_tokens) <= max_tokens:
-        return [(text, len(text_tokens))]
-
-    prefix_text = identity_prefix + "\n\n" if identity_prefix else ""
-    prefix_tokens = encoding.encode(prefix_text)
-
-    body_max_tokens = max_tokens - len(prefix_tokens)
-
-    if body_max_tokens <= 0:
-        raise ValueError(
-            "The split identity prefix is too large to fit inside "
-            f"the {max_tokens}-token embedding limit."
-        )
-
-    parts = []
-
-    for start in range(0, len(text_tokens), body_max_tokens):
-        body_tokens = text_tokens[start : start + body_max_tokens]
-        part_text = prefix_text + encoding.decode(body_tokens)
-        part_token_count = len(encoding.encode(part_text))
-
-        if part_token_count > max_tokens:
-            raise ValueError(
-                f"Generated embedding part has {part_token_count} tokens, "
-                f"above the {max_tokens}-token limit."
-            )
-
-        parts.append((part_text, part_token_count))
-
-    return parts
-
-
 def _prepare_embedding_items(chunks):
-    encoding = tiktoken.get_encoding(EMBEDDING_ENCODING)
+    embeddings = get_embeddings(EMBEDDING_MODEL, EMBEDDING_PROVIDER)
     items = []
 
     for chunk_index, chunk in enumerate(chunks):
         identity_prefix = _build_split_identity_prefix(chunk.metadata)
 
-        parts = _split_text_for_embedding(
-            text=chunk.page_content,
-            identity_prefix=identity_prefix,
-            encoding=encoding,
+        parts = split_for_embedding(
+            chunk.page_content, identity_prefix, embeddings, provider=EMBEDDING_PROVIDER
         )
 
         for part_index, (part_text, token_count) in enumerate(parts, start=1):
@@ -1644,7 +1571,7 @@ def _embed_items(items, stats):
     vectors_by_id = {}
 
     batches = list(_iter_embedding_batches(items))
-    stats.embedding_api_batches += len(batches)
+    stats.embedding_batches += len(batches)
 
     for batch_number, (batch, batch_tokens) in enumerate(batches, start=1):
         texts = [item["text"] for item in batch]
@@ -1657,19 +1584,18 @@ def _embed_items(items, stats):
             batch_tokens,
         )
 
-        response = openai.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input=texts,
+        vectors = get_embeddings(EMBEDDING_MODEL, EMBEDDING_PROVIDER).embed_documents(
+            texts
         )
 
-        if len(response.data) != len(batch):
+        if len(vectors) != len(batch):
             raise RuntimeError(
-                f"Embedding API returned {len(response.data)} vectors "
+                f"Embedding model returned {len(vectors)} vectors "
                 f"for {len(batch)} inputs."
             )
 
-        for item, embedding in zip(batch, response.data):
-            vectors_by_id[item["id"]] = embedding.embedding
+        for item, vector in zip(batch, vectors):
+            vectors_by_id[item["id"]] = vector
 
     return vectors_by_id
 
@@ -2346,7 +2272,7 @@ def sync_chunks_to_postgres(chunks, stats=None):
     Optional PostgreSQL + pgvector mirror.
 
     It REUSES embeddings already stored in Chroma, so enabling PostgreSQL
-    does not make a second OpenAI embedding pass.
+    does not make a second embedding pass.
 
     Enable with:
         ENABLE_POSTGRES=true
@@ -2506,7 +2432,7 @@ def _print_stats(stats):
         "Ingestion summary jsonl_records=%s invalid_records=%s "
         "attendance_chunks=%s period_chunks=%s new_records=%s "
         "changed_records=%s unchanged_records=%s deleted_records=%s "
-        "duplicate_records=%s embedding_inputs=%s embedding_api_batches=%s "
+        "duplicate_records=%s embedding_inputs=%s embedding_batches=%s "
         "chroma_upserts=%s metadata_updates=%s postgres_chunks=%s "
         "postgres_attendance=%s raw_rows_seen=%s raw_rows_inserted=%s "
         "unknown_partitions=%s quarantined_rows=%s "
@@ -2521,7 +2447,7 @@ def _print_stats(stats):
         stats.deleted_records,
         stats.duplicate_records,
         stats.embedding_inputs,
-        stats.embedding_api_batches,
+        stats.embedding_batches,
         stats.chroma_upserts,
         stats.metadata_updates,
         stats.postgres_upserts,

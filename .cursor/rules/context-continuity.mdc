@@ -1,0 +1,34 @@
+---
+description: Compact context and reliably resume long-running work
+alwaysApply: true
+---
+
+# Context Compaction and Work Continuity
+
+When the conversation becomes long, responses slow down, context is nearly full,
+or earlier details become difficult to track:
+
+1. Pause at a safe checkpoint before making further changes.
+2. Create a compact working summary containing:
+   - The user's goal and acceptance criteria.
+   - Decisions and assumptions already made.
+   - Files changed and the purpose of each change.
+   - Commands and tests run, including their results.
+   - Current problems, errors, or blockers.
+   - Remaining tasks in priority order.
+   - The exact next action to perform.
+3. Use Cursor's available context-compaction mechanism.
+4. After compaction, read the working summary and inspect the current repository
+   state.
+5. Resume from the exact next action without restarting completed work or asking
+   the user to repeat information already provided.
+6. Revalidate important assumptions against the files because the repository is
+   the source of truth.
+7. Continue working until the requested outcome is complete. Do not stop merely
+   because compaction occurred.
+8. Do not claim completion until all remaining tasks are finished and relevant
+   checks or tests pass.
+
+Do not wait until the context is completely exhausted. Compact proactively when
+progress becomes noticeably slow or the task state becomes difficult to track
+reliably.

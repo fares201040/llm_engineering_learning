@@ -1,12 +1,33 @@
+from pathlib import Path
+import subprocess
+import sys
 import unittest
 from unittest.mock import patch
 
-try:
-    from week5.new_implementation import answer
-    from week5 import new_app
-except ModuleNotFoundError:
-    from new_implementation import answer
-    import new_app
+from week5 import new_app
+from week5.new_implementation import answer
+
+
+class LaunchModeTests(unittest.TestCase):
+    def test_new_app_imports_when_executed_as_a_standalone_script(self):
+        week5_directory = Path(__file__).resolve().parent
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import runpy; "
+                    "runpy.run_path('new_app.py', run_name='new_app_import_test')"
+                ),
+            ],
+            cwd=week5_directory,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
 
 class ContextRenderingTests(unittest.TestCase):
@@ -48,46 +69,15 @@ class ContextRenderingTests(unittest.TestCase):
 
 class SessionStateTests(unittest.TestCase):
     def test_reset_conversation_clears_context_and_trusted_state(self):
-        selected = answer.EmployeeCandidate(
-            employee_id="A11017", name="Example Employee Alpha"
-        )
-        original = answer.ConversationState(
-            selected_employees=[selected],
-            referents=[
-                answer.EmployeeReferent(
-                    employee_id="A11017", name="Example Employee Alpha"
-                )
-            ],
-            active_referent_ids=["A11017"],
-            recent_frames=[
-                answer.ConversationTurnFrame(
-                    original_question="worked days",
-                    reply_locale="en",
-                    units=(
-                        answer.AttendanceUnitFrame(
-                            unit_id="unit-1",
-                            source_text="worked days",
-                            result=answer.ResultSnapshot(matched_count=1),
-                        ),
-                    ),
-                )
-            ],
-            pending_request=answer.PendingRequestFrame(
-                original_question="Which employee?", reply_locale="en"
-            ),
-            pending_question="Which employee?",
-            pending_proposal=answer.PlannerProposal(
-                status="unsupported",
-                unsupported_capabilities=["nested_boolean_filters"],
-            ),
-            pending_candidates=[selected],
-        )
+        original = answer.ConversationState(active_employee_ids=("A11017",))
 
         context, state = new_app.reset_conversation(original)
 
         self.assertIn("Relevant Context", context)
         self.assertNotIn("Employee_ID", context)
-        self.assertEqual(state, answer.ConversationState())
+        self.assertEqual(state.verified_turns, ())
+        self.assertEqual(state.active_employee_ids, ())
+        self.assertIsNone(state.pending_employee_confirmation)
         self.assertIsNot(state, original)
 
     def test_chat_with_state_renders_the_answer_evidence(self):
@@ -118,26 +108,22 @@ class SessionStateTests(unittest.TestCase):
     def test_chat_with_state_returns_an_independent_updated_session(self):
         first = answer.ConversationState()
         second = answer.ConversationState()
-        selected = answer.EmployeeCandidate(
-            employee_id="A11000", name="Alex Example North"
-        )
-
         with patch.object(
             new_app,
             "answer_question_with_state",
             return_value=(
                 "Selected Alex Example North.",
                 [],
-                answer.ConversationState(selected_employees=[selected]),
+                answer.ConversationState(active_employee_ids=("A11000",)),
             ),
         ):
             _history, _context, updated = new_app.chat_with_state(
                 [{"role": "user", "content": "1"}], first
             )
 
-        self.assertEqual(updated.selected_employees, [selected])
-        self.assertEqual(first.selected_employees, [])
-        self.assertEqual(second.selected_employees, [])
+        self.assertEqual(updated.active_employee_ids, ("A11000",))
+        self.assertEqual(first.active_employee_ids, ())
+        self.assertEqual(second.active_employee_ids, ())
 
     def test_unexpected_answer_error_is_logged_and_rendered_safely(self):
         history = [{"role": "user", "content": "Show attendance"}]
@@ -157,7 +143,8 @@ class SessionStateTests(unittest.TestCase):
         self.assertIn("try again", updated_history[-1]["content"].lower())
         self.assertNotIn("password", updated_history[-1]["content"].lower())
         self.assertIn("Relevant Context", context)
-        self.assertEqual(state, answer.ConversationState())
+        self.assertEqual(state.verified_turns, ())
+        self.assertEqual(state.active_employee_ids, ())
 
     def test_unexpected_answer_error_preserves_arabic_locale(self):
         history = [{"role": "user", "content": "اعرض سجلات الحضور"}]

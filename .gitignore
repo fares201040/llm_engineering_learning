@@ -209,6 +209,8 @@ week5/new-knowledge-base/
 week5/new_preprocessed_db/
 week5/new_evaluation/tests.jsonl
 week5/new_evaluation/dataset_manifest.json
+# Private 311-case evaluation outputs may contain question/answer details.
+week5/new_evaluation/results/
 
 
 local/

@@ -5,7 +5,6 @@ from unittest.mock import patch, mock_open
 import uuid
 
 from week5.new_implementation import ingest
-from week5.new_implementation import answer
 from week5.new_implementation.source_ingestion import RawSourceRow
 
 
@@ -180,21 +179,6 @@ class PostgresIngestionTests(unittest.TestCase):
         self.assertIs(result, stats)
         self.assertEqual(stats.postgres_upserts, 0)
 
-    def test_semantic_backend_requires_pgvector_flag(self):
-        with (
-            patch.object(answer, "ENABLE_POSTGRES", True),
-            patch.object(answer, "POSTGRES_DSN", "postgresql://local/test"),
-            patch.object(answer, "ENABLE_PGVECTOR", False),
-        ):
-            self.assertFalse(answer._postgres_vector_enabled())
-
-        with (
-            patch.object(answer, "ENABLE_POSTGRES", True),
-            patch.object(answer, "POSTGRES_DSN", "postgresql://local/test"),
-            patch.object(answer, "ENABLE_PGVECTOR", True),
-        ):
-            self.assertTrue(answer._postgres_vector_enabled())
-
 
 class _FakeCollection:
     def __init__(self):
@@ -219,6 +203,21 @@ class _FakeChromaClient:
 
 
 class ChromaIngestionSafetyTests(unittest.TestCase):
+    def test_embedding_batch_uses_selected_model(self):
+        stats = ingest.IngestionStats()
+        items = [
+            {"id": "synthetic-1", "text": "Synthetic attendance row", "token_count": 3}
+        ]
+        with (
+            patch.object(ingest, "get_embeddings") as selected,
+            patch("openai.OpenAI", side_effect=AssertionError("paid embedding called")),
+        ):
+            selected.return_value.embed_documents.return_value = [[0.1] * 384]
+            vectors = ingest._embed_items(items, stats)
+
+        self.assertEqual(vectors["synthetic-1"], [0.1] * 384)
+        selected.assert_called_with(ingest.EMBEDDING_MODEL, ingest.EMBEDDING_PROVIDER)
+
     def test_metadata_only_change_does_not_call_embedding_api(self):
         item = {
             "id": "attendance:e-1",

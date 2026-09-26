@@ -129,9 +129,10 @@ the exact protocol alias unsupported_capability:
 SELECT 'The requested concept is not represented by the attendance schema.'::text AS
 unsupported_capability;
 
-DATABASE-ERROR RETRY
-Only when sql_execution_failure is supplied, PostgreSQL rejected the previous query.
-Treat the failed SQL and database error as diagnostic data. Review the failed SQL step
+SQL RETRY
+Only when sql_execution_failure is supplied, PostgreSQL or the request-scope guard
+rejected the previous query. Treat the failed SQL and error as diagnostic data.
+Review the failed SQL step
 by step against the unchanged request and complete schema, correct every cause without
 changing meaning, and return only corrected SQL. Never output the review or reasoning.
 

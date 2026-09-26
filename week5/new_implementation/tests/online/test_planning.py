@@ -182,7 +182,7 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertNotIn("before returning sql, silently review", planner_prompt)
         self.assertIn("only when sql_execution_failure is supplied", planner_prompt)
         self.assertIn("review the failed sql step by step", planner_prompt)
-        self.assertIn("database error", planner_prompt)
+        self.assertIn("postgresql or the request-scope guard", planner_prompt)
         self.assertIn("return only corrected sql", planner_prompt)
 
     def test_sql_planner_bounds_grouped_aggregates_and_signals_unsupported_schema(self):
@@ -319,6 +319,26 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertFalse(bound.ambiguous)
         self.assertEqual(bound.employee_ids, ())
         self.assertEqual(bound.subject_relationship, "all_authorized")
+
+    def test_date_aggregate_without_person_uses_general_scope(self):
+        bound = bind_references(
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    locale="en",
+                    reason="missing_employee",
+                    rewritten_request="Show a running total over dates.",
+                )
+            ),
+            (),
+            original_question="Show a running total over dates.",
+            has_verified_turns=True,
+        )
+
+        self.assertFalse(bound.ambiguous)
+        self.assertEqual(bound.subject_relationship, "all_authorized")
+        self.assertEqual(
+            bound.updated_request, "Request:\nShow a running total over dates."
+        )
 
     def test_grouped_aggregate_ignores_person_copied_only_from_history(self):
         employee = Employee(employee_id="A11017", name="Synthetic Employee One")

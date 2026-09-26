@@ -19,10 +19,14 @@ from week5.new_implementation.online.pipeline import (
     TurnRequest,
     Unsupported,
     _locale,
+    _missing_join_target,
+    _schema_grounded_analytic_question,
     _mentions_time_period,
     _previous_having,
+    _request_value_issue,
     _sql_date_scope,
     _sql_semantic_issue,
+    _unrequested_date_filter,
     run_turn,
 )
 from week5.new_implementation.online.provider import ProviderFailure
@@ -36,6 +40,7 @@ from week5.new_implementation.online.reference import (
 )
 from week5.new_implementation.online.state import ConversationState, VerifiedTurn
 from week5.new_implementation.tests.online.test_query import database_context
+from week5.new_implementation.tests.online.test_comparison import attendance_schema
 
 
 def ready_reference(*_args, **_kwargs):
@@ -63,6 +68,316 @@ def sql_result():
 
 
 class PipelineTests(unittest.TestCase):
+    def test_unrequested_date_filter_detects_predicate_not_date_grouping(self):
+        self.assertTrue(
+            _unrequested_date_filter(
+                "SELECT department, SUM(CASE WHEN attendance_date >= '2026-09-01' "
+                "THEN total_worked_hrs ELSE 0 END) AS worked_hours "
+                "FROM attendance_records GROUP BY department"
+            )
+        )
+        self.assertFalse(
+            _unrequested_date_filter(
+                "SELECT attendance_date, SUM(total_worked_hrs) AS worked_hours "
+                "FROM attendance_records GROUP BY attendance_date"
+            )
+        )
+        self.assertTrue(
+            _unrequested_date_filter(
+                "SELECT department, SUM(total_worked_hrs) FROM attendance_records "
+                "WHERE attendance_date = (SELECT MAX(attendance_date) "
+                "FROM attendance_records) GROUP BY department"
+            )
+        )
+        self.assertTrue(
+            _unrequested_date_filter(
+                "SELECT department, SUM(total_worked_hrs) FROM attendance_records "
+                "WHERE attendance_date IS NULL GROUP BY department"
+            )
+        )
+
+    def test_independent_aggregate_retries_unrequested_date_filter_before_execution(
+        self,
+    ):
+        dependencies = self.dependencies()
+        dependencies.context_loader = lambda **_kwargs: attendance_schema()
+        attempts = []
+        executed = []
+
+        def planner(**kwargs):
+            attempts.append(kwargs)
+            if len(attempts) == 1:
+                return (
+                    "SELECT department, SUM(CASE WHEN attendance_date >= '2026-09-01' "
+                    "THEN total_worked_hrs ELSE 0 END) AS worked_hours "
+                    "FROM attendance_records GROUP BY department"
+                )
+            return (
+                "SELECT department, SUM(total_worked_hrs) AS worked_hours "
+                "FROM attendance_records GROUP BY department"
+            )
+
+        dependencies.planner = planner
+        dependencies.executor = lambda sql, **_kwargs: (
+            executed.append(sql)
+            or SqlExecutionResult(
+                columns=(),
+                rows=({"department": "Engineering", "worked_hours": 56},),
+                coverage=ExecutionCoverage(
+                    fetched_rows=1, result_limit=100, response_bytes=50
+                ),
+            )
+        )
+        dependencies.answer_writer = lambda **_kwargs: "Engineering: 56 hours."
+
+        outcome = run_turn(
+            TurnRequest(
+                question="Rank departments by worked hours.",
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(len(executed), 1)
+        self.assertEqual(
+            attempts[1]["sql_execution_failure"]["error_type"], "sql_semantics"
+        )
+
+    def test_over_dates_is_not_a_malformed_numeric_comparison(self):
+        self.assertIsNone(_request_value_issue("Show a running total over dates."))
+        self.assertEqual(
+            _request_value_issue("Show lateness greater than nonsense hours."),
+            "malformed_value",
+        )
+
+    def test_schema_grounded_analytic_detection_rejects_unknown_concepts(self):
+        schema = attendance_schema()
+        table = schema.tables[0]
+        schema = schema.model_copy(
+            update={
+                "tables": (
+                    table.model_copy(
+                        update={
+                            "columns": tuple(
+                                column.model_copy(
+                                    update={
+                                        "description": "Payroll-effective worked hours."
+                                    }
+                                )
+                                if column.name == "total_worked_hrs"
+                                else column
+                                for column in table.columns
+                            )
+                        }
+                    ),
+                )
+            }
+        )
+        self.assertTrue(
+            _schema_grounded_analytic_question(
+                "Rank departments by worked hours.", schema
+            )
+        )
+        self.assertFalse(
+            _schema_grounded_analytic_question("Rank departments by salary.", schema)
+        )
+        self.assertFalse(
+            _schema_grounded_analytic_question(
+                "Rank departments by payroll worked hours.", schema
+            )
+        )
+        self.assertFalse(
+            _schema_grounded_analytic_question("Compare that with last month.", schema)
+        )
+
+    def test_unsupported_reference_cannot_veto_schema_grounded_aggregate(self):
+        dependencies = self.dependencies()
+        dependencies.context_loader = lambda **_kwargs: attendance_schema()
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=UnsupportedReference(
+                rewritten_request="Rank departments by worked hours.",
+                locale="en",
+                capability="outside_attendance_domain",
+            )
+        )
+        dependencies.planner = lambda **_kwargs: (
+            "SELECT department, SUM(total_worked_hrs) AS worked_hours "
+            "FROM attendance_records GROUP BY department ORDER BY worked_hours DESC"
+        )
+        dependencies.executor = lambda *_args, **_kwargs: SqlExecutionResult(
+            columns=(),
+            rows=({"department": "Engineering", "worked_hours": 56},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=50
+            ),
+        )
+        dependencies.answer_writer = lambda **_kwargs: "Engineering: 56 hours."
+
+        outcome = run_turn(
+            TurnRequest(
+                question="Rank departments by worked hours.",
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(outcome.state.verified_turns[-1].employee_ids, ())
+
+    def test_join_preflight_defers_when_both_or_neither_targets_are_known(self):
+        schema = attendance_schema()
+        self.assertFalse(
+            _missing_join_target("Join attendance to attendance_records.", schema)
+        )
+        self.assertFalse(_missing_join_target("Join payroll to benefits.", schema))
+
+    def test_missing_join_target_is_schema_unsupported_before_reference_model(self):
+        state = ConversationState()
+        dependencies = self.dependencies()
+        dependencies.context_loader = lambda **_kwargs: attendance_schema()
+        dependencies.reference_writer = lambda *_args, **_kwargs: self.fail(
+            "schema-declared join target absence should be resolved before the model"
+        )
+
+        outcome = run_turn(
+            TurnRequest(
+                question="Join attendance to payroll.",
+                state=state,
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Unsupported)
+        self.assertEqual(outcome.capability, "schema")
+        self.assertEqual(outcome.state, state)
+
+    def test_grouped_month_followup_uses_verified_sql_without_model_replanning(self):
+        previous_sql = (
+            "SELECT department, SUM(total_worked_hrs) AS total_hours "
+            "FROM attendance_records GROUP BY department "
+            "HAVING SUM(total_worked_hrs) > 10"
+        )
+        previous_turn = VerifiedTurn(
+            turn_id="prior-grouped",
+            original_question="Group worked hours by department over 10.",
+            rewritten_request="Group worked hours by department over 10.",
+            answer="Engineering: 56 hours.",
+            locale="en",
+            executed_sql=previous_sql,
+            result={"rows": [{"department": "Engineering", "total_hours": 56}]},
+        )
+        state = ConversationState(verified_turns=(previous_turn,))
+        dependencies = self.dependencies()
+        dependencies.reference_writer = lambda *_args, **_kwargs: self.fail(
+            "clear grouped comparison must use verified state"
+        )
+        dependencies.planner = lambda **_kwargs: self.fail(
+            "clear grouped comparison must not be model-replanned"
+        )
+        dependencies.answer_writer = lambda **_kwargs: self.fail(
+            "typed grouped comparison result must be rendered consistently"
+        )
+        dependencies.context_loader = lambda **_kwargs: attendance_schema()
+        executed = []
+
+        def executor(sql, **_kwargs):
+            executed.append(sql)
+            return SqlExecutionResult(
+                rows=(
+                    {
+                        "department": "Engineering",
+                        "previous_period_value": 16,
+                        "current_period_value": 40,
+                        "difference": 24,
+                        "matched_count": 1,
+                    },
+                ),
+                coverage=ExecutionCoverage(
+                    fetched_rows=1, result_limit=100, response_bytes=100
+                ),
+            )
+
+        dependencies.executor = executor
+        outcome = run_turn(
+            TurnRequest(
+                question="Compare that with last month.",
+                state=state,
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(len(executed), 1)
+        self.assertIn("HAVING SUM(total_worked_hrs) > 10", executed[0])
+        self.assertIn("Engineering: August", outcome.reply)
+        self.assertEqual(len(outcome.state.verified_turns), 2)
+        self.assertIsNone(outcome.state.verified_turns[-1].date_scope)
+
+    def test_running_total_followup_uses_verified_metric_and_checks_series(self):
+        previous_turn = VerifiedTurn(
+            turn_id="prior-ranking",
+            original_question="Rank departments by worked hours.",
+            rewritten_request="Rank departments by worked hours.",
+            answer="Engineering: 56 hours.",
+            locale="en",
+            executed_sql=(
+                "SELECT department, SUM(total_worked_hrs) AS worked_hours "
+                "FROM attendance_records GROUP BY department ORDER BY worked_hours DESC"
+            ),
+            result={"rows": [{"department": "Engineering", "worked_hours": 56}]},
+        )
+        dependencies = self.dependencies()
+        dependencies.context_loader = lambda **_kwargs: attendance_schema()
+        dependencies.reference_writer = lambda *_args, **_kwargs: self.fail(
+            "verified running total must not use reference model"
+        )
+        dependencies.planner = lambda **_kwargs: self.fail(
+            "verified running total must not be model-replanned"
+        )
+        dependencies.answer_writer = lambda **_kwargs: self.fail(
+            "verified running total must be rendered from checked results"
+        )
+
+        def executor(sql, **_kwargs):
+            self.assertIn("SUM(daily_value) OVER", sql)
+            return SqlExecutionResult(
+                rows=(
+                    {
+                        "attendance_date": "2026-08-03",
+                        "daily_value": 14,
+                        "running_total": 14,
+                        "matched_count": 2,
+                    },
+                    {
+                        "attendance_date": "2026-08-04",
+                        "daily_value": 22,
+                        "running_total": 36,
+                        "matched_count": 2,
+                    },
+                ),
+                coverage=ExecutionCoverage(
+                    fetched_rows=2, result_limit=100, response_bytes=100
+                ),
+            )
+
+        dependencies.executor = executor
+        outcome = run_turn(
+            TurnRequest(
+                question="Show a running total over dates.",
+                state=ConversationState(verified_turns=(previous_turn,)),
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertIn("2026-08-04: 36", outcome.reply)
+        self.assertIsNone(outcome.state.verified_turns[-1].date_scope)
+
     def test_previous_group_eligibility_is_extracted_from_verified_sql(self):
         self.assertEqual(
             _previous_having(
@@ -541,10 +856,17 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertIsInstance(outcome, Answered)
-        self.assertEqual(execution_calls, ["SELECT attempt_1", "SELECT attempt_2", "SELECT attempt_3"])
+        self.assertEqual(
+            execution_calls,
+            ["SELECT attempt_1", "SELECT attempt_2", "SELECT attempt_3"],
+        )
         self.assertEqual(planner_calls[2]["sql_execution_failure"]["retry_number"], 2)
-        self.assertEqual(planner_calls[2]["sql_execution_failure"]["failed_sql"], "SELECT attempt_2")
-        self.assertEqual(outcome.state.verified_turns[-1].executed_sql, "SELECT attempt_3")
+        self.assertEqual(
+            planner_calls[2]["sql_execution_failure"]["failed_sql"], "SELECT attempt_2"
+        )
+        self.assertEqual(
+            outcome.state.verified_turns[-1].executed_sql, "SELECT attempt_3"
+        )
 
     def test_third_postgres_query_rejection_fails_without_publishing_state(self):
         state = ConversationState()

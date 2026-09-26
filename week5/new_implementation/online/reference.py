@@ -350,6 +350,12 @@ def _requests_general_scope(question: str) -> bool:
     if re.search(r"\bgroup\b.*\bby\b", normalized) and not has_person_reference:
         return True
     words = set(normalized.split())
+    if (
+        not has_person_reference
+        and words.intersection({"date", "dates"})
+        and words.intersection({"running", "cumulative", "total", "sum", "count"})
+    ):
+        return True
     if words.intersection({"records", "employees"}) or (
         "departments" in words and not has_person_reference
     ):

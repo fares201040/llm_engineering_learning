@@ -11,6 +11,8 @@ from pathlib import Path
 import re
 
 from pydantic import BaseModel
+from sqlglot import exp, parse
+from sqlglot.errors import ParseError
 
 from ..new_implementation.online.execution import LOCAL_DEMO_ACCESS
 from ..new_implementation.online.pipeline import (
@@ -81,6 +83,16 @@ def _plan_matches(sql: str, expected: dict | None) -> bool:
     if expected is None:
         return True
     folded = " ".join(sql.casefold().split())
+    try:
+        statements = parse(sql, read="postgres")
+    except ParseError:
+        statements = []
+    predicate_scope = " ".join(
+        node.sql(dialect="postgres").casefold()
+        for statement in statements
+        if statement is not None
+        for node in statement.find_all(exp.Where, exp.Having)
+    )
 
     def contains_filter(item: dict) -> bool:
         field = str(
@@ -96,18 +108,18 @@ def _plan_matches(sql: str, expected: dict | None) -> bool:
             "lt": r"<",
             "lte": r"<=",
         }.get(operator_name)
-        if not field or field not in folded:
+        if not field or field not in predicate_scope:
             return False
         if operator_name == "in" and isinstance(value, list):
             match = re.search(
                 rf"\b{re.escape(field)}\b\s+in\s*\(([^)]*(?:\)[^)]*)?)\)",
-                folded,
+                predicate_scope,
             )
             return match is not None and all(
                 str(item_value).casefold() in match.group(1) for item_value in value
             )
         if operator is None:
-            return not value or str(value).casefold() in folded
+            return not value or str(value).casefold() in predicate_scope
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             numeric = float(value)
             literal = (
@@ -124,7 +136,7 @@ def _plan_matches(sql: str, expected: dict | None) -> bool:
                 rf"\b{re.escape(field)}\b\s+between\s+"
                 rf"(?:date\s+)?'?([^'\s]+)'?\s+and\s+"
                 rf"(?:date\s+)?'?([^'\s]+)'?",
-                folded,
+                predicate_scope,
             )
             if between is not None:
                 bound = between.group(1 if operator_name == "gte" else 2)
@@ -136,8 +148,9 @@ def _plan_matches(sql: str, expected: dict | None) -> bool:
                 exclusive_end = ""
             if exclusive_end and re.search(
                 rf"\b{re.escape(field)}\b\s*<\s*"
-                rf"(?:date\s+)?'?{re.escape(exclusive_end)}'?",
-                folded,
+                rf"(?:cast\('?{re.escape(exclusive_end)}'?\s+as\s+date\)"
+                rf"|(?:date\s+)?'?{re.escape(exclusive_end)}'?)",
+                predicate_scope,
             ):
                 return True
         field_expression = (
@@ -147,7 +160,7 @@ def _plan_matches(sql: str, expected: dict | None) -> bool:
         return (
             re.search(
                 rf"{field_expression}\s*{operator}\s*{quote}{literal}{quote}",
-                folded,
+                predicate_scope,
             )
             is not None
         )
@@ -219,10 +232,29 @@ def _expected_subset(actual, expected) -> bool:
             for key, value in expected.items()
         )
     if isinstance(expected, list):
-        return isinstance(actual, list) and all(
-            any(_expected_subset(candidate, item) for candidate in actual)
+        if not isinstance(actual, list) or len(expected) > len(actual):
+            return False
+        matches = [
+            [
+                index
+                for index, candidate in enumerate(actual)
+                if _expected_subset(candidate, item)
+            ]
             for item in expected
-        )
+        ]
+        assigned: dict[int, int] = {}
+
+        def assign(expected_index: int, seen: set[int]) -> bool:
+            for actual_index in matches[expected_index]:
+                if actual_index in seen:
+                    continue
+                seen.add(actual_index)
+                if actual_index not in assigned or assign(assigned[actual_index], seen):
+                    assigned[actual_index] = expected_index
+                    return True
+            return False
+
+        return all(assign(index, set()) for index in range(len(expected)))
     if (
         isinstance(actual, (int, float))
         and not isinstance(actual, bool)
@@ -543,7 +575,7 @@ def evaluate_outcome(test: TestQuestion, outcome) -> BehaviorEval:
             )
             or (
                 isinstance(outcome, Unsupported)
-                and outcome.capability in {*expected_unsupported, "schema"}
+                and outcome.capability in expected_unsupported
             )
         ),
     )
@@ -633,8 +665,9 @@ def main(argv=None) -> int:
     parser.add_argument("--behavior", action="store_true")
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--test-file", type=Path)
     args = parser.parse_args(argv)
-    cases = load_tests()
+    cases = load_tests(test_file=args.test_file)
     index = args.test_number if args.test_number is not None else 0
     selected = tuple(enumerate(cases)) if args.all else ((index, cases[index]),)
     report = {

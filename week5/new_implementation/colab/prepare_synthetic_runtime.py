@@ -18,6 +18,17 @@ RUNTIME_CONFIG = Path("/content/.attendance_phase3_runtime.json")
 OLLAMA_LOG = Path("/content/ollama-phase3.log")
 
 
+def model_stage_timeout_seconds() -> str:
+    """Allow slower CPU inference without relaxing GPU session timeouts."""
+    if shutil.which("nvidia-smi") is not None:
+        probe = subprocess.run(
+            ["nvidia-smi", "-L"], capture_output=True, text=True, check=False
+        )
+        if probe.returncode == 0 and probe.stdout.strip():
+            return "240"
+    return "900"
+
+
 def run(
     command: list[str], *, input_text: str | None = None
 ) -> subprocess.CompletedProcess:
@@ -193,14 +204,14 @@ def main() -> None:
             "LLM_PLANNER_MODEL": "ollama_chat/qwen3.5:4b",
             "LLM_PLANNER_MAX_OUTPUT_TOKENS": "512",
             "LLM_ANSWER_MODEL": "ollama_chat/qwen3.5:4b",
-            "LLM_REFERENCE_TIMEOUT_SECONDS": "240",
-            "LLM_PLANNER_TIMEOUT_SECONDS": "240",
-            "LLM_ANSWER_TIMEOUT_SECONDS": "240",
             "OLLAMA_API_BASE": "http://127.0.0.1:11434",
             "OLLAMA_HOST": "127.0.0.1:11434",
         }
-        RUNTIME_CONFIG.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-        RUNTIME_CONFIG.chmod(0o600)
+    timeout = model_stage_timeout_seconds()
+    for stage in ("REFERENCE", "PLANNER", "ANSWER"):
+        settings[f"LLM_{stage}_TIMEOUT_SECONDS"] = timeout
+    RUNTIME_CONFIG.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    RUNTIME_CONFIG.chmod(0o600)
     os.environ.update(settings)
     import psycopg
 

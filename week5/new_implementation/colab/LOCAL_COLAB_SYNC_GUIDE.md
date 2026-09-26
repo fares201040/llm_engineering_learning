@@ -9,50 +9,27 @@ For the WSL, Google Cloud SDK, Colab CLI installation, and ADC login steps, see
 [`COLAB_CLI_GUIDE.md`](COLAB_CLI_GUIDE.md). The commands below assume those tools are
 installed in Ubuntu 24.04 under WSL2 and ADC is already available there.
 
-## Current handoff status (2026-09-25)
+## Current handoff status (2026-09-26)
 
-- ADC and the official CLI work in WSL. The previous T4 runtime expired and its
-  `/content` directory became inaccessible. Attempts to create a replacement T4
-  returned Colab `Service Unavailable`; retry session creation when service resumes.
-- The latest row-only executed notebook validated snapshot
-  `d171a25ed2fe5cb11e3c2277ac10b8765a5fa33f1f7f4adaf571b827244ed60c`:
-  149 tests, Ruff lint, formatting for 19 files, and compilation passed. The current
-  ZIP and input notebook pin are
-  `6a1853bd6bbc79a7cd01feb98b6c521bee66eeb547c86de8fb3e39dc8d26ad88`;
-  this newer snapshot has not run in Colab.
-- The current source permits three SQL planner/execution attempts when the first
-  two PostgreSQL queries fail with programming or data errors. The local attendance
-  online/evaluator/acceptance/UI suite passed 153 tests and 3 subtests. Colab T4
-  allocation still returned `Service Unavailable` after this change.
-- A separate local Gradio reproduction of “who is fares hasan” found that
-  PostgreSQL whole-name similarity returned no options and the former OpenAI
-  embedding fallback returned HTTP 429 (`credit_balance_exhausted`). PostgreSQL
-  first-name token candidates now include the stored three-part name A11017.
-  Employee-name Chroma embeddings now use local `all-MiniLM-L6-v2`; a direct
-  semantic search alone did not place A11017 in its top five, so confirmation
-  still depends on the PostgreSQL candidate path for this question. The local
-  Gradio reply offered A11017 as option 2. The current Chroma store has only the
-  MiniLM document (6,904 parts) and employee (568 names) collections, each with
-  384-dimensional vectors.
-- Embeddings can be switched by `EMBEDDING_PROVIDER` and `EMBEDDING_MODEL`. The
-  provider-specific splitter and model-specific Chroma collections are documented
-  in `week5/new_implementation/POSTGRES_SETUP.md`. The current local suites passed
-  102 online tests and 38 ingestion/configuration/rebuild/UI tests. OpenAI client
-  construction was checked without a paid API request; no OpenAI collection was
-  rebuilt because the configured account previously exhausted its credits. The
-  current archive still needs Colab verification.
-- The official Ollama installer needed `zstd`. The setup helper now installs it before
-  Ollama, and the synthetic 16-row database plus Qwen 3.5 4B smoke test passed before
-  expiration. Runtime credentials stayed only in the temporary Colab VM.
-- The Gradio callback path was exercised one question per CLI invocation. Verified
-  turns 1–4 passed, including follow-up negation and a department aggregate. Turn 5,
-  a relative-month grouped comparison, repeatedly generated SQL or answers with
-  incorrect eligibility, values, or coverage. The semantic oracle stopped each
-  failed attempt; turns 6–8 and broader Arabic/complex cases have not run. Use the
-  synthetic four-turn checkpoint `attendance_phase3_ui_prefix4.json` after the new
-  snapshot passes deterministic checks, then retry turn 5 before advancing.
-- Do not ask the user to sign in again unless `colab --auth=adc sessions` reports an
-  actual authentication failure. Never print a runtime config or synthetic DSN.
+- The sanitized 42-file ZIP and executed notebook match SHA-256
+  `98a304a5dae85c965b65f0999ef88528effebd9f67d4d4f0fce93202c1322f7d`.
+  The T4 notebook passed 187 deterministic tests, Ruff lint and formatting for 23
+  files, and Python compilation.
+- The synthetic 16-row PostgreSQL fixture and Qwen 3.5 4B ran on T4. The UI long
+  conversation passed turns 1–7 on the preceding snapshot. Turn 8 was rerun on
+  this exact snapshot from the verified seven-turn checkpoint and passed all
+  semantic, outcome, and state checks. The final checkpoint reports eight turns.
+- `run_synthetic_eval.py` ran the evaluator against four generated cases on this
+  snapshot: missing join table, invalid date, non-finite threshold, and grouped
+  department ranking. It reported four completed and no failures. The ranking
+  initially failed because the SQL planner invented September/August filters for a
+  date-unbounded question. A SQL predicate scope guard now rejects that plan
+  before execution and uses the three-attempt planner retry path.
+- Only synthetic data was uploaded. The private 311-case corpus and ignored
+  `.env.postgres` were excluded. The 311-case run is a separate next phase.
+- The exact T4 session creation command is below. Check session status before
+  reuse; Colab runtimes can expire. Do not ask for ADC sign-in unless the CLI
+  reports an authentication failure. Never print runtime credentials.
 
 ## 1. Open the local checkout in WSL
 
@@ -97,7 +74,7 @@ The archive SHA-256 printed by `sha256sum` must equal
 `expected_archive_sha256` in `attendance_phase2_tests.ipynb`. The packager updates that
 value automatically. Colab checks it again before extracting any source.
 
-## 3. Create or reuse the Colab T4 runtime
+## 3. Create or reuse the Colab runtime
 
 List existing sessions first:
 
@@ -119,7 +96,21 @@ wsl.exe -d Ubuntu-24.04 -- /home/faris/.local/bin/colab --auth=adc new --session
 
 Run either creation command only when the named session is absent.
 
-Confirm the new runtime is listed and reports a T4 before uploading source.
+If T4 allocation is unavailable or the account has reached its accelerator limit,
+create a Colab CPU session instead (omit `--gpu`):
+
+```powershell
+wsl.exe -d Ubuntu-24.04 -- /home/faris/.local/bin/colab --auth=adc new --session attendance-phase2-3
+```
+
+When an A100 is available, use the same session name with the A100 accelerator:
+
+```powershell
+wsl.exe -d Ubuntu-24.04 -- /home/faris/.local/bin/colab --auth=adc new --session attendance-phase2-3 --gpu A100
+```
+
+Use either creation command only when the named session is absent. Confirm the
+session is listed and inspect its accelerator before uploading source.
 
 Verify the accelerator and state:
 
@@ -128,8 +119,9 @@ colab --auth=adc status --session attendance-phase2-3
 ```
 
 T4 availability depends on the Colab account and current capacity. The deterministic
-tests mock model and database calls, so they do not use the GPU; the T4 is for a later
-live model run if one is needed.
+tests mock model and database calls and do not use the GPU. Live Qwen inference on
+Colab CPU can take several minutes per turn; the setup helper assigns longer model
+stage timeouts automatically in a CPU session.
 
 ## 4. Upload the exact local snapshot
 
@@ -227,8 +219,7 @@ request. It stores the runtime-only connection settings at
 and employee counts, never the generated DSN or password.
 
 The earlier Ollama installation failure was caused by missing `zstd` and is resolved
-by the setup helper. The current live blockers are Colab session creation and turn 5
-comparison accuracy. Do not advance after a failed semantic turn or infer correctness
+by the setup helper. Review each semantic check rather than inferring correctness
 from an aggregate pass flag alone.
 
 Run **one** long-scenario turn with one CLI call. This example starts the sequence:
@@ -264,11 +255,30 @@ colab --auth=adc download \
   "$REPO/week5/new_implementation/colab/attendance_phase3_long_synthetic.json"
 ```
 
-Never run multiple live turns as a batch, the seven-case batch, or the private
-311-case evaluation. Stop after any failed turn. The other named Wail, Faris, and
-generic-subject scenarios remain blocked until they have explicit factual oracles.
+## 8. Run the attendance evaluator on synthetic cases
 
-## 8. Stop the runtime
+The source archive includes four generated-case expectations for the direct-SQL
+evaluator: a missing join target, an impossible date, a non-finite number, and a
+grouped worked-hours ranking. Run the evaluator through the prepared private runtime
+settings after the deterministic notebook and synthetic database setup have passed:
+
+```bash
+colab --auth=adc exec \
+  --session attendance-phase2-3 \
+  --file "$REPO/week5/new_implementation/colab/run_synthetic_eval.py" \
+  --timeout 2400
+```
+
+The runner invokes `week5.new_evaluation.eval --all --test-file` with the synthetic
+case file and writes `/content/attendance-synthetic-eval.json`. Inspect each failed
+flag in that report before changing application logic. The private 311-case corpus
+is excluded from the archive; it is not evaluated in Colab.
+
+Never run multiple live turns as a batch. Stop after any failed turn. The other
+named Wail, Faris, and generic-subject scenarios need explicit factual oracles.
+The private 311-case corpus requires a separately reviewed data-transfer decision.
+
+## 9. Stop the runtime
 
 After the deterministic checks and any optional live turns are complete, release the
 accelerator:

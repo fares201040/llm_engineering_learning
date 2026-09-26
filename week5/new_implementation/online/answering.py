@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import calendar
+from datetime import date
 import re
 from typing import Literal
 
@@ -188,6 +190,51 @@ def _missing_names(answer: str, employees: tuple[Employee, ...]) -> tuple[str, .
     return tuple(item.name for item in employees if item.name.casefold() not in folded)
 
 
+def _answer_mentions_date(answer: str, iso_date: str) -> bool:
+    """Match an exact coverage date across ISO and spelled-out English forms."""
+    target = date.fromisoformat(iso_date)
+    if re.search(rf"(?<!\d){re.escape(iso_date)}(?!\d)", answer):
+        return True
+    month_names = "|".join(calendar.month_name[1:])
+    patterns = (
+        rf"\b({month_names})\s+(\d{{1,2}})(?:st|nd|rd|th)?\s*,?\s*(\d{{4}})\b",
+        rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({month_names})\s*,?\s*(\d{{4}})\b",
+    )
+    month_numbers = {
+        name.casefold(): index for index, name in enumerate(calendar.month_name) if name
+    }
+    for order, pattern in enumerate(patterns):
+        for match in re.finditer(pattern, answer, flags=re.IGNORECASE):
+            first, second, year = match.groups()
+            month, day = (first, second) if order == 0 else (second, first)
+            try:
+                if date(int(year), month_numbers[month.casefold()], int(day)) == target:
+                    return True
+            except ValueError:
+                continue
+    return False
+
+
+def _claims_sample(answer: str) -> bool:
+    """Distinguish a claimed sample from an explicit denial of sampling."""
+    for match in re.finditer(r"\bsample\b", answer, flags=re.IGNORECASE):
+        prefix = answer[max(0, match.start() - 50) : match.start()]
+        if re.search(
+            r"\b(?:no|not|without|never)\b(?:\W+\w+){0,3}\W*$",
+            prefix,
+            flags=re.IGNORECASE,
+        ):
+            continue
+        if re.match(
+            r"\s+(?:was|is|were)\s+not\s+(?:returned|used|taken)\b",
+            answer[match.end() :],
+            flags=re.IGNORECASE,
+        ):
+            continue
+        return True
+    return False
+
+
 def generate_answer(
     *,
     shared_context: SharedModelContext,
@@ -227,7 +274,7 @@ def generate_answer(
         )
         if not any(
             column.name == "matched_count" for column in result.columns
-        ) and re.search(r"\bsample\b", draft.answer, re.IGNORECASE):
+        ) and _claims_sample(draft.answer):
             repair = {
                 "codes": ["wrong_coverage"],
                 "detail": "This result has no matched_count and is not a sample.",
@@ -253,7 +300,7 @@ def generate_answer(
             bound
             for coverage in base["database_date_coverage"]
             for bound in (coverage["available_start"], coverage["available_end"])
-            if bound is not None and bound not in draft.answer
+            if bound is not None and not _answer_mentions_date(draft.answer, bound)
         ]
         if missing_coverage:
             repair = {

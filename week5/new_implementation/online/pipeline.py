@@ -11,9 +11,16 @@ from uuid import uuid4
 
 import psycopg
 from pydantic import BaseModel, ConfigDict, Field
+from sqlglot import exp, parse
+from sqlglot.errors import ParseError
 
 from ..config import settings
 from .answering import Result, generate_answer
+from .comparison import (
+    build_grouped_month_comparison,
+    is_grouped_month_comparison_question,
+    render_grouped_month_comparison,
+)
 from .context import DatabaseContext, SharedModelContext, load_database_context
 from .execution import (
     AccessContext,
@@ -34,16 +41,23 @@ from .provider import (
     log_layer_output,
 )
 from .reference import (
+    BoundReferences,
     Employee,
     EmployeeOption,
     PendingEmployeeConfirmation,
     ReferenceResponse,
     UnsupportedReference,
+    attach_resolved_employees,
     bind_references,
     complete_confirmation,
     has_malformed_identifier,
     request_references,
     search_employee_candidates,
+)
+from .running_total import (
+    build_running_total,
+    is_running_total_question,
+    render_running_total,
 )
 from .state import ConversationState, VerifiedTurn
 
@@ -213,6 +227,23 @@ def _sql_semantic_issue(question: str, sql: str) -> str | None:
     return None
 
 
+def _unrequested_date_filter(sql: str) -> bool:
+    """Find attendance-date predicates, including nested or computed bounds."""
+
+    try:
+        statements = parse(sql, read="postgres")
+    except ParseError:
+        return False
+    for statement in statements:
+        for predicate in statement.find_all(exp.Predicate):
+            if any(
+                column.name.casefold() == "attendance_date"
+                for column in predicate.find_all(exp.Column)
+            ):
+                return True
+    return False
+
+
 def _mentions_time_period(question: str) -> bool:
     folded = question.casefold()
     if re.search(r"\b(?:19|20)\d{2}\b", folded):
@@ -325,6 +356,92 @@ def _unsupported_domain(locale: str) -> str:
     return "This assistant supports authorized attendance questions only."
 
 
+def _missing_join_target(question: str, database_context: DatabaseContext) -> bool:
+    """Recognize an explicit join to a table absent from the allowed schema."""
+
+    match = re.fullmatch(
+        r"join\s+(.+?)\s+(?:to|with)\s+(.+?)\s*[.?!]*",
+        question.strip(),
+        flags=re.IGNORECASE,
+    )
+    if match is None:
+        return False
+
+    def known_table(phrase: str) -> bool:
+        words = set(re.findall(r"[a-z0-9]+", phrase.casefold()))
+        return bool(words) and any(
+            words <= set(re.findall(r"[a-z0-9]+", table.table_name.casefold()))
+            or words
+            == set(
+                re.findall(
+                    r"[a-z0-9]+",
+                    f"{table.schema_name} {table.table_name}".casefold(),
+                )
+            )
+            for table in database_context.tables
+        )
+
+    left_known, right_known = (known_table(phrase) for phrase in match.groups())
+    return left_known != right_known
+
+
+def _schema_grounded_analytic_question(
+    question: str, database_context: DatabaseContext
+) -> bool:
+    """Confirm an independent aggregate request uses only known schema concepts."""
+
+    def normalized_words(value: str) -> set[str]:
+        words = re.findall(r"[a-z]+", value.casefold())
+        return {
+            "hour"
+            if word in {"hours", "hrs"}
+            else word[:-1]
+            if word.endswith("s")
+            else word
+            for word in words
+        }
+
+    words = normalized_words(question)
+    if words.intersection({"that", "those", "previous", "last", "instead", "same"}):
+        return False
+    analytic_words = {
+        "rank",
+        "ranking",
+        "group",
+        "grouped",
+        "sum",
+        "average",
+        "avg",
+        "count",
+        "total",
+    }
+    if not words.intersection(analytic_words):
+        return False
+    grammar_words = {
+        "a",
+        "an",
+        "and",
+        "by",
+        "each",
+        "for",
+        "of",
+        "per",
+        "please",
+        "show",
+        "the",
+        "with",
+    }
+    concepts = words - analytic_words - grammar_words
+    if len(concepts) < 2:
+        return False
+    schema_words: set[str] = set()
+    for table in database_context.tables:
+        schema_words.update(normalized_words(table.table_name.replace("_", " ")))
+        for column in table.columns:
+            schema_words.update(normalized_words(column.name.replace("_", " ")))
+    return concepts <= schema_words
+
+
 def _request_value_issue(question: str) -> str | None:
     """Return a typed issue for literals PostgreSQL may accept misleadingly."""
 
@@ -362,6 +479,8 @@ def _request_value_issue(question: str) -> str | None:
         operand = " ".join(match.group(1).casefold().split())
         first_operand = operand.split(maxsplit=1)[0] if operand else ""
         if first_operand in _NUMBER_WORDS:
+            continue
+        if not re.match(r"\s+hours?\b", question[match.end() :], re.IGNORECASE):
             continue
         try:
             numeric = float(first_operand.replace(",", ""))
@@ -493,6 +612,9 @@ def run_turn(
     question = request.question
     as_of_date = date.today().isoformat()
     try:
+        native_comparison = None
+        native_running_total = None
+        database_context = None
         loaded_directory = deps.directory_loader(
             dsn=settings.postgres_readonly_dsn,
             table=settings.postgres_attendance_table,
@@ -574,43 +696,124 @@ def run_turn(
                     state=previous,
                     capability=request_issue,
                 )
+            if re.match(r"\s*join\b", question, flags=re.IGNORECASE):
+                database_context = deps.context_loader(
+                    dsn=settings.postgres_readonly_dsn,
+                    attendance_objects=(settings.postgres_attendance_table,),
+                    connect_timeout=settings.postgres_connect_timeout_seconds,
+                )
+                if _missing_join_target(question, database_context):
+                    reply = (
+                        "جدول الربط المطلوب غير موجود في مخطط الحضور المصرح به."
+                        if locale == "ar"
+                        else "The requested join target is not in the authorized attendance schema."
+                    )
+                    log_layer_output(
+                        "unsupported",
+                        {"capability": "schema", "reason": "missing_join_target"},
+                    )
+                    return Unsupported(reply=reply, state=previous, capability="schema")
             active = tuple(
                 authoritative[item]
                 for item in previous.active_employee_ids
                 if item in authoritative
             )
-            reference = deps.reference_writer(
-                question,
-                history=request.history[-2:],
-                trusted_context=previous.trusted_context(),
-                active_employees=active,
-                as_of_date=as_of_date,
-                model=settings.llm_reference_model,
-                budget=budget,
-                timeout=settings.llm_reference_timeout_seconds,
-                max_output_tokens=settings.llm_reference_max_output_tokens,
-                observer=observer,
-            )
-            if isinstance(reference.decision, UnsupportedReference):
-                log_layer_output(
-                    "unsupported",
-                    {
-                        "capability": reference.decision.capability,
-                        "rewritten_request": reference.decision.rewritten_request,
-                    },
+            if previous.verified_turns and is_grouped_month_comparison_question(
+                question
+            ):
+                database_context = deps.context_loader(
+                    dsn=settings.postgres_readonly_dsn,
+                    attendance_objects=(settings.postgres_attendance_table,),
+                    connect_timeout=settings.postgres_connect_timeout_seconds,
                 )
-                return Unsupported(
-                    reply=_unsupported_domain(reference.decision.locale),
-                    state=previous,
-                    capability=reference.decision.capability,
+                native_comparison = build_grouped_month_comparison(
+                    question=question,
+                    previous_sql=previous.verified_turns[-1].executed_sql,
+                    previous_date_scope=previous.verified_turns[-1].date_scope,
+                    as_of_date=as_of_date,
+                    database_context=database_context,
                 )
-            bound = bind_references(
-                reference,
-                directory,
-                original_question=question,
-                active_employees=active,
-                has_verified_turns=bool(previous.verified_turns),
-            )
+            if (
+                previous.verified_turns
+                and not active
+                and is_running_total_question(question)
+            ):
+                if database_context is None:
+                    database_context = deps.context_loader(
+                        dsn=settings.postgres_readonly_dsn,
+                        attendance_objects=(settings.postgres_attendance_table,),
+                        connect_timeout=settings.postgres_connect_timeout_seconds,
+                    )
+                native_running_total = build_running_total(
+                    question=question,
+                    previous_sql=previous.verified_turns[-1].executed_sql,
+                    previous_date_scope=previous.verified_turns[-1].date_scope,
+                    database_context=database_context,
+                )
+            if native_comparison is not None or native_running_total is not None:
+                bound = BoundReferences(
+                    rewritten_request=question,
+                    updated_request=attach_resolved_employees(question, active),
+                    locale=locale,
+                    request_relationship="follow_up",
+                    subject_relationship="employees" if active else "all_authorized",
+                    employees=active,
+                )
+                if native_comparison is not None:
+                    log_layer_output("native_comparison_plan", native_comparison.sql)
+                else:
+                    log_layer_output(
+                        "native_running_total_plan", native_running_total.sql
+                    )
+            else:
+                reference = deps.reference_writer(
+                    question,
+                    history=request.history[-2:],
+                    trusted_context=previous.trusted_context(),
+                    active_employees=active,
+                    as_of_date=as_of_date,
+                    model=settings.llm_reference_model,
+                    budget=budget,
+                    timeout=settings.llm_reference_timeout_seconds,
+                    max_output_tokens=settings.llm_reference_max_output_tokens,
+                    observer=observer,
+                )
+                if isinstance(reference.decision, UnsupportedReference):
+                    database_context = deps.context_loader(
+                        dsn=settings.postgres_readonly_dsn,
+                        attendance_objects=(settings.postgres_attendance_table,),
+                        connect_timeout=settings.postgres_connect_timeout_seconds,
+                    )
+                    if _schema_grounded_analytic_question(question, database_context):
+                        bound = BoundReferences(
+                            rewritten_request=question,
+                            updated_request=attach_resolved_employees(question, ()),
+                            locale=locale,
+                            request_relationship="new",
+                            subject_relationship="all_authorized",
+                        )
+                        log_layer_output("schema_grounded_reference", question)
+                    else:
+                        log_layer_output(
+                            "unsupported",
+                            {
+                                "capability": reference.decision.capability,
+                                "rewritten_request": reference.decision.rewritten_request,
+                            },
+                        )
+                        return Unsupported(
+                            reply=_unsupported_domain(reference.decision.locale),
+                            state=previous,
+                            capability=reference.decision.capability,
+                        )
+                else:
+                    bound = bind_references(
+                        reference,
+                        directory,
+                        original_question=question,
+                        active_employees=active,
+                        has_verified_turns=bool(previous.verified_turns),
+                    )
 
         bound = bound.model_copy(update={"locale": _locale(question)})
 
@@ -737,11 +940,12 @@ def run_turn(
             and not _mentions_time_period(question)
             else None
         )
-        database_context = deps.context_loader(
-            dsn=settings.postgres_readonly_dsn,
-            attendance_objects=(settings.postgres_attendance_table,),
-            connect_timeout=settings.postgres_connect_timeout_seconds,
-        )
+        if database_context is None:
+            database_context = deps.context_loader(
+                dsn=settings.postgres_readonly_dsn,
+                attendance_objects=(settings.postgres_attendance_table,),
+                connect_timeout=settings.postgres_connect_timeout_seconds,
+            )
         log_layer_output("database_context", database_context)
         downstream_history = (
             tuple(item for item in request.history[-2:] if item.get("role") == "user")
@@ -793,8 +997,34 @@ def run_turn(
             }
             if sql_execution_failure is not None:
                 planner_args["sql_execution_failure"] = sql_execution_failure
-            sql = deps.planner(**planner_args)
+            sql = (
+                native_comparison.sql
+                if native_comparison is not None and attempt == 1
+                else native_running_total.sql
+                if native_running_total is not None and attempt == 1
+                else deps.planner(**planner_args)
+            )
             log_layer_output("sql_planner", sql, attempt=attempt)
+            if not shared_context.request_has_date_period and _unrequested_date_filter(
+                sql
+            ):
+                issue = "unrequested_date_filter"
+                if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
+                    raise ProviderFailure("sql_semantics", issue, issue)
+                sql_execution_failure = {
+                    "retry_number": attempt,
+                    "failed_sql": sql,
+                    "error_type": "sql_semantics",
+                    "database_error": (
+                        "The user did not request a date interval, but this SQL filters "
+                        "attendance_date. Remove the invented date restriction and "
+                        "answer over all authorized rows."
+                    ),
+                }
+                log_layer_output(
+                    "sql_execution_failure", sql_execution_failure, attempt=attempt
+                )
+                continue
             try:
                 result = deps.executor(
                     sql,
@@ -826,7 +1056,17 @@ def run_turn(
         semantic_issue = _sql_semantic_issue(question, sql)
         if semantic_issue is not None:
             raise ProviderFailure("sql_semantics", semantic_issue, semantic_issue)
-        date_scope = _sql_date_scope(sql)
+        native_comparison_used = (
+            native_comparison is not None and sql == native_comparison.sql
+        )
+        native_running_total_used = (
+            native_running_total is not None and sql == native_running_total.sql
+        )
+        date_scope = (
+            None
+            if native_comparison_used or native_running_total_used
+            else _sql_date_scope(sql)
+        )
         if required_date_scope is not None and date_scope != required_date_scope:
             raise ProviderFailure(
                 "sql_semantics", "date_scope_mismatch", "date_scope_mismatch"
@@ -842,18 +1082,27 @@ def run_turn(
                 state=previous,
                 capability="schema",
             )
-        answer = deps.answer_writer(
-            shared_context=shared_context,
-            sql=sql,
-            result=result,
-            employees=bound.employees,
-            locale=bound.locale,
-            model=settings.llm_answer_model,
-            budget=budget,
-            timeout=settings.llm_answer_timeout_seconds,
-            max_output_tokens=settings.llm_answer_max_output_tokens,
-            observer=observer,
-        )
+        if native_comparison_used:
+            answer = render_grouped_month_comparison(
+                native_comparison, result, locale=bound.locale
+            )
+        elif native_running_total_used:
+            answer = render_running_total(
+                native_running_total, result, locale=bound.locale
+            )
+        else:
+            answer = deps.answer_writer(
+                shared_context=shared_context,
+                sql=sql,
+                result=result,
+                employees=bound.employees,
+                locale=bound.locale,
+                model=settings.llm_answer_model,
+                budget=budget,
+                timeout=settings.llm_answer_timeout_seconds,
+                max_output_tokens=settings.llm_answer_max_output_tokens,
+                observer=observer,
+            )
         log_layer_output("answer", answer)
         verified = VerifiedTurn(
             turn_id=uuid4().hex,

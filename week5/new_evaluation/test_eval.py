@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import unittest
+import json
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import call, patch
 
-from week5.new_evaluation.eval import _answer_fact_matches, _write, evaluate_outcome
+from week5.new_evaluation.eval import (
+    _answer_fact_matches,
+    _expected_subset,
+    _plan_matches,
+    _write,
+    evaluate_outcome,
+    main,
+)
 from week5.new_evaluation.test import TestQuestion, load_tests as load_evaluation_tests
 from week5.new_implementation.online.execution import ExecutionCoverage
 from week5.new_implementation.online.pipeline import (
@@ -21,6 +30,74 @@ from week5.new_implementation.online.state import ConversationState, VerifiedTur
 
 
 class EvaluatorTests(unittest.TestCase):
+    def test_wrong_unsupported_capability_does_not_pass_as_schema(self):
+        case = TestQuestion(
+            question="Count records on September 31, 2026.",
+            keywords=[],
+            reference_answer="The date is invalid.",
+            category="synthetic_invalid_date",
+            expected_unsupported_capabilities=["malformed_value"],
+        )
+        outcome = Unsupported(
+            reply="The schema does not include this field.",
+            state=ConversationState(),
+            capability="schema",
+        )
+
+        result = evaluate_outcome(case, outcome)
+
+        self.assertFalse(result.unsupported_capabilities_ok)
+
+    def test_cli_can_use_explicit_synthetic_case_file(self):
+        with TemporaryDirectory() as directory:
+            case_file = Path(directory) / "synthetic.jsonl"
+            case_file.write_text(
+                json.dumps(
+                    {
+                        "question": "Join attendance to a missing table.",
+                        "keywords": [],
+                        "reference_answer": "The join target is absent.",
+                        "category": "synthetic_schema",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with patch("week5.new_evaluation.eval.evaluate_behavior") as evaluate:
+                evaluate.return_value.passed = True
+                self.assertEqual(main(["--all", "--test-file", str(case_file)]), 0)
+            self.assertEqual(evaluate.call_count, 1)
+
+    def test_expected_rows_cannot_reuse_one_actual_row(self):
+        actual = [{"group": ["Engineering"], "value": 56}]
+        expected = [
+            {"group": ["Engineering"], "value": 56},
+            {"group": ["Engineering"], "value": 56},
+        ]
+        self.assertFalse(_expected_subset(actual, expected))
+
+    def test_required_sql_filter_must_be_in_a_predicate_clause(self):
+        expected = {
+            "required_filter": {
+                "field": "Employee_ID",
+                "operator": "eq",
+                "value": "A1",
+            }
+        }
+        self.assertFalse(
+            _plan_matches(
+                "SELECT CASE WHEN employee_id = 'A1' THEN 1 ELSE 0 END AS marker "
+                "FROM attendance_records",
+                expected,
+            )
+        )
+        self.assertTrue(
+            _plan_matches(
+                "SELECT COUNT(*) FROM attendance_records WHERE employee_id = 'A1'",
+                expected,
+            )
+        )
+
     def test_evaluation_record_model_is_not_collected_as_a_pytest_test_class(self):
         self.assertFalse(getattr(TestQuestion, "__test__", True))
 

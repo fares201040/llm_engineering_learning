@@ -48,7 +48,7 @@ class TestQuestion(BaseModel):
     expected_exception_type: ExpectedErrorType | None = None
 
 
-def load_tests(loader=None, tests=None, pattern=None):
+def load_tests(loader=None, tests=None, pattern=None, *, test_file: Path | None = None):
     """Load test questions, while remaining compatible with unittest discovery.
 
     ``unittest`` reserves the module-level ``load_tests`` name and calls it
@@ -60,7 +60,8 @@ def load_tests(loader=None, tests=None, pattern=None):
 
         return unittest.TestSuite()
 
-    if not Path(TEST_FILE).is_file():
+    source = test_file if test_file is not None else Path(TEST_FILE)
+    if not source.is_file():
         raise FileNotFoundError(
             "The private evaluation corpus is not available in this checkout. "
             "Provide week5/new_evaluation/tests.jsonl from an authorized local "
@@ -68,7 +69,7 @@ def load_tests(loader=None, tests=None, pattern=None):
         )
 
     tests = []
-    with open(TEST_FILE, "r", encoding="utf-8") as f:
+    with source.open("r", encoding="utf-8") as f:
         for line in f:
             data = json.loads(line.strip())
             tests.append(TestQuestion(**data))

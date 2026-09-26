@@ -14,6 +14,7 @@ per turn, with at most two eligible retries after PostgreSQL programming or data
 | `online/reference.py` | Complete request rewrite, typed employee references, authorized exact/fuzzy/Chroma-confirmed resolution |
 | `online/context.py` | Immutable allowlisted physical PostgreSQL metadata and shared context with question/history |
 | `online/planner.py` | Request-specific schema projection, SQL-only prompt, and raw text response |
+| `online/comparison.py` | Schema-checked relative-month comparison of a previous verified grouped aggregate |
 | `online/execution.py` | Access check, ID/name directory lookup, bounded read-only direct SQL execution |
 | `online/answering.py` | Same-model answer writing and independent verification |
 | `online/state.py` | Minimal verified turns and pending confirmation |
@@ -80,6 +81,20 @@ asks for it). The verified case 17 planner payload was 63.2% smaller after proje
 The schema is normally sent once per question and is sent again only after an eligible
 SQL retry.
 
+A narrow, generic grouped-aggregate follow-up is planned from the previous verified
+SQL without another model rewrite. The prior query must be a single grouped SUM/COUNT
+over an allowlisted table, with one group column, one aggregate, and no prior date
+scope. The comparison keeps the prior query as the eligibility CTE and calculates
+the previous and current calendar-month values from PostgreSQL rows. Its deterministic
+answer checks each group, numeric difference, result count, and available date range.
+Requests outside that supported shape use the normal model path.
+
+When the reference model labels an independent aggregate request as outside the
+attendance domain, the runtime checks its terms against authorized table and column
+names. A request with only grounded schema concepts proceeds
+to SQL planning; unknown concepts and relative follow-ups retain the unsupported
+decision. The SQL planner remains responsible for the exact SQL.
+
 For follow-ups, the model sees the latest verified turn and the previous user question.
 The current follow-up change and previous verified SQL are made explicit in the
 planner request. The SQL planner receives calendar-month boundaries calculated from
@@ -93,6 +108,8 @@ history, trusted context, database type, resolution statement, database date-cov
 summary, exact executed SQL, typed result and execution coverage, authoritative
 employee IDs/names, and locale. They do not receive the attendance schema. The verifier
 also receives the proposed answer.
+The writer's coverage-bound check accepts exact ISO dates and equivalent spelled-out
+English dates; the verifier still judges whether the coverage statement is accurate.
 
 Every physical column in an allowlisted attendance object must have an authored
 description in `online/context.py`. Context loading fails with the missing column names
@@ -152,16 +169,18 @@ system/auth/config or private-ingestion objects, migration tables, or credential
 
 ## Direct execution and bounds
 
-The exact planner string is passed to `connection.execute(sql)` without parameters,
-AST parsing, returned-identifier validation, authorization wrapping, limit injection,
-or literal conversion. Execution starts `REPEATABLE READ READ ONLY`, applies local
+The planner string is checked for an unrequested attendance-date predicate, then
+passed to `connection.execute(sql)` without parameters, general structural
+authorization, limit injection, or literal conversion. Execution starts
+`REPEATABLE READ READ ONLY`, applies local
 statement/lock/idle-transaction timeouts, fetches at most `result_limit + 1`, bounds
 the serialized response size, records column type codes and row coverage, and rolls
 back on both success and failure. Database/provider/size/timeout failures return a safe
 failed outcome and preserve the exact prior trusted state.
 
-A PostgreSQL `ProgrammingError` or `DataError` triggers at most two repair retries after
-the initial query: no more than three database execution attempts. Each retry receives
+A PostgreSQL `ProgrammingError`, `DataError`, or an unrequested date filter triggers
+at most two planner retries after the initial query: no more than three planning
+attempts. Each retry receives
 the failed SQL, error type, database error text capped at 4,000 characters, retry
 number, and the same `SharedModelContext` with the same projected schema. Connection,
 timeout, result-bound, authorization, provider, and answer failures do not trigger SQL
@@ -176,7 +195,8 @@ confirmation-only candidates after authorized-directory checks. Unsupported
 non-attendance requests stop before SQL; unsupported schema concepts use the
 `unsupported_capability` SQL-result protocol and return an explicit unsupported
 outcome. Empty/malformed provider responses and planner Markdown fences fail safely.
-The runtime does not structurally parse SQL before execution.
+The narrow date-predicate check uses SQL parsing; it does not provide general SQL
+authorization.
 
 ## Security limitation and deferred safeguards
 
@@ -201,43 +221,28 @@ result. A clarification may store one pending employee confirmation. All provide
 SQL, bound, and verification failures preserve prior state. State from another runtime
 version resets safely.
 
-## Verification record (2026-09-25)
+## Verification record (2026-09-26)
 
-The previously verified sanitized archive SHA-256 was
-`fccad7a9e9ea23cb3e0c70c80e4734258a9072f0811584b269606adfe1f1a19d`.
+The sanitized archive SHA-256 is
+`98a304a5dae85c965b65f0999ef88528effebd9f67d4d4f0fce93202c1322f7d`.
 The [executed Colab notebook](colab/attendance_phase2_tests_output.ipynb) validated
-that hash and passed **127 deterministic tests**, Ruff lint, formatting for 19 files,
-and Python compilation in a T4 session; it has no error cells. The ZIP contains 32
-allowlisted source/helper files and a generated 311-line placeholder manifest. It
-excludes credentials, environment files, attendance exports, previous results, and
-the private evaluation corpus. Deterministic checks mock model/database boundaries.
+42 allowlisted files and passed **187 deterministic tests**, Ruff lint and formatting
+for 23 files, and Python compilation on T4. The synthetic database has 16 rows and
+three employees; the temporary model is Qwen 3.5 4B. The archive has a generated
+311-line placeholder manifest, but excludes the private evaluation corpus and all
+credentials and attendance exports.
 
-The Ollama setup failure was caused by missing `zstd`; the setup helper now installs
-it, starts Qwen 3.5 4B, and verifies the temporary read-only PostgreSQL database with
-16 synthetic rows and three employees. The one-turn runner now launches a fresh Python
-process per invocation so Colab's persistent kernel cannot reuse stale imported code.
-The approved UI was reviewed without adding features.
+The synthetic UI conversation passed turns 1–7 on the preceding source snapshot.
+Turn 8 was rerun against this exact archive from its verified seven-turn checkpoint;
+the running total, result arithmetic, answer facts, and state checks passed. The
+checkpoint reports eight completed turns. The native grouped relative-month plan
+corrected turn 5's eligibility and date-coverage errors. The native running-total
+plan derives its metric from the previous verified grouped SQL.
 
-The long synthetic scenario was run one turn per CLI invocation. Turns 1 and 2 passed:
-five September worked dates for A11017 and the explicit September 6 absence. Turn 3
-failed semantic acceptance. With the latest source, SQL correctly used
-`exception IS DISTINCT FROM 'Absent'`, but omitted the inherited September interval
-and returned two August dates alongside September 1–5. The exact five-row oracle
-rejected the result. The [saved synthetic checkpoint](colab/attendance_phase3_long_synthetic_negation.json)
-contains the answer, SQL, result, and state checks. Turns 4–8 were not run. The T4
-session was stopped after the failed turn.
-
-Later synthetic Gradio callback acceptance passed verified turns 1–4. Turn 5 exposed
-inaccurate relative-month comparison SQL and answer wording, so the sequence again
-stopped before turns 6–8. The current code includes further context, planner, and
-answer-grounding changes that have not yet run in Colab: the runtime expired and
-replacement T4 creation returned `Service Unavailable`. See
-[the sync guide](colab/LOCAL_COLAB_SYNC_GUIDE.md) for tested and pending snapshot
-hashes. The grouped comparison remains unverified.
-
-The model can still publish a plausible answer after misinterpreting follow-up scope;
-the model verifier did not catch this case. Structural SQL authorization and semantic
-validation remain deferred as described above. Do not treat passing deterministic
-tests as evidence of long-conversation correctness. Do not run the private 311-case
-evaluation or the seven-case batch. Cases 20, 23, 26, 29, 94, and 128 remain
-unverified; Wail, Faris, and generic-subject live scenarios still lack factual oracles.
+The live synthetic evaluator completed four cases with no failed flags on this exact
+archive. A prior run found that the planner invented September/August filters for a
+date-unbounded department ranking. The SQL date-predicate guard now rejects that
+plan before execution and retries against the unchanged request. See
+[the sync guide](colab/LOCAL_COLAB_SYNC_GUIDE.md) and
+[the phase handoff](../../docs/superpowers/reports/2026-09-26-attendance-colab-evaluation-handoff.md)
+for issue classes and run details. The private 311 cases have not been run in Colab.

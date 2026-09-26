@@ -21,6 +21,7 @@ class AcceptanceStep:
     expected_outcome: Literal["answered", "clarification", "unsupported"]
     expected_capability: str | None = None
     expected_answer_groups: tuple[tuple[str, ...], ...] = ()
+    expected_answer_rows: tuple[tuple[str, ...], ...] = ()
     expected_result_groups: tuple[tuple[str, ...], ...] = ()
     expected_result_rows: tuple[tuple[str, ...], ...] = ()
     expected_sql_groups: tuple[tuple[str, ...], ...] = ()
@@ -122,6 +123,11 @@ SCENARIOS = {
                 ("2026-08-03",),
                 ("2026-09-06",),
             ),
+            expected_answer_rows=(
+                ("Engineering", "56"),
+                ("Finance", "36"),
+                ("Operations", "16"),
+            ),
             expected_result_groups=(
                 ("Engineering",),
                 ("56",),
@@ -153,6 +159,11 @@ SCENARIOS = {
                 ("8",),
                 ("40",),
                 ("24",),
+            ),
+            expected_answer_rows=(
+                ("Engineering", "16", "40"),
+                ("Finance", "12", "24"),
+                ("Operations", "8"),
             ),
             expected_result_groups=(
                 ("Engineering",),
@@ -246,6 +257,37 @@ def _semantic_answer_check(
             for item in alternatives
         ):
             missing.append(alternatives[0] if alternatives else "answer fact")
+
+    normalized_answer_rows = [
+        f" {_normalize_answer_fact(line)} "
+        for line in reply.splitlines()
+        if line.strip()
+    ]
+    if len(step.expected_answer_rows) > 1:
+        labels = {
+            _normalize_answer_fact(required_row[0])
+            for required_row in step.expected_answer_rows
+            if required_row
+        }
+        mentions = sorted(
+            (match.start(), label)
+            for label in labels
+            for match in re.finditer(
+                rf"(?<!\w){re.escape(label)}(?!\w)",
+                _normalize_answer_fact(reply),
+            )
+        )
+        normalized = _normalize_answer_fact(reply)
+        normalized_answer_rows = [
+            f" {normalized[start : mentions[index + 1][0] if index + 1 < len(mentions) else len(normalized)]} "
+            for index, (start, _label) in enumerate(mentions)
+        ]
+    for required_row in step.expected_answer_rows:
+        if not any(
+            all(f" {_normalize_answer_fact(fact)} " in row for fact in required_row)
+            for row in normalized_answer_rows
+        ):
+            missing.append(f"same answer row: {', '.join(required_row)}")
 
     normalized_result = f" {_normalize_answer_fact(json.dumps(result, default=str))} "
     missing_result = []
@@ -444,7 +486,11 @@ def run_scenario_turn(
         missing_answer_facts.append("requested answer language")
         semantic_ok = False
     record = {
-        "reference_trace": reference_trace if not outcome_ok else {},
+        "reference_trace": (
+            reference_trace
+            if not (outcome_ok and semantic_ok and state_continuity_ok)
+            else {}
+        ),
         "surface": surface,
         "turn_number": turn_index + 1,
         "question": step.question,
@@ -453,6 +499,7 @@ def run_scenario_turn(
         "expected_answer_groups": [
             list(group) for group in step.expected_answer_groups
         ],
+        "expected_answer_rows": [list(row) for row in step.expected_answer_rows],
         "expected_result_groups": [
             list(group) for group in step.expected_result_groups
         ],

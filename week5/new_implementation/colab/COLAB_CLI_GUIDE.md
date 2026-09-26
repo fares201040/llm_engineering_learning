@@ -2,9 +2,9 @@
 
 This guide uses the official Google Colab CLI from Ubuntu 24.04 under WSL2. It covers a user-level install, Google ADC login, T4 session creation, file transfer, notebook execution, and shutdown. No Ubuntu installation commands are needed. The CLI is already installed as version 0.7.2 in the current WSL account and ADC is already available; reuse that setup instead of reinstalling or signing in again. For full local-to-Colab source sync, deterministic tests, and synthetic live acceptance, continue with [`LOCAL_COLAB_SYNC_GUIDE.md`](LOCAL_COLAB_SYNC_GUIDE.md).
 
-The current verified archive hash and the stopped long-scenario turn 3 are recorded in
-the sync guide. The earlier Ollama installer failure was caused by missing `zstd` and
-is resolved in the synthetic setup helper.
+The current verified archive hash, T4 synthetic acceptance, and evaluator results
+are recorded in the sync guide. The earlier Ollama installer failure was caused by
+missing `zstd` and is resolved in the synthetic setup helper.
 
 ## 1. Open Ubuntu and enter the project
 
@@ -114,7 +114,7 @@ colab --auth=adc sessions
 
 `No active sessions found` means authentication worked but no Colab runtime is currently registered.
 
-## 5. Create and inspect a T4 session
+## 5. Create and inspect a Colab session
 
 List sessions first. If `attendance-phase2-3` is absent, create it with a T4; otherwise
 reuse the existing session:
@@ -135,6 +135,21 @@ wsl.exe -d Ubuntu-24.04 -- /home/faris/.local/bin/colab --auth=adc new --session
 ```
 
 Use it only when `attendance-phase2-3` is absent.
+
+When T4 allocation is unavailable, create a Colab CPU session by omitting `--gpu`:
+
+```powershell
+wsl.exe -d Ubuntu-24.04 -- /home/faris/.local/bin/colab --auth=adc new --session attendance-phase2-3
+```
+
+When A100 allocation is available, request it explicitly:
+
+```powershell
+wsl.exe -d Ubuntu-24.04 -- /home/faris/.local/bin/colab --auth=adc new --session attendance-phase2-3 --gpu A100
+```
+
+Live Qwen inference on Colab CPU can take several minutes per turn. The synthetic
+runtime helper gives CPU model calls a longer timeout automatically.
 
 T4 availability depends on the Google account's Colab plan and current accelerator availability. The Phase 2 deterministic tests below mock model/database boundaries and do not use the GPU. The T4 is selected for the already-approved synthetic live acceptance described in `LOCAL_COLAB_SYNC_GUIDE.md`.
 
@@ -161,7 +176,7 @@ colab --auth=adc exec \
   --timeout 1200
 ```
 
-`colab exec` sends notebook code cells to the Colab kernel and writes an output notebook alongside the local input, named `attendance_phase2_tests_output.ipynb`. The notebook verifies the source ZIP SHA-256, extracts only its sanitized snapshot, installs a minimal test environment, and runs mocked Phase 2 runtime/evaluator, Phase 3 acceptance-checkpoint and Gradio UI tests plus Ruff and compilation checks. Its paired archive contains an explicit 33-file allowlist and generated placeholder manifest; it excludes `.env` files, credentials, attendance rows, previous results, and the private 311-case evaluation corpus. The deterministic notebook does not call an LLM or connect to PostgreSQL. For the separately approved live test, follow `LOCAL_COLAB_SYNC_GUIDE.md`; it uses only a generated synthetic PostgreSQL database and a Colab T4 model.
+`colab exec` sends notebook code cells to the Colab kernel and writes an output notebook alongside the local input, named `attendance_phase2_tests_output.ipynb`. The notebook verifies the source ZIP SHA-256, extracts only its sanitized snapshot, installs a minimal test environment, and runs mocked Phase 2 runtime/evaluator, Phase 3 acceptance-checkpoint and Gradio UI tests plus Ruff and compilation checks. Its paired archive contains an explicit 42-file allowlist and generated placeholder manifest; it excludes `.env` files, credentials, attendance rows, previous results, and the private 311-case evaluation corpus. The deterministic notebook does not call an LLM or connect to PostgreSQL. For live tests, follow `LOCAL_COLAB_SYNC_GUIDE.md`; they use only a generated synthetic PostgreSQL database and a Colab T4 model.
 
 ## 7. Common session commands
 

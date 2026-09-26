@@ -161,6 +161,35 @@ class AcceptanceCliTests(unittest.TestCase):
         self.assertFalse(record["passed"])
         self.assertEqual(record["missing_answer_facts"], ["5"])
 
+    def test_semantic_failure_keeps_ui_stage_trace(self):
+        from week5.new_implementation.online import pipeline
+
+        step = acceptance.AcceptanceStep(
+            "Count synthetic work days.",
+            "answered",
+            expected_answer_groups=(("5 days",),),
+            expected_result_groups=(("4",),),
+        )
+
+        def traced_answer(request):
+            pipeline.log_layer_output(
+                "sql_planner", "SELECT 4 AS worked_days", attempt=1
+            )
+            return answered_for(request)
+
+        with (
+            patch.dict(acceptance.SCENARIOS, {"long": (step,)}),
+            patch.object(acceptance, "run_turn", side_effect=traced_answer),
+        ):
+            record, _state, _history = acceptance.run_scenario_turn(
+                "long", 0, surface="ui"
+            )
+
+        self.assertFalse(record["semantic_ok"])
+        self.assertEqual(
+            record["reference_trace"]["sql_planner_1"], "SELECT 4 AS worked_days"
+        )
+
     def test_answer_fact_matching_uses_word_boundaries_and_is_case_insensitive(self):
         step = acceptance.AcceptanceStep(
             "Summarize synthetic work days.",
@@ -287,6 +316,50 @@ class AcceptanceCliTests(unittest.TestCase):
         self.assertFalse(passed)
         self.assertIn("same result row: Engineering, 56", missing_result)
         self.assertIn("result order: Finance", missing_result)
+
+    def test_grouped_answer_rejects_values_assigned_to_wrong_group(self):
+        step = acceptance.AcceptanceStep(
+            "Group hours by department.",
+            "answered",
+            expected_answer_groups=(("Engineering",), ("56",), ("Finance",), ("36",)),
+            expected_result_groups=(("Engineering",), ("56",), ("Finance",), ("36",)),
+            expected_answer_rows=(("Engineering", "56"), ("Finance", "36")),
+        )
+        result = {
+            "rows": [
+                {"department": "Engineering", "total": 56},
+                {"department": "Finance", "total": 36},
+            ]
+        }
+        passed, missing_answer, _missing_result = acceptance._semantic_answer_check(
+            step,
+            "answered",
+            "Engineering: 36 hours\nFinance: 56 hours",
+            result,
+            None,
+        )
+        self.assertFalse(passed)
+        self.assertIn("same answer row: Engineering, 56", missing_answer)
+
+        passed, missing_answer, _missing_result = acceptance._semantic_answer_check(
+            step,
+            "answered",
+            "Engineering: 56 hours; Finance: 36 hours",
+            result,
+            None,
+        )
+        self.assertTrue(passed)
+        self.assertEqual(missing_answer, [])
+
+        passed, missing_answer, _missing_result = acceptance._semantic_answer_check(
+            step,
+            "answered",
+            "Engineering: 36 hours; Finance: 56 hours",
+            result,
+            None,
+        )
+        self.assertFalse(passed)
+        self.assertIn("same answer row: Engineering, 56", missing_answer)
 
     def test_result_rejects_extra_rows_when_exact_count_is_expected(self):
         step = acceptance.AcceptanceStep(

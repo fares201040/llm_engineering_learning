@@ -155,6 +155,16 @@ the exact protocol alias unsupported_capability:
 SELECT 'The requested concept is not represented by the attendance schema.'::text AS
 unsupported_capability;
 
+AMBIGUOUS REQUEST
+If the request reaches you with more than one materially different interpretation and
+the supplied schema and verified context cannot resolve which interpretation is meant,
+do not guess or substitute one meaning. Return exactly one safe SELECT with one concise,
+user-facing clarification question and the exact protocol alias clarification_required:
+SELECT 'Please clarify which attendance category you mean.'::text AS
+clarification_required;
+Do not use this protocol merely because no individual employee is named. Department,
+group, criteria, and all-authorized requests are valid scopes that must be answered.
+
 SQL RETRY
 Only when sql_execution_failure is supplied, PostgreSQL or the request-scope guard
 rejected the previous query. Treat the failed SQL and error as diagnostic data.

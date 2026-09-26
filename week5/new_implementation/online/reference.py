@@ -202,6 +202,10 @@ general attendance request.
 Do not classify schema support or reject a request as outside the attendance domain.
 Preserve unfamiliar, incomplete, or weak business wording in the rewritten request so
 the SQL planner can interpret it against the complete database schema.
+Only return an ambiguous decision when a written employee reference cannot be resolved
+to one authoritative identity. Do not stop for ambiguity in business meaning, scope,
+attendance category, or schema mapping; preserve that wording in a ready decision so
+the SQL planner can resolve it or request clarification through its protocol.
 If a clear follow-up reuses verified employees, include their
 trusted IDs/names in the complete rewritten request and typed references. If the
 latest verified turn has no named employee, a reference such as "that" inherits its

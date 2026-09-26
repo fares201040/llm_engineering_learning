@@ -285,6 +285,8 @@ def _has_complete_manual_swipe_filter(sql: str) -> bool:
 def _sql_semantic_issue(
     question: str, sql: str, *, rewritten_request: str = ""
 ) -> str | None:
+    if _planner_control_alias(sql) is not None:
+        return None
     folded = question.casefold()
     detail_noun = re.search(
         r"\b(?:attendance|details?|entries|records?|rows?)\b", folded
@@ -335,6 +337,32 @@ def _sql_semantic_issue(
             if re.search(r"\bday_type\b", filters, re.IGNORECASE):
                 return "wrong_absence_semantics"
     return None
+
+
+def _planner_control_alias(sql: str) -> str | None:
+    """Recognize the planner's safe, single-value control protocol."""
+
+    try:
+        statements = parse(sql, read="postgres")
+    except ParseError:
+        return None
+    if len(statements) != 1 or not isinstance(statements[0], exp.Select):
+        return None
+    statement = statements[0]
+    if any(statement.find_all(exp.Table)) or len(statement.expressions) != 1:
+        return None
+    expression = statement.expressions[0]
+    if not isinstance(expression, exp.Alias):
+        return None
+    alias = expression.alias.casefold()
+    if alias not in {"clarification_required", "unsupported_capability"}:
+        return None
+    value = expression.this
+    while isinstance(value, (exp.Cast, exp.Paren)):
+        value = value.this
+    if not isinstance(value, exp.Literal) or not value.is_string:
+        return None
+    return alias
 
 
 def _unrequested_date_filter(sql: str) -> bool:
@@ -1078,6 +1106,16 @@ def _unsupported_schema_reason(result: SqlExecutionResult) -> str | None:
     return None
 
 
+def _planner_clarification_reason(result: SqlExecutionResult) -> str | None:
+    if len(result.rows) != 1:
+        return None
+    row = result.rows[0]
+    for key, value in row.items():
+        if str(key).casefold() == "clarification_required" and value is not None:
+            return str(value)
+    return None
+
+
 def _confirmation_reply(pending: PendingEmployeeConfirmation, locale: str) -> str:
     if len(pending.options) > 1:
         choices = "\n".join(
@@ -1456,31 +1494,28 @@ def run_turn(
 
         bound = bound.model_copy(update={"locale": _locale(question)})
 
-        if bound.ambiguous:
-            if database_context is None:
-                database_context = deps.context_loader(
-                    dsn=settings.postgres_readonly_dsn,
-                    attendance_objects=(settings.postgres_attendance_table,),
-                    connect_timeout=settings.postgres_connect_timeout_seconds,
-                )
-            native_general_observation = _build_native_attendance_observation_sql(
-                question, database_context, ()
+        if (
+            bound.ambiguous
+            and bound.unresolved_mention is None
+            and bound.subject_relationship is None
+            and not (previous.active_employee_ids and not active)
+        ):
+            rewritten_request = bound.rewritten_request or question
+            bound = BoundReferences(
+                rewritten_request=rewritten_request,
+                updated_request=attach_resolved_employees(
+                    rewritten_request, bound.employees
+                ),
+                locale=bound.locale,
+                request_relationship=bound.request_relationship,
+                subject_relationship=(
+                    bound.subject_relationship
+                    or ("employees" if bound.employees else "all_authorized")
+                ),
+                employee_criteria=bound.employee_criteria,
+                employees=bound.employees,
             )
-            if _build_native_schema_aggregate_sql(
-                question, database_context, ()
-            ) is not None or (
-                bound.reason == "missing_employee"
-                and bound.unresolved_mention is None
-                and native_general_observation is not None
-            ):
-                bound = BoundReferences(
-                    rewritten_request=question,
-                    updated_request=attach_resolved_employees(question, ()),
-                    locale=bound.locale,
-                    request_relationship="new",
-                    subject_relationship="all_authorized",
-                )
-                log_layer_output("schema_grounded_reference", question)
+            log_layer_output("planner_owned_ambiguity", rewritten_request)
 
         log_layer_output("employee_resolution", bound)
 
@@ -1804,6 +1839,28 @@ def run_turn(
         )
         if semantic_issue is not None:
             raise ProviderFailure("sql_semantics", semantic_issue, semantic_issue)
+        clarification_reason = _planner_clarification_reason(result)
+        if clarification_reason is not None:
+            log_layer_output(
+                "clarification",
+                {"reason": "planner_clarification", "reply": clarification_reason},
+            )
+            return Clarification(
+                reply=clarification_reason,
+                state=previous,
+                reason="planner_clarification",
+            )
+        unsupported_reason = _unsupported_schema_reason(result)
+        if unsupported_reason is not None:
+            log_layer_output(
+                "unsupported",
+                {"capability": "schema", "reason": unsupported_reason},
+            )
+            return Unsupported(
+                reply=unsupported_reason,
+                state=previous,
+                capability="schema",
+            )
         native_comparison_used = (
             native_comparison is not None and sql == native_comparison.sql
         )
@@ -1818,17 +1875,6 @@ def run_turn(
         if required_date_scope is not None and date_scope != required_date_scope:
             raise ProviderFailure(
                 "sql_semantics", "date_scope_mismatch", "date_scope_mismatch"
-            )
-        unsupported_reason = _unsupported_schema_reason(result)
-        if unsupported_reason is not None:
-            log_layer_output(
-                "unsupported",
-                {"capability": "schema", "reason": unsupported_reason},
-            )
-            return Unsupported(
-                reply=unsupported_reason,
-                state=previous,
-                capability="schema",
             )
         if native_comparison_used:
             answer = render_grouped_month_comparison(

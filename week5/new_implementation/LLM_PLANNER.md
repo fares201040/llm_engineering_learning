@@ -42,8 +42,9 @@ There are exactly three configured roles:
    criteria, request relationship, subject union/intersection relationship, and locale.
    Its prompt preserves dates, comparisons, grouping, requested output, and follow-up
    intent. It receives no database schema or SQL vocabulary and cannot classify a
-   request as unsupported. It may flag an unresolved employee reference as ambiguous
-   for the application's confirmation flow.
+   request as unsupported. It may flag a written employee reference as ambiguous only
+   for the application's authorized identity-confirmation flow. Missing individual
+   employees and unclear business or scope wording continue to the SQL planner.
 2. The SQL planner receives a payload derived from the immutable
    `SharedModelContext` and returns plain SQL.
    Its prompt explains what query to produce, how to map every business term to exact
@@ -58,7 +59,9 @@ There are exactly three configured roles:
    `sql_execution_failure`; it then reviews the failed SQL and database error against
    the unchanged request and schema and returns corrected SQL without exposing its
    reasoning. An unrepresentable request should become a safe SQL `SELECT` result
-   stating that it is unsupported.
+   stating that it is unsupported. If schema and verified context still leave multiple
+   materially different meanings, it returns a safe `clarification_required` SQL
+   result containing the question to show the user.
 3. The answer model is invoked in two independent calls with distinct complete system
    prompts. The writer grounds a complete answer only in the executed result and must
    name authoritative employees. The verifier independently checks attribution,
@@ -162,7 +165,13 @@ Request:
 Show total worked hours during September 2026.
 ```
 
-General criteria remain natural language for the SQL planner.
+General criteria remain natural language for the SQL planner. A reference-model
+`missing_employee` decision without a written unresolved person is also converted to
+an all-authorized planner request. This prevents a department, group, criteria, Arabic,
+or indirect follow-up request from being rejected merely because no person was named.
+Written names that resolve to multiple authorized people still use confirmation before
+planning, and an employee inherited from state is never used after it leaves the
+caller's authorized directory.
 
 ## Physical database context
 
@@ -200,8 +209,12 @@ non-finite/malformed numeric comparisons are rejected before planning. An unknow
 standalone ID receives no candidate alternatives. Unresolved names can produce
 confirmation-only candidates after authorized-directory checks. Unsupported concepts,
 including non-attendance requests, use the planner's `unsupported_capability` SQL-result
-protocol and return an explicit unsupported outcome. Empty/malformed provider responses
-and planner Markdown fences fail safely.
+protocol and return an explicit unsupported outcome. Genuine business ambiguity uses
+the parallel `clarification_required` protocol and returns the planner's concise
+question without calling the answer writer or publishing a verified turn. Both control
+protocols accept only a single literal text expression with no table reference, so
+manual-swipe and other semantic guards do not block the safe control result.
+Empty/malformed provider responses and planner Markdown fences fail safely.
 The narrow date-predicate check uses SQL parsing; it does not provide general SQL
 authorization.
 
@@ -231,9 +244,9 @@ version resets safely.
 ## Verification record (2026-09-27)
 
 The current sanitized archive SHA-256 is
-`f04377f8bf8ec1884f845e591b64d4ee7cc8f6a31cb6fd42b7fe20e495ef8c3c`.
-The local deterministic suite passed **248 tests and 10 subtests** after the
-manual-swipe validation and context-bound fixes. The archive has a generated 311-line
+`6336d4d7a6f4a86ddce7916876b8d283c05f4948a928229f0b56b734cc2cbac5`.
+The local deterministic suite passed **250 tests and 10 subtests** after the
+planner-owned ambiguity and clarification-protocol fixes. The archive has a generated 311-line
 placeholder manifest, but excludes the private evaluation corpus and all credentials
 and attendance exports. The source [Colab notebook](colab/attendance_phase2_tests.ipynb)
 contains the current hash and is ready for a new Colab execution.

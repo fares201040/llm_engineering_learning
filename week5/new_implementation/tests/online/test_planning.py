@@ -176,6 +176,11 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertIn("which employees", reference_prompt)
         self.assertIn("never mark it as missing_employee", reference_prompt)
         self.assertIn("outside the attendance domain", reference_prompt)
+        self.assertIn("only return an ambiguous decision", reference_prompt)
+        self.assertIn("clarification_required", planner_prompt.casefold())
+        self.assertIn(
+            "do not use this protocol merely because", planner_prompt.casefold()
+        )
 
     def test_sql_planner_review_instruction_is_conditional_on_execution_failure(self):
         planner_prompt = " ".join(planner._SYSTEM.split()).casefold()

@@ -733,6 +733,75 @@ class PipelineTests(unittest.TestCase):
             outcome.state.verified_turns[-1].executed_sql,
         )
 
+    def test_missing_employee_general_scope_is_delegated_to_sql_planner(self):
+        dependencies = self.dependencies()
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=AmbiguousReference(
+                rewritten_request=(
+                    "list all employees in the hr department who have manual swipe access"
+                ),
+                locale="en",
+                reason="missing_employee",
+            )
+        )
+        planned_contexts = []
+        manual_swipe_sql = (
+            "SELECT employee_id, name, COUNT(*) AS manual_swipe_records, "
+            "COUNT(*) OVER() AS matched_count FROM attendance_records WHERE "
+            "department = 'HR' AND ((record_json ->> 'From_Date') "
+            "IS DISTINCT FROM (record_json ->> 'Actual_From_Date') OR "
+            "(record_json ->> 'From_Time') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_From_Time') OR "
+            "(record_json ->> 'To_Date') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_To_Date') OR "
+            "(record_json ->> 'To_Time') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_To_Time')) GROUP BY employee_id, name "
+            "ORDER BY employee_id LIMIT 100"
+        )
+
+        def planner(**kwargs):
+            planned_contexts.append(kwargs["shared_context"])
+            return manual_swipe_sql
+
+        dependencies.planner = planner
+        dependencies.executor = lambda *_args, **_kwargs: SqlExecutionResult(
+            columns=(),
+            rows=(
+                {
+                    "employee_id": "A1",
+                    "name": "Wail Ali",
+                    "manual_swipe_records": 1,
+                    "matched_count": 1,
+                },
+            ),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=95
+            ),
+        )
+        dependencies.answer_writer = lambda **_kwargs: (
+            "Wail Ali (A1) has one manual-swipe record in HR."
+        )
+
+        outcome = run_turn(
+            TurnRequest(
+                question="list all in hr department which has manual swipe",
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(len(planned_contexts), 1)
+        self.assertEqual(
+            planned_contexts[0].current_question,
+            "list all in hr department which has manual swipe",
+        )
+        self.assertIn(
+            "list all in hr department which has manual swipe",
+            planned_contexts[0].updated_request,
+        )
+        self.assertEqual(planned_contexts[0].subject_relationship, "all_authorized")
+
     def test_unknown_grouped_metric_is_typed_unsupported_calculation(self):
         dependencies = self.dependencies()
         dependencies.context_loader = lambda **_kwargs: attendance_schema()
@@ -1832,6 +1901,54 @@ class PipelineTests(unittest.TestCase):
 
         self.assertIsInstance(outcome, Unsupported)
         self.assertEqual(outcome.capability, "schema")
+
+    def test_planner_clarification_protocol_returns_explicit_clarification(self):
+        dependencies = self.dependencies()
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request="List HR employees with an unclear manual swipe meaning.",
+                locale="en",
+                request_relationship="new",
+                subject_relationship="all_authorized",
+            )
+        )
+        dependencies.planner = lambda **_kwargs: (
+            "SELECT 'Please clarify which attendance category you mean.'::text "
+            "AS clarification_required"
+        )
+        dependencies.executor = lambda *_args, **_kwargs: SqlExecutionResult(
+            columns=(),
+            rows=(
+                {
+                    "clarification_required": (
+                        "Please clarify which attendance category you mean."
+                    )
+                },
+            ),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=76
+            ),
+        )
+        dependencies.answer_writer = lambda **_kwargs: self.fail(
+            "planner clarification must not reach answer writing"
+        )
+
+        previous = ConversationState()
+        outcome = run_turn(
+            TurnRequest(
+                question="List HR employees with the unclear manual swipe category.",
+                state=previous,
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Clarification)
+        self.assertEqual(outcome.reason, "planner_clarification")
+        self.assertEqual(
+            outcome.reply, "Please clarify which attendance category you mean."
+        )
+        self.assertEqual(outcome.state, previous)
 
     def test_reference_unsupported_domain_stops_before_planning(self):
         dependencies = self.dependencies()

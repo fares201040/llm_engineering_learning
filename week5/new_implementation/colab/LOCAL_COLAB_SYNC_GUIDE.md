@@ -12,8 +12,8 @@ installed in Ubuntu 24.04 under WSL2 and ADC is already available there.
 ## Current handoff status (2026-09-27)
 
 - The current sanitized 48-file ZIP has SHA-256
-  `f04377f8bf8ec1884f845e591b64d4ee7cc8f6a31cb6fd42b7fe20e495ef8c3c`.
-  The local deterministic suite passed 248 tests and 10 subtests. The source notebook
+  `6336d4d7a6f4a86ddce7916876b8d283c05f4948a928229f0b56b734cc2cbac5`.
+  The local deterministic suite passed 250 tests and 10 subtests. The source notebook
   contains this hash and is ready for a new Colab execution.
 - The executed A100 notebook remains evidence for the preceding archive
   `c77544ccf51f9805267dd568b03c5a4478f9eb0a1beeab238895dc4afd7b36c1`.
@@ -22,6 +22,11 @@ installed in Ubuntu 24.04 under WSL2 and ADC is already available there.
 - The authorized private evaluator completed all 311 cases on the same runtime and
   evaluator fingerprints with zero failures. The separate 25-case regression replay,
   including its employee-confirmation follow-up, also completed with no failures.
+- The current source moves business and scope ambiguity to the SQL planner. Only an
+  unresolved written employee identity remains in the pre-planner confirmation flow;
+  the planner can return a safe `clarification_required` control row in parallel with
+  `unsupported_capability`. The current archive and deterministic count include these
+  changes.
 - On that preceding snapshot, the A100 rerun passed cases 100–149 (50/50), the 25 recently fixed cases
   with their confirmation turns (25/25), and cases 150–199 (50/50). The exact manual-
   swipe diagnostic used one planner attempt and rendered all 65 returned employees.

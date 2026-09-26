@@ -117,6 +117,14 @@ not automatic identity matches. If no PostgreSQL candidates appear, the runtime 
 query the configured Chroma collection and show up to five choices. All choices are
 restricted to the caller's employee scope,
 cross-checked against PostgreSQL, and never trusted until the user confirms one. The
+reference stage reserves ambiguity for unresolved written employee identities. A
+department, group, criteria, or all-authorized request continues to the SQL planner
+even when the reference model incorrectly reports `missing_employee`. If the schema
+and verified context cannot resolve the request's business meaning, the planner emits
+a one-row `clarification_required` result; the runtime returns that question without
+calling the answer model. The existing `unsupported_capability` result remains the
+parallel protocol for concepts the supplied schema cannot represent.
+
 The default embedding provider is local Hugging Face with
 `EMBEDDING_MODEL=all-MiniLM-L6-v2` (384 dimensions). To select OpenAI, set
 `EMBEDDING_PROVIDER=openai` and `EMBEDDING_MODEL=text-embedding-3-large` (or omit

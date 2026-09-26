@@ -331,7 +331,7 @@ class DatabaseContextTests(unittest.TestCase):
 
         self.assertEqual(captured["reasoning_effort"], "none")
         self.assertEqual(captured["temperature"], 0)
-        self.assertEqual(captured["num_ctx"], 8192)
+        self.assertEqual(captured["num_ctx"], 65536)
 
     def test_ollama_structured_provider_disables_reasoning(self):
         captured = {}

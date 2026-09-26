@@ -96,14 +96,15 @@ LLM_ANSWER_MODEL=ollama_chat/qwen3.5:4b
 LLM_PLANNER_MAX_OUTPUT_TOKENS=512
 ```
 
-For these local Ollama calls, the provider sets `reasoning_effort="none"`,
-`temperature=0`, and `num_ctx=8192`. The answer model is used for separate writer and
-verifier calls. The maximum provider-call budget is eight. Keep
+For these local Ollama calls, the provider sets `reasoning_effort="none"` and
+`temperature=0`. The SQL planner uses `num_ctx=65536`; reference, writer, and verifier
+calls use `num_ctx=8192`. The answer model is used for separate writer and verifier
+calls. The maximum provider-call budget is eight. Keep
 `POSTGRES_READONLY_DSN` configured independently from the ingestion writer DSN.
 
-The SQL planner receives the complete typed column catalog and descriptions plus a
-request-specific projection of JSON-only fields. JSON fallbacks duplicated by typed
-columns are omitted. The answer writer and verifier receive the current question,
+The SQL planner receives the complete typed column catalog and descriptions plus all
+58 described `record_json` fields on every planner request. Typed relational columns
+remain preferred over equivalent JSON fallbacks. The answer writer and verifier receive the current question,
 history, trusted context, date-coverage summary, executed SQL, result, and authoritative
 employees, but not the schema.
 

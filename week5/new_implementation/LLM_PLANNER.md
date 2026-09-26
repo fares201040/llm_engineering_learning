@@ -13,7 +13,7 @@ per turn, with at most two eligible retries after PostgreSQL programming or data
 | `rebuild_chroma.py` | Rebuild a selected model's Chroma document collection while retaining the source for a later switch |
 | `online/reference.py` | Complete request rewrite, typed employee references, authorized exact/fuzzy/Chroma-confirmed resolution |
 | `online/context.py` | Immutable allowlisted physical PostgreSQL metadata and shared context with question/history |
-| `online/planner.py` | Request-specific schema projection, SQL-only prompt, and raw text response |
+| `online/planner.py` | Complete schema payload, SQL-only prompt, and raw text response |
 | `online/comparison.py` | Schema-checked relative-month comparison of a previous verified grouped aggregate |
 | `online/execution.py` | Access check, ID/name directory lookup, bounded read-only direct SQL execution |
 | `online/answering.py` | Same-model answer writing and independent verification |
@@ -29,8 +29,9 @@ query, witness query, narrative query route, shadow/canary path, or old state ad
 
 For the current Phase 2 local configuration, the three roles use
 `ollama_chat/qwen3.5:4b`. The provider sends local calls with
-`reasoning_effort="none"`, `temperature=0`, and `num_ctx=8192`. Set
-`LLM_PLANNER_MAX_OUTPUT_TOKENS=512` for the planner.
+`reasoning_effort="none"` and `temperature=0`. The SQL planner uses
+`num_ctx=65536`; reference and answer stages use `num_ctx=8192`. Set
+`LLM_PLANNER_MAX_OUTPUT_TOKENS=512` for planner output.
 
 There are exactly three configured roles:
 
@@ -39,14 +40,16 @@ There are exactly three configured roles:
    rewritten request plus typed IDs, names, paired identity claims, general employee
    criteria, request relationship, subject union/intersection relationship, and locale.
    Its prompt preserves dates, comparisons, grouping, requested output, and follow-up
-   intent. It receives no database schema or SQL vocabulary.
-2. The SQL planner receives a request-specific payload derived from the immutable
+   intent. It receives no database schema or SQL vocabulary and cannot classify a
+   request as unsupported. It may flag an unresolved employee reference as ambiguous
+   for the application's confirmation flow.
+2. The SQL planner receives a payload derived from the immutable
    `SharedModelContext` and returns plain SQL.
    Its prompt explains what query to produce, how to map every business term to exact
    supplied physical identifiers, and why physical schema alignment is its
    responsibility. Before generating SQL it must study each candidate column's exact
    name, type, nullability, authored description, and standard values. It must
-   also inspect the supplied request-relevant `json_fields` entries and use each
+   also inspect every supplied `json_fields` entry and use each
    exact SQL expression and normalized type. It must preserve authoritative employee
    IDs and return no JSON, Markdown, explanation, or mapping. Joins, nested queries,
    aggregates, and CTEs are permitted. The initial request has no extra SQL-review
@@ -69,17 +72,15 @@ stage so the full attendance schema is sent only to the SQL planner:
 3. untrusted conversation history;
 4. labelled trusted context;
 5. database type;
-6. for the planner only, projected allowlisted attendance schema/tables; and
+6. for the planner only, the complete allowlisted attendance schema/tables; and
 7. an explicit statement that rewriting and employee resolution are complete.
 
-The planner projection always keeps every typed relational column and its description.
-It omits table date-coverage metadata so the planner cannot turn observed availability
-into a permanent SQL filter. The writer and verifier still receive coverage bounds.
-It removes JSON fallback entries duplicated by typed columns and retains only
-request-relevant JSON-only fields (or the JSON-only catalog when the request explicitly
-asks for it). The verified case 17 planner payload was 63.2% smaller after projection.
-The schema is normally sent once per question and is sent again only after an eligible
-SQL retry.
+The planner receives every typed relational column and all 58 described
+`record_json.json_fields` entries, including exact SQL expressions, normalized types,
+descriptions, and standard values. Typed relational columns remain preferred when they
+represent the same concept. The schema is included once in each planner request and is
+sent again only when a planner retry is required; it is never duplicated within one
+request.
 
 A narrow, generic grouped-aggregate follow-up is planned from the previous verified
 SQL without another model rewrite. The prior query must be a single grouped SUM/COUNT
@@ -88,12 +89,6 @@ scope. The comparison keeps the prior query as the eligibility CTE and calculate
 the previous and current calendar-month values from PostgreSQL rows. Its deterministic
 answer checks each group, numeric difference, result count, and available date range.
 Requests outside that supported shape use the normal model path.
-
-When the reference model labels an independent aggregate request as outside the
-attendance domain, the runtime checks its terms against authorized table and column
-names. A request with only grounded schema concepts proceeds
-to SQL planning; unknown concepts and relative follow-ups retain the unsupported
-decision. The SQL planner remains responsible for the exact SQL.
 
 For follow-ups, the model sees the latest verified turn and the previous user question.
 The current follow-up change and previous verified SQL are made explicit in the
@@ -182,7 +177,7 @@ A PostgreSQL `ProgrammingError`, `DataError`, or an unrequested date filter trig
 at most two planner retries after the initial query: no more than three planning
 attempts. Each retry receives
 the failed SQL, error type, database error text capped at 4,000 characters, retry
-number, and the same `SharedModelContext` with the same projected schema. Connection,
+number, and the same `SharedModelContext` with the same complete schema. Connection,
 timeout, result-bound, authorization, provider, and answer failures do not trigger SQL
 repair. A third eligible rejection fails safely without publishing conversation
 state. The maximum provider-call budget remains 8; a third planner call consumes one
@@ -191,10 +186,10 @@ of the calls otherwise available for answer writing or verification.
 Malformed employee identifier shapes and recognized impossible dates or
 non-finite/malformed numeric comparisons are rejected before planning. An unknown
 standalone ID receives no candidate alternatives. Unresolved names can produce
-confirmation-only candidates after authorized-directory checks. Unsupported
-non-attendance requests stop before SQL; unsupported schema concepts use the
-`unsupported_capability` SQL-result protocol and return an explicit unsupported
-outcome. Empty/malformed provider responses and planner Markdown fences fail safely.
+confirmation-only candidates after authorized-directory checks. Unsupported concepts,
+including non-attendance requests, use the planner's `unsupported_capability` SQL-result
+protocol and return an explicit unsupported outcome. Empty/malformed provider responses
+and planner Markdown fences fail safely.
 The narrow date-predicate check uses SQL parsing; it does not provide general SQL
 authorization.
 

@@ -172,12 +172,12 @@ def _content(response: object, stage: str) -> str:
     )
 
 
-def _local_model_options(model: str) -> dict[str, object]:
+def _local_model_options(model: str, stage: str) -> dict[str, object]:
     if model.startswith(("ollama/", "ollama_chat/")):
         return {
             "reasoning_effort": "none",
             "temperature": 0,
-            "num_ctx": 8192,
+            "num_ctx": 65536 if stage == "sql_planner" else 8192,
         }
     return {}
 
@@ -225,7 +225,7 @@ def call_structured(
             timeout=timeout,
             num_retries=0,
             max_tokens=max_output_tokens,
-            **_local_model_options(model),
+            **_local_model_options(model, stage),
         )
         parsed = response_model.model_validate_json(
             _content(response, stage), strict=True
@@ -281,7 +281,7 @@ def call_text(
             timeout=timeout,
             num_retries=0,
             max_tokens=max_output_tokens,
-            **_local_model_options(model),
+            **_local_model_options(model, stage),
         )
         content = _content(response, stage).strip()
     except ProviderFailure as exc:

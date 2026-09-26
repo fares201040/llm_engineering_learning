@@ -212,6 +212,73 @@ class PipelineTests(unittest.TestCase):
             "COUNT(*) OVER() AS matched_count.",
         )
 
+    def test_manual_swipe_retries_incomplete_comparison_before_execution(self):
+        dependencies = self.dependencies()
+        attempts = []
+        executed = []
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request="List employees who have a manual swipe.",
+                locale="en",
+                request_relationship="new",
+                subject_relationship="all_authorized",
+            )
+        )
+
+        incomplete_sql = (
+            "SELECT employee_id, name FROM attendance_records WHERE "
+            "(record_json ->> 'From_Time') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_From_Time')"
+        )
+        complete_sql = (
+            "SELECT employee_id, name, COUNT(*) AS manual_swipe_records, "
+            "COUNT(*) OVER() AS matched_count FROM attendance_records WHERE "
+            "(record_json ->> 'From_Date') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_From_Date') OR "
+            "(record_json ->> 'From_Time') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_From_Time') OR "
+            "(record_json ->> 'To_Date') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_To_Date') OR "
+            "(record_json ->> 'To_Time') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_To_Time') "
+            "GROUP BY employee_id, name ORDER BY employee_id LIMIT 100"
+        )
+
+        def planner_call(**kwargs):
+            attempts.append(kwargs)
+            return incomplete_sql if len(attempts) == 1 else complete_sql
+
+        dependencies.planner = planner_call
+        dependencies.executor = lambda sql, **_kwargs: (
+            executed.append(sql)
+            or SqlExecutionResult(
+                columns=(),
+                rows=({"employee_id": "A1", "name": "Wail Ali"},),
+                coverage=ExecutionCoverage(
+                    fetched_rows=1, result_limit=100, response_bytes=45
+                ),
+            )
+        )
+        dependencies.answer_writer = lambda **_kwargs: "Wail Ali has manual swipes."
+
+        outcome = run_turn(
+            TurnRequest(
+                question="list the employees who has manual swipe",
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual(executed, [complete_sql])
+        self.assertEqual(
+            attempts[1]["sql_execution_failure"]["error_type"], "sql_semantics"
+        )
+        self.assertIn(
+            "all four", attempts[1]["sql_execution_failure"]["database_error"]
+        )
+
     def test_over_dates_is_not_a_malformed_numeric_comparison(self):
         self.assertIsNone(_request_value_issue("Show a running total over dates."))
         self.assertIsNone(
@@ -1024,6 +1091,32 @@ class PipelineTests(unittest.TestCase):
                 "WHERE exception = 'Absent' AND day_type = 'Working Day'",
             ),
             "wrong_absence_semantics",
+        )
+
+    def test_manual_swipe_requires_all_four_null_safe_device_comparisons(self):
+        incomplete_sql = (
+            "SELECT employee_id, name FROM attendance_records WHERE "
+            "(record_json ->> 'From_Time') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_From_Time')"
+        )
+        complete_sql = (
+            "SELECT employee_id, name FROM attendance_records WHERE "
+            "(record_json ->> 'From_Date') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_From_Date') OR "
+            "(record_json ->> 'From_Time') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_From_Time') OR "
+            "(record_json ->> 'To_Date') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_To_Date') OR "
+            "(record_json ->> 'To_Time') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_To_Time')"
+        )
+
+        self.assertEqual(
+            _sql_semantic_issue("list employees who has manual swipe", incomplete_sql),
+            "incomplete_manual_swipe_comparison",
+        )
+        self.assertIsNone(
+            _sql_semantic_issue("list employees who has manual swipe", complete_sql)
         )
 
     def test_sql_date_scope_normalizes_inclusive_and_exclusive_bounds(self):

@@ -4,7 +4,7 @@
 
 **Goal:** Move schema/domain judgment to the SQL planner, give it the complete schema at 64K context, and make manual-swipe questions reliably produce the correct SQL.
 
-**Architecture:** Keep the reference boundary focused on request rewriting and employee identity extraction without schema input or an unsupported veto. Serialize the complete shared database context for the planner, preserve typed-column preference in its prompt, and enforce the four-pair manual-swipe meaning at the SQL semantic boundary.
+**Architecture:** Keep the reference boundary focused on request rewriting and employee identity extraction without schema input or an unsupported veto. It may flag an unresolved employee reference for the existing confirmation flow. Serialize the complete shared database context for the planner, preserve typed-column preference in its prompt, and enforce the four-pair manual-swipe meaning at the SQL semantic boundary.
 
 **Tech Stack:** Python 3.12, Pydantic, LiteLLM/Ollama, PostgreSQL, unittest, Colab A100
 
@@ -90,4 +90,3 @@
 - [ ] Run the exact manual-swipe conversation on Colab A100, including any confirmation turn, and record generated SQL attempts.
 - [ ] Run evaluator cases 100-149 on Colab A100; investigate failures by root cause and add RED-to-GREEN regression tests before fixes.
 - [ ] Re-run affected cases and the full local unit suite, review the system prompts for responsibility consistency, then commit all scoped files.
-

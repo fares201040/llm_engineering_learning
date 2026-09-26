@@ -1,6 +1,6 @@
 # Planner Schema Responsibilities
 
-The reference model rewrites the complete request, preserves multi-part and follow-up meaning, and extracts explicit employee identities. It does not receive database schema and cannot reject a request as unsupported.
+The reference model rewrites the complete request, preserves multi-part and follow-up meaning, and extracts explicit employee identities. It does not receive database schema and cannot reject a request as unsupported. It may identify an ambiguous employee reference so the application can resolve or confirm it.
 
 The application resolves employee IDs and names, including confirmation flows, and appends authoritative identities to the rewritten request. General criteria may describe any number of employees and do not require a named employee.
 

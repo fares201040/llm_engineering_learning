@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import re
-
 from .context import SharedModelContext
 from .provider import CallBudget, ProviderFailure, TurnObserver, call_text
 
@@ -49,7 +47,7 @@ CONSTRUCTION ORDER
    define absence; do not add schedule or worked-hours conditions unless the user
    explicitly asks for those extra filters. If attendance_meaning is not_absent,
    use exception IS DISTINCT FROM 'Absent' and do not copy a prior absence predicate.
-2. Before writing SQL, carefully read the complete database schema projection supplied
+2. Before writing SQL, carefully read the complete database schema supplied
    for this request. For each candidate column, use its exact name, PostgreSQL data
    type, nullability, description, and standard stored values. The description is
    authoritative; do not choose by name alone. Use only supplied tables, columns,
@@ -104,6 +102,11 @@ MANDATORY ATTENDANCE MEANINGS
 - "zero worked hours", "no positive worked hours", or "not worked":
   COALESCE(total_worked_hrs, 0) <= 0. Do not add a schedule condition.
 - "off day": day_type IN ('OFF Day', 'OFF Day (ZAS)'). Do not add worked-hours logic.
+- "manual swipe", a manually modified swipe, an adjusted swipe, or a clerk-entered
+  swipe means a payroll-effective From_Date, From_Time, To_Date, or To_Time differs
+  from its corresponding immutable device Actual_From_Date, Actual_From_Time,
+  Actual_To_Date, or Actual_To_Time. Compare all four corresponding pairs with
+  IS DISTINCT FROM and join the four comparisons with OR so NULL differences count.
 - A schedule column or workflow status is not evidence that work occurred.
 Use exactly the predicate for the requested meaning. Do not combine plausible schedule,
 workflow, exception, leave, holiday, or worked-hours predicates into a stricter meaning.
@@ -164,116 +167,6 @@ No prose, no label, no Markdown, no JSON, and no SQL comments.
 """
 
 
-_JSON_TYPED_EQUIVALENTS = {
-    "Country",
-    "Date",
-    "Day",
-    "Day_Type",
-    "Department",
-    "Early_Out_Hrs",
-    "Employee_ID",
-    "Exception",
-    "Grade",
-    "Gradeset",
-    "Holiday_Type",
-    "Job",
-    "Lateness_Hrs",
-    "Leave_Hrs",
-    "Leave_Type",
-    "Name",
-    "OT_Authorized",
-    "OT_Not_Authorized",
-    "Organization_Unit",
-    "Overbreak_Hrs",
-    "Position",
-    "Post_OT_hrs",
-    "Regular_Units",
-    "Shift",
-    "Status",
-    "Total_OT",
-    "Total_Worked_Hrs",
-    "Work_Location",
-    "last_Updated_date",
-    "pre_ot_hrs",
-}
-_JSON_FIELD_GROUPS = {
-    "actual_swipes": {
-        "Actual_From_Date",
-        "Actual_From_Time",
-        "Actual_To_Date",
-        "Actual_To_Time",
-    },
-    "employee_remarks": {"Employee_Remarks"},
-    "payroll_swipes": {"From_Date", "From_Time", "To_Date", "To_Time"},
-    "overtime_categories": {
-        *(f"OT_Type_{index}" for index in range(1, 6)),
-        *(f"OT_Value_{index}" for index in range(1, 6)),
-    },
-    "pending_owner": {"Pending_with"},
-    "overtime_boundaries": {
-        "Post_OT_End_Time",
-        "Post_OT_Start_Time",
-        "Pre_OT_End_Time",
-        "Pre_OT_Start_Time",
-    },
-    "schedule_boundaries": {
-        "Schedule_From_Date",
-        "Schedule_From_Time",
-        "Schedule_To_Date",
-        "Schedule_To_Time",
-    },
-}
-
-
-def _requested_json_fields(question: str) -> set[str] | None:
-    """Return relevant JSON-only fields, or None for an explicit full catalog."""
-
-    folded = question.casefold()
-    words = folded.replace("_", " ")
-    if re.search(
-        r"\b(?:record json|raw json|all (?:raw |source )?fields|source field catalog)\b",
-        words,
-    ):
-        return None
-
-    selected: set[str] = set()
-    json_only = set().union(*_JSON_FIELD_GROUPS.values())
-    for field in json_only:
-        if field.casefold() in folded or field.casefold().replace("_", " ") in words:
-            selected.add(field)
-
-    triggers = {
-        "actual_swipes": (
-            r"\b(?:actual|device|raw)\s+(?:(?:first|last)\s+)?"
-            r"(?:swipe|clock|check[ -]?(?:in|out))\b|\bswipe device\b"
-        ),
-        "employee_remarks": r"\b(?:employee\s+)?remarks?\b",
-        "payroll_swipes": (
-            r"\bpayroll[ -]effective\b.{0,40}\b"
-            r"(?:start|end|from|to|swipe|clock|time|date)\b|"
-            r"\b(?:adjusted|clerk[ -]adjusted)\s+"
-            r"(?:swipe|clock|start|end|time|date)\b"
-        ),
-        "overtime_categories": (
-            r"\b(?:overtime|ot)\s+(?:type|types|category|categories|rate|rates|"
-            r"breakdown|value|values)\b"
-        ),
-        "pending_owner": r"\bpending\s+(?:with|owner|approver)\b|\bcurrent approver\b",
-        "overtime_boundaries": (
-            r"\b(?:pre|post)[ -]?(?:shift[ -]?)?(?:overtime|ot)\s+"
-            r"(?:start|end|date|time)\b"
-        ),
-        "schedule_boundaries": (
-            r"\b(?:scheduled|schedule)\b.{0,40}\b(?:start|end|from|to)\b"
-            r".{0,20}\b(?:date|time)\b"
-        ),
-    }
-    for group, pattern in triggers.items():
-        if re.search(pattern, words):
-            selected.update(_JSON_FIELD_GROUPS[group])
-    return selected
-
-
 def _planning_payload(shared_context: SharedModelContext) -> dict[str, object]:
     payload = shared_context.model_payload()
     trusted = payload.get("trusted_context")
@@ -294,47 +187,6 @@ def _planning_payload(shared_context: SharedModelContext) -> dict[str, object]:
                 if isinstance(turn, dict)
             ],
         }
-    request_text = (
-        f"{shared_context.current_question}\n{shared_context.updated_request}"
-    )
-    selected = _requested_json_fields(request_text)
-    folded_request = request_text.casefold()
-    words = folded_request.replace("_", " ")
-    database = payload["database_context"]
-    if not isinstance(database, dict):
-        return payload
-    for table in database.get("tables", []):
-        if not isinstance(table, dict):
-            continue
-        table.pop("date_coverage", None)
-        for column in table.get("columns", []):
-            if not isinstance(column, dict) or column.get("name") != "record_json":
-                continue
-            fields = column.get("json_fields", [])
-            if not isinstance(fields, list):
-                continue
-            column["json_fields"] = [
-                field
-                for field in fields
-                if isinstance(field, dict)
-                and field.get("name") not in _JSON_TYPED_EQUIVALENTS
-                and (
-                    selected is None
-                    or (
-                        isinstance(field.get("name"), str)
-                        and (
-                            field["name"] in selected
-                            or field["name"].casefold() in folded_request
-                            or field["name"].casefold().replace("_", " ") in words
-                        )
-                    )
-                )
-            ]
-    payload["schema_projection"] = (
-        "All typed columns and descriptions are complete. record_json.json_fields "
-        "contains only request-relevant JSON-only fields; omitted JSON entries are "
-        "typed-column duplicates or unrelated to this request."
-    )
     return payload
 
 

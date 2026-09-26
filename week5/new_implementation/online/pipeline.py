@@ -235,6 +235,23 @@ def _sql_semantic_issue(question: str, sql: str) -> str | None:
         and not re.search(r"\brecord_id\b", select_list, re.IGNORECASE)
     ):
         return "detail_request_requires_rows"
+    manual_swipe = re.search(
+        r"\b(?:manual(?:ly)?|modified|adjusted|clerk[ -]entered|clerk[ -]adjusted)\b",
+        folded,
+    ) and re.search(r"\b(?:swipe|clock|check[ -]?(?:in|out))s?\b", folded)
+    if manual_swipe:
+        for effective, actual in (
+            ("From_Date", "Actual_From_Date"),
+            ("From_Time", "Actual_From_Time"),
+            ("To_Date", "Actual_To_Date"),
+            ("To_Time", "Actual_To_Time"),
+        ):
+            forward = rf"'{effective}'.{{0,160}}\bIS\s+DISTINCT\s+FROM\b.{{0,160}}'{actual}'"
+            reverse = rf"'{actual}'.{{0,160}}\bIS\s+DISTINCT\s+FROM\b.{{0,160}}'{effective}'"
+            if not re.search(forward, sql, re.IGNORECASE | re.DOTALL) and not re.search(
+                reverse, sql, re.IGNORECASE | re.DOTALL
+            ):
+                return "incomplete_manual_swipe_comparison"
     meaning = _attendance_meaning(question)
     if meaning == "not_absent" and not re.search(
         r"\bexception\s+IS\s+DISTINCT\s+FROM\s+'Absent'", sql, flags=re.IGNORECASE
@@ -1660,7 +1677,10 @@ def run_turn(
                 )
                 continue
             semantic_issue = _sql_semantic_issue(question, sql)
-            if semantic_issue == "detail_request_requires_rows":
+            if semantic_issue in {
+                "detail_request_requires_rows",
+                "incomplete_manual_swipe_comparison",
+            }:
                 if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
                     raise ProviderFailure(
                         "sql_semantics", semantic_issue, semantic_issue
@@ -1671,6 +1691,13 @@ def run_turn(
                         "The user requested attendance detail rows, but this SQL "
                         "returns only an aggregate. Return bounded matching rows with "
                         "record_id and COUNT(*) OVER() AS matched_count."
+                    )
+                elif semantic_issue == "incomplete_manual_swipe_comparison":
+                    database_error = (
+                        "Manual swipe detection must compare all four payroll-effective "
+                        "From_Date, From_Time, To_Date, and To_Time values with their "
+                        "corresponding Actual_* device values using IS DISTINCT FROM, "
+                        "joining all four comparisons with OR."
                     )
                 sql_execution_failure = {
                     "retry_number": attempt,

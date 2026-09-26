@@ -5,7 +5,7 @@ import inspect
 import unittest
 from unittest.mock import patch
 
-from week5.new_implementation.online import answering, planner, reference
+from week5.new_implementation.online import answering, context, planner, reference
 from week5.new_implementation.online.answering import (
     AnswerDraft,
     VerdictPass,
@@ -223,10 +223,8 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertNotIn("database_schema", payload)
 
     def test_reference_response_schema_omits_unsupported_classification(self):
-        self.assertNotIn(
-            "outside_attendance_domain",
-            json.dumps(ReferenceResponse.model_json_schema()),
-        )
+        schema = json.dumps(ReferenceResponse.model_json_schema())
+        self.assertNotIn("outside_attendance_domain", schema)
 
     def test_exact_multiple_employees_attach_one_stable_authoritative_block(self):
         bound = bind_references(
@@ -1092,16 +1090,11 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         payload = call.call_args.kwargs["payload"]
         self.assertEqual(payload["current_question"], shared.current_question)
         expected_database = shared.model_payload()["database_context"]
-        for table in expected_database["tables"]:
-            table.pop("date_coverage", None)
         self.assertEqual(payload["database_context"], expected_database)
-        self.assertIn(
-            "date_coverage", shared.model_payload()["database_context"]["tables"][0]
-        )
-        self.assertIn("schema_projection", payload)
+        self.assertNotIn("schema_projection", payload)
 
     @patch("week5.new_implementation.online.planner.call_text")
-    def test_sql_planner_projects_json_fallbacks_to_requested_unique_fields(self, call):
+    def test_sql_planner_receives_every_described_json_field(self, call):
         call.return_value = "SELECT 1"
         shared = SharedModelContext(
             current_question="Show the actual device swipe time for A1.",
@@ -1170,11 +1163,11 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertIn("attendance_date", columns)
         self.assertEqual(
             [field["name"] for field in columns["record_json"]["json_fields"]],
-            ["Actual_From_Time"],
+            ["Date", "Actual_From_Time", "Employee_Remarks"],
         )
 
     @patch("week5.new_implementation.online.planner.call_text")
-    def test_sql_planner_omits_unrequested_json_fallback_catalog(self, call):
+    def test_sql_planner_keeps_json_fields_for_unrelated_wording(self, call):
         call.return_value = "SELECT 1"
         shared = SharedModelContext(
             current_question="Count A1's scheduled work dates.",
@@ -1228,7 +1221,53 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         record_json = next(
             column for column in table["columns"] if column["name"] == "record_json"
         )
-        self.assertEqual(record_json["json_fields"], [])
+        self.assertEqual(
+            [field["name"] for field in record_json["json_fields"]],
+            ["Schedule_From_Time"],
+        )
+
+    @patch("week5.new_implementation.online.planner.call_text")
+    def test_sql_planner_receives_all_58_record_json_fields(self, call):
+        call.return_value = "SELECT 1"
+        shared = SharedModelContext(
+            current_question="List employees with manual swipes.",
+            updated_request="Request:\nList employees with manual swipes.",
+            database_context=DatabaseContext(
+                server_version="17.2",
+                tables=(
+                    DatabaseTable(
+                        schema_name="public",
+                        table_name="attendance_records",
+                        object_type="BASE TABLE",
+                        description="Authoritative attendance records.",
+                        columns=(
+                            DatabaseColumn(
+                                name="record_json",
+                                data_type="jsonb",
+                                nullable=False,
+                                description="Normalized source record.",
+                                json_fields=context._record_json_fields(),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        planner.request_sql(
+            shared_context=shared,
+            model="planner-model",
+            budget=CallBudget(),
+            timeout=1,
+            max_output_tokens=100,
+        )
+
+        fields = call.call_args.kwargs["payload"]["database_context"]["tables"][0][
+            "columns"
+        ][0]["json_fields"]
+        self.assertEqual(len(fields), 58)
+        self.assertEqual(fields[0]["name"], "Actual_From_Date")
+        self.assertEqual(fields[-1]["name"], "pre_ot_hrs")
 
     @patch("week5.new_implementation.online.planner.call_text")
     def test_sql_planner_forwards_execution_failure_only_on_retry(self, call):

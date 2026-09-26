@@ -118,7 +118,10 @@ class EvaluatorTests(unittest.TestCase):
                     )
             original = json.loads(output.read_text(encoding="utf-8"))
             variants = (
-                {**original, "fingerprints": {**original["fingerprints"], "cases": "bad"}},
+                {
+                    **original,
+                    "fingerprints": {**original["fingerprints"], "cases": "bad"},
+                },
                 {**original, "selected_indices": [1, 0]},
             )
             for variant in variants:
@@ -139,6 +142,58 @@ class EvaluatorTests(unittest.TestCase):
                                 ]
                             )
                         evaluate.assert_not_called()
+
+    def test_batch_size_checkpoints_a_prefix_without_marking_complete(self):
+        with TemporaryDirectory() as directory:
+            case_file = Path(directory) / "cases.jsonl"
+            output = Path(directory) / "report.json"
+            self._write_cases(case_file, count=3)
+            with patch(
+                "week5.new_evaluation.eval.evaluate_behavior",
+                return_value=BehaviorEval(),
+            ) as evaluate:
+                self.assertEqual(
+                    main(
+                        [
+                            "--all",
+                            "--test-file",
+                            str(case_file),
+                            "--output",
+                            str(output),
+                            "--batch-size",
+                            "2",
+                        ]
+                    ),
+                    0,
+                )
+                self.assertEqual(evaluate.call_count, 2)
+            partial = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(partial["status"], "running")
+            self.assertEqual(partial["completed"], 2)
+
+            with patch(
+                "week5.new_evaluation.eval.evaluate_behavior",
+                return_value=BehaviorEval(),
+            ) as evaluate:
+                self.assertEqual(
+                    main(
+                        [
+                            "--all",
+                            "--test-file",
+                            str(case_file),
+                            "--output",
+                            str(output),
+                            "--batch-size",
+                            "2",
+                            "--resume",
+                        ]
+                    ),
+                    0,
+                )
+                self.assertEqual(evaluate.call_count, 1)
+            complete = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(complete["status"], "complete")
+            self.assertEqual(complete["completed"], 3)
 
     def test_wrong_unsupported_capability_does_not_pass_as_schema(self):
         case = TestQuestion(

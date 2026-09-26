@@ -38,7 +38,9 @@ def export_attendance_jsonl(dsn: str) -> bytes:
     )
     with psycopg.connect(dsn) as connection:
         with connection.transaction():
-            connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            connection.execute(
+                "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+            )
             rows = connection.execute(query).fetchall()
     return "".join(f"{row[0]}\n" for row in rows).encode("utf-8")
 

@@ -15,6 +15,7 @@ from week5.new_implementation.colab.private_payload import (
     validate_case_bytes,
     validate_payload_archive,
 )
+from week5.new_implementation.colab.package_source import _source_archive_bytes
 
 
 def _case_bytes(*, placeholder: bool = False) -> bytes:
@@ -190,6 +191,25 @@ class PrivatePayloadTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "employee_count"):
                 validate_payload_archive(output)
+
+    def test_sanitized_source_includes_private_tools_but_not_private_inputs(self):
+        with ZipFile(BytesIO(_source_archive_bytes())) as archive:
+            names = set(archive.namelist())
+            cases = archive.read("week5/new_evaluation/tests.jsonl")
+
+        self.assertTrue(
+            {
+                "week5/new_implementation/colab/private_payload.py",
+                "week5/new_implementation/colab/prepare_private_runtime.py",
+                "week5/new_implementation/colab/run_private_eval.py",
+                "week5/new_implementation/colab/cleanup_private_runtime.py",
+                "week5/new_implementation/colab/test_private_runtime.py",
+            }.issubset(names)
+        )
+        self.assertEqual(
+            json.loads(cases.splitlines()[0])["category"], "synthetic_manifest"
+        )
+        self.assertFalse(any("results" in name.casefold() for name in names))
 
 
 if __name__ == "__main__":

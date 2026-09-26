@@ -11,9 +11,7 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 from week5.new_evaluation.test import TestQuestion
 
 
-DATASET_FINGERPRINT = (
-    "6860e7657deb91023d6f199c230edf9b7d40cd3e402a1ad23ccea39f3487dde9"
-)
+DATASET_FINGERPRINT = "6860e7657deb91023d6f199c230edf9b7d40cd3e402a1ad23ccea39f3487dde9"
 EXPECTED_FACTS = {
     "version": 1,
     "dataset_fingerprint": DATASET_FINGERPRINT,
@@ -134,9 +132,9 @@ def build_payload_archive(
         },
     }
     _validate_required_facts(manifest)
-    manifest_bytes = (
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n"
-    ).encode("utf-8")
+    manifest_bytes = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode(
+        "utf-8"
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     with ZipFile(path, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
         archive.writestr(_zip_info("attendance_records.jsonl"), attendance_bytes)
@@ -177,7 +175,9 @@ def validate_payload_archive(
         try:
             manifest = json.loads(archive.read("manifest.json"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError("private payload manifest is not valid UTF-8 JSON") from exc
+            raise ValueError(
+                "private payload manifest is not valid UTF-8 JSON"
+            ) from exc
     if not isinstance(manifest, dict):
         raise ValueError("private payload manifest must be a JSON object")
     files = manifest.get("files")

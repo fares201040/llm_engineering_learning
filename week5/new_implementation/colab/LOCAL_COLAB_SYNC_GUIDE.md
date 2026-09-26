@@ -276,9 +276,67 @@ is excluded from the archive; it is not evaluated in Colab.
 
 Never run multiple live turns as a batch. Stop after any failed turn. The other
 named Wail, Faris, and generic-subject scenarios need explicit factual oracles.
-The private 311-case corpus requires a separately reviewed data-transfer decision.
+The private 311-case corpus uses the separately approved bounded workflow below.
 
-## 9. Stop the runtime
+## 9. Run the authorized private 311-case evaluation
+
+Keep this payload separate from `attendance_phase2_source.zip`. The local exporter
+selects only `public.attendance_records`, reads the ignored private case JSONL, checks
+the fixed dataset oracle (3,964 rows, 568 employees, 2026-09-01 through 2026-09-07,
+311 cases, and the approved dataset fingerprint), and writes only three members under
+the ignored results directory. It never serializes a DSN or environment file.
+
+```powershell
+.\.venv\Scripts\python.exe -m week5.new_implementation.colab.export_private_payload
+Get-FileHash -Algorithm SHA256 .\week5\new_evaluation\results\attendance_private_payload.zip
+```
+
+Record the printed payload SHA-256 without opening or printing the private members.
+Upload source and private data as separate files:
+
+```powershell
+wsl.exe -d Ubuntu-24.04 -- /home/faris/.local/bin/colab --auth=adc upload --session attendance-phase2-3 /mnt/d/projects/llm_engineering_ed_donner/llm_engineering/week5/new_implementation/colab/attendance_phase2_source.zip /content/attendance_phase2_source.zip
+wsl.exe -d Ubuntu-24.04 -- /home/faris/.local/bin/colab --auth=adc upload --session attendance-phase2-3 /mnt/d/projects/llm_engineering_ed_donner/llm_engineering/week5/new_evaluation/results/attendance_private_payload.zip /content/attendance_private_payload.zip
+```
+
+Run the deterministic notebook first. On a newly created runtime, also run the
+Section 7 synthetic-runtime preparer to install/start PostgreSQL and Ollama and pull
+Qwen; the private importer replaces only the database/config used by its own runner.
+Then prepare the private database, passing the exact payload digest through the
+process environment (replace `<sha256>`):
+
+```powershell
+wsl.exe -d Ubuntu-24.04 -- /home/faris/.local/bin/colab --auth=adc exec --session attendance-phase2-3 --file /mnt/d/projects/llm_engineering_ed_donner/llm_engineering/week5/new_implementation/colab/prepare_private_runtime.py --env ATTENDANCE_PRIVATE_PAYLOAD_SHA256=<sha256> --timeout 1200
+```
+
+The helper validates the archive before database mutation, imports a fresh ephemeral
+database, and creates a generated role with only `CONNECT`, schema `USAGE`, and table
+`SELECT`. The DSN exists only in `/content/.attendance_private_runtime.json`, mode
+0600, and is never printed.
+
+Run one bounded batch at a time. The default is 10 cases; set a value from 1 to 50.
+Every completed case is checkpointed atomically, and later calls resume only when the
+corpus, runtime/evaluator fingerprints, and selected indices match.
+
+```powershell
+wsl.exe -d Ubuntu-24.04 -- /home/faris/.local/bin/colab --auth=adc exec --session attendance-phase2-3 --file /mnt/d/projects/llm_engineering_ed_donner/llm_engineering/week5/new_implementation/colab/run_private_eval.py --env PRIVATE_EVAL_BATCH_SIZE=10 --timeout 3600
+wsl.exe -d Ubuntu-24.04 -- /home/faris/.local/bin/colab --auth=adc download --session attendance-phase2-3 /content/attendance-private-eval.json /mnt/d/projects/llm_engineering_ed_donner/llm_engineering/week5/new_evaluation/results/attendance-private-eval.json
+```
+
+Inspect `status`, `completed`, and each native failed check before the next batch. A
+failed flag must be reproduced and classified before a generic schema/SQL/state fix.
+Do not upload a modified payload to continue an existing checkpoint.
+
+After downloading the final report, remove the private database, role, config,
+payload, extracted files, and remote report, then stop the runtime:
+
+```powershell
+wsl.exe -d Ubuntu-24.04 -- /home/faris/.local/bin/colab --auth=adc exec --session attendance-phase2-3 --file /mnt/d/projects/llm_engineering_ed_donner/llm_engineering/week5/new_implementation/colab/cleanup_private_runtime.py --timeout 600
+wsl.exe -d Ubuntu-24.04 -- /home/faris/.local/bin/colab --auth=adc stop --session attendance-phase2-3
+wsl.exe -d Ubuntu-24.04 -- /home/faris/.local/bin/colab --auth=adc sessions
+```
+
+## 10. Stop the runtime
 
 After the deterministic checks and any optional live turns are complete, release the
 accelerator:

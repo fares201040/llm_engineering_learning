@@ -708,9 +708,12 @@ def main(argv=None) -> int:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--test-file", type=Path)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--batch-size", type=int)
     args = parser.parse_args(argv)
     if args.resume and args.output is None:
         parser.error("--resume requires --output")
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error("--batch-size must be at least 1")
     case_path = args.test_file if args.test_file is not None else Path(TEST_FILE)
     case_bytes = case_path.read_bytes()
     cases = load_tests(test_file=args.test_file)
@@ -735,7 +738,13 @@ def main(argv=None) -> int:
         }
     if args.output and not args.resume:
         _write(args.output, report)
-    for case_index, case in selected[report["completed"] :]:
+    start = report["completed"]
+    stop = (
+        min(len(selected), start + args.batch_size)
+        if args.batch_size is not None
+        else len(selected)
+    )
+    for case_index, case in selected[start:stop]:
         result = evaluate_behavior(case)
         if not result.passed:
             report["failures"].append(
@@ -744,7 +753,9 @@ def main(argv=None) -> int:
         report["completed"] += 1
         if args.output:
             _write(args.output, report)
-    report["status"] = "complete"
+    report["status"] = (
+        "complete" if report["completed"] == report["tests"] else "running"
+    )
     if args.output:
         _write(args.output, report)
     print(json.dumps(report, indent=2))

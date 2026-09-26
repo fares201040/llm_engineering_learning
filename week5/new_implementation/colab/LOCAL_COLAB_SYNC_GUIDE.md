@@ -9,16 +9,20 @@ For the WSL, Google Cloud SDK, Colab CLI installation, and ADC login steps, see
 [`COLAB_CLI_GUIDE.md`](COLAB_CLI_GUIDE.md). The commands below assume those tools are
 installed in Ubuntu 24.04 under WSL2 and ADC is already available there.
 
-## Current handoff status (2026-09-26)
+## Current handoff status (2026-09-27)
 
-- The sanitized 48-file ZIP and executed notebook match SHA-256
+- The current sanitized 48-file ZIP has SHA-256
+  `f04377f8bf8ec1884f845e591b64d4ee7cc8f6a31cb6fd42b7fe20e495ef8c3c`.
+  The local deterministic suite passed 248 tests and 10 subtests. The source notebook
+  contains this hash and is ready for a new Colab execution.
+- The executed A100 notebook remains evidence for the preceding archive
   `c77544ccf51f9805267dd568b03c5a4478f9eb0a1beeab238895dc4afd7b36c1`.
-  The A100 notebook passed 245 deterministic tests, Ruff lint and formatting for 29
-  files, and Python compilation.
+  It passed 245 deterministic tests, Ruff lint and formatting for 29 files, and Python
+  compilation.
 - The authorized private evaluator completed all 311 cases on the same runtime and
   evaluator fingerprints with zero failures. The separate 25-case regression replay,
   including its employee-confirmation follow-up, also completed with no failures.
-- The current A100 rerun passed cases 100–149 (50/50), the 25 recently fixed cases
+- On that preceding snapshot, the A100 rerun passed cases 100–149 (50/50), the 25 recently fixed cases
   with their confirmation turns (25/25), and cases 150–199 (50/50). The exact manual-
   swipe diagnostic used one planner attempt and rendered all 65 returned employees.
 - The synthetic 16-row PostgreSQL fixture and Qwen 3.5 4B ran on T4. The UI long

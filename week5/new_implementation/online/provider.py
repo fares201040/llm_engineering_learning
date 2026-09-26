@@ -177,7 +177,11 @@ def _local_model_options(model: str, stage: str) -> dict[str, object]:
         return {
             "reasoning_effort": "none",
             "temperature": 0,
-            "num_ctx": 65536 if stage == "sql_planner" else 8192,
+            "num_ctx": (
+                65536
+                if stage in {"sql_planner", "answer_writer", "answer_verifier"}
+                else 8192
+            ),
         }
     return {}
 

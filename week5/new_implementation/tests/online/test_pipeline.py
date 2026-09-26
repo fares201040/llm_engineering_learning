@@ -226,13 +226,15 @@ class PipelineTests(unittest.TestCase):
             "COUNT(*) OVER() AS matched_count.",
         )
 
-    def test_manual_swipe_retries_incomplete_comparison_before_execution(self):
+    def test_rewritten_manual_swipe_request_retries_before_execution(self):
         dependencies = self.dependencies()
         attempts = []
         executed = []
         dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
             decision=ReadyReference(
-                rewritten_request="List employees who have a manual swipe.",
+                rewritten_request=(
+                    "List employees who have a manual swipe from September."
+                ),
                 locale="en",
                 request_relationship="new",
                 subject_relationship="all_authorized",
@@ -277,7 +279,7 @@ class PipelineTests(unittest.TestCase):
 
         outcome = run_turn(
             TurnRequest(
-                question="list the employees who has manual swipe",
+                question="Only those from September.",
                 access_context=LOCAL_DEMO_ACCESS,
             ),
             dependencies=dependencies,
@@ -1053,7 +1055,9 @@ class PipelineTests(unittest.TestCase):
             context["verified_turns"][0]["original_question"],
             "Group hours by department.",
         )
-        self.assertEqual(context["verified_turns"][0]["executed_sql"], "SELECT 1")
+        self.assertNotIn("executed_sql", context["verified_turns"][0])
+        self.assertNotIn("answer", context["verified_turns"][0])
+        self.assertNotIn("result", context["verified_turns"][0])
 
     def test_question_language_controls_output_locale(self):
         self.assertEqual(_locale("كم يوم اشتغل A1؟"), "ar")
@@ -1131,6 +1135,58 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertIsNone(
             _sql_semantic_issue("list employees who has manual swipe", complete_sql)
+        )
+
+    def test_manual_swipe_requires_one_or_filter_for_all_four_comparisons(self):
+        comparisons = (
+            "(record_json ->> 'From_Date') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_From_Date')",
+            "(record_json ->> 'From_Time') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_From_Time')",
+            "(record_json ->> 'To_Date') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_To_Date')",
+            "(record_json ->> 'To_Time') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_To_Time')",
+        )
+        and_sql = "SELECT employee_id FROM attendance_records WHERE " + " AND ".join(
+            comparisons
+        )
+        selected_only_sql = (
+            "SELECT " + ", ".join(comparisons) + " FROM attendance_records"
+        )
+
+        self.assertEqual(
+            _sql_semantic_issue("List employees with manual swipes.", and_sql),
+            "incomplete_manual_swipe_comparison",
+        )
+        self.assertEqual(
+            _sql_semantic_issue(
+                "List employees with manual swipes.", selected_only_sql
+            ),
+            "incomplete_manual_swipe_comparison",
+        )
+
+    def test_manual_swipe_semantics_use_rewritten_and_arabic_requests(self):
+        incomplete_sql = (
+            "SELECT employee_id FROM attendance_records WHERE "
+            "(record_json ->> 'From_Time') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_From_Time')"
+        )
+
+        self.assertEqual(
+            _sql_semantic_issue(
+                "Only those from September.",
+                incomplete_sql,
+                rewritten_request=("List employees with manual swipes from September."),
+            ),
+            "incomplete_manual_swipe_comparison",
+        )
+        self.assertEqual(
+            _sql_semantic_issue(
+                "اعرض الموظفين الذين تم تعديل بصماتهم يدويا",
+                incomplete_sql,
+            ),
+            "incomplete_manual_swipe_comparison",
         )
 
     def test_sql_date_scope_normalizes_inclusive_and_exclusive_bounds(self):

@@ -366,6 +366,38 @@ class DatabaseContextTests(unittest.TestCase):
         self.assertEqual(captured["temperature"], 0)
         self.assertEqual(captured["num_ctx"], 8192)
 
+    def test_ollama_answer_stages_use_64k_context(self):
+        for stage in ("answer_writer", "answer_verifier"):
+            with self.subTest(stage=stage):
+                captured = {}
+
+                class Message:
+                    content = '{"value":"ok"}'
+
+                class Choice:
+                    message = Message()
+
+                class Response:
+                    choices = [Choice()]
+
+                def complete(**kwargs):
+                    captured.update(kwargs)
+                    return Response()
+
+                call_structured(
+                    stage=stage,
+                    model="ollama_chat/qwen3.5:2b",
+                    system="system",
+                    payload={"current_question": "test"},
+                    response_model=StructuredProbe,
+                    budget=CallBudget(limit=1),
+                    timeout=1,
+                    max_output_tokens=100,
+                    completion_fn=complete,
+                )
+
+                self.assertEqual(captured["num_ctx"], 65536)
+
     def test_layer_logger_emits_summary_and_exact_debug_output(self):
         with self.assertLogs(
             "week5.new_implementation.online.layers", level="DEBUG"

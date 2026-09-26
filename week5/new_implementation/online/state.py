@@ -82,13 +82,10 @@ class ConversationState(_Strict):
                     "turn_id": turn.turn_id,
                     "original_question": turn.original_question,
                     "rewritten_request": turn.rewritten_request,
-                    "executed_sql": turn.executed_sql,
-                    "answer": turn.answer,
                     "locale": turn.locale,
                     "employees": [
                         item.model_dump(mode="json") for item in turn.employees
                     ],
-                    "result": turn.result,
                     "date_scope": turn.date_scope,
                 }
                 for turn in self.verified_turns[-1:]

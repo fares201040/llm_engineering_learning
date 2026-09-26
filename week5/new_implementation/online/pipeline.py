@@ -211,7 +211,80 @@ def _attendance_meaning(
     return None
 
 
-def _sql_semantic_issue(question: str, sql: str) -> str | None:
+_MANUAL_SWIPE_PAIRS = frozenset(
+    {
+        frozenset({"From_Date", "Actual_From_Date"}),
+        frozenset({"From_Time", "Actual_From_Time"}),
+        frozenset({"To_Date", "Actual_To_Date"}),
+        frozenset({"To_Time", "Actual_To_Time"}),
+    }
+)
+
+
+def _manual_swipe_intent(*requests: str) -> bool:
+    text = "\n".join(requests)
+    folded = text.casefold()
+    english = re.search(
+        r"\b(?:manual(?:ly)?|modified|adjusted|edited|clerk[ -]entered|"
+        r"clerk[ -]adjusted)\b",
+        folded,
+    ) and re.search(r"\b(?:swipe|clock|punch|check[ -]?(?:in|out))s?\b", folded)
+    arabic = re.search(
+        r"(?:يدوي(?:ا|اً)?|معدل(?:ة|ه)?|تعديل|تعديلات|تغيير)", text
+    ) and re.search(r"(?:بصم|دخول|خروج|دوام)", text)
+    return bool(english or arabic)
+
+
+def _unwrap_parentheses(node: exp.Expression) -> exp.Expression:
+    while isinstance(node, exp.Paren):
+        node = node.this
+    return node
+
+
+def _flatten_or(node: exp.Expression) -> tuple[exp.Expression, ...]:
+    node = _unwrap_parentheses(node)
+    if isinstance(node, exp.Or):
+        return _flatten_or(node.this) + _flatten_or(node.expression)
+    return (node,)
+
+
+def _manual_swipe_pair(node: exp.Expression) -> frozenset[str] | None:
+    node = _unwrap_parentheses(node)
+    if not isinstance(node, exp.NullSafeNEQ):
+        return None
+    names = frozenset(
+        re.findall(
+            r"\b(?:Actual_)?(?:From|To)_(?:Date|Time)\b",
+            node.sql(dialect="postgres"),
+        )
+    )
+    return names if names in _MANUAL_SWIPE_PAIRS else None
+
+
+def _has_complete_manual_swipe_filter(sql: str) -> bool:
+    try:
+        statements = parse(sql, read="postgres")
+    except ParseError:
+        return False
+    for statement in statements:
+        for where in statement.find_all(exp.Where):
+            for candidate in where.this.walk():
+                if not isinstance(candidate, exp.Or):
+                    continue
+                leaves = _flatten_or(candidate)
+                pairs = tuple(_manual_swipe_pair(leaf) for leaf in leaves)
+                if (
+                    len(pairs) == 4
+                    and None not in pairs
+                    and frozenset(pairs) == _MANUAL_SWIPE_PAIRS
+                ):
+                    return True
+    return False
+
+
+def _sql_semantic_issue(
+    question: str, sql: str, *, rewritten_request: str = ""
+) -> str | None:
     folded = question.casefold()
     detail_noun = re.search(
         r"\b(?:attendance|details?|entries|records?|rows?)\b", folded
@@ -235,27 +308,10 @@ def _sql_semantic_issue(question: str, sql: str) -> str | None:
         and not re.search(r"\brecord_id\b", select_list, re.IGNORECASE)
     ):
         return "detail_request_requires_rows"
-    manual_swipe = re.search(
-        r"\b(?:manual(?:ly)?|modified|adjusted|clerk[ -]entered|clerk[ -]adjusted)\b",
-        folded,
-    ) and re.search(r"\b(?:swipe|clock|check[ -]?(?:in|out))s?\b", folded)
-    if manual_swipe:
-        for effective, actual in (
-            ("From_Date", "Actual_From_Date"),
-            ("From_Time", "Actual_From_Time"),
-            ("To_Date", "Actual_To_Date"),
-            ("To_Time", "Actual_To_Time"),
-        ):
-            forward = (
-                rf"'{effective}'.{{0,160}}\bIS\s+DISTINCT\s+FROM\b.{{0,160}}'{actual}'"
-            )
-            reverse = (
-                rf"'{actual}'.{{0,160}}\bIS\s+DISTINCT\s+FROM\b.{{0,160}}'{effective}'"
-            )
-            if not re.search(forward, sql, re.IGNORECASE | re.DOTALL) and not re.search(
-                reverse, sql, re.IGNORECASE | re.DOTALL
-            ):
-                return "incomplete_manual_swipe_comparison"
+    if _manual_swipe_intent(question, rewritten_request) and not (
+        _has_complete_manual_swipe_filter(sql)
+    ):
+        return "incomplete_manual_swipe_comparison"
     meaning = _attendance_meaning(question)
     if meaning == "not_absent" and not re.search(
         r"\bexception\s+IS\s+DISTINCT\s+FROM\s+'Absent'", sql, flags=re.IGNORECASE
@@ -1680,7 +1736,9 @@ def run_turn(
                     "sql_execution_failure", sql_execution_failure, attempt=attempt
                 )
                 continue
-            semantic_issue = _sql_semantic_issue(question, sql)
+            semantic_issue = _sql_semantic_issue(
+                question, sql, rewritten_request=bound.updated_request
+            )
             if semantic_issue in {
                 "detail_request_requires_rows",
                 "incomplete_manual_swipe_comparison",
@@ -1741,7 +1799,9 @@ def run_turn(
                     attempt=attempt,
                 )
         log_layer_output("sql_execution", result)
-        semantic_issue = _sql_semantic_issue(question, sql)
+        semantic_issue = _sql_semantic_issue(
+            question, sql, rewritten_request=bound.updated_request
+        )
         if semantic_issue is not None:
             raise ProviderFailure("sql_semantics", semantic_issue, semantic_issue)
         native_comparison_used = (

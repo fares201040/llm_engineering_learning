@@ -97,16 +97,18 @@ LLM_PLANNER_MAX_OUTPUT_TOKENS=512
 ```
 
 For these local Ollama calls, the provider sets `reasoning_effort="none"` and
-`temperature=0`. The SQL planner uses `num_ctx=65536`; reference, writer, and verifier
-calls use `num_ctx=8192`. The answer model is used for separate writer and verifier
-calls. The maximum provider-call budget is eight. Keep
+`temperature=0`. The SQL planner, answer writer, and answer verifier use
+`num_ctx=65536`; the reference call uses `num_ctx=8192`. The answer model is used for
+separate writer and verifier calls. The maximum provider-call budget is eight. Keep
 `POSTGRES_READONLY_DSN` configured independently from the ingestion writer DSN.
 
 The SQL planner receives the complete typed column catalog and descriptions plus all
 58 described `record_json` fields on every planner request. Typed relational columns
 remain preferred over equivalent JSON fallbacks. The answer writer and verifier receive the current question,
 history, trusted context, date-coverage summary, executed SQL, result, and authoritative
-employees, but not the schema.
+employees, but not the schema. Prior complete answers, raw results, and executed SQL
+remain persisted in application state and are omitted from later model-facing trusted
+context.
 
 Employee lookup uses the authorized PostgreSQL directory first. A written name that
 does not match exactly gets whole-name trigram candidates, followed by first-name

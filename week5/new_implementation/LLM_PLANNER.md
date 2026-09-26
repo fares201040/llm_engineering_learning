@@ -30,7 +30,8 @@ query, witness query, narrative query route, shadow/canary path, or old state ad
 For the current Phase 2 local configuration, the three roles use
 `ollama_chat/qwen3.5:4b`. The provider sends local calls with
 `reasoning_effort="none"` and `temperature=0`. The SQL planner uses
-`num_ctx=65536`; reference and answer stages use `num_ctx=8192`. Set
+`num_ctx=65536`; the answer writer and verifier also use `num_ctx=65536`, while the
+reference stage uses `num_ctx=8192`. Set
 `LLM_PLANNER_MAX_OUTPUT_TOKENS=512` for planner output.
 
 There are exactly three configured roles:
@@ -75,6 +76,11 @@ stage so the full attendance schema is sent only to the SQL planner:
 6. for the planner only, the complete allowlisted attendance schema/tables; and
 7. an explicit statement that rewriting and employee resolution are complete.
 
+Model-facing trusted context includes the latest verified request, locale, employees,
+and inherited date scope. The complete prior answer, raw SQL result, and executed SQL
+remain in application state but are omitted from later model payloads so a large
+bounded answer cannot overflow the next reference or answer call.
+
 The planner receives every typed relational column and all 58 described
 `record_json.json_fields` entries, including exact SQL expressions, normalized types,
 descriptions, and standard values. Typed relational columns remain preferred when they
@@ -116,6 +122,12 @@ attendance fields. The descriptions distinguish immutable original device swipes
 payroll-effective swipe values (`From_*`/`To_*`). They also define positive
 `Total_Worked_Hrs` as attendance evidence and direct the planner to leave and exception
 fields when worked hours are null, empty, or zero.
+
+For manual-swipe requests, the runtime parses the proposed SQL and requires one filter
+whose four effective-versus-device comparisons are joined with `OR`. Comparisons
+joined only with `AND`, emitted outside a filter, or missing a pair trigger a planner
+retry. Detection uses both the original and self-contained rewritten request, including
+supported Arabic manual-swipe wording and inherited follow-up intent.
 
 The planner counts distinct attendance dates when a request asks for a number of
 days, unless the request explicitly asks for records or rows. Attendance detail-row
@@ -216,30 +228,36 @@ result. A clarification may store one pending employee confirmation. All provide
 SQL, bound, and verification failures preserve prior state. State from another runtime
 version resets safely.
 
-## Verification record (2026-09-26)
+## Verification record (2026-09-27)
 
-The sanitized archive SHA-256 is
-`c77544ccf51f9805267dd568b03c5a4478f9eb0a1beeab238895dc4afd7b36c1`.
-The [executed Colab notebook](colab/attendance_phase2_tests_output.ipynb) validated
+The current sanitized archive SHA-256 is
+`f04377f8bf8ec1884f845e591b64d4ee7cc8f6a31cb6fd42b7fe20e495ef8c3c`.
+The local deterministic suite passed **248 tests and 10 subtests** after the
+manual-swipe validation and context-bound fixes. The archive has a generated 311-line
+placeholder manifest, but excludes the private evaluation corpus and all credentials
+and attendance exports. The source [Colab notebook](colab/attendance_phase2_tests.ipynb)
+contains the current hash and is ready for a new Colab execution.
+
+The last [executed Colab notebook](colab/attendance_phase2_tests_output.ipynb) remains
+the A100 record for the preceding archive
+`c77544ccf51f9805267dd568b03c5a4478f9eb0a1beeab238895dc4afd7b36c1`; it validated
 48 allowlisted files and passed **245 deterministic tests**, Ruff lint and formatting
-for 29 files, and Python compilation on A100. The synthetic database has 16 rows and
-three employees; the temporary model is Qwen 3.5 4B. The archive has a generated
-311-line placeholder manifest, but excludes the private evaluation corpus and all
-credentials and attendance exports.
+for 29 files, and Python compilation. The synthetic database has 16 rows and three
+employees; the temporary model is Qwen 3.5 4B.
 
-The private A100 evaluator passed cases 100–149 (50/50), the 25-case fixed-case
+On that preceding snapshot, the private A100 evaluator passed cases 100–149 (50/50), the 25-case fixed-case
 conversation replay including employee confirmations (25/25), and cases 150–199
 (50/50). The exact manual-swipe question produced all 65 returned employees from one
 planner attempt, with no answer truncation.
 
 The synthetic UI conversation passed turns 1–7 on the preceding source snapshot.
-Turn 8 was rerun against this exact archive from its verified seven-turn checkpoint;
+Turn 8 was rerun against that A100 archive from its verified seven-turn checkpoint;
 the running total, result arithmetic, answer facts, and state checks passed. The
 checkpoint reports eight completed turns. The native grouped relative-month plan
 corrected turn 5's eligibility and date-coverage errors. The native running-total
 plan derives its metric from the previous verified grouped SQL.
 
-The live synthetic evaluator completed four cases with no failed flags on this exact
+The live synthetic evaluator completed four cases with no failed flags on that
 archive. A prior run found that the planner invented September/August filters for a
 date-unbounded department ranking. The SQL date-predicate guard now rejects that
 plan before execution and retries against the unchanged request. See

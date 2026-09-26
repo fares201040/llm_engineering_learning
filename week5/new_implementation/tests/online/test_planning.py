@@ -1786,6 +1786,50 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         call.assert_not_called()
 
     @patch("week5.new_implementation.online.answering.call_structured")
+    def test_complete_employee_list_renders_every_returned_row(self, call):
+        shared = SharedModelContext(
+            current_question="List employees who have manual swipes.",
+            updated_request="Request:\nList employees who have manual swipes.",
+            database_context=database_context(),
+        )
+        rows = tuple(
+            {
+                "employee_id": f"A{index:05d}",
+                "name": f"Employee {index}",
+                "manual_swipe_count": 1,
+            }
+            for index in range(1, 31)
+        )
+        result = SqlExecutionResult(
+            columns=(
+                ResultColumn(name="employee_id", type_code="25"),
+                ResultColumn(name="name", type_code="25"),
+                ResultColumn(name="manual_swipe_count", type_code="20"),
+            ),
+            rows=rows,
+            coverage=ExecutionCoverage(
+                fetched_rows=30, result_limit=100, response_bytes=2400
+            ),
+        )
+
+        answer = generate_answer(
+            shared_context=shared,
+            sql="SELECT employee_id, name, COUNT(*) AS manual_swipe_count",
+            result=result,
+            employees=(),
+            locale="en",
+            model="answer-model",
+            budget=CallBudget(),
+            timeout=1,
+            max_output_tokens=100,
+        )
+
+        self.assertIn("30. employee id=A00030", answer)
+        self.assertIn("30 complete result row(s)", answer)
+        self.assertNotIn("showing 25", answer)
+        call.assert_not_called()
+
+    @patch("week5.new_implementation.online.answering.call_structured")
     def test_complete_multi_metric_row_is_rendered_locally(self, call):
         shared = SharedModelContext(
             current_question="Find concerning overtime behavior for A1.",

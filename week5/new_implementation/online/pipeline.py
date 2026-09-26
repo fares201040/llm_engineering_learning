@@ -246,8 +246,12 @@ def _sql_semantic_issue(question: str, sql: str) -> str | None:
             ("To_Date", "Actual_To_Date"),
             ("To_Time", "Actual_To_Time"),
         ):
-            forward = rf"'{effective}'.{{0,160}}\bIS\s+DISTINCT\s+FROM\b.{{0,160}}'{actual}'"
-            reverse = rf"'{actual}'.{{0,160}}\bIS\s+DISTINCT\s+FROM\b.{{0,160}}'{effective}'"
+            forward = (
+                rf"'{effective}'.{{0,160}}\bIS\s+DISTINCT\s+FROM\b.{{0,160}}'{actual}'"
+            )
+            reverse = (
+                rf"'{actual}'.{{0,160}}\bIS\s+DISTINCT\s+FROM\b.{{0,160}}'{effective}'"
+            )
             if not re.search(forward, sql, re.IGNORECASE | re.DOTALL) and not re.search(
                 reverse, sql, re.IGNORECASE | re.DOTALL
             ):

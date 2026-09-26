@@ -219,13 +219,18 @@ version resets safely.
 ## Verification record (2026-09-26)
 
 The sanitized archive SHA-256 is
-`98a304a5dae85c965b65f0999ef88528effebd9f67d4d4f0fce93202c1322f7d`.
+`c77544ccf51f9805267dd568b03c5a4478f9eb0a1beeab238895dc4afd7b36c1`.
 The [executed Colab notebook](colab/attendance_phase2_tests_output.ipynb) validated
-42 allowlisted files and passed **187 deterministic tests**, Ruff lint and formatting
-for 23 files, and Python compilation on T4. The synthetic database has 16 rows and
+48 allowlisted files and passed **245 deterministic tests**, Ruff lint and formatting
+for 29 files, and Python compilation on A100. The synthetic database has 16 rows and
 three employees; the temporary model is Qwen 3.5 4B. The archive has a generated
 311-line placeholder manifest, but excludes the private evaluation corpus and all
 credentials and attendance exports.
+
+The private A100 evaluator passed cases 100–149 (50/50), the 25-case fixed-case
+conversation replay including employee confirmations (25/25), and cases 150–199
+(50/50). The exact manual-swipe question produced all 65 returned employees from one
+planner attempt, with no answer truncation.
 
 The synthetic UI conversation passed turns 1–7 on the preceding source snapshot.
 Turn 8 was rerun against this exact archive from its verified seven-turn checkpoint;

@@ -27,7 +27,7 @@ class Result(BaseModel):
 
 
 class AnswerDraft(_Strict):
-    answer: str = Field(min_length=1, max_length=12000)
+    answer: str = Field(min_length=1, max_length=1000000)
 
 
 class VerdictPass(_Strict):
@@ -543,7 +543,7 @@ def _render_complete_rows(
         return str(value)
 
     rendered_rows = []
-    for index, row in enumerate(result.rows[:25], start=1):
+    for index, row in enumerate(result.rows, start=1):
         values = [
             f"{label(name)}={value_text(row.get(name))}"
             for name in selected
@@ -566,20 +566,15 @@ def _render_complete_rows(
     }
     if len(matched_counts) == 1:
         total_matches = matched_counts.pop()
-        display = (
-            f"displaying {min(25, len(result.rows))}"
-            if len(result.rows) > 25
-            else f"displaying all {len(result.rows)}"
-        )
         count_text = (
             f"{total_matches} matching result row(s); returned {len(result.rows)}, "
-            f"{display}"
+            f"displaying all {len(result.rows)} returned"
         )
     else:
         count_text = (
             f"{len(result.rows)} complete result row(s)"
-            if len(result.rows) <= 25
-            else f"showing 25 of {len(result.rows)} returned result rows"
+            if result.coverage.complete
+            else f"{len(result.rows)} returned result row(s)"
         )
     coverage = [
         table.date_coverage

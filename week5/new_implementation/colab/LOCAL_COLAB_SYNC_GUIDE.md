@@ -12,12 +12,15 @@ installed in Ubuntu 24.04 under WSL2 and ADC is already available there.
 ## Current handoff status (2026-09-26)
 
 - The sanitized 48-file ZIP and executed notebook match SHA-256
-  `4bdca6e1f88225563d09e333f3aef46afecccd720688976136cbf5f5cc8ac164`.
-  The A100 notebook passed 239 deterministic tests, Ruff lint and formatting for 29
+  `c77544ccf51f9805267dd568b03c5a4478f9eb0a1beeab238895dc4afd7b36c1`.
+  The A100 notebook passed 245 deterministic tests, Ruff lint and formatting for 29
   files, and Python compilation.
 - The authorized private evaluator completed all 311 cases on the same runtime and
   evaluator fingerprints with zero failures. The separate 25-case regression replay,
   including its employee-confirmation follow-up, also completed with no failures.
+- The current A100 rerun passed cases 100–149 (50/50), the 25 recently fixed cases
+  with their confirmation turns (25/25), and cases 150–199 (50/50). The exact manual-
+  swipe diagnostic used one planner attempt and rendered all 65 returned employees.
 - The synthetic 16-row PostgreSQL fixture and Qwen 3.5 4B ran on T4. The UI long
   conversation passed turns 1–7 on the preceding snapshot. Turn 8 was rerun on
   this exact snapshot from the verified seven-turn checkpoint and passed all

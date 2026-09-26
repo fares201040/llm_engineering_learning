@@ -72,6 +72,20 @@ def sql_result():
 
 
 class PipelineTests(unittest.TestCase):
+    def test_verified_turn_preserves_complete_bounded_result_answer(self):
+        answer = "employee row\n" * 1000
+
+        turn = VerifiedTurn(
+            turn_id="complete-list",
+            original_question="List every matching employee.",
+            rewritten_request="List every matching employee.",
+            answer=answer,
+            locale="en",
+            executed_sql="SELECT employee_id FROM attendance_records",
+        )
+
+        self.assertEqual(turn.answer, answer.strip())
+
     def test_unrequested_date_filter_detects_predicate_not_date_grouping(self):
         self.assertTrue(
             _unrequested_date_filter(

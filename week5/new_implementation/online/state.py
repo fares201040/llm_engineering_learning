@@ -22,7 +22,7 @@ class VerifiedTurn(_Strict):
     turn_id: str = Field(min_length=1, max_length=128)
     original_question: str = Field(min_length=1, max_length=50000)
     rewritten_request: str = Field(min_length=1, max_length=60000)
-    answer: str = Field(min_length=1, max_length=12000)
+    answer: str = Field(min_length=1, max_length=1000000)
     locale: Literal["en", "ar"]
     employees: tuple[Employee, ...] = Field(default=(), max_length=20)
     executed_sql: str = Field(min_length=1, max_length=100000)

@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import call, patch
 
 from week5.new_evaluation.eval import (
+    BehaviorEval,
     _answer_fact_matches,
     _expected_subset,
     _plan_matches,
@@ -30,6 +31,115 @@ from week5.new_implementation.online.state import ConversationState, VerifiedTur
 
 
 class EvaluatorTests(unittest.TestCase):
+    @staticmethod
+    def _write_cases(path: Path, count: int = 2) -> None:
+        path.write_text(
+            "".join(
+                json.dumps(
+                    {
+                        "question": f"Question {index}",
+                        "keywords": [],
+                        "reference_answer": f"Answer {index}",
+                        "category": "resume_test",
+                    }
+                )
+                + "\n"
+                for index in range(count)
+            ),
+            encoding="utf-8",
+        )
+
+    def test_interrupted_report_resumes_remaining_prefix_and_preserves_failures(self):
+        with TemporaryDirectory() as directory:
+            case_file = Path(directory) / "cases.jsonl"
+            output = Path(directory) / "report.json"
+            self._write_cases(case_file)
+            with patch(
+                "week5.new_evaluation.eval.evaluate_behavior",
+                side_effect=[BehaviorEval(outcome_ok=False), RuntimeError("stop")],
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop"):
+                    main(
+                        [
+                            "--all",
+                            "--test-file",
+                            str(case_file),
+                            "--output",
+                            str(output),
+                        ]
+                    )
+            interrupted = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(interrupted["status"], "running")
+            self.assertEqual(interrupted["selected_indices"], [0, 1])
+            self.assertEqual(interrupted["completed"], 1)
+            self.assertEqual(interrupted["failures"][0]["index"], 0)
+            self.assertFalse(interrupted["failures"][0]["result"]["outcome_ok"])
+
+            with patch(
+                "week5.new_evaluation.eval.evaluate_behavior",
+                return_value=BehaviorEval(),
+            ) as evaluate:
+                return_code = main(
+                    [
+                        "--all",
+                        "--test-file",
+                        str(case_file),
+                        "--output",
+                        str(output),
+                        "--resume",
+                    ]
+                )
+
+            self.assertEqual(return_code, 1)
+            self.assertEqual(evaluate.call_count, 1)
+            complete = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(complete["status"], "complete")
+            self.assertEqual(complete["completed"], 2)
+            self.assertEqual(complete["failures"], interrupted["failures"])
+
+    def test_resume_rejects_mismatched_fingerprint_or_selected_indices(self):
+        with TemporaryDirectory() as directory:
+            case_file = Path(directory) / "cases.jsonl"
+            output = Path(directory) / "report.json"
+            self._write_cases(case_file)
+            with patch(
+                "week5.new_evaluation.eval.evaluate_behavior",
+                side_effect=RuntimeError("stop"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stop"):
+                    main(
+                        [
+                            "--all",
+                            "--test-file",
+                            str(case_file),
+                            "--output",
+                            str(output),
+                        ]
+                    )
+            original = json.loads(output.read_text(encoding="utf-8"))
+            variants = (
+                {**original, "fingerprints": {**original["fingerprints"], "cases": "bad"}},
+                {**original, "selected_indices": [1, 0]},
+            )
+            for variant in variants:
+                output.write_text(json.dumps(variant), encoding="utf-8")
+                with self.subTest(variant=variant):
+                    with patch(
+                        "week5.new_evaluation.eval.evaluate_behavior"
+                    ) as evaluate:
+                        with self.assertRaises(ValueError):
+                            main(
+                                [
+                                    "--all",
+                                    "--test-file",
+                                    str(case_file),
+                                    "--output",
+                                    str(output),
+                                    "--resume",
+                                ]
+                            )
+                        evaluate.assert_not_called()
+
     def test_wrong_unsupported_capability_does_not_pass_as_schema(self):
         case = TestQuestion(
             question="Count records on September 31, 2026.",

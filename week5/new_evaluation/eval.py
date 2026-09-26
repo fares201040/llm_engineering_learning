@@ -23,7 +23,7 @@ from ..new_implementation.online.pipeline import (
     run_turn,
 )
 from ..new_implementation.online.state import ConversationState, VerifiedTurn
-from .test import TestQuestion, load_tests
+from .test import TEST_FILE, TestQuestion, load_tests
 
 
 class BehaviorEval(BaseModel):
@@ -637,14 +637,16 @@ def evaluate_behavior(test: TestQuestion) -> BehaviorEval:
     return result.model_copy(update={"multi_turn_ok": multi_turn_ok})
 
 
-def _fingerprints() -> dict[str, str]:
+def _fingerprints(case_bytes: bytes) -> dict[str, str]:
     values = {
         "runtime": "attendance-online/v1",
         "evaluator": "attendance-direct-sql-eval/v1",
     }
-    return {
+    fingerprints = {
         key: hashlib.sha256(value.encode()).hexdigest() for key, value in values.items()
     }
+    fingerprints["cases"] = hashlib.sha256(case_bytes).hexdigest()
+    return fingerprints
 
 
 def _write(path: Path, report: dict) -> None:
@@ -659,6 +661,45 @@ def _write(path: Path, report: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _resume_report(
+    path: Path,
+    *,
+    selected_indices: list[int],
+    fingerprints: dict[str, str],
+) -> dict:
+    try:
+        report = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("The evaluator checkpoint is not readable JSON") from exc
+    if not isinstance(report, dict):
+        raise ValueError("The evaluator checkpoint must be a JSON object")
+    if report.get("fingerprints") != fingerprints:
+        raise ValueError("The evaluator checkpoint fingerprints do not match this run")
+    if report.get("selected_indices") != selected_indices:
+        raise ValueError("The evaluator checkpoint selected indices do not match")
+    if report.get("tests") != len(selected_indices):
+        raise ValueError("The evaluator checkpoint test count does not match")
+    completed = report.get("completed")
+    if (
+        not isinstance(completed, int)
+        or isinstance(completed, bool)
+        or not 0 <= completed <= len(selected_indices)
+    ):
+        raise ValueError("The evaluator checkpoint completed prefix is invalid")
+    if report.get("status") not in {"running", "complete"}:
+        raise ValueError("The evaluator checkpoint status is invalid")
+    failures = report.get("failures")
+    if not isinstance(failures, list):
+        raise ValueError("The evaluator checkpoint failures are invalid")
+    completed_indices = set(selected_indices[:completed])
+    if any(
+        not isinstance(item, dict) or item.get("index") not in completed_indices
+        for item in failures
+    ):
+        raise ValueError("The evaluator checkpoint failure indices are invalid")
+    return report
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("test_number", nargs="?", type=int)
@@ -666,20 +707,35 @@ def main(argv=None) -> int:
     parser.add_argument("--all", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--test-file", type=Path)
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args(argv)
+    if args.resume and args.output is None:
+        parser.error("--resume requires --output")
+    case_path = args.test_file if args.test_file is not None else Path(TEST_FILE)
+    case_bytes = case_path.read_bytes()
     cases = load_tests(test_file=args.test_file)
     index = args.test_number if args.test_number is not None else 0
     selected = tuple(enumerate(cases)) if args.all else ((index, cases[index]),)
-    report = {
-        "status": "running",
-        "tests": len(selected),
-        "completed": 0,
-        "failures": [],
-        "fingerprints": _fingerprints(),
-    }
-    if args.output:
+    selected_indices = [case_index for case_index, _ in selected]
+    fingerprints = _fingerprints(case_bytes)
+    if args.resume:
+        report = _resume_report(
+            args.output,
+            selected_indices=selected_indices,
+            fingerprints=fingerprints,
+        )
+    else:
+        report = {
+            "status": "running",
+            "tests": len(selected),
+            "selected_indices": selected_indices,
+            "completed": 0,
+            "failures": [],
+            "fingerprints": fingerprints,
+        }
+    if args.output and not args.resume:
         _write(args.output, report)
-    for case_index, case in selected:
+    for case_index, case in selected[report["completed"] :]:
         result = evaluate_behavior(case)
         if not result.passed:
             report["failures"].append(

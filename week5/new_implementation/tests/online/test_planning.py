@@ -220,6 +220,13 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertIn("conversation_history", payload)
         self.assertIn("trusted_context", payload)
         self.assertNotIn("database_context", payload)
+        self.assertNotIn("database_schema", payload)
+
+    def test_reference_response_schema_omits_unsupported_classification(self):
+        self.assertNotIn(
+            "outside_attendance_domain",
+            json.dumps(ReferenceResponse.model_json_schema()),
+        )
 
     def test_exact_multiple_employees_attach_one_stable_authoritative_block(self):
         bound = bind_references(

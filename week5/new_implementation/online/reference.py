@@ -8,6 +8,7 @@ import unicodedata
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic.json_schema import SkipJsonSchema
 
 from ..embedding import collection_name_for_model, get_embeddings
 from .provider import CallBudget, ProviderFailure, TurnObserver, call_structured
@@ -100,7 +101,9 @@ class UnsupportedReference(_Strict):
     capability: Literal["outside_attendance_domain"]
 
 
-ReferenceDecision = ReadyReference | AmbiguousReference | UnsupportedReference
+ReferenceDecision = (
+    ReadyReference | AmbiguousReference | SkipJsonSchema[UnsupportedReference]
+)
 
 
 class ReferenceResponse(_Strict):
@@ -196,12 +199,9 @@ pattern/summary or grouping questions without a named person are valid criteria 
 all-authorized requests; never mark them as missing_employee merely because no
 individual is named, and never mark it as missing_employee when it is clearly a
 general attendance request.
-If the requested information or action is outside the attendance domain, such as a
-financial, repayment, loan, or unrelated business request, return unsupported with
-capability outside_attendance_domain. Do not rewrite an unsupported concept into an
-attendance request and do not claim that unrelated data is absent from attendance
-rows. Attendance questions remain supported even when their requested attendance
-field or value later requires database-schema inspection by the SQL planner.
+Do not classify schema support or reject a request as outside the attendance domain.
+Preserve unfamiliar, incomplete, or weak business wording in the rewritten request so
+the SQL planner can interpret it against the complete database schema.
 If a clear follow-up reuses verified employees, include their
 trusted IDs/names in the complete rewritten request and typed references. If the
 latest verified turn has no named employee, a reference such as "that" inherits its

@@ -267,14 +267,21 @@ def search_employee_directory_postgres(
                 token_sql = (
                     'SELECT DISTINCT "employee_id", "name", '
                     "similarity(lower(split_part(\"name\", ' ', 1)), "
-                    "lower(split_part(%s, ' ', 1))) AS match_score "
+                    "lower(split_part(%s, ' ', 1))) AS match_score, "
+                    'similarity(lower("name"), lower(%s)) AS full_match_score '
                     f"FROM {_identifier(table)} "
                     'WHERE "employee_id" IS NOT NULL AND "name" IS NOT NULL '
                     "AND similarity(lower(split_part(\"name\", ' ', 1)), "
                     "lower(split_part(%s, ' ', 1))) >= %s"
-                    f'{scope_sql} ORDER BY match_score DESC, "employee_id" ASC LIMIT %s'
+                    f"{scope_sql} ORDER BY match_score DESC, full_match_score DESC, "
+                    '"employee_id" ASC LIMIT %s'
                 )
-                token_params: list[object] = [mention, mention, token_threshold]
+                token_params: list[object] = [
+                    mention,
+                    mention,
+                    mention,
+                    token_threshold,
+                ]
                 if allowed_employee_ids is not None:
                     token_params.append(list(allowed_employee_ids))
                 token_params.append(limit)

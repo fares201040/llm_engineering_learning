@@ -419,6 +419,15 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("day_type = 'Working Day'", missed_sql)
         self.assertIn("COALESCE(total_worked_hrs, 0) <= 0", missed_sql)
 
+    def test_native_employee_day_count_does_not_capture_worked_hours(self):
+        sql = _build_native_employee_day_count_sql(
+            "How many total hours did A11000 work during September 2026?",
+            attendance_schema(),
+            (Employee(employee_id="A11000", name="Mukhtar Ahmed Meer"),),
+        )
+
+        self.assertIsNone(sql)
+
     def test_native_semantic_plan_covers_hr_review_and_early_departures(self):
         hr_sql = _build_native_attendance_observation_sql(
             "Describe attendance behavior that may need HR review.",
@@ -802,6 +811,53 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(planned_contexts[0].subject_relationship, "all_authorized")
 
+    def test_unmatched_reference_mention_is_delegated_to_sql_planner(self):
+        dependencies = self.dependencies()
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=AmbiguousReference(
+                rewritten_request=(
+                    "How many total worked hours are in the Finance department?"
+                ),
+                locale="en",
+                reason="ambiguous_reference",
+                employee_mention="Finance department",
+            )
+        )
+        dependencies.employee_fuzzy_search = lambda *_args, **_kwargs: ()
+        dependencies.employee_fallback_search = lambda *_args, **_kwargs: self.fail(
+            "unmatched business wording must not be mapped to arbitrary employees"
+        )
+        planned_contexts = []
+
+        def planner(**kwargs):
+            planned_contexts.append(kwargs["shared_context"])
+            return (
+                "SELECT SUM(total_worked_hrs) AS total_worked_hours "
+                "FROM attendance_records WHERE department = 'Finance'"
+            )
+
+        dependencies.planner = planner
+        dependencies.executor = lambda *_args, **_kwargs: SqlExecutionResult(
+            columns=(),
+            rows=({"total_worked_hours": 116.75},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=38
+            ),
+        )
+
+        outcome = run_turn(
+            TurnRequest(
+                question="How many total worked hours are in the Finance department?",
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(len(planned_contexts), 1)
+        self.assertEqual(planned_contexts[0].subject_relationship, "all_authorized")
+        self.assertIn("Finance department", planned_contexts[0].updated_request)
+
     def test_unknown_grouped_metric_is_typed_unsupported_calculation(self):
         dependencies = self.dependencies()
         dependencies.context_loader = lambda **_kwargs: attendance_schema()
@@ -822,7 +878,6 @@ class PipelineTests(unittest.TestCase):
 
     def test_unsupported_reference_cannot_veto_named_employee_aggregate(self):
         dependencies = self.dependencies()
-        employee = Employee(employee_id="A1", name="Wail Ali")
         dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
             decision=UnsupportedReference(
                 rewritten_request="What were Wail Ali's total worked hours?",
@@ -856,7 +911,6 @@ class PipelineTests(unittest.TestCase):
 
     def test_unsupported_reference_cannot_veto_employee_status_count(self):
         dependencies = self.dependencies()
-        employee = Employee(employee_id="A1", name="Wail Ali")
         schema = attendance_schema()
         table = schema.tables[0]
         dependencies.context_loader = lambda **_kwargs: schema.model_copy(
@@ -1972,7 +2026,7 @@ class PipelineTests(unittest.TestCase):
         self.assertIsInstance(outcome, Unsupported)
         self.assertEqual(outcome.capability, "outside_attendance_domain")
 
-    def test_unresolved_name_uses_confirm_only_chroma_options(self):
+    def test_unresolved_name_uses_confirm_only_postgres_options(self):
         dependencies = self.dependencies()
         dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
             decision=ReadyReference(
@@ -1987,8 +2041,11 @@ class PipelineTests(unittest.TestCase):
             Employee(employee_id="A1", name="Wail Ali"),
             Employee(employee_id="A2", name="Faris Hassan"),
         )
-        dependencies.employee_fallback_search = lambda *_args, **_kwargs: (
+        dependencies.employee_fuzzy_search = lambda *_args, **_kwargs: (
             EmployeeOption(employee_id="A2", employee_name="Faris Hassan"),
+        )
+        dependencies.employee_fallback_search = lambda *_args, **_kwargs: self.fail(
+            "semantic nearest-neighbor names must not be offered for confirmation"
         )
 
         first = run_turn(

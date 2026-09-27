@@ -164,6 +164,8 @@ _STANDARD_VALUES = {
     "exception": ("Absent", "OK"),
 }
 
+_STANDARD_VALUE_LIMIT = 100
+
 _RECORD_JSON_FIELD_TYPES = {
     "Actual_From_Date": "ISO date string (YYYY-MM-DD)",
     "Actual_From_Time": "ISO time string (HH:MM:SS)",
@@ -296,6 +298,34 @@ def _require_column_descriptions(column_names: tuple[str, ...]) -> None:
         )
 
 
+def _discover_standard_values(
+    connection,
+    *,
+    schema_name: str,
+    table_name: str,
+    column_name: str,
+) -> tuple[str, ...]:
+    """Return bounded exact values for a low-cardinality categorical column."""
+
+    from psycopg import sql
+
+    rows = connection.execute(
+        sql.SQL(
+            "SELECT DISTINCT btrim({column}::text) AS value "
+            "FROM {schema}.{table} "
+            "WHERE {column} IS NOT NULL AND btrim({column}::text) <> '' "
+            "ORDER BY value LIMIT {limit}"
+        ).format(
+            column=sql.Identifier(column_name),
+            schema=sql.Identifier(schema_name),
+            table=sql.Identifier(table_name),
+            limit=sql.Literal(_STANDARD_VALUE_LIMIT + 1),
+        )
+    ).fetchall()
+    values = tuple(str(row["value"]) for row in rows if row.get("value") is not None)
+    return values if len(values) <= _STANDARD_VALUE_LIMIT else ()
+
+
 def load_database_context(
     *,
     dsn: str,
@@ -348,6 +378,18 @@ def load_database_context(
                 _require_column_descriptions(
                     tuple(str(row["column_name"]) for row in rows)
                 )
+                discovered_standard_values = {
+                    column_name: _discover_standard_values(
+                        connection,
+                        schema_name=schema_name,
+                        table_name=table_name,
+                        column_name=column_name,
+                    )
+                    for row in rows
+                    for column_name in (str(row["column_name"]),)
+                    if str(row["data_type"])
+                    in {"character varying", "character", "text"}
+                }
                 columns = tuple(
                     DatabaseColumn(
                         name=str(row["column_name"]),
@@ -359,7 +401,8 @@ def load_database_context(
                         nullable=row["is_nullable"] == "YES",
                         description=_COLUMN_DESCRIPTIONS[str(row["column_name"])],
                         standard_values=_STANDARD_VALUES.get(
-                            str(row["column_name"]), ()
+                            str(row["column_name"]),
+                            discovered_standard_values.get(str(row["column_name"]), ()),
                         ),
                         json_fields=(
                             _record_json_fields()

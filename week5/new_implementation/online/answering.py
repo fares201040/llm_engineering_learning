@@ -383,6 +383,22 @@ def _matched_count_statement(question: str, rendered_value: str) -> str | None:
     return None
 
 
+def _render_empty_result(
+    *,
+    shared_context: SharedModelContext,
+    result: SqlExecutionResult,
+    locale: Literal["en", "ar"],
+) -> str | None:
+    """Render a complete empty query result without probabilistic answer retries."""
+
+    if not result.coverage.complete or not result.columns or result.rows:
+        return None
+    statement = (
+        "لم تطابق أي صفوف الطلب." if locale == "ar" else "No rows matched the request."
+    )
+    return f"{statement}{_scalar_coverage_text(shared_context, locale)}"
+
+
 def _render_complete_scalar(
     *,
     shared_context: SharedModelContext,
@@ -605,6 +621,13 @@ def generate_answer(
     max_output_tokens: int,
     observer: TurnObserver | None = None,
 ) -> str:
+    empty_answer = _render_empty_result(
+        shared_context=shared_context,
+        result=result,
+        locale=locale,
+    )
+    if empty_answer is not None:
+        return empty_answer
     detail_answer = _render_bounded_details(
         shared_context=shared_context,
         result=result,

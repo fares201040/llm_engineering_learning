@@ -1791,6 +1791,43 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         call.assert_not_called()
 
     @patch("week5.new_implementation.online.answering.call_structured")
+    def test_complete_empty_result_is_rendered_without_model_calls(self, call):
+        shared = SharedModelContext(
+            current_question="List matching employees.",
+            updated_request="Request:\nList matching employees.",
+            database_context=database_context(),
+        )
+        result = SqlExecutionResult(
+            columns=(
+                ResultColumn(name="employee_id", type_code="25"),
+                ResultColumn(name="name", type_code="25"),
+            ),
+            rows=(),
+            coverage=ExecutionCoverage(
+                fetched_rows=0, result_limit=100, response_bytes=2
+            ),
+        )
+
+        answer = generate_answer(
+            shared_context=shared,
+            sql="SELECT employee_id, name FROM attendance_records",
+            result=result,
+            employees=(),
+            locale="en",
+            model="answer-model",
+            budget=CallBudget(),
+            timeout=1,
+            max_output_tokens=100,
+        )
+
+        self.assertEqual(
+            answer,
+            "No rows matched the request. Attendance records are available from "
+            "2026-09-01 to 2026-09-07.",
+        )
+        call.assert_not_called()
+
+    @patch("week5.new_implementation.online.answering.call_structured")
     def test_complete_employee_list_renders_every_returned_row(self, call):
         shared = SharedModelContext(
             current_question="List employees who have manual swipes.",

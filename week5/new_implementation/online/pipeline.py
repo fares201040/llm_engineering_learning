@@ -663,6 +663,9 @@ def _build_native_employee_day_count_sql(
 
     if not employees or not re.search(r"\bhow many\b", question, re.IGNORECASE):
         return None
+    folded = " ".join(question.casefold().split())
+    if re.search(r"\b(?:days?|dates?|attendance records?)\b", folded) is None:
+        return None
     month_scope = _requested_month_scope(question)
     if month_scope is None:
         return None
@@ -692,7 +695,6 @@ def _build_native_employee_day_count_sql(
         f"attendance_date >= '{start}'",
         f"attendance_date <= '{end}'",
     ]
-    folded = " ".join(question.casefold().split())
     aggregate = "COUNT(DISTINCT attendance_date)"
     alias = "matched_count"
     if "attendance records" in folded:
@@ -1570,45 +1572,15 @@ def run_turn(
                     state=state,
                     reason="employee_confirmation",
                 )
-            semantic_options: tuple[EmployeeOption, ...] = ()
-            try:
-                semantic_options = deps.employee_fallback_search(
-                    bound.unresolved_mention,
-                    directory,
-                    embedding_model=settings.embedding_model,
-                    embedding_provider=settings.embedding_provider,
-                    collection_name=settings.chroma_collection_name,
-                    allowed_employee_ids=allowed_employee_ids,
-                )
-                log_layer_output("employee_chroma_fallback", semantic_options)
-                _emit(
-                    observer,
-                    "employee_fallback",
-                    "completed",
-                    f"candidates={len(semantic_options)}",
-                )
-            except Exception as exc:
-                _emit(observer, "employee_fallback", "unavailable", type(exc).__name__)
-            combined = semantic_options[:5]
-            if bound.fallback_options:
-                combined = semantic_options[:4] + bound.fallback_options
-            options = _verified_options(combined, directory)
-            if options and bound.pending_resolution is not None:
-                pending = PendingEmployeeConfirmation(
-                    original_question=question,
-                    mention=bound.unresolved_mention,
-                    options=options,
-                    resolution=bound.pending_resolution,
-                )
-                state = previous.model_copy(
-                    update={"pending_employee_confirmation": pending}
-                )
-                log_layer_output("publication", state)
-                return Clarification(
-                    reply=_confirmation_reply(pending, bound.locale),
-                    state=state,
-                    reason="employee_confirmation",
-                )
+            rewritten_request = bound.rewritten_request or question
+            bound = BoundReferences(
+                rewritten_request=rewritten_request,
+                updated_request=attach_resolved_employees(rewritten_request, ()),
+                locale=bound.locale,
+                request_relationship=bound.request_relationship,
+                subject_relationship="all_authorized",
+            )
+            log_layer_output("planner_owned_ambiguity", rewritten_request)
         if bound.reason == "malformed_identifier":
             log_layer_output(
                 "unsupported",

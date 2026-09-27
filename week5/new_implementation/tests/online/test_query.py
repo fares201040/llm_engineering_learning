@@ -59,6 +59,46 @@ class StructuredProbe(BaseModel):
 
 
 class DatabaseContextTests(unittest.TestCase):
+    def test_database_categories_are_discovered_as_exact_standard_values(self):
+        class Result:
+            def fetchall(self):
+                return [
+                    {"value": "Finance"},
+                    {"value": "Human Resource"},
+                    {"value": "Operations"},
+                ]
+
+        class Connection:
+            def execute(self, _query):
+                return Result()
+
+        values = context._discover_standard_values(
+            Connection(),
+            schema_name="public",
+            table_name="attendance_records",
+            column_name="department",
+        )
+
+        self.assertEqual(values, ("Finance", "Human Resource", "Operations"))
+
+    def test_high_cardinality_text_is_not_sent_as_standard_values(self):
+        class Result:
+            def fetchall(self):
+                return [{"value": f"value-{index}"} for index in range(101)]
+
+        class Connection:
+            def execute(self, _query):
+                return Result()
+
+        values = context._discover_standard_values(
+            Connection(),
+            schema_name="public",
+            table_name="attendance_records",
+            column_name="department",
+        )
+
+        self.assertEqual(values, ())
+
     def test_all_record_json_source_fields_have_queryable_semantic_descriptions(self):
         expected_fields = {
             "Actual_From_Date",

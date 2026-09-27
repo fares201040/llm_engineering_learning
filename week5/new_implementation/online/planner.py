@@ -62,7 +62,10 @@ CONSTRUCTION ORDER
 4. Map each requested business term to the described column and add only the predicates
    required by the request. Add a WHERE predicate only when the current question
    requires it and a column description justifies it. Do not combine plausible but
-   unrequested predicates.
+   unrequested predicates. A column's standard_values are exact values observed in the
+   database. Resolve abbreviations and alternate wording to the single matching stored
+   value, then use that exact value in SQL. If multiple standard values could match,
+   use the clarification_required protocol instead of guessing.
 5. Construct the simplest valid query and immediately emit only that SQL. Do not narrate
    these steps and do not perform a separate initial SQL review.
    In PostgreSQL, HAVING cannot refer to a SELECT output alias; repeat the aggregate

@@ -174,8 +174,11 @@ def _content(response: object, stage: str) -> str:
 
 def _local_model_options(model: str, stage: str) -> dict[str, object]:
     if model.startswith(("ollama/", "ollama_chat/")):
+        local_model = model.rsplit("/", 1)[-1].casefold()
         return {
-            "reasoning_effort": "none",
+            "reasoning_effort": (
+                "medium" if local_model.startswith("gpt-oss:") else "none"
+            ),
             "temperature": 0,
             "num_ctx": (
                 65536

@@ -129,7 +129,7 @@ class Settings:
             global_model.strip() if global_model and global_model.strip() else None
         )
         reference_default_model = global_model or "openai/gpt-4.1-mini"
-        planner_default_model = global_model or "openai/gpt-4.1-mini"
+        planner_default_model = global_model or "ollama_chat/gpt-oss:20b"
         answer_default_model = global_model or "openai/gpt-4.1"
         postgres_dsn = _text("POSTGRES_DSN", "")
         embedding_provider = _text("EMBEDDING_PROVIDER", "huggingface").lower()

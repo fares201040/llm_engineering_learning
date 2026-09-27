@@ -69,10 +69,11 @@ calculations. A positive `Total_Worked_Hrs` is evidence that work occurred; null
 empty, or zero is not attendance evidence and must be interpreted with leave and
 exception fields.
 
-The active model roles use `ollama_chat/qwen3.5:4b` for reference/rewrite, SQL
-planning, and answering. Local calls use `reasoning_effort="none"`, temperature 0,
-and `num_ctx=8192`; the planner output limit is 512 tokens. The answer role is called
-separately for writing and verification.
+The active model roles use `ollama_chat/qwen3.5:4b` for reference/rewrite and
+answering, and `ollama_chat/gpt-oss:20b` for SQL planning. Local GPT-OSS calls use
+`reasoning_effort="medium"`; other local models use `reasoning_effort="none"`.
+All use temperature 0. The planner output limit is 512 tokens. The answer role is
+called separately for writing and verification.
 
 `Actual_From_*` and `Actual_To_*` are immutable swipe-device facts. `From_*` and
 `To_*` are payroll-effective values that clerks may adjust and should be used for

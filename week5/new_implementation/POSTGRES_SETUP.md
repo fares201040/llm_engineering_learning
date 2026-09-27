@@ -87,17 +87,21 @@ database.
 
 `attendance-online/v1` is the only runtime and state version. Provider boundary
 versions are implementation details, not deployment settings. For the current Phase 2
-local run, configure all three model roles as follows:
+local run, configure the model roles as follows:
 
 ```env
 LLM_REFERENCE_MODEL=ollama_chat/qwen3.5:4b
-LLM_PLANNER_MODEL=ollama_chat/qwen3.5:4b
+LLM_PLANNER_MODEL=ollama_chat/gpt-oss:20b
 LLM_ANSWER_MODEL=ollama_chat/qwen3.5:4b
 LLM_PLANNER_MAX_OUTPUT_TOKENS=512
 ```
 
-For these local Ollama calls, the provider sets `reasoning_effort="none"` and
-`temperature=0`. The SQL planner, answer writer, and answer verifier use
+Install the planner model in Ollama with `ollama pull gpt-oss:20b`. The Ollama tag is
+`gpt-oss:20b`; the LiteLLM configuration name is `ollama_chat/gpt-oss:20b`.
+
+For local Ollama calls, the provider sets `reasoning_effort="medium"` for GPT-OSS,
+`reasoning_effort="none"` for the other configured models, and `temperature=0`.
+The SQL planner, answer writer, and answer verifier use
 `num_ctx=65536`; the reference call uses `num_ctx=8192`. The answer model is used for
 separate writer and verifier calls. The maximum provider-call budget is eight. Keep
 `POSTGRES_READONLY_DSN` configured independently from the ingestion writer DSN.

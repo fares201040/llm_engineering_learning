@@ -27,9 +27,11 @@ query, witness query, narrative query route, shadow/canary path, or old state ad
 
 ## Model roles and payloads
 
-For the current Phase 2 local configuration, the three roles use
-`ollama_chat/qwen3.5:4b`. The provider sends local calls with
-`reasoning_effort="none"` and `temperature=0`. The SQL planner uses
+For the current Phase 2 local configuration, reference and answer use
+`ollama_chat/qwen3.5:4b`, while SQL planning uses
+`ollama_chat/gpt-oss:20b`. The provider sends GPT-OSS calls with
+`reasoning_effort="medium"`, other local calls with `reasoning_effort="none"`, and
+all local calls with `temperature=0`. The SQL planner uses
 `num_ctx=65536`; the answer writer and verifier also use `num_ctx=65536`, while the
 reference stage uses `num_ctx=8192`. Set
 `LLM_PLANNER_MAX_OUTPUT_TOKENS=512` for planner output.

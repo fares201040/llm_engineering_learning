@@ -333,6 +333,37 @@ class DatabaseContextTests(unittest.TestCase):
         self.assertEqual(captured["temperature"], 0)
         self.assertEqual(captured["num_ctx"], 65536)
 
+    def test_ollama_gpt_oss_uses_supported_reasoning_effort(self):
+        captured = {}
+
+        class Message:
+            content = "SELECT 1"
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+
+        def complete(**kwargs):
+            captured.update(kwargs)
+            return Response()
+
+        call_text(
+            stage="sql_planner",
+            model="ollama_chat/gpt-oss:20b",
+            system="system",
+            payload={"current_question": "test", "conversation_history": []},
+            budget=CallBudget(limit=1),
+            timeout=1,
+            max_output_tokens=100,
+            completion_fn=complete,
+        )
+
+        self.assertEqual(captured["reasoning_effort"], "medium")
+        self.assertEqual(captured["temperature"], 0)
+        self.assertEqual(captured["num_ctx"], 65536)
+
     def test_ollama_structured_provider_disables_reasoning(self):
         captured = {}
 

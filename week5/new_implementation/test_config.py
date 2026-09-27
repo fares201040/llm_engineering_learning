@@ -21,7 +21,7 @@ class ConfigTests(unittest.TestCase):
             configured = Settings.from_environment()
 
         self.assertEqual(configured.llm_reference_model, "openai/gpt-4.1-mini")
-        self.assertEqual(configured.llm_planner_model, "openai/gpt-4.1-mini")
+        self.assertEqual(configured.llm_planner_model, "ollama_chat/gpt-oss:20b")
         self.assertEqual(configured.llm_answer_model, "openai/gpt-4.1")
 
     def test_global_model_remains_an_explicit_all_role_override(self):

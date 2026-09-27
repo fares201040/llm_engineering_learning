@@ -9,6 +9,35 @@ from week5.new_implementation import answer
 
 
 class LaunchModeTests(unittest.TestCase):
+    def test_default_launch_mode_opens_the_local_browser(self):
+        with patch.dict("os.environ", {}, clear=True):
+            options = new_app.launch_options()
+
+        self.assertEqual(options, {"inbrowser": True})
+
+    def test_colab_launch_mode_creates_a_nonblocking_share_link(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "GRADIO_SHARE": "true",
+                "GRADIO_PREVENT_THREAD_LOCK": "true",
+                "GRADIO_AUTH_USER": "attendance",
+                "GRADIO_AUTH_PASSWORD": "generated-password",
+            },
+            clear=True,
+        ):
+            options = new_app.launch_options()
+
+        self.assertEqual(
+            options,
+            {
+                "inbrowser": False,
+                "share": True,
+                "prevent_thread_lock": True,
+                "auth": ("attendance", "generated-password"),
+            },
+        )
+
     def test_new_app_imports_when_executed_as_a_standalone_script(self):
         week5_directory = Path(__file__).resolve().parent
         completed = subprocess.run(

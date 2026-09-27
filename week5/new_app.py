@@ -1,5 +1,6 @@
 import html
 import logging
+import os
 
 import gradio as gr
 
@@ -20,6 +21,27 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _environment_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def launch_options() -> dict[str, object]:
+    """Return local defaults or Colab-friendly Gradio launch options."""
+
+    if not _environment_flag("GRADIO_SHARE"):
+        return {"inbrowser": True}
+    options: dict[str, object] = {
+        "inbrowser": False,
+        "share": True,
+        "prevent_thread_lock": _environment_flag("GRADIO_PREVENT_THREAD_LOCK"),
+    }
+    auth_user = os.getenv("GRADIO_AUTH_USER", "").strip()
+    auth_password = os.getenv("GRADIO_AUTH_PASSWORD", "").strip()
+    if auth_user and auth_password:
+        options["auth"] = (auth_user, auth_password)
+    return options
 
 
 def format_context(context):
@@ -132,7 +154,7 @@ def main():
             show_progress="hidden",
         )
 
-    ui.launch(inbrowser=True)
+    ui.launch(**launch_options())
 
 
 if __name__ == "__main__":

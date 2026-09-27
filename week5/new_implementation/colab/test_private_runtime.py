@@ -65,6 +65,20 @@ class PrivateRuntimeTests(unittest.TestCase):
                 prepare_private_runtime.main()
         run.assert_not_called()
 
+    def test_private_runtime_uses_gpt_oss_for_sql_planning(self):
+        from week5.new_implementation.colab import prepare_private_runtime
+
+        with TemporaryDirectory() as directory:
+            missing_config = Path(directory) / "missing-runtime.json"
+            with patch.object(
+                prepare_private_runtime,
+                "SYNTHETIC_RUNTIME_CONFIG",
+                missing_config,
+            ):
+                settings = prepare_private_runtime._model_settings()
+
+        self.assertEqual(settings["LLM_PLANNER_MODEL"], "ollama_chat/gpt-oss:20b")
+
     def test_database_sql_grants_only_select_and_defaults_role_to_read_only(self):
         sql = private_database_sql(
             database="attendance_private_ab12",

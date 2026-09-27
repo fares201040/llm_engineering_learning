@@ -211,6 +211,7 @@ week5/new_evaluation/tests.jsonl
 week5/new_evaluation/dataset_manifest.json
 # Private 311-case evaluation outputs may contain question/answer details.
 week5/new_evaluation/results/
+week5/new_implementation/colab/attendance_chatbot_source.zip
 
 
 local/

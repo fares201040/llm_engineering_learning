@@ -206,7 +206,7 @@ def write_runtime_config(path: Path, settings: dict[str, str]) -> None:
 def _model_settings() -> dict[str, str]:
     defaults = {
         "LLM_REFERENCE_MODEL": "ollama_chat/qwen3.5:4b",
-        "LLM_PLANNER_MODEL": "ollama_chat/qwen3.5:4b",
+        "LLM_PLANNER_MODEL": "ollama_chat/gpt-oss:20b",
         "LLM_PLANNER_MAX_OUTPUT_TOKENS": "512",
         "LLM_ANSWER_MODEL": "ollama_chat/qwen3.5:4b",
         "OLLAMA_API_BASE": "http://127.0.0.1:11434",

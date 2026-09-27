@@ -32,6 +32,7 @@ from .execution import (
     load_employee_directory,
     search_employee_directory_postgres,
 )
+from .limits import MAX_EMPLOYEE_CANDIDATES
 from .planner import request_sql
 from .provider import (
     CallBudget,
@@ -1150,9 +1151,11 @@ def _pending_response(response: str, pending: PendingEmployeeConfirmation):
     try:
         index = int(normalized) - 1
     except ValueError:
-        index = -1
-    if 0 <= index < len(pending.options):
-        return "selected", pending.options[index]
+        index = None
+    if index is not None:
+        if 0 <= index < len(pending.options):
+            return "selected", pending.options[index]
+        return "invalid_selection", None
     matches = [
         option
         for option in pending.options
@@ -1162,7 +1165,11 @@ def _pending_response(response: str, pending: PendingEmployeeConfirmation):
             " ".join(option.employee_name.casefold().split()),
         }
     ]
-    return ("selected", matches[0]) if len(matches) == 1 else ("invalid", None)
+    if len(matches) == 1:
+        return "selected", matches[0]
+    if normalized in {"yes", "y", "correct", "confirm", "نعم", "صحيح", "أجل"}:
+        return "invalid_selection", None
+    return "new_request", None
 
 
 def _authorized_directory(
@@ -1194,7 +1201,7 @@ def _verified_options(
             continue
         seen.add(option.employee_id)
         verified.append(option)
-        if len(verified) == 5:
+        if len(verified) == MAX_EMPLOYEE_CANDIDATES:
             break
     return tuple(verified)
 
@@ -1250,16 +1257,33 @@ def run_turn(
         )
         authoritative = {item.employee_id: item for item in directory}
         pending = previous.pending_employee_confirmation
-        if pending is not None:
-            locale = pending.resolution.locale
-            status, selected_option = _pending_response(request.question, pending)
-            if status == "invalid":
+        pending_response = (
+            _pending_response(request.question, pending) if pending is not None else None
+        )
+        if pending is not None and pending_response is not None:
+            status, _selected_option = pending_response
+            if status == "new_request":
+                previous = previous.model_copy(
+                    update={"pending_employee_confirmation": None}
+                )
                 log_layer_output(
                     "employee_confirmation",
-                    {"status": "invalid", "pending": pending.model_dump(mode="json")},
+                    {"status": "replaced_by_new_request"},
+                )
+                pending = None
+        if pending is not None:
+            assert pending_response is not None
+            status, selected_option = pending_response
+            if status == "invalid_selection":
+                log_layer_output(
+                    "employee_confirmation",
+                    {
+                        "status": "invalid_selection",
+                        "pending": pending.model_dump(mode="json"),
+                    },
                 )
                 return Clarification(
-                    reply=_confirmation_reply(pending, locale),
+                    reply=_confirmation_reply(pending, _locale(pending.original_question)),
                     state=previous,
                     reason="employee_confirmation",
                 )

@@ -11,6 +11,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from .limits import MAX_EMPLOYEE_CANDIDATES
+
 
 @dataclass(frozen=True)
 class AttendanceRowScope:
@@ -227,7 +229,7 @@ def search_employee_directory_postgres(
     allowed_employee_ids: tuple[str, ...] | None,
     threshold: float = 0.62,
     token_threshold: float = 0.3,
-    limit: int = 5,
+    limit: int = MAX_EMPLOYEE_CANDIDATES,
     connect_timeout: int = 5,
 ):
     """Return deterministic pg_trgm candidates from the authorized directory."""

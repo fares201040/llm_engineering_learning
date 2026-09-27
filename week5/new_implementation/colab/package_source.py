@@ -42,6 +42,7 @@ SOURCE_PATHS = (
     "week5/new_implementation/online/comparison.py",
     "week5/new_implementation/online/context.py",
     "week5/new_implementation/online/execution.py",
+    "week5/new_implementation/online/limits.py",
     "week5/new_implementation/online/pipeline.py",
     "week5/new_implementation/online/planner.py",
     "week5/new_implementation/online/provider.py",

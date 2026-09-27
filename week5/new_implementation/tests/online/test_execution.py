@@ -165,6 +165,7 @@ class DirectExecutionTests(unittest.TestCase):
         self.assertIn("ORDER BY match_score DESC", sql)
         self.assertIn('"employee_id" = ANY(%s)', sql)
         self.assertEqual(params[3], ["A1"])
+        self.assertEqual(params[-1], 20)
         self.assertEqual(options[0].employee_id, "A1")
 
     def test_fuzzy_directory_search_offers_shortened_misspelled_name(self):

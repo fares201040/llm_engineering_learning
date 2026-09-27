@@ -38,6 +38,8 @@ from week5.new_implementation.online.reference import (
     AmbiguousReference,
     Employee,
     EmployeeOption,
+    PendingEmployeeConfirmation,
+    PendingResolution,
     ReadyReference,
     ReferenceResponse,
     UnsupportedReference,
@@ -72,6 +74,87 @@ def sql_result():
 
 
 class PipelineTests(unittest.TestCase):
+    def test_new_question_replaces_pending_employee_confirmation(self):
+        candidates = tuple(
+            EmployeeOption(
+                employee_id=f"A{index:05d}", employee_name=f"Candidate {index}"
+            )
+            for index in range(1, 21)
+        )
+        pending = PendingEmployeeConfirmation(
+            original_question="What is the full name of Muktar Ahmd?",
+            mention="Muktar Ahmd",
+            options=candidates,
+            resolution=PendingResolution(
+                rewritten_request="What is the full name of Muktar Ahmd?",
+                locale="ar",
+                request_relationship="new",
+                subject_relationship="employees",
+            ),
+        )
+        state = ConversationState(pending_employee_confirmation=pending)
+        dependencies = self.dependencies()
+        seen_questions = []
+        seen_plans = []
+
+        def reference_writer(question, *_args, **_kwargs):
+            seen_questions.append(question)
+            return ReferenceResponse(
+                decision=ReadyReference(
+                    rewritten_request=question,
+                    locale="en",
+                    request_relationship="new",
+                    subject_relationship="all_authorized",
+                )
+            )
+
+        def planner(**kwargs):
+            seen_plans.append(kwargs["shared_context"].current_question)
+            return (
+                "SELECT employee_id, name, COUNT(*) AS manual_swipe_records, "
+                "COUNT(*) OVER() AS matched_count FROM attendance_records WHERE "
+                "department = 'HR' AND attendance_date >= '2026-09-01' AND "
+                "attendance_date < '2026-10-01' AND ("
+                "(record_json ->> 'From_Date') IS DISTINCT FROM "
+                "(record_json ->> 'Actual_From_Date') OR "
+                "(record_json ->> 'From_Time') IS DISTINCT FROM "
+                "(record_json ->> 'Actual_From_Time') OR "
+                "(record_json ->> 'To_Date') IS DISTINCT FROM "
+                "(record_json ->> 'Actual_To_Date') OR "
+                "(record_json ->> 'To_Time') IS DISTINCT FROM "
+                "(record_json ->> 'Actual_To_Time')) "
+                "GROUP BY employee_id, name ORDER BY employee_id LIMIT 100"
+            )
+
+        dependencies.reference_writer = reference_writer
+        dependencies.planner = planner
+        dependencies.executor = lambda *_args, **_kwargs: SqlExecutionResult(
+            columns=(),
+            rows=({"employee_id": "A1", "name": "Wail Ali"},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=50
+            ),
+        )
+        dependencies.answer_writer = lambda **_kwargs: "Wail Ali matched."
+        question = (
+            "Please list the employees who have manual swipe in HR during "
+            "September 2026."
+        )
+
+        outcome = run_turn(
+            TurnRequest(
+                question=question,
+                state=state,
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(seen_questions, [question])
+        self.assertEqual(seen_plans, [question])
+        self.assertIsNone(outcome.state.pending_employee_confirmation)
+
     def test_verified_turn_preserves_complete_bounded_result_answer(self):
         answer = "employee row\n" * 1000
 

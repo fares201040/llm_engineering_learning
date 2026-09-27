@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from pydantic.json_schema import SkipJsonSchema
 
 from ..embedding import collection_name_for_model, get_embeddings
+from .limits import MAX_EMPLOYEE_CANDIDATES
 from .provider import CallBudget, ProviderFailure, TurnObserver, call_structured
 
 FUZZY_THRESHOLD = 0.62
@@ -123,7 +124,9 @@ class PendingResolution(_Strict):
 class PendingEmployeeConfirmation(_Strict):
     original_question: str = Field(min_length=1, max_length=50000)
     mention: str = Field(min_length=1, max_length=256)
-    options: tuple[EmployeeOption, ...] = Field(min_length=1, max_length=5)
+    options: tuple[EmployeeOption, ...] = Field(
+        min_length=1, max_length=MAX_EMPLOYEE_CANDIDATES
+    )
     resolution: PendingResolution
 
 
@@ -148,7 +151,9 @@ class BoundReferences(_Strict):
     ] = "ambiguous_reference"
     unresolved_mention: str | None = Field(default=None, min_length=1, max_length=256)
     pending_resolution: PendingResolution | None = None
-    fallback_options: tuple[EmployeeOption, ...] = Field(default=(), max_length=5)
+    fallback_options: tuple[EmployeeOption, ...] = Field(
+        default=(), max_length=MAX_EMPLOYEE_CANDIDATES
+    )
 
     @property
     def employee_ids(self) -> tuple[str, ...]:
@@ -448,7 +453,7 @@ def _options_for_name(
     exact = by_name.get(_normalize(name), ())
     return tuple(
         EmployeeOption(employee_id=item.employee_id, employee_name=item.name)
-        for item in exact[:5]
+        for item in exact[:MAX_EMPLOYEE_CANDIDATES]
     )
 
 
@@ -573,7 +578,9 @@ def bind_references(
     deterministic_ambiguous_options = (
         tuple(
             EmployeeOption(employee_id=item.employee_id, employee_name=item.name)
-            for item in ambiguous_partial_names[normalized_ambiguous_mention][:5]
+            for item in ambiguous_partial_names[normalized_ambiguous_mention][
+                :MAX_EMPLOYEE_CANDIDATES
+            ]
         )
         if normalized_ambiguous_mention is not None
         else ()
@@ -917,7 +924,7 @@ def bind_references(
         if id_owner is not None and all(
             option.employee_id != id_owner.employee_id for option in options
         ):
-            options = options[:4] + [
+            options = options[: MAX_EMPLOYEE_CANDIDATES - 1] + [
                 EmployeeOption(
                     employee_id=id_owner.employee_id, employee_name=id_owner.name
                 )
@@ -929,7 +936,7 @@ def bind_references(
                 confirmation=PendingEmployeeConfirmation(
                     original_question=original_question,
                     mention=claim.employee_name,
-                    options=tuple(options[:5]),
+                    options=tuple(options[:MAX_EMPLOYEE_CANDIDATES]),
                     resolution=pending_resolution,
                 ),
             )
@@ -1035,7 +1042,7 @@ def search_employee_candidates(
     embedding_provider: str,
     collection_name: str,
     allowed_employee_ids: tuple[str, ...] | None,
-    limit: int = 5,
+    limit: int = MAX_EMPLOYEE_CANDIDATES,
 ) -> tuple[EmployeeOption, ...]:
     """Index authorized names and verify Chroma candidates against PostgreSQL."""
     if not directory or limit < 1 or allowed_employee_ids == ():

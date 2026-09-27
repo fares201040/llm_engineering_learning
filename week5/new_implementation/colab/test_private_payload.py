@@ -204,6 +204,7 @@ class PrivatePayloadTests(unittest.TestCase):
                 "week5/new_implementation/colab/run_private_eval.py",
                 "week5/new_implementation/colab/cleanup_private_runtime.py",
                 "week5/new_implementation/colab/test_private_runtime.py",
+                "week5/new_implementation/online/limits.py",
             }.issubset(names)
         )
         self.assertEqual(

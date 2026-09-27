@@ -283,6 +283,7 @@ class DatabaseContextTests(unittest.TestCase):
                 "request_relationship",
                 "subject_relationship",
                 "resolved_employee_ids",
+                "required_categorical_filters",
                 "required_date_scope",
                 "request_has_date_period",
                 "attendance_meaning",

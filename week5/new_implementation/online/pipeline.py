@@ -283,8 +283,176 @@ def _has_complete_manual_swipe_filter(sql: str) -> bool:
     return False
 
 
+_CATEGORY_ALIAS_STOP_WORDS = frozenset(
+    {"as", "at", "by", "in", "is", "it", "no", "of", "ok", "on", "or", "to"}
+)
+
+
+def _category_tokens(value: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"[A-Za-z0-9]+", value.casefold()))
+
+
+def _required_categorical_values(
+    request: str, database_context: DatabaseContext
+) -> dict[str, frozenset[str]]:
+    """Resolve unambiguous request terms from database-observed categorical values."""
+
+    request_tokens = _category_tokens(request)
+    request_words = set(request_tokens)
+    candidates: list[tuple[str, str, tuple[str, ...], str | None]] = []
+    for table in database_context.tables:
+        for column in table.columns:
+            for value in column.standard_values:
+                tokens = _category_tokens(value)
+                if not tokens:
+                    continue
+                acronym = "".join(token[0] for token in tokens) if len(tokens) > 1 else None
+                candidates.append((column.name, value, tokens, acronym))
+
+    exact_aliases: dict[tuple[str, ...], list[tuple[str, str]]] = {}
+    acronym_aliases: dict[str, list[tuple[str, str]]] = {}
+    for column, value, tokens, acronym in candidates:
+        exact_aliases.setdefault(tokens, []).append((column, value))
+        if acronym and acronym not in _CATEGORY_ALIAS_STOP_WORDS:
+            acronym_aliases.setdefault(acronym, []).append((column, value))
+
+    resolved: dict[str, set[str]] = {}
+    for tokens, matches in exact_aliases.items():
+        if len(matches) != 1:
+            continue
+        is_present = any(
+            request_tokens[index : index + len(tokens)] == tokens
+            for index in range(len(request_tokens) - len(tokens) + 1)
+        )
+        if not is_present:
+            continue
+        if len(tokens) == 1 and (
+            len(tokens[0]) < 4 or tokens[0] in _CATEGORY_ALIAS_STOP_WORDS
+        ):
+            continue
+        column, value = matches[0]
+        resolved.setdefault(column, set()).add(value)
+    for acronym, matches in acronym_aliases.items():
+        if acronym not in request_words or len(matches) != 1:
+            continue
+        column, value = matches[0]
+        resolved.setdefault(column, set()).add(value)
+    return {column: frozenset(values) for column, values in resolved.items()}
+
+
+def _boolean_paths(node: exp.Expression) -> tuple[tuple[exp.Expression, ...], ...]:
+    """Return bounded disjunctive paths through a WHERE Boolean expression."""
+
+    node = _unwrap_parentheses(node)
+    if isinstance(node, exp.Or):
+        paths = _boolean_paths(node.this) + _boolean_paths(node.expression)
+        return paths[:256]
+    if isinstance(node, exp.And):
+        left = _boolean_paths(node.this)
+        right = _boolean_paths(node.expression)
+        return tuple(
+            left_path + right_path
+            for left_path in left
+            for right_path in right
+        )[:256]
+    return ((node,),)
+
+
+def _categorical_predicate_values(
+    node: exp.Expression, column_name: str
+) -> frozenset[str]:
+    node = _unwrap_parentheses(node)
+    if isinstance(node, exp.EQ):
+        sides = ((node.this, node.expression), (node.expression, node.this))
+        for column, literal in sides:
+            if (
+                isinstance(column, exp.Column)
+                and column.name.casefold() == column_name.casefold()
+                and isinstance(literal, exp.Literal)
+                and literal.is_string
+            ):
+                return frozenset({str(literal.this)})
+    if isinstance(node, exp.In):
+        column = node.this
+        if isinstance(column, exp.Column) and column.name.casefold() == column_name.casefold():
+            literals = tuple(node.expressions)
+            if literals and all(
+                isinstance(item, exp.Literal) and item.is_string for item in literals
+            ):
+                return frozenset(str(item.this) for item in literals)
+    return frozenset()
+
+
+def _has_required_categorical_filters(
+    sql: str, requirements: dict[str, frozenset[str]]
+) -> bool:
+    if not requirements:
+        return True
+    try:
+        statements = parse(sql, read="postgres")
+    except ParseError:
+        return False
+    where_nodes = tuple(
+        where.this for statement in statements for where in statement.find_all(exp.Where)
+    )
+    for column_name, required_values in requirements.items():
+        requirement_satisfied = False
+        for where_node in where_nodes:
+            paths = _boolean_paths(where_node)
+            path_values = tuple(
+                frozenset().union(
+                    *(
+                        _categorical_predicate_values(predicate, column_name)
+                        for predicate in path
+                    )
+                )
+                for path in paths
+            )
+            if (
+                paths
+                and all(values and values <= required_values for values in path_values)
+                and required_values <= frozenset().union(*path_values)
+            ):
+                requirement_satisfied = True
+                break
+        if not requirement_satisfied:
+            return False
+    return True
+
+
+def _has_required_date_scope(
+    sql: str, required_date_scope: tuple[str, str] | None
+) -> bool:
+    if required_date_scope is None:
+        return True
+    try:
+        statements = parse(sql, read="postgres")
+    except ParseError:
+        return False
+    for statement in statements:
+        for where in statement.find_all(exp.Where):
+            paths = _boolean_paths(where.this)
+            if paths and all(
+                _sql_date_scope(
+                    "SELECT 1 WHERE "
+                    + " AND ".join(
+                        predicate.sql(dialect="postgres") for predicate in path
+                    )
+                )
+                == required_date_scope
+                for path in paths
+            ):
+                return True
+    return False
+
+
 def _sql_semantic_issue(
-    question: str, sql: str, *, rewritten_request: str = ""
+    question: str,
+    sql: str,
+    *,
+    rewritten_request: str = "",
+    database_context: DatabaseContext | None = None,
+    required_date_scope: tuple[str, str] | None = None,
 ) -> str | None:
     if _planner_control_alias(sql) is not None:
         return None
@@ -315,6 +483,14 @@ def _sql_semantic_issue(
         _has_complete_manual_swipe_filter(sql)
     ):
         return "incomplete_manual_swipe_comparison"
+    if database_context is not None:
+        required_categories = _required_categorical_values(
+            "\n".join((question, rewritten_request)), database_context
+        )
+        if not _has_required_categorical_filters(sql, required_categories):
+            return "missing_required_categorical_filter"
+    if not _has_required_date_scope(sql, required_date_scope):
+        return "date_scope_mismatch"
     meaning = _attendance_meaning(question)
     if meaning == "not_absent" and not re.search(
         r"\bexception\s+IS\s+DISTINCT\s+FROM\s+'Absent'", sql, flags=re.IGNORECASE
@@ -1643,8 +1819,11 @@ def run_turn(
                 }
             )
 
+        explicit_date_scope = _requested_month_scope(question)
         required_date_scope = (
-            previous.verified_turns[-1].date_scope
+            explicit_date_scope
+            if explicit_date_scope is not None
+            else previous.verified_turns[-1].date_scope
             if bound.request_relationship == "follow_up"
             and previous.verified_turns
             and not _mentions_time_period(question)
@@ -1657,6 +1836,9 @@ def run_turn(
                 connect_timeout=settings.postgres_connect_timeout_seconds,
             )
         log_layer_output("database_context", database_context)
+        required_categorical_filters = _required_categorical_values(
+            "\n".join((question, bound.updated_request)), database_context
+        )
         downstream_history = (
             tuple(item for item in request.history[-2:] if item.get("role") == "user")
             if bound.request_relationship == "follow_up"
@@ -1685,6 +1867,10 @@ def run_turn(
             request_relationship=bound.request_relationship,
             subject_relationship=bound.subject_relationship,
             resolved_employee_ids=bound.employee_ids,
+            required_categorical_filters={
+                column: tuple(sorted(values))
+                for column, values in sorted(required_categorical_filters.items())
+            },
             required_date_scope=required_date_scope,
             request_has_date_period=(
                 _mentions_time_period(question) or required_date_scope is not None
@@ -1768,11 +1954,17 @@ def run_turn(
                 )
                 continue
             semantic_issue = _sql_semantic_issue(
-                question, sql, rewritten_request=bound.updated_request
+                question,
+                sql,
+                rewritten_request=bound.updated_request,
+                database_context=database_context,
+                required_date_scope=required_date_scope,
             )
             if semantic_issue in {
                 "detail_request_requires_rows",
                 "incomplete_manual_swipe_comparison",
+                "missing_required_categorical_filter",
+                "date_scope_mismatch",
             }:
                 if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
                     raise ProviderFailure(
@@ -1791,6 +1983,27 @@ def run_turn(
                         "From_Date, From_Time, To_Date, and To_Time values with their "
                         "corresponding Actual_* device values using IS DISTINCT FROM, "
                         "joining all four comparisons with OR."
+                    )
+                elif semantic_issue == "missing_required_categorical_filter":
+                    required_categories = _required_categorical_values(
+                        "\n".join((question, bound.updated_request)),
+                        database_context,
+                    )
+                    required_text = "; ".join(
+                        f"{column} IN ({', '.join(sorted(values))})"
+                        for column, values in sorted(required_categories.items())
+                    )
+                    database_error = (
+                        "The SQL omitted or incorrectly scoped a categorical filter "
+                        "resolved from exact database values. Include each required "
+                        "filter so it applies to every OR branch: "
+                        f"{required_text}."
+                    )
+                elif semantic_issue == "date_scope_mismatch":
+                    database_error = (
+                        "The SQL omitted or incorrectly scoped the required inclusive "
+                        "attendance_date range. Apply both bounds to every OR branch: "
+                        f"{required_date_scope[0]} through {required_date_scope[1]}."
                     )
                 sql_execution_failure = {
                     "retry_number": attempt,
@@ -1831,7 +2044,11 @@ def run_turn(
                 )
         log_layer_output("sql_execution", result)
         semantic_issue = _sql_semantic_issue(
-            question, sql, rewritten_request=bound.updated_request
+            question,
+            sql,
+            rewritten_request=bound.updated_request,
+            database_context=database_context,
+            required_date_scope=required_date_scope,
         )
         if semantic_issue is not None:
             raise ProviderFailure("sql_semantics", semantic_issue, semantic_issue)

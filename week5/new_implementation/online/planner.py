@@ -43,6 +43,10 @@ CONSTRUCTION ORDER
    If required_date_scope is present, it is the inclusive inherited attendance_date
    range verified by the application. Include both bounds in SQL even if the short
    current question omits dates. A new period in the current question replaces it.
+   required_categorical_filters contains exact database-observed values resolved from
+   the user's wording. Include every listed column/value filter, using the supplied
+   stored values exactly, and apply each filter to the whole relevant WHERE expression,
+   including every OR branch.
    If attendance_meaning is explicit_absence, use exception = 'Absent' alone to
    define absence; do not add schedule or worked-hours conditions unless the user
    explicitly asks for those extra filters. If attendance_meaning is not_absent,

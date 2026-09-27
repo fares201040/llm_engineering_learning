@@ -78,6 +78,9 @@ class SharedModelContext(_Strict):
         "employees", "criteria", "union", "intersection", "all_authorized"
     ] = "all_authorized"
     resolved_employee_ids: tuple[str, ...] = ()
+    required_categorical_filters: dict[str, tuple[str, ...]] = Field(
+        default_factory=dict
+    )
     required_date_scope: tuple[str, str] | None = None
     request_has_date_period: bool = False
     attendance_meaning: Literal["explicit_absence", "not_absent"] | None = None
@@ -104,6 +107,7 @@ class SharedModelContext(_Strict):
             "request_relationship": self.request_relationship,
             "subject_relationship": self.subject_relationship,
             "resolved_employee_ids": self.resolved_employee_ids,
+            "required_categorical_filters": self.required_categorical_filters,
             "required_date_scope": self.required_date_scope,
             "request_has_date_period": self.request_has_date_period,
             "attendance_meaning": self.attendance_meaning,

@@ -73,6 +73,36 @@ def sql_result():
     )
 
 
+def database_context_with_departments():
+    schema = database_context()
+    table = schema.tables[0]
+    return schema.model_copy(
+        update={
+            "tables": (
+                table.model_copy(
+                    update={
+                        "columns": table.columns
+                        + (
+                            DatabaseColumn(
+                                name="department",
+                                data_type="text",
+                                nullable=False,
+                                description="Department assigned to the employee.",
+                                standard_values=(
+                                    "Finance",
+                                    "Human Resource",
+                                    "Information Technology",
+                                    "Operations",
+                                ),
+                            ),
+                        )
+                    }
+                ),
+            )
+        }
+    )
+
+
 class PipelineTests(unittest.TestCase):
     def test_new_question_replaces_pending_employee_confirmation(self):
         candidates = tuple(
@@ -376,6 +406,78 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertIn(
             "all four", attempts[1]["sql_execution_failure"]["database_error"]
+        )
+
+    def test_missing_database_category_filter_retries_before_execution(self):
+        dependencies = self.dependencies()
+        dependencies.context_loader = lambda **_kwargs: (
+            database_context_with_departments()
+        )
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request=(
+                    "List Human Resource employees with manual swipes in September 2026."
+                ),
+                locale="en",
+                request_relationship="new",
+                subject_relationship="all_authorized",
+            )
+        )
+        comparisons = (
+            "(record_json ->> 'From_Date') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_From_Date')",
+            "(record_json ->> 'From_Time') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_From_Time')",
+            "(record_json ->> 'To_Date') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_To_Date')",
+            "(record_json ->> 'To_Time') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_To_Time')",
+        )
+        manual_filter = "(" + " OR ".join(comparisons) + ")"
+        missing_department = (
+            "SELECT employee_id, name FROM attendance_records WHERE " + manual_filter
+        )
+        correct = (
+            "SELECT employee_id, name FROM attendance_records WHERE "
+            "department = 'Human Resource' AND "
+            "attendance_date >= '2026-09-01' AND "
+            "attendance_date < '2026-10-01' AND "
+            + manual_filter
+        )
+        attempts = []
+        executed = []
+
+        def planner(**kwargs):
+            attempts.append(kwargs)
+            return missing_department if len(attempts) == 1 else correct
+
+        dependencies.planner = planner
+        dependencies.executor = lambda sql, **_kwargs: (
+            executed.append(sql) or sql_result()
+        )
+
+        outcome = run_turn(
+            TurnRequest(
+                question=(
+                    "List employees who have manual swipe in HR during September 2026."
+                ),
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(executed, [correct])
+        self.assertEqual(
+            attempts[0]["shared_context"].required_categorical_filters,
+            {"department": ("Human Resource",)},
+        )
+        self.assertEqual(
+            attempts[1]["sql_execution_failure"]["error_type"], "sql_semantics"
+        )
+        self.assertIn(
+            "Human Resource",
+            attempts[1]["sql_execution_failure"]["database_error"],
         )
 
     def test_over_dates_is_not_a_malformed_numeric_comparison(self):
@@ -1395,6 +1497,128 @@ class PipelineTests(unittest.TestCase):
             "incomplete_manual_swipe_comparison",
         )
 
+    def test_database_category_in_request_is_required_in_every_sql_filter_path(self):
+        comparisons = (
+            "(record_json ->> 'From_Date') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_From_Date')",
+            "(record_json ->> 'From_Time') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_From_Time')",
+            "(record_json ->> 'To_Date') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_To_Date')",
+            "(record_json ->> 'To_Time') IS DISTINCT FROM "
+            "(record_json ->> 'Actual_To_Time')",
+        )
+        manual_filter = "(" + " OR ".join(comparisons) + ")"
+        question = (
+            "List employees who have manual swipe in HR during September 2026."
+        )
+        missing_department = (
+            "SELECT employee_id, name FROM attendance_records WHERE " + manual_filter
+        )
+        wrong_department_value = (
+            "SELECT employee_id, name FROM attendance_records WHERE "
+            "department = 'HR' AND "
+            + manual_filter
+        )
+        correct = (
+            "SELECT employee_id, name FROM attendance_records WHERE "
+            "department = 'Human Resource' AND "
+            + manual_filter
+        )
+
+        self.assertEqual(
+            _sql_semantic_issue(
+                question,
+                missing_department,
+                database_context=database_context_with_departments(),
+            ),
+            "missing_required_categorical_filter",
+        )
+        self.assertEqual(
+            _sql_semantic_issue(
+                question,
+                wrong_department_value,
+                database_context=database_context_with_departments(),
+            ),
+            "missing_required_categorical_filter",
+        )
+        self.assertIsNone(
+            _sql_semantic_issue(
+                question,
+                correct,
+                database_context=database_context_with_departments(),
+            )
+        )
+
+    def test_required_category_filter_must_apply_to_every_or_branch(self):
+        question = "List employees in HR with adjusted attendance records."
+        leaky_sql = (
+            "SELECT employee_id FROM attendance_records WHERE "
+            "department = 'Human Resource' AND exception = 'Late' "
+            "OR exception = 'Missing In'"
+        )
+        scoped_sql = (
+            "SELECT employee_id FROM attendance_records WHERE "
+            "department = 'Human Resource' AND "
+            "(exception = 'Late' OR exception = 'Missing In')"
+        )
+
+        self.assertEqual(
+            _sql_semantic_issue(
+                question,
+                leaky_sql,
+                database_context=database_context_with_departments(),
+            ),
+            "missing_required_categorical_filter",
+        )
+        self.assertIsNone(
+            _sql_semantic_issue(
+                question,
+                scoped_sql,
+                database_context=database_context_with_departments(),
+            )
+        )
+
+    def test_common_word_is_not_treated_as_a_category_acronym(self):
+        self.assertIsNone(
+            _sql_semantic_issue(
+                "Show it by attendance date.",
+                "SELECT attendance_date FROM attendance_records",
+                database_context=database_context_with_departments(),
+            )
+        )
+
+    def test_required_date_scope_must_apply_to_every_or_branch(self):
+        question = "List attendance records during September 2026."
+        leaky_sql = (
+            "SELECT employee_id FROM attendance_records WHERE "
+            "attendance_date >= '2026-09-01' AND "
+            "attendance_date < '2026-10-01' AND exception = 'Late' "
+            "OR exception = 'Missing In'"
+        )
+        scoped_sql = (
+            "SELECT employee_id FROM attendance_records WHERE "
+            "attendance_date >= '2026-09-01' AND "
+            "attendance_date < '2026-10-01' AND "
+            "(exception = 'Late' OR exception = 'Missing In')"
+        )
+
+        self.assertEqual(
+            _sql_semantic_issue(
+                question,
+                leaky_sql,
+                required_date_scope=("2026-09-01", "2026-09-30"),
+            ),
+            "date_scope_mismatch",
+        )
+        self.assertIsNone(
+            _sql_semantic_issue(
+                question,
+                scoped_sql,
+                required_date_scope=("2026-09-01", "2026-09-30"),
+            )
+        )
+
     def test_sql_date_scope_normalizes_inclusive_and_exclusive_bounds(self):
         self.assertEqual(
             _sql_date_scope(
@@ -1693,6 +1917,7 @@ class PipelineTests(unittest.TestCase):
                 "request_relationship",
                 "subject_relationship",
                 "resolved_employee_ids",
+                "required_categorical_filters",
                 "required_date_scope",
                 "request_has_date_period",
                 "attendance_meaning",

@@ -96,6 +96,27 @@ class PrivateRuntimeTests(unittest.TestCase):
             180.0,
         )
 
+    def test_private_runtime_allows_local_models_to_warm_before_timing_out(self):
+        from week5.new_implementation.colab import prepare_private_runtime
+
+        with TemporaryDirectory() as directory:
+            missing_config = Path(directory) / "missing-runtime.json"
+            with patch.object(
+                prepare_private_runtime,
+                "SYNTHETIC_RUNTIME_CONFIG",
+                missing_config,
+            ):
+                settings = prepare_private_runtime._model_settings()
+
+        self.assertGreaterEqual(
+            float(settings["LLM_REFERENCE_TIMEOUT_SECONDS"]),
+            180.0,
+        )
+        self.assertGreaterEqual(
+            float(settings["LLM_ANSWER_TIMEOUT_SECONDS"]),
+            180.0,
+        )
+
     def test_private_runtime_does_not_truncate_gpt_oss_sql_after_reasoning(self):
         from week5.new_implementation.colab import prepare_private_runtime
 

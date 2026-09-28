@@ -93,6 +93,12 @@ def _plan_matches(sql: str, expected: dict | None) -> bool:
         if statement is not None
         for node in statement.find_all(exp.Where, exp.Having)
     )
+    predicate_scope = re.sub(r'"([a-z_][a-z0-9_]*)"', r"\1", predicate_scope)
+    predicate_scope = re.sub(
+        r"cast\('([0-9]{4}-[0-9]{2}-[0-9]{2})' as date\)",
+        r"date '\1'",
+        predicate_scope,
+    )
 
     def contains_filter(item: dict) -> bool:
         field = str(
@@ -335,6 +341,50 @@ def _group_values(
     return normalized
 
 
+def _group_values_by_shape(
+    rows: list[dict[str, object]], expected: list[dict[str, object]]
+) -> tuple[list[dict[str, object]], list[dict[str, object]]] | None:
+    """Compare one-measure grouped rows without depending on the SQL alias."""
+
+    if not expected or not all(isinstance(item, dict) for item in expected):
+        return None
+    group_fields = tuple(
+        key for key, value in expected[0].items() if isinstance(value, str)
+    )
+    measure_fields = tuple(
+        key
+        for key, value in expected[0].items()
+        if isinstance(value, (int, float)) and not isinstance(value, bool)
+    )
+    if (
+        not group_fields
+        or len(measure_fields) != 1
+        or any(set(item) != set(expected[0]) for item in expected)
+    ):
+        return None
+    actual_values = []
+    for row in rows:
+        numbers = [
+            value
+            for key, value in row.items()
+            if key not in {*group_fields, "matched_count"}
+            and isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        ]
+        if all(field in row for field in group_fields) and len(numbers) == 1:
+            actual_values.append(
+                {"group": [row[field] for field in group_fields], "value": numbers[0]}
+            )
+    expected_values = [
+        {
+            "group": [item[field] for field in group_fields],
+            "value": item[measure_fields[0]],
+        }
+        for item in expected
+    ]
+    return actual_values, expected_values
+
+
 def _record_ids(turn: VerifiedTurn | None) -> list[str]:
     return [str(row["record_id"]) for row in _result_rows(turn) if "record_id" in row]
 
@@ -451,6 +501,7 @@ def evaluate_outcome(test: TestQuestion, outcome) -> BehaviorEval:
     pending = outcome.state.pending_employee_confirmation
     pending_ids = [option.employee_id for option in pending.options] if pending else []
     calculation = _calculation(turn, test.expected_calculation)
+    shaped_group_values = _group_values_by_shape(rows, test.expected_group_values)
     matched_count = next(
         (
             value
@@ -549,9 +600,15 @@ def evaluate_outcome(test: TestQuestion, outcome) -> BehaviorEval:
                         isinstance(item, dict) and "group" in item and "value" in item
                         for item in test.expected_group_values
                     )
+                    else shaped_group_values[0]
+                    if shaped_group_values
                     else rows
                 ),
-                test.expected_group_values,
+                (
+                    shaped_group_values[1]
+                    if shaped_group_values
+                    else test.expected_group_values
+                ),
             )
         ),
         unsupported_capabilities_ok=(

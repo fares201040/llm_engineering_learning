@@ -20,19 +20,17 @@ from week5.new_implementation.online.pipeline import (
     TurnRequest,
     Unsupported,
     _locale,
-    _missing_join_target,
-    _schema_grounded_analytic_question,
+    _has_required_date_scope,
     _mentions_time_period,
+    _pending_response,
     _previous_having,
     _request_value_issue,
-    _build_native_attendance_observation_sql,
-    _build_native_employee_day_count_sql,
-    _build_native_schema_aggregate_sql,
+    _repair_group_order,
     _sql_date_scope,
     _sql_semantic_issue,
-    _unrequested_date_filter,
     run_turn,
 )
+from week5.new_implementation.online.planner import ReplanRequest
 from week5.new_implementation.online.provider import ProviderFailure
 from week5.new_implementation.online.reference import (
     AmbiguousReference,
@@ -43,6 +41,7 @@ from week5.new_implementation.online.reference import (
     ReadyReference,
     ReferenceResponse,
     UnsupportedReference,
+    bind_references,
 )
 from week5.new_implementation.online.state import ConversationState, VerifiedTurn
 from week5.new_implementation.tests.online.test_query import database_context
@@ -103,7 +102,405 @@ def database_context_with_departments():
     )
 
 
+def database_context_with_locations():
+    schema = database_context()
+    table = schema.tables[0]
+    return schema.model_copy(
+        update={
+            "tables": (
+                table.model_copy(
+                    update={
+                        "columns": table.columns
+                        + (
+                            DatabaseColumn(
+                                name="work_location",
+                                data_type="text",
+                                nullable=True,
+                                description="Assigned work location.",
+                                standard_values=("MES-Eng", "N/NA"),
+                            ),
+                        )
+                    }
+                ),
+            )
+        }
+    )
+
+
 class PipelineTests(unittest.TestCase):
+    def test_adjusted_swipe_lookup_keeps_selected_employee_without_prior_location(self):
+        employee = Employee(employee_id="A1", name="Wail Ali")
+        prior = VerifiedTurn(
+            turn_id="prior",
+            original_question="Who is A1?",
+            rewritten_request="Who is A1?",
+            answer="A1 is at N/NA; another candidate is at MES-Eng.",
+            locale="en",
+            employees=(employee,),
+            executed_sql=(
+                "SELECT employee_id, name, work_location "
+                "FROM attendance_records WHERE employee_id = 'A1'"
+            ),
+            result={"rows": [{"employee_id": "A1", "work_location": "N/NA"}]},
+        )
+        dependencies = self.dependencies()
+        dependencies.context_loader = (
+            lambda **_kwargs: database_context_with_locations()
+        )
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request=(
+                    "Tell me if A1 has a manually adjusted swipe during September 2026."
+                ),
+                locale="en",
+                request_relationship="follow_up",
+                subject_relationship="employees",
+                employee_ids=("A1",),
+            )
+        )
+        comparisons = (
+            f"(record_json ->> '{effective}') IS DISTINCT FROM "
+            f"(record_json ->> '{actual}')"
+            for effective, actual in (
+                ("From_Date", "Actual_From_Date"),
+                ("From_Time", "Actual_From_Time"),
+                ("To_Date", "Actual_To_Date"),
+                ("To_Time", "Actual_To_Time"),
+            )
+        )
+        sql = (
+            "SELECT employee_id, work_location, attendance_date, "
+            "COUNT(*) OVER() AS matched_count FROM attendance_records "
+            "WHERE employee_id = 'A1' "
+            "AND attendance_date >= '2026-09-01' "
+            "AND attendance_date < '2026-10-01' AND ("
+            + " OR ".join(comparisons)
+            + ") LIMIT 100"
+        )
+        dependencies.planner = lambda **_kwargs: sql
+        executed = []
+        dependencies.executor = lambda query, **_kwargs: (
+            executed.append(query)
+            or SqlExecutionResult(
+                columns=(),
+                rows=(
+                    {
+                        "employee_id": "A1",
+                        "work_location": "N/NA",
+                        "attendance_date": "2026-09-01",
+                        "matched_count": 1,
+                    },
+                ),
+                coverage=ExecutionCoverage(
+                    fetched_rows=1, result_limit=100, response_bytes=100
+                ),
+            )
+        )
+        dependencies.answerer = lambda **_kwargs: (
+            "A1 has a manually adjusted swipe on September 1."
+        )
+        outcome = run_turn(
+            TurnRequest(
+                question="Please tell me if he has manual swipe during September 2026.",
+                state=ConversationState(
+                    verified_turns=(prior,),
+                    active_employee_ids=("A1",),
+                    active_employees=(employee,),
+                ),
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(executed, [sql])
+        self.assertNotIn("MES-Eng", outcome.state.verified_turns[-1].rewritten_request)
+        self.assertNotIn("work_location =", sql)
+
+    def test_plain_language_does_not_force_a_database_location(self):
+        sql = (
+            "SELECT employee_id, attendance_date FROM attendance_records "
+            "WHERE employee_id = 'A1' AND attendance_date >= '2026-09-01' "
+            "AND attendance_date < '2026-10-01'"
+        )
+        for question in (
+            "Please tell me about A1 during September 2026.",
+            "Now give me A1's details during September 2026.",
+        ):
+            with self.subTest(question=question):
+                self.assertIsNone(
+                    _sql_semantic_issue(
+                        question,
+                        sql,
+                        database_context=database_context_with_locations(),
+                        required_date_scope=("2026-09-01", "2026-09-30"),
+                    )
+                )
+
+    def test_general_request_preserves_location_explicit_in_current_question(self):
+        question = "Compare departments at South Dock during September 2026."
+        bound = bind_references(
+            ReferenceResponse(
+                decision=ReadyReference(
+                    rewritten_request=(
+                        "Compare departments at North Yard during September 2026."
+                    ),
+                    locale="en",
+                    request_relationship="new",
+                    subject_relationship="criteria",
+                    employee_criteria=("North Yard",),
+                )
+            ),
+            (Employee(employee_id="A1", name="Wail Ali"),),
+            original_question=question,
+        )
+
+        self.assertEqual(bound.request_relationship, "new")
+        self.assertEqual(bound.subject_relationship, "all_authorized")
+        self.assertEqual(bound.updated_request, f"Request:\n{question}")
+
+    def test_new_department_comparison_ignores_old_employee_and_location(self):
+        dependencies = self.dependencies()
+        prior = VerifiedTurn(
+            turn_id="prior",
+            original_question="Show A1's manual swipes at North Yard.",
+            rewritten_request="Show A1's manual swipes at North Yard.",
+            answer="A1 has no manual swipes at North Yard.",
+            locale="en",
+            employees=(Employee(employee_id="A1", name="Wail Ali"),),
+            executed_sql=(
+                "SELECT employee_id FROM attendance_records "
+                "WHERE employee_id = 'A1' AND work_location = 'North Yard'"
+            ),
+            result={},
+        )
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request=(
+                    "Compare overtime by department at North Yard "
+                    "during September 2026 for A1."
+                ),
+                locale="en",
+                request_relationship="follow_up",
+                subject_relationship="employees",
+                employee_ids=("A1",),
+                employee_criteria=("North Yard",),
+            )
+        )
+        seen = []
+
+        def planner(**kwargs):
+            seen.append(kwargs["shared_context"])
+            return (
+                "SELECT department, SUM(total_ot) AS overtime_hours, "
+                "COUNT(*) OVER() AS matched_count FROM attendance_records "
+                "WHERE attendance_date >= '2026-09-01' "
+                "AND attendance_date < '2026-10-01' "
+                "GROUP BY department ORDER BY overtime_hours DESC LIMIT 100"
+            )
+
+        dependencies.planner = planner
+        dependencies.executor = lambda *_args, **_kwargs: SqlExecutionResult(
+            columns=(),
+            rows=(
+                {"department": "Operations", "overtime_hours": 30, "matched_count": 2},
+                {"department": "Engineering", "overtime_hours": 20, "matched_count": 2},
+            ),
+            coverage=ExecutionCoverage(
+                fetched_rows=2, result_limit=100, response_bytes=120
+            ),
+        )
+        dependencies.answerer = lambda **_kwargs: "Operations 30; Engineering 20."
+        question = "Now compare overtime between departments during September 2026."
+        outcome = run_turn(
+            TurnRequest(
+                question=question,
+                state=ConversationState(
+                    verified_turns=(prior,),
+                    active_employee_ids=("A1",),
+                    active_employees=(Employee(employee_id="A1", name="Wail Ali"),),
+                ),
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].request_relationship, "new")
+        self.assertEqual(seen[0].subject_relationship, "all_authorized")
+        self.assertEqual(seen[0].resolved_employee_ids, ())
+        self.assertEqual(seen[0].updated_request, f"Request:\n{question}")
+        self.assertEqual(seen[0].required_date_scope, ("2026-09-01", "2026-09-30"))
+        self.assertEqual(
+            seen[0].scope_provenance["current_original_question"], question
+        )
+        self.assertEqual(
+            seen[0].scope_provenance["previous_original_question"],
+            prior.original_question,
+        )
+        self.assertEqual(seen[0].scope_provenance["carried_employee_ids_source"], [])
+        self.assertEqual(outcome.state.active_employee_ids, ())
+
+    def test_arbitrary_new_topic_uses_current_request_even_with_date(self):
+        dependencies = self.dependencies()
+        question = "Analyze overtime distribution across units during September 2026."
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request=(
+                    "Analyze overtime distribution across units at North Yard "
+                    "during September 2026."
+                ),
+                locale="en",
+                request_relationship="new",
+                subject_relationship="all_authorized",
+            )
+        )
+        seen = []
+
+        def planner(**kwargs):
+            seen.append(kwargs["shared_context"])
+            return (
+                "SELECT department, SUM(total_ot) AS overtime_hours, "
+                "COUNT(*) OVER() AS matched_count FROM attendance_records "
+                "WHERE attendance_date >= '2026-09-01' "
+                "AND attendance_date < '2026-10-01' "
+                "GROUP BY department ORDER BY overtime_hours DESC LIMIT 100"
+            )
+
+        dependencies.planner = planner
+        dependencies.executor = lambda *_args, **_kwargs: SqlExecutionResult(
+            columns=(),
+            rows=(
+                {"department": "Operations", "overtime_hours": 30, "matched_count": 1},
+            ),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=60
+            ),
+        )
+        dependencies.answerer = lambda **_kwargs: "Operations: 30 hours."
+        outcome = run_turn(
+            TurnRequest(question=question, access_context=LOCAL_DEMO_ACCESS),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(seen[0].updated_request, f"Request:\n{question}")
+        self.assertEqual(seen[0].request_relationship, "new")
+
+    def test_unsupported_plan_is_reconsidered_against_schema(self):
+        dependencies = self.dependencies()
+        calls = []
+
+        def planner(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return (
+                    "SELECT 'The requested concept is not represented by the "
+                    "attendance schema.'::text AS unsupported_capability"
+                )
+            return "SELECT attendance_date FROM attendance_records WHERE employee_id = 'A1'"
+
+        dependencies.planner = planner
+        outcome = run_turn(
+            TurnRequest(question="show A1 dates", access_context=LOCAL_DEMO_ACCESS),
+            dependencies=dependencies,
+        )
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(
+            calls[1]["sql_execution_failure"]["error_type"],
+            "capability_reconsideration",
+        )
+
+    def test_invalid_sql_reports_syntax_to_planner_retry(self):
+        dependencies = self.dependencies()
+        calls = []
+
+        def planner(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return (
+                    "SELECT ARRAY_AGG(ROW(attendance_date)) ORDER BY employee_id FROM"
+                )
+            return "SELECT attendance_date FROM attendance_records WHERE employee_id = 'A1'"
+
+        dependencies.planner = planner
+        outcome = run_turn(
+            TurnRequest(question="show A1 dates", access_context=LOCAL_DEMO_ACCESS),
+            dependencies=dependencies,
+        )
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(
+            calls[1]["sql_execution_failure"]["error_type"],
+            "invalid_sql_syntax",
+        )
+
+    def test_follow_up_name_search_is_not_rejected_as_employee_scope(self):
+        dependencies = self.dependencies()
+        seen = []
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request="Search for close name matches to Raed Ans.",
+                locale="en",
+                request_relationship="follow_up",
+                subject_relationship="all_authorized",
+            )
+        )
+        dependencies.planner = lambda **kwargs: (
+            seen.append(kwargs)
+            or "SELECT employee_id, name FROM attendance_records "
+            "WHERE name ILIKE '%Raed%' LIMIT 10"
+        )
+        dependencies.executor = lambda *_args, **_kwargs: SqlExecutionResult(
+            columns=(),
+            rows=({"employee_id": "A1", "name": "Raed Ansi"},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=64
+            ),
+        )
+        dependencies.answerer = lambda **_kwargs: "Raed Ansi (A1)."
+        prior = VerifiedTurn(
+            turn_id="prior",
+            original_question="Who is Raed Ans?",
+            rewritten_request="Who is Raed Ans?",
+            answer="No exact match. I can search for close matches.",
+            locale="en",
+            executed_sql="SELECT name FROM attendance_records WHERE name = 'Raed Ans'",
+            result={},
+        )
+        outcome = run_turn(
+            TurnRequest(
+                question="Search for close matches",
+                state=ConversationState(verified_turns=(prior,)),
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(outcome.reply, "Raed Ansi (A1).")
+        self.assertEqual(len(seen), 1)
+
+    def test_multiple_choice_words_preserve_ambiguous_employee_options(self):
+        pending = PendingEmployeeConfirmation(
+            original_question="What was the overtime?",
+            mention="shared name",
+            options=(
+                EmployeeOption(employee_id="A1", employee_name="First Person"),
+                EmployeeOption(employee_id="A2", employee_name="Second Person"),
+            ),
+            resolution=PendingResolution(
+                rewritten_request="What was the overtime?",
+                locale="en",
+                request_relationship="new",
+                subject_relationship="employees",
+            ),
+        )
+        for reply in ("all", "both"):
+            self.assertEqual(
+                _pending_response(reply, pending), ("invalid_selection", None)
+            )
+
     def test_new_question_replaces_pending_employee_confirmation(self):
         candidates = tuple(
             EmployeeOption(
@@ -165,7 +562,7 @@ class PipelineTests(unittest.TestCase):
                 fetched_rows=1, result_limit=100, response_bytes=50
             ),
         )
-        dependencies.answer_writer = lambda **_kwargs: "Wail Ali matched."
+        dependencies.answerer = lambda **_kwargs: "Wail Ali matched."
         question = (
             "Please list the employees who have manual swipe in HR during "
             "September 2026."
@@ -199,82 +596,45 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(turn.answer, answer.strip())
 
-    def test_unrequested_date_filter_detects_predicate_not_date_grouping(self):
-        self.assertTrue(
-            _unrequested_date_filter(
-                "SELECT department, SUM(CASE WHEN attendance_date >= '2026-09-01' "
-                "THEN total_worked_hrs ELSE 0 END) AS worked_hours "
-                "FROM attendance_records GROUP BY department"
-            )
-        )
-        self.assertFalse(
-            _unrequested_date_filter(
-                "SELECT attendance_date, SUM(total_worked_hrs) AS worked_hours "
-                "FROM attendance_records GROUP BY attendance_date"
-            )
-        )
-        self.assertTrue(
-            _unrequested_date_filter(
-                "SELECT department, SUM(total_worked_hrs) FROM attendance_records "
-                "WHERE attendance_date = (SELECT MAX(attendance_date) "
-                "FROM attendance_records) GROUP BY department"
-            )
-        )
-        self.assertTrue(
-            _unrequested_date_filter(
-                "SELECT department, SUM(total_worked_hrs) FROM attendance_records "
-                "WHERE attendance_date IS NULL GROUP BY department"
-            )
-        )
-
-    def test_independent_aggregate_retries_unrequested_date_filter_before_execution(
-        self,
-    ):
+    def test_implicit_yesterday_request_can_use_a_date_predicate(self):
         dependencies = self.dependencies()
-        dependencies.context_loader = lambda **_kwargs: attendance_schema()
-        attempts = []
-        executed = []
-
-        def planner(**kwargs):
-            attempts.append(kwargs)
-            if len(attempts) == 1:
-                return (
-                    "SELECT department, SUM(CASE WHEN attendance_date >= '2026-09-01' "
-                    "THEN total_worked_hrs ELSE 0 END) AS worked_hours "
-                    "FROM attendance_records GROUP BY department"
-                )
-            return (
-                "SELECT department, SUM(total_worked_hrs) AS worked_hours "
-                "FROM attendance_records GROUP BY department"
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request="Count A1's attendance records from yesterday.",
+                locale="en",
+                request_relationship="new",
+                subject_relationship="employees",
+                employee_ids=("A1",),
             )
-
-        dependencies.planner = planner
-        dependencies.executor = lambda sql, **_kwargs: (
-            executed.append(sql)
+        )
+        sql = (
+            "SELECT COUNT(*) AS record_count FROM attendance_records "
+            "WHERE employee_id = 'A1' "
+            "AND attendance_date = CURRENT_DATE - INTERVAL '1 day'"
+        )
+        captured = []
+        dependencies.planner = lambda **_kwargs: sql
+        dependencies.executor = lambda query, **_kwargs: (
+            captured.append(query)
             or SqlExecutionResult(
                 columns=(),
-                rows=({"department": "Engineering", "worked_hours": 56},),
+                rows=({"record_count": 0},),
                 coverage=ExecutionCoverage(
-                    fetched_rows=1, result_limit=100, response_bytes=50
+                    fetched_rows=1, result_limit=100, response_bytes=20
                 ),
             )
         )
-        dependencies.answer_writer = lambda **_kwargs: "Engineering: 56 hours."
-
+        dependencies.answerer = lambda **_kwargs: "No attendance records yesterday."
         outcome = run_turn(
             TurnRequest(
-                question="Rank departments by worked hours.",
+                question="How many attendance records did A1 have yesterday?",
                 access_context=LOCAL_DEMO_ACCESS,
             ),
             dependencies=dependencies,
         )
 
         self.assertIsInstance(outcome, Answered)
-        self.assertEqual(len(attempts), 2)
-        self.assertEqual(len(executed), 1)
-        self.assertEqual(
-            attempts[1]["sql_execution_failure"]["error_type"], "sql_semantics"
-        )
+        self.assertEqual(captured, [sql])
 
     def test_detail_request_retries_scalar_count_before_execution(self):
         dependencies = self.dependencies()
@@ -313,7 +673,7 @@ class PipelineTests(unittest.TestCase):
                 ),
             )
         )
-        dependencies.answer_writer = lambda **_kwargs: (
+        dependencies.answerer = lambda **_kwargs: (
             "Wail Ali has record 17 on 2026-09-05."
         )
 
@@ -339,7 +699,9 @@ class PipelineTests(unittest.TestCase):
             "COUNT(*) OVER() AS matched_count.",
         )
 
-    def test_rewritten_manual_swipe_request_retries_before_execution(self):
+    def test_rewritten_manual_swipe_request_uses_planner_sql_without_contract_check(
+        self,
+    ):
         dependencies = self.dependencies()
         attempts = []
         executed = []
@@ -349,7 +711,7 @@ class PipelineTests(unittest.TestCase):
                     "List employees who have a manual swipe from September."
                 ),
                 locale="en",
-                request_relationship="new",
+                request_relationship="follow_up",
                 subject_relationship="all_authorized",
             )
         )
@@ -359,23 +721,10 @@ class PipelineTests(unittest.TestCase):
             "(record_json ->> 'From_Time') IS DISTINCT FROM "
             "(record_json ->> 'Actual_From_Time')"
         )
-        complete_sql = (
-            "SELECT employee_id, name, COUNT(*) AS manual_swipe_records, "
-            "COUNT(*) OVER() AS matched_count FROM attendance_records WHERE "
-            "(record_json ->> 'From_Date') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_From_Date') OR "
-            "(record_json ->> 'From_Time') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_From_Time') OR "
-            "(record_json ->> 'To_Date') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_To_Date') OR "
-            "(record_json ->> 'To_Time') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_To_Time') "
-            "GROUP BY employee_id, name ORDER BY employee_id LIMIT 100"
-        )
 
         def planner_call(**kwargs):
             attempts.append(kwargs)
-            return incomplete_sql if len(attempts) == 1 else complete_sql
+            return incomplete_sql
 
         dependencies.planner = planner_call
         dependencies.executor = lambda sql, **_kwargs: (
@@ -388,7 +737,7 @@ class PipelineTests(unittest.TestCase):
                 ),
             )
         )
-        dependencies.answer_writer = lambda **_kwargs: "Wail Ali has manual swipes."
+        dependencies.answerer = lambda **_kwargs: "Wail Ali has manual swipes."
 
         outcome = run_turn(
             TurnRequest(
@@ -399,86 +748,8 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertIsInstance(outcome, Answered)
-        self.assertEqual(len(attempts), 2)
-        self.assertEqual(executed, [complete_sql])
-        self.assertEqual(
-            attempts[1]["sql_execution_failure"]["error_type"], "sql_semantics"
-        )
-        self.assertIn(
-            "all four", attempts[1]["sql_execution_failure"]["database_error"]
-        )
-
-    def test_missing_database_category_filter_retries_before_execution(self):
-        dependencies = self.dependencies()
-        dependencies.context_loader = lambda **_kwargs: (
-            database_context_with_departments()
-        )
-        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
-            decision=ReadyReference(
-                rewritten_request=(
-                    "List Human Resource employees with manual swipes in September 2026."
-                ),
-                locale="en",
-                request_relationship="new",
-                subject_relationship="all_authorized",
-            )
-        )
-        comparisons = (
-            "(record_json ->> 'From_Date') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_From_Date')",
-            "(record_json ->> 'From_Time') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_From_Time')",
-            "(record_json ->> 'To_Date') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_To_Date')",
-            "(record_json ->> 'To_Time') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_To_Time')",
-        )
-        manual_filter = "(" + " OR ".join(comparisons) + ")"
-        missing_department = (
-            "SELECT employee_id, name FROM attendance_records WHERE " + manual_filter
-        )
-        correct = (
-            "SELECT employee_id, name FROM attendance_records WHERE "
-            "department = 'Human Resource' AND "
-            "attendance_date >= '2026-09-01' AND "
-            "attendance_date < '2026-10-01' AND "
-            + manual_filter
-        )
-        attempts = []
-        executed = []
-
-        def planner(**kwargs):
-            attempts.append(kwargs)
-            return missing_department if len(attempts) == 1 else correct
-
-        dependencies.planner = planner
-        dependencies.executor = lambda sql, **_kwargs: (
-            executed.append(sql) or sql_result()
-        )
-
-        outcome = run_turn(
-            TurnRequest(
-                question=(
-                    "List employees who have manual swipe in HR during September 2026."
-                ),
-                access_context=LOCAL_DEMO_ACCESS,
-            ),
-            dependencies=dependencies,
-        )
-
-        self.assertIsInstance(outcome, Answered)
-        self.assertEqual(executed, [correct])
-        self.assertEqual(
-            attempts[0]["shared_context"].required_categorical_filters,
-            {"department": ("Human Resource",)},
-        )
-        self.assertEqual(
-            attempts[1]["sql_execution_failure"]["error_type"], "sql_semantics"
-        )
-        self.assertIn(
-            "Human Resource",
-            attempts[1]["sql_execution_failure"]["database_error"],
-        )
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(executed, [incomplete_sql])
 
     def test_over_dates_is_not_a_malformed_numeric_comparison(self):
         self.assertIsNone(_request_value_issue("Show a running total over dates."))
@@ -512,281 +783,6 @@ class PipelineTests(unittest.TestCase):
             "reversed_temporal_range",
         )
 
-    def test_native_semantic_employee_plan_uses_observable_indicators(self):
-        sql = _build_native_attendance_observation_sql(
-            "Which employees show unusual attendance patterns?",
-            attendance_schema(),
-            (),
-        )
-
-        self.assertIsNotNone(sql)
-        self.assertIn("GROUP BY employee_id, name", sql)
-        self.assertIn("NULLIF(BTRIM(exception), '') IS NOT NULL", sql)
-        self.assertIn("COUNT(*) OVER() AS matched_count", sql)
-
-    def test_native_semantic_detail_plan_keeps_employee_date_and_threshold(self):
-        sql = _build_native_attendance_observation_sql(
-            "Show concerning records with more than 1 lateness hour on 2026-09-05.",
-            attendance_schema(),
-            (Employee(employee_id="A1", name="Wail Ali"),),
-        )
-
-        self.assertIsNotNone(sql)
-        self.assertIn("employee_id IN ('A1')", sql)
-        self.assertIn("attendance_date = '2026-09-05'", sql)
-        self.assertIn("lateness_hrs > 1", sql)
-        self.assertIn("record_id", sql)
-
-    def test_native_status_detail_plan_handles_schema_values_without_model(self):
-        sql = _build_native_attendance_observation_sql(
-            "Show Draft records.", attendance_schema(), ()
-        )
-
-        self.assertIsNotNone(sql)
-        self.assertIn("status = 'Draft'", sql)
-        self.assertIn("COUNT(*) OVER() AS matched_count", sql)
-
-    def test_native_status_detail_accepts_attendance_between_status_and_records(self):
-        sql = _build_native_attendance_observation_sql(
-            "List Authorized attendance records for A10029.",
-            attendance_schema(),
-            (Employee(employee_id="A10029", name="Suhail Mustafa Yousuf"),),
-        )
-
-        self.assertIn("status = 'Authorized'", sql)
-        self.assertIn("employee_id IN ('A10029')", sql)
-
-    def test_native_month_detail_plan_supports_general_attendance_scope(self):
-        sql = _build_native_attendance_observation_sql(
-            "Show attendance in September 2026.", attendance_schema(), ()
-        )
-
-        self.assertIn("attendance_date >= '2026-09-01'", sql)
-        self.assertIn("attendance_date <= '2026-09-30'", sql)
-        self.assertIn("COUNT(*) OVER() AS matched_count", sql)
-
-    def test_native_employee_day_counts_preserve_business_meaning(self):
-        employee = (Employee(employee_id="A11017", name="Faris Nasser Ali"),)
-        schema = attendance_schema()
-        table = schema.tables[0]
-        schema = schema.model_copy(
-            update={
-                "tables": (
-                    table.model_copy(
-                        update={
-                            "columns": table.columns
-                            + (
-                                DatabaseColumn(
-                                    name="day_type",
-                                    data_type="text",
-                                    nullable=False,
-                                    description="Scheduled day classification.",
-                                ),
-                            )
-                        }
-                    ),
-                )
-            }
-        )
-        worked_sql = _build_native_employee_day_count_sql(
-            "How many days did A11017 attend during September 2026?",
-            schema,
-            employee,
-        )
-        missed_sql = _build_native_employee_day_count_sql(
-            "Tell me how many days employee A11017 did not attend during September 2026.",
-            schema,
-            employee,
-        )
-
-        self.assertIn("COUNT(DISTINCT attendance_date)", worked_sql)
-        self.assertIn("COALESCE(total_worked_hrs, 0) > 0", worked_sql)
-        self.assertIn("day_type = 'Working Day'", missed_sql)
-        self.assertIn("COALESCE(total_worked_hrs, 0) <= 0", missed_sql)
-
-    def test_native_employee_day_count_does_not_capture_worked_hours(self):
-        sql = _build_native_employee_day_count_sql(
-            "How many total hours did A11000 work during September 2026?",
-            attendance_schema(),
-            (Employee(employee_id="A11000", name="Mukhtar Ahmed Meer"),),
-        )
-
-        self.assertIsNone(sql)
-
-    def test_native_semantic_plan_covers_hr_review_and_early_departures(self):
-        hr_sql = _build_native_attendance_observation_sql(
-            "Describe attendance behavior that may need HR review.",
-            attendance_schema(),
-            (),
-        )
-        early_sql = _build_native_attendance_observation_sql(
-            "Find attendance patterns involving early departures.",
-            attendance_schema(),
-            (),
-        )
-
-        self.assertIsNotNone(hr_sql)
-        self.assertIn("attendance_indicator", hr_sql)
-        self.assertIn("UPPER(BTRIM(exception)) <> 'OK'", hr_sql)
-        self.assertIsNotNone(early_sql)
-        self.assertIn("COALESCE(early_out_hrs, 0) > 0", early_sql)
-
-    def test_native_exact_count_and_percentage_use_schema_columns(self):
-        count_sql = _build_native_schema_aggregate_sql(
-            'How many attendance records have Department equal to "Operations"?',
-            attendance_schema(),
-            (),
-        )
-        percentage_sql = _build_native_schema_aggregate_sql(
-            'What percentage of all attendance records have Department equal to "Finance"?',
-            attendance_schema(),
-            (),
-        )
-
-        self.assertEqual(
-            count_sql,
-            'SELECT COUNT(*) AS matched_count FROM "public"."attendance_records" '
-            "WHERE department = 'Operations'",
-        )
-        self.assertIn("COUNT(*) FILTER (WHERE department = 'Finance')", percentage_sql)
-        self.assertIn("AS percentage", percentage_sql)
-
-    def test_native_distinct_employee_status_count_preserves_aggregation(self):
-        schema = attendance_schema()
-        table = schema.tables[0]
-        schema = schema.model_copy(
-            update={
-                "tables": (
-                    table.model_copy(
-                        update={
-                            "columns": table.columns
-                            + (
-                                DatabaseColumn(
-                                    name="status",
-                                    data_type="text",
-                                    nullable=False,
-                                    description="Authorization status.",
-                                ),
-                            )
-                        }
-                    ),
-                )
-            }
-        )
-        sql = _build_native_schema_aggregate_sql(
-            "Count distinct employees with Authorized attendance records.",
-            schema,
-            (),
-        )
-
-        self.assertIn("COUNT(DISTINCT employee_id)", sql)
-        self.assertIn("status = 'Authorized'", sql)
-
-        employee_sql = _build_native_schema_aggregate_sql(
-            "How many Authorized attendance records does A10055 have?",
-            schema,
-            (Employee(employee_id="A10055", name="Example Employee"),),
-        )
-        self.assertIn("COUNT(*) AS matched_count", employee_sql)
-        self.assertIn("employee_id IN ('A10055')", employee_sql)
-        self.assertIn("status = 'Authorized'", employee_sql)
-
-        combined_sql = _build_native_schema_aggregate_sql(
-            (
-                "How many Authorized attendance records belong to A10017 and "
-                "A10029 combined?"
-            ),
-            schema,
-            (
-                Employee(employee_id="A10017", name="Employee One"),
-                Employee(employee_id="A10029", name="Employee Two"),
-            ),
-        )
-        self.assertIn("employee_id IN ('A10017', 'A10029')", combined_sql)
-        self.assertIn("status = 'Authorized'", combined_sql)
-        self.assertIsNone(
-            _build_native_schema_aggregate_sql(
-                "How many Authorized attendance records belong to A99999?",
-                schema,
-                (),
-            )
-        )
-
-    def test_native_threshold_counts_validate_columns_and_comparators(self):
-        greater_sql = _build_native_schema_aggregate_sql(
-            "How many attendance records have Total_Worked_Hrs greater than 0?",
-            attendance_schema(),
-            (),
-        )
-        at_least_sql = _build_native_schema_aggregate_sql(
-            "How many attendance records have Total_Worked_Hrs at least 8?",
-            attendance_schema(),
-            (),
-        )
-
-        self.assertIn("total_worked_hrs > 0", greater_sql)
-        self.assertIn("total_worked_hrs >= 8", at_least_sql)
-
-    def test_native_grouped_average_and_sum_preserve_metric_and_group(self):
-        average_sql = _build_native_schema_aggregate_sql(
-            "What is average Total_Worked_Hrs by Department?",
-            attendance_schema(),
-            (),
-        )
-        sum_sql = _build_native_schema_aggregate_sql(
-            "Sum Total_Worked_Hrs by Department.", attendance_schema(), ()
-        )
-
-        self.assertIn(
-            "department, AVG(total_worked_hrs) AS average_total_worked_hrs",
-            average_sql,
-        )
-        self.assertIn("GROUP BY department", average_sql)
-        self.assertIn(
-            "department, SUM(total_worked_hrs) AS total_total_worked_hrs", sum_sql
-        )
-        self.assertIn("GROUP BY department", sum_sql)
-
-    def test_schema_grounded_analytic_detection_rejects_unknown_concepts(self):
-        schema = attendance_schema()
-        table = schema.tables[0]
-        schema = schema.model_copy(
-            update={
-                "tables": (
-                    table.model_copy(
-                        update={
-                            "columns": tuple(
-                                column.model_copy(
-                                    update={
-                                        "description": "Payroll-effective worked hours."
-                                    }
-                                )
-                                if column.name == "total_worked_hrs"
-                                else column
-                                for column in table.columns
-                            )
-                        }
-                    ),
-                )
-            }
-        )
-        self.assertTrue(
-            _schema_grounded_analytic_question(
-                "Rank departments by worked hours.", schema
-            )
-        )
-        self.assertFalse(
-            _schema_grounded_analytic_question("Rank departments by salary.", schema)
-        )
-        self.assertFalse(
-            _schema_grounded_analytic_question(
-                "Rank departments by payroll worked hours.", schema
-            )
-        )
-        self.assertFalse(
-            _schema_grounded_analytic_question("Compare that with last month.", schema)
-        )
-
     def test_unsupported_reference_cannot_veto_schema_grounded_aggregate(self):
         dependencies = self.dependencies()
         dependencies.context_loader = lambda **_kwargs: attendance_schema()
@@ -808,7 +804,7 @@ class PipelineTests(unittest.TestCase):
                 fetched_rows=1, result_limit=100, response_bytes=50
             ),
         )
-        dependencies.answer_writer = lambda **_kwargs: "Engineering: 56 hours."
+        dependencies.answerer = lambda **_kwargs: "Engineering: 56 hours."
 
         outcome = run_turn(
             TurnRequest(
@@ -832,6 +828,10 @@ class PipelineTests(unittest.TestCase):
                 locale="en",
                 capability="outside_attendance_domain",
             )
+        )
+        dependencies.planner = lambda **_kwargs: (
+            "SELECT COUNT(*) AS matched_count FROM attendance_records "
+            "WHERE department = 'Operations'"
         )
         dependencies.executor = lambda sql, *_args, **_kwargs: SqlExecutionResult(
             columns=(),
@@ -866,6 +866,11 @@ class PipelineTests(unittest.TestCase):
                 locale="en",
                 reason="missing_employee",
             )
+        )
+        dependencies.planner = lambda **_kwargs: (
+            "SELECT department, SUM(total_worked_hrs) AS total_total_worked_hrs, "
+            "COUNT(*) OVER() AS matched_count FROM attendance_records "
+            "GROUP BY department LIMIT 100"
         )
         dependencies.executor = lambda sql, *_args, **_kwargs: SqlExecutionResult(
             columns=(),
@@ -904,6 +909,11 @@ class PipelineTests(unittest.TestCase):
                 locale="en",
                 reason="missing_employee",
             )
+        )
+        dependencies.planner = lambda **_kwargs: (
+            "SELECT record_id, attendance_date, COUNT(*) OVER() AS matched_count "
+            "FROM attendance_records WHERE attendance_date >= '2026-09-01' "
+            "AND attendance_date < '2026-10-01' ORDER BY record_id LIMIT 100"
         )
         dependencies.executor = lambda sql, *_args, **_kwargs: SqlExecutionResult(
             columns=(),
@@ -972,7 +982,7 @@ class PipelineTests(unittest.TestCase):
                 fetched_rows=1, result_limit=100, response_bytes=95
             ),
         )
-        dependencies.answer_writer = lambda **_kwargs: (
+        dependencies.answerer = lambda **_kwargs: (
             "Wail Ali (A1) has one manual-swipe record in HR."
         )
 
@@ -1043,11 +1053,26 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(planned_contexts[0].subject_relationship, "all_authorized")
         self.assertIn("Finance department", planned_contexts[0].updated_request)
 
-    def test_unknown_grouped_metric_is_typed_unsupported_calculation(self):
+    def test_unknown_grouped_metric_reaches_planner_capability_protocol(self):
         dependencies = self.dependencies()
         dependencies.context_loader = lambda **_kwargs: attendance_schema()
-        dependencies.reference_writer = lambda *_args, **_kwargs: self.fail(
-            "invalid schema calculations should stop before model classification"
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request="What is the average of banana by department?",
+                locale="en",
+                request_relationship="new",
+                subject_relationship="all_authorized",
+            )
+        )
+        dependencies.planner = lambda **_kwargs: (
+            "SELECT 'Metric is not in the schema.'::text AS unsupported_capability"
+        )
+        dependencies.executor = lambda *_args, **_kwargs: SqlExecutionResult(
+            columns=(),
+            rows=({"unsupported_capability": "Metric is not in the schema."},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=40
+            ),
         )
 
         outcome = run_turn(
@@ -1059,7 +1084,7 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertIsInstance(outcome, Unsupported)
-        self.assertEqual(outcome.capability, "unsupported_calculation")
+        self.assertEqual(outcome.capability, "schema")
 
     def test_unsupported_reference_cannot_veto_named_employee_aggregate(self):
         dependencies = self.dependencies()
@@ -1081,7 +1106,7 @@ class PipelineTests(unittest.TestCase):
                 fetched_rows=1, result_limit=100, response_bytes=25
             ),
         )
-        dependencies.answer_writer = lambda **_kwargs: "Wail Ali worked 32.41 hours."
+        dependencies.answerer = lambda **_kwargs: "Wail Ali worked 32.41 hours."
 
         outcome = run_turn(
             TurnRequest(
@@ -1126,6 +1151,10 @@ class PipelineTests(unittest.TestCase):
                 capability="outside_attendance_domain",
             )
         )
+        dependencies.planner = lambda **_kwargs: (
+            "SELECT COUNT(*) AS matched_count FROM attendance_records "
+            "WHERE employee_id = 'A1' AND status = 'Authorized'"
+        )
         dependencies.executor = lambda *_args, **_kwargs: SqlExecutionResult(
             columns=(),
             rows=({"matched_count": 2},),
@@ -1168,7 +1197,7 @@ class PipelineTests(unittest.TestCase):
                 fetched_rows=1, result_limit=100, response_bytes=50
             ),
         )
-        dependencies.answer_writer = lambda **_kwargs: "Lateness: 8 records."
+        dependencies.answerer = lambda **_kwargs: "Lateness: 8 records."
 
         outcome = run_turn(
             TurnRequest(
@@ -1181,19 +1210,27 @@ class PipelineTests(unittest.TestCase):
         self.assertIsInstance(outcome, Answered)
         self.assertEqual(outcome.state.verified_turns[-1].employee_ids, ())
 
-    def test_join_preflight_defers_when_both_or_neither_targets_are_known(self):
-        schema = attendance_schema()
-        self.assertFalse(
-            _missing_join_target("Join attendance to attendance_records.", schema)
-        )
-        self.assertFalse(_missing_join_target("Join payroll to benefits.", schema))
-
-    def test_missing_join_target_is_schema_unsupported_before_reference_model(self):
+    def test_missing_join_target_is_assessed_by_planner_schema(self):
         state = ConversationState()
         dependencies = self.dependencies()
         dependencies.context_loader = lambda **_kwargs: attendance_schema()
-        dependencies.reference_writer = lambda *_args, **_kwargs: self.fail(
-            "schema-declared join target absence should be resolved before the model"
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request="Join attendance to payroll.",
+                locale="en",
+                request_relationship="new",
+                subject_relationship="all_authorized",
+            )
+        )
+        dependencies.planner = lambda **_kwargs: (
+            "SELECT 'Payroll is not in the schema.'::text AS unsupported_capability"
+        )
+        dependencies.executor = lambda *_args, **_kwargs: SqlExecutionResult(
+            columns=(),
+            rows=({"unsupported_capability": "Payroll is not in the schema."},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=40
+            ),
         )
 
         outcome = run_turn(
@@ -1232,8 +1269,8 @@ class PipelineTests(unittest.TestCase):
         dependencies.planner = lambda **_kwargs: self.fail(
             "clear grouped comparison must not be model-replanned"
         )
-        dependencies.answer_writer = lambda **_kwargs: self.fail(
-            "typed grouped comparison result must be rendered consistently"
+        dependencies.answerer = lambda **_kwargs: (
+            "Engineering: August 16 hours; September 40 hours; difference 24 hours."
         )
         dependencies.context_loader = lambda **_kwargs: attendance_schema()
         executed = []
@@ -1293,8 +1330,8 @@ class PipelineTests(unittest.TestCase):
         dependencies.planner = lambda **_kwargs: self.fail(
             "verified running total must not be model-replanned"
         )
-        dependencies.answer_writer = lambda **_kwargs: self.fail(
-            "verified running total must be rendered from checked results"
+        dependencies.answerer = lambda **_kwargs: (
+            "2026-08-03: 14 hours; 2026-08-04: 36 hours running total."
         )
 
         def executor(sql, **_kwargs):
@@ -1373,210 +1410,137 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(_locale("How many days for A1? Reply in Arabic."), "ar")
         self.assertEqual(_locale("كم يوم اشتغل A1؟ جاوب بالإنجليزية"), "en")
 
-    def test_negated_absence_requires_the_distinct_predicate(self):
-        question = "Show dates that are not absent."
+    def test_bounded_grouped_result_has_distinct_result_count(self):
         self.assertEqual(
             _sql_semantic_issue(
-                question,
+                "Show absence dates.",
+                "SELECT ARRAY_AGG(attendance_date) FROM attendance_records",
+            ),
+            "nested_result_shape",
+        )
+        self.assertEqual(
+            _sql_semantic_issue(
+                "Find attendance indicators by employee.",
+                "SELECT employee_id, COUNT(*) AS matched_count "
+                "FROM attendance_records GROUP BY employee_id LIMIT 100",
+            ),
+            "invalid_grouped_matched_count",
+        )
+        self.assertIsNone(
+            _sql_semantic_issue(
+                "Find attendance indicators by employee.",
+                "SELECT employee_id, COUNT(*) AS indicator_count, "
+                "COUNT(*) OVER() AS matched_count FROM attendance_records "
+                "GROUP BY employee_id LIMIT 100",
+            )
+        )
+        self.assertEqual(
+            _sql_semantic_issue(
+                "Find attendance indicators by employee.",
+                "SELECT employee_id, COUNT(*) OVER() AS matched_count "
+                "FROM attendance_records GROUP BY employee_id LIMIT 100",
+            ),
+            "missing_group_measure",
+        )
+        self.assertEqual(
+            _sql_semantic_issue(
+                "Find attendance indicators by employee.",
+                "SELECT employee_id, COUNT(*) AS indicator_count, "
+                "COUNT(*) OVER() AS matched_count FROM attendance_records "
+                "GROUP BY employee_id ORDER BY matched_count DESC LIMIT 100",
+            ),
+            "group_order_uses_total_count",
+        )
+        repaired = _repair_group_order(
+            "SELECT employee_id, COUNT(*) AS indicator_count, "
+            "COUNT(*) OVER() AS matched_count FROM attendance_records "
+            "GROUP BY employee_id ORDER BY matched_count DESC LIMIT 100"
+        )
+        self.assertIn("ORDER BY indicator_count DESC", repaired)
+        self.assertIsNone(_sql_semantic_issue("Find indicators by employee.", repaired))
+
+    def test_running_total_alias_requires_an_ordered_window(self):
+        self.assertEqual(
+            _sql_semantic_issue(
+                "Show a running total over dates.",
+                "SELECT attendance_date, SUM(total_worked_hrs) AS daily_value "
+                "FROM attendance_records GROUP BY attendance_date",
+            ),
+            "missing_running_total_expression",
+        )
+        self.assertEqual(
+            _sql_semantic_issue(
+                "Show a running total over dates.",
+                "SELECT attendance_date, SUM(total_worked_hrs) AS running_total "
+                "FROM attendance_records GROUP BY attendance_date",
+            ),
+            "invalid_running_total_expression",
+        )
+        self.assertIsNone(
+            _sql_semantic_issue(
+                "Show a running total over dates.",
+                "WITH daily_values AS (SELECT attendance_date, "
+                "SUM(total_worked_hrs) AS daily_value FROM attendance_records "
+                "GROUP BY attendance_date) SELECT attendance_date, "
+                "SUM(daily_value) OVER (ORDER BY attendance_date) "
+                "AS running_total FROM daily_values",
+            )
+        )
+        self.assertIsNone(
+            _sql_semantic_issue(
+                "Show a running total over dates.",
+                "WITH daily_values AS (SELECT attendance_date, "
+                "SUM(total_worked_hrs) AS daily_value FROM attendance_records "
+                "GROUP BY attendance_date), running AS (SELECT attendance_date, "
+                "SUM(daily_value) OVER (ORDER BY attendance_date) AS running_total "
+                "FROM daily_values) SELECT attendance_date, running_total FROM running",
+            )
+        )
+        self.assertEqual(
+            _sql_semantic_issue(
+                "Show a running total over dates.",
+                "SELECT attendance_date, SUM(total_worked_hrs) OVER "
+                "(ORDER BY attendance_date) AS running_total "
+                "FROM attendance_records",
+            ),
+            "running_total_requires_daily_grouping",
+        )
+
+    def test_schema_meaning_is_not_enforced_by_request_wording_checks(self):
+        self.assertIsNone(
+            _sql_semantic_issue(
+                "Show dates that are not absent.",
                 "SELECT attendance_date FROM attendance_records WHERE exception = 'Absent'",
-            ),
-            "wrong_absence_polarity",
-        )
-        self.assertIsNone(
-            _sql_semantic_issue(
-                question,
-                "SELECT attendance_date FROM attendance_records WHERE exception IS DISTINCT FROM 'Absent'",
             )
         )
         self.assertIsNone(
             _sql_semantic_issue(
-                "Compare absence counts by department.",
-                "SELECT department, SUM(CASE WHEN exception = 'Absent' THEN 1 ELSE 0 END) "
-                "FROM attendance_records GROUP BY department",
+                "List employees with manual swipes.",
+                "SELECT employee_id FROM attendance_records WHERE "
+                "(record_json ->> 'From_Time') IS DISTINCT FROM "
+                "(record_json ->> 'Actual_From_Time')",
             )
         )
+
+    def test_negated_category_does_not_require_positive_filter(self):
         self.assertIsNone(
             _sql_semantic_issue(
-                'How many attendance records have Exception equal to "Absence Hours"?',
-                "SELECT COUNT(*) FROM attendance_records "
-                "WHERE exception = 'Absence Hours'",
-            )
-        )
-        self.assertEqual(
-            _sql_semantic_issue(
-                "Show the absence dates instead.",
+                "Show dates that are not absent.",
                 "SELECT attendance_date FROM attendance_records "
-                "WHERE exception = 'Absent' OR COALESCE(total_worked_hrs, 0) <= 0",
-            ),
-            "wrong_absence_semantics",
-        )
-        self.assertEqual(
-            _sql_semantic_issue(
-                "Show the absence dates instead.",
-                "SELECT attendance_date FROM attendance_records "
-                "WHERE exception = 'Absent' AND day_type = 'Working Day'",
-            ),
-            "wrong_absence_semantics",
-        )
-
-    def test_manual_swipe_requires_all_four_null_safe_device_comparisons(self):
-        incomplete_sql = (
-            "SELECT employee_id, name FROM attendance_records WHERE "
-            "(record_json ->> 'From_Time') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_From_Time')"
-        )
-        complete_sql = (
-            "SELECT employee_id, name FROM attendance_records WHERE "
-            "(record_json ->> 'From_Date') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_From_Date') OR "
-            "(record_json ->> 'From_Time') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_From_Time') OR "
-            "(record_json ->> 'To_Date') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_To_Date') OR "
-            "(record_json ->> 'To_Time') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_To_Time')"
-        )
-
-        self.assertEqual(
-            _sql_semantic_issue("list employees who has manual swipe", incomplete_sql),
-            "incomplete_manual_swipe_comparison",
-        )
-        self.assertIsNone(
-            _sql_semantic_issue("list employees who has manual swipe", complete_sql)
-        )
-
-    def test_manual_swipe_requires_one_or_filter_for_all_four_comparisons(self):
-        comparisons = (
-            "(record_json ->> 'From_Date') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_From_Date')",
-            "(record_json ->> 'From_Time') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_From_Time')",
-            "(record_json ->> 'To_Date') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_To_Date')",
-            "(record_json ->> 'To_Time') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_To_Time')",
-        )
-        and_sql = "SELECT employee_id FROM attendance_records WHERE " + " AND ".join(
-            comparisons
-        )
-        selected_only_sql = (
-            "SELECT " + ", ".join(comparisons) + " FROM attendance_records"
-        )
-
-        self.assertEqual(
-            _sql_semantic_issue("List employees with manual swipes.", and_sql),
-            "incomplete_manual_swipe_comparison",
-        )
-        self.assertEqual(
-            _sql_semantic_issue(
-                "List employees with manual swipes.", selected_only_sql
-            ),
-            "incomplete_manual_swipe_comparison",
-        )
-
-    def test_manual_swipe_semantics_use_rewritten_and_arabic_requests(self):
-        incomplete_sql = (
-            "SELECT employee_id FROM attendance_records WHERE "
-            "(record_json ->> 'From_Time') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_From_Time')"
-        )
-
-        self.assertEqual(
-            _sql_semantic_issue(
-                "Only those from September.",
-                incomplete_sql,
-                rewritten_request=("List employees with manual swipes from September."),
-            ),
-            "incomplete_manual_swipe_comparison",
-        )
-        self.assertEqual(
-            _sql_semantic_issue(
-                "اعرض الموظفين الذين تم تعديل بصماتهم يدويا",
-                incomplete_sql,
-            ),
-            "incomplete_manual_swipe_comparison",
-        )
-
-    def test_database_category_in_request_is_required_in_every_sql_filter_path(self):
-        comparisons = (
-            "(record_json ->> 'From_Date') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_From_Date')",
-            "(record_json ->> 'From_Time') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_From_Time')",
-            "(record_json ->> 'To_Date') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_To_Date')",
-            "(record_json ->> 'To_Time') IS DISTINCT FROM "
-            "(record_json ->> 'Actual_To_Time')",
-        )
-        manual_filter = "(" + " OR ".join(comparisons) + ")"
-        question = (
-            "List employees who have manual swipe in HR during September 2026."
-        )
-        missing_department = (
-            "SELECT employee_id, name FROM attendance_records WHERE " + manual_filter
-        )
-        wrong_department_value = (
-            "SELECT employee_id, name FROM attendance_records WHERE "
-            "department = 'HR' AND "
-            + manual_filter
-        )
-        correct = (
-            "SELECT employee_id, name FROM attendance_records WHERE "
-            "department = 'Human Resource' AND "
-            + manual_filter
-        )
-
-        self.assertEqual(
-            _sql_semantic_issue(
-                question,
-                missing_department,
-                database_context=database_context_with_departments(),
-            ),
-            "missing_required_categorical_filter",
-        )
-        self.assertEqual(
-            _sql_semantic_issue(
-                question,
-                wrong_department_value,
-                database_context=database_context_with_departments(),
-            ),
-            "missing_required_categorical_filter",
-        )
-        self.assertIsNone(
-            _sql_semantic_issue(
-                question,
-                correct,
-                database_context=database_context_with_departments(),
+                "WHERE exception IS DISTINCT FROM 'Absent'",
+                database_context=database_context(),
             )
         )
 
-    def test_required_category_filter_must_apply_to_every_or_branch(self):
-        question = "List employees in HR with adjusted attendance records."
-        leaky_sql = (
-            "SELECT employee_id FROM attendance_records WHERE "
-            "department = 'Human Resource' AND exception = 'Late' "
-            "OR exception = 'Missing In'"
-        )
-        scoped_sql = (
-            "SELECT employee_id FROM attendance_records WHERE "
-            "department = 'Human Resource' AND "
-            "(exception = 'Late' OR exception = 'Missing In')"
-        )
-
+    def test_unfiltered_self_membership_predicate_is_rejected(self):
         self.assertEqual(
             _sql_semantic_issue(
-                question,
-                leaky_sql,
-                database_context=database_context_with_departments(),
+                "Group worked hours by department.",
+                "SELECT department, SUM(total_worked_hrs) "
+                "FROM attendance_records WHERE employee_id IN "
+                "(SELECT employee_id FROM attendance_records) GROUP BY department",
             ),
-            "missing_required_categorical_filter",
-        )
-        self.assertIsNone(
-            _sql_semantic_issue(
-                question,
-                scoped_sql,
-                database_context=database_context_with_departments(),
-            )
+            "self_membership_filter",
         )
 
     def test_common_word_is_not_treated_as_a_category_acronym(self):
@@ -1643,6 +1607,42 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(_mentions_time_period("Show the absence dates instead."))
         self.assertTrue(_mentions_time_period("Compare with last month."))
 
+    def test_postgres_date_literals_survive_scope_validation(self):
+        sql = (
+            'SELECT COUNT(DISTINCT "attendance_date") FROM public.attendance_records '
+            "WHERE \"employee_id\" = 'A11017' "
+            "AND \"attendance_date\" BETWEEN DATE '2026-09-01' "
+            "AND DATE '2026-09-30' AND total_worked_hrs > 0"
+        )
+        self.assertEqual(_sql_date_scope(sql), ("2026-09-01", "2026-09-30"))
+        self.assertIsNone(
+            _sql_semantic_issue(
+                "How many days did A11017 attend during September 2026?",
+                sql,
+                required_date_scope=("2026-09-01", "2026-09-30"),
+            )
+        )
+
+    def test_unused_cte_cannot_satisfy_date_or_category_scope(self):
+        sql = (
+            "WITH scoped AS (SELECT employee_id FROM attendance_records "
+            "WHERE attendance_date BETWEEN DATE '2026-09-01' "
+            "AND DATE '2026-09-30' AND department = 'Engineering'), "
+            "raw AS (SELECT COUNT(*) AS n FROM attendance_records) "
+            "SELECT n FROM raw"
+        )
+        self.assertFalse(_has_required_date_scope(sql, ("2026-09-01", "2026-09-30")))
+        self.assertIsNone(_sql_date_scope(sql))
+
+    def test_outer_cte_filter_scopes_contributing_rows(self):
+        sql = (
+            "WITH raw AS (SELECT attendance_date, department "
+            "FROM attendance_records) SELECT COUNT(*) FROM raw "
+            "WHERE attendance_date BETWEEN DATE '2026-09-01' "
+            "AND DATE '2026-09-30' AND department = 'Engineering'"
+        )
+        self.assertTrue(_has_required_date_scope(sql, ("2026-09-01", "2026-09-30")))
+
     def test_inherited_date_scope_must_survive_a_short_follow_up(self):
         employee = Employee(employee_id="A1", name="Wail Ali")
         previous = ConversationState(
@@ -1677,7 +1677,7 @@ class PipelineTests(unittest.TestCase):
             )
 
         dependencies.planner = planner
-        dependencies.answer_writer = lambda **_kwargs: self.fail(
+        dependencies.answerer = lambda **_kwargs: self.fail(
             "out-of-period SQL must not reach the answer writer"
         )
         outcome = run_turn(
@@ -1692,37 +1692,14 @@ class PipelineTests(unittest.TestCase):
         self.assertIsInstance(outcome, Failed)
         self.assertEqual(outcome.code, "date_scope_mismatch")
         self.assertEqual(outcome.state, previous)
-        self.assertIn("Immediately previous verified request:", seen[0].updated_request)
-        self.assertIn("Show A1 in September 2026.", seen[0].updated_request)
-        self.assertIn(
-            "Its verified SQL defines the grouping and eligibility:",
-            seen[0].updated_request,
+        self.assertIn("Show absence dates for employee A1.", seen[0].updated_request)
+        self.assertEqual(
+            seen[0].previous_verified_turn["request"],
+            "Show A1 in September 2026.",
         )
+        self.assertIn("attendance_records", seen[0].previous_verified_turn["sql"])
         self.assertEqual(seen[0].subject_relationship, "employees")
         self.assertEqual(seen[0].resolved_employee_ids, ("A1",))
-
-    def test_wrong_absence_polarity_does_not_publish_state(self):
-        dependencies = self.dependencies()
-        dependencies.planner = lambda **_kwargs: (
-            "SELECT attendance_date FROM attendance_records "
-            "WHERE employee_id = 'A1' AND exception = 'Absent'"
-        )
-        dependencies.answer_writer = lambda **_kwargs: self.fail(
-            "wrong SQL must not reach the answer writer"
-        )
-        previous = ConversationState()
-        outcome = run_turn(
-            TurnRequest(
-                question="Show A1 dates that are not absent.",
-                state=previous,
-                access_context=LOCAL_DEMO_ACCESS,
-            ),
-            dependencies=dependencies,
-        )
-
-        self.assertIsInstance(outcome, Failed)
-        self.assertEqual(outcome.code, "wrong_absence_polarity")
-        self.assertEqual(outcome.state, previous)
 
     def dependencies(self):
         return RuntimeDependencies(
@@ -1737,7 +1714,7 @@ class PipelineTests(unittest.TestCase):
                 "WHERE employee_id = 'A1' AND exception = 'Absent'"
             ),
             executor=lambda *_args, **_kwargs: sql_result(),
-            answer_writer=lambda **_kwargs: "Wail Ali was absent on 2026-09-03.",
+            answerer=lambda **_kwargs: "Wail Ali was absent on 2026-09-03.",
         )
 
     def test_answered_turn_publishes_rewrite_sql_result_and_answer_atomically(self):
@@ -1786,7 +1763,7 @@ class PipelineTests(unittest.TestCase):
                 fetched_rows=1, result_limit=100, response_bytes=20
             ),
         )
-        dependencies.answer_writer = lambda **_kwargs: "Wail Ali worked 5 days."
+        dependencies.answerer = lambda **_kwargs: "Wail Ali worked 5 days."
 
         outcome = run_turn(
             TurnRequest(
@@ -1844,7 +1821,10 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(seen[0].request_relationship, "follow_up")
         self.assertEqual(
             seen[0].conversation_history,
-            ({"role": "user", "content": "Show A1 attendance."},),
+            (
+                {"role": "user", "content": "Show A1 attendance."},
+                {"role": "assistant", "content": "One record."},
+            ),
         )
         self.assertEqual(outcome.state.active_employee_ids, ("A1",))
         self.assertIn(
@@ -1890,12 +1870,12 @@ class PipelineTests(unittest.TestCase):
             seen["planner"] = kwargs["shared_context"]
             return "SELECT 1"
 
-        def answer_writer(**kwargs):
+        def answerer(**kwargs):
             seen["answer"] = kwargs["shared_context"]
             return "Wail Ali has one matching row."
 
         dependencies.planner = planner
-        dependencies.answer_writer = answer_writer
+        dependencies.answerer = answerer
         outcome = run_turn(
             TurnRequest(
                 question="show A1 dates",
@@ -1914,24 +1894,27 @@ class PipelineTests(unittest.TestCase):
                 "as_of_date",
                 "last_calendar_month",
                 "updated_request",
+                "previous_verified_turn",
                 "request_relationship",
                 "subject_relationship",
                 "resolved_employee_ids",
-                "required_categorical_filters",
                 "required_date_scope",
+                "requested_period_vs_observed_rows",
                 "request_has_date_period",
-                "attendance_meaning",
                 "conversation_history",
                 "trusted_context",
+                "scope_provenance",
                 "database_type",
                 "database_context",
+                "observed_date_ranges",
+                "calendar_month_date_extent",
                 "resolution_statement",
             },
         )
         self.assertEqual(seen["planner"].current_question, "show A1 dates")
         self.assertEqual(
             seen["planner"].conversation_history,
-            (),
+            ({"role": "user", "content": "attendance for A1"},),
         )
         self.assertEqual(seen["planner"].trusted_context, {})
 
@@ -1963,8 +1946,8 @@ class PipelineTests(unittest.TestCase):
     def test_provider_or_verifier_failure_preserves_exact_prior_state(self):
         state = ConversationState(active_employee_ids=("A1",))
         dependencies = self.dependencies()
-        dependencies.answer_writer = lambda **_kwargs: (_ for _ in ()).throw(
-            ProviderFailure("answer_verifier", "answer_verdict_failed", "rejected")
+        dependencies.answerer = lambda **_kwargs: (_ for _ in ()).throw(
+            ProviderFailure("sql_answer_review", "answer_review_failed", "rejected")
         )
 
         outcome = run_turn(
@@ -1978,6 +1961,113 @@ class PipelineTests(unittest.TestCase):
 
         self.assertIsInstance(outcome, Failed)
         self.assertEqual(outcome.state, state)
+
+    def test_review_can_replan_sql_and_publish_only_corrected_evidence(self):
+        state = ConversationState()
+        dependencies = self.dependencies()
+        plans = []
+        executed = []
+        reviewed = []
+
+        def planner(**kwargs):
+            plans.append(kwargs)
+            return f"SELECT attempt_{len(plans)}"
+
+        def executor(sql, **_kwargs):
+            executed.append(sql)
+            return sql_result()
+
+        def answerer(**kwargs):
+            reviewed.append(kwargs["sql"])
+            if len(reviewed) == 1:
+                return ReplanRequest(
+                    reason="The first SQL omitted a requested measure. Include it in a new query."
+                )
+            return "The corrected result answers both requested measures."
+
+        dependencies.planner = planner
+        dependencies.executor = executor
+        dependencies.answerer = answerer
+
+        outcome = run_turn(
+            TurnRequest(
+                question="Show A1 absence dates and hours",
+                state=state,
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(executed, ["SELECT attempt_1", "SELECT attempt_2"])
+        self.assertEqual(reviewed, executed)
+        self.assertEqual(
+            plans[1]["sql_execution_failure"]["error_type"], "answer_review_requery"
+        )
+        self.assertIn(
+            "omitted a requested measure",
+            plans[1]["sql_execution_failure"]["database_error"],
+        )
+        self.assertEqual(
+            outcome.state.verified_turns[-1].executed_sql, "SELECT attempt_2"
+        )
+
+    def test_review_requery_stops_at_sql_attempt_limit_without_publication(self):
+        state = ConversationState()
+        dependencies = self.dependencies()
+        plans = []
+
+        def planner(**kwargs):
+            plans.append(kwargs)
+            return f"SELECT attempt_{len(plans)}"
+
+        dependencies.planner = planner
+        dependencies.answerer = lambda **_kwargs: ReplanRequest(
+            reason="The query still lacks required evidence."
+        )
+        outcome = run_turn(
+            TurnRequest(
+                question="Show A1 absence dates",
+                state=state,
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Failed)
+        self.assertEqual(outcome.state, state)
+        self.assertLessEqual(len(plans), 4)
+
+    def test_review_requery_respects_shared_provider_call_budget(self):
+        state = ConversationState()
+        dependencies = self.dependencies()
+        plans = []
+
+        def planner(**kwargs):
+            kwargs["budget"].claim("sql_planner")
+            plans.append(kwargs)
+            return f"SELECT attempt_{len(plans)}"
+
+        def answerer(**kwargs):
+            kwargs["budget"].claim("sql_final_answer")
+            kwargs["budget"].claim("sql_answer_review")
+            return ReplanRequest(reason="The evidence still omits a requested field.")
+
+        dependencies.planner = planner
+        dependencies.answerer = answerer
+        outcome = run_turn(
+            TurnRequest(
+                question="Show A1 absence dates",
+                state=state,
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Failed)
+        self.assertEqual(outcome.code, "call_budget_exceeded")
+        self.assertEqual(outcome.state, state)
+        self.assertLessEqual(len(plans), 4)
 
     def test_database_failure_preserves_exact_prior_state(self):
         state = ConversationState()
@@ -2040,6 +2130,69 @@ class PipelineTests(unittest.TestCase):
             outcome.state.verified_turns[-1].executed_sql, "SELECT attempt_2"
         )
 
+    def test_row_bound_replans_with_bounded_result_contract(self):
+        dependencies = self.dependencies()
+        calls = []
+
+        def planner(**kwargs):
+            calls.append(kwargs)
+            return f"SELECT attempt_{len(calls)}"
+
+        executions = []
+
+        def executor(sql, **_kwargs):
+            executions.append(sql)
+            if len(executions) == 1:
+                raise RuntimeError("result row bound exceeded")
+            return sql_result()
+
+        dependencies.planner = planner
+        dependencies.executor = executor
+        outcome = run_turn(
+            TurnRequest(question="show A1 dates", access_context=LOCAL_DEMO_ACCESS),
+            dependencies=dependencies,
+        )
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(len(calls), 2)
+        self.assertIn(
+            "COUNT(*) OVER() AS matched_count",
+            calls[1]["sql_execution_failure"]["database_error"],
+        )
+
+    def test_unavailable_table_stops_before_meaning_changing_retry(self):
+        dependencies = self.dependencies()
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request="Join attendance to payroll.",
+                locale="en",
+                request_relationship="new",
+                subject_relationship="all_authorized",
+            )
+        )
+        planner_calls = []
+
+        def planner(**kwargs):
+            planner_calls.append(kwargs)
+            return "SELECT * FROM payroll WHERE attendance_date >= '2026-09-01'"
+
+        dependencies.planner = planner
+        dependencies.executor = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unavailable relation reached execution")
+        )
+        state = ConversationState()
+        outcome = run_turn(
+            TurnRequest(
+                question="Join attendance to payroll.",
+                state=state,
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+        self.assertIsInstance(outcome, Unsupported)
+        self.assertEqual(outcome.capability, "schema")
+        self.assertEqual(outcome.state, state)
+        self.assertEqual(len(planner_calls), 1)
+
     def test_two_postgres_query_rejections_allow_third_planner_attempt(self):
         dependencies = self.dependencies()
         planner_calls = []
@@ -2079,7 +2232,7 @@ class PipelineTests(unittest.TestCase):
             outcome.state.verified_turns[-1].executed_sql, "SELECT attempt_3"
         )
 
-    def test_third_postgres_query_rejection_fails_without_publishing_state(self):
+    def test_fourth_postgres_query_rejection_fails_without_publishing_state(self):
         state = ConversationState()
         dependencies = self.dependencies()
         planner_calls = []
@@ -2098,7 +2251,7 @@ class PipelineTests(unittest.TestCase):
 
         outcome = run_turn(
             TurnRequest(
-                question="show A1 absence dates",
+                question="show A1 records",
                 state=state,
                 access_context=LOCAL_DEMO_ACCESS,
             ),
@@ -2107,8 +2260,8 @@ class PipelineTests(unittest.TestCase):
 
         self.assertIsInstance(outcome, Failed)
         self.assertEqual(outcome.state, state)
-        self.assertEqual(len(planner_calls), 3)
-        self.assertEqual(len(execution_calls), 3)
+        self.assertEqual(len(planner_calls), 4)
+        self.assertEqual(len(execution_calls), 4)
 
     def test_missing_access_fails_before_planning_and_preserves_state(self):
         dependencies = self.dependencies()
@@ -2150,6 +2303,51 @@ class PipelineTests(unittest.TestCase):
 
         self.assertIsInstance(outcome, Unsupported)
         self.assertEqual(outcome.capability, "malformed_identifier")
+
+    def test_well_formed_unknown_employee_id_stops_before_reference(self):
+        dependencies = self.dependencies()
+        dependencies.directory_loader = lambda **_kwargs: (
+            Employee(employee_id="A11017", name="Known Person"),
+        )
+        dependencies.reference_writer = lambda *_args, **_kwargs: self.fail(
+            "unknown explicit ID must stop before reference rewriting"
+        )
+        state = ConversationState()
+        outcome = run_turn(
+            TurnRequest(
+                question="Show attendance for employee A99999.",
+                state=state,
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+        self.assertIsInstance(outcome, Clarification)
+        self.assertEqual(outcome.reason, "unknown_employee_id")
+        self.assertEqual(outcome.state, state)
+
+    def test_unknown_written_person_stops_after_empty_directory_search(self):
+        dependencies = self.dependencies()
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request="Count authorized records for Unknown Human.",
+                locale="en",
+                request_relationship="new",
+                subject_relationship="all_authorized",
+            )
+        )
+        dependencies.employee_fuzzy_search = lambda *_args, **_kwargs: ()
+        dependencies.planner = lambda **_kwargs: self.fail(
+            "unknown written person must not become an all-records query"
+        )
+        outcome = run_turn(
+            TurnRequest(
+                question="Count authorized records for Unknown Human.",
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+        self.assertIsInstance(outcome, Clarification)
+        self.assertEqual(outcome.reason, "unknown_employee_id")
 
     def test_non_finite_numeric_comparison_is_unsupported_before_reference(self):
         dependencies = self.dependencies()
@@ -2249,8 +2447,8 @@ class PipelineTests(unittest.TestCase):
                 fetched_rows=1, result_limit=100, response_bytes=90
             ),
         )
-        dependencies.answer_writer = lambda **_kwargs: self.fail(
-            "unsupported results must not reach answer writing"
+        dependencies.answerer = lambda **_kwargs: (
+            "The attendance schema has no loan balance field."
         )
 
         outcome = run_turn(
@@ -2263,6 +2461,9 @@ class PipelineTests(unittest.TestCase):
 
         self.assertIsInstance(outcome, Unsupported)
         self.assertEqual(outcome.capability, "schema")
+        self.assertEqual(
+            outcome.reply, "The attendance schema has no loan balance field."
+        )
 
     def test_planner_clarification_protocol_returns_explicit_clarification(self):
         dependencies = self.dependencies()
@@ -2291,8 +2492,8 @@ class PipelineTests(unittest.TestCase):
                 fetched_rows=1, result_limit=100, response_bytes=76
             ),
         )
-        dependencies.answer_writer = lambda **_kwargs: self.fail(
-            "planner clarification must not reach answer writing"
+        dependencies.answerer = lambda **_kwargs: (
+            "Which attendance category do you mean?"
         )
 
         previous = ConversationState()
@@ -2307,12 +2508,10 @@ class PipelineTests(unittest.TestCase):
 
         self.assertIsInstance(outcome, Clarification)
         self.assertEqual(outcome.reason, "planner_clarification")
-        self.assertEqual(
-            outcome.reply, "Please clarify which attendance category you mean."
-        )
+        self.assertEqual(outcome.reply, "Which attendance category do you mean?")
         self.assertEqual(outcome.state, previous)
 
-    def test_reference_unsupported_domain_stops_before_planning(self):
+    def test_reference_unsupported_domain_reaches_planner(self):
         dependencies = self.dependencies()
         dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
             decision=UnsupportedReference(
@@ -2321,7 +2520,16 @@ class PipelineTests(unittest.TestCase):
                 capability="outside_attendance_domain",
             )
         )
-        dependencies.planner = lambda **_kwargs: self.fail("planning must not run")
+        dependencies.planner = lambda **_kwargs: (
+            "SELECT 'Repayment is not in the schema.'::text AS unsupported_capability"
+        )
+        dependencies.executor = lambda *_args, **_kwargs: SqlExecutionResult(
+            columns=(),
+            rows=({"unsupported_capability": "Repayment is not in the schema."},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=40
+            ),
+        )
 
         outcome = run_turn(
             TurnRequest(
@@ -2332,7 +2540,7 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertIsInstance(outcome, Unsupported)
-        self.assertEqual(outcome.capability, "outside_attendance_domain")
+        self.assertEqual(outcome.capability, "schema")
 
     def test_unresolved_name_uses_confirm_only_postgres_options(self):
         dependencies = self.dependencies()

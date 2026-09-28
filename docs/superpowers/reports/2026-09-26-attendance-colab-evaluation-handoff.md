@@ -1,5 +1,9 @@
 # Attendance synthetic Colab evaluation handoff
 
+> Historical snapshot. The current implementation and remaining-work handoff is
+> [2026-09-28-attendance-planner-handoff.md](2026-09-28-attendance-planner-handoff.md).
+> Several architecture and test details below were superseded on September 28.
+
 Date: 2026-09-26
 Branch: `codex/attendance-llm-planner`
 

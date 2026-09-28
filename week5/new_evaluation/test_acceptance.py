@@ -60,7 +60,7 @@ class AcceptanceCliTests(unittest.TestCase):
         self.assertEqual(payroll_step.expected_outcome, "unsupported")
         self.assertEqual(payroll_step.expected_capability, "schema")
 
-    def test_long_answered_steps_declare_semantic_answer_facts(self):
+    def test_long_answered_steps_declare_structured_result_facts(self):
         answered_steps = [
             step
             for step in acceptance.SCENARIOS["long"]
@@ -68,16 +68,13 @@ class AcceptanceCliTests(unittest.TestCase):
         ]
 
         self.assertTrue(answered_steps)
-        self.assertTrue(
-            all(
-                step.expected_answer_groups and step.expected_result_groups
-                for step in answered_steps
-            )
-        )
+        self.assertTrue(all(step.expected_result_groups for step in answered_steps))
 
-    def test_turn_without_semantic_oracle_is_rejected_before_model_call(self):
+    def test_turn_without_structured_result_oracle_is_rejected_before_model_call(self):
         with patch.object(acceptance, "run_turn") as run:
-            with self.assertRaisesRegex(ValueError, "no semantic answer expectations"):
+            with self.assertRaisesRegex(
+                ValueError, "no structured result expectations"
+            ):
                 acceptance.run_scenario_turn("wail", 0)
 
         run.assert_not_called()
@@ -97,6 +94,8 @@ class AcceptanceCliTests(unittest.TestCase):
 
         self.assertEqual(run.call_count, 1)
         self.assertTrue(record["passed"])
+        self.assertEqual(record["answer_review_status"], "pending")
+        self.assertTrue(record["automated_checks_only"])
         self.assertTrue(record["state_continuity_ok"])
         self.assertEqual(record["outcome"], "answered")
         self.assertEqual(len(state.verified_turns), 1)
@@ -138,7 +137,7 @@ class AcceptanceCliTests(unittest.TestCase):
         self.assertTrue(record["state_continuity_ok"])
         self.assertEqual(state, previous)
 
-    def test_answer_missing_an_expected_fact_does_not_pass(self):
+    def test_answer_wording_is_not_scored_as_correctness(self):
         step = acceptance.AcceptanceStep(
             "Count synthetic work days.",
             "answered",
@@ -157,9 +156,10 @@ class AcceptanceCliTests(unittest.TestCase):
 
         self.assertTrue(record["outcome_ok"])
         self.assertTrue(record["state_continuity_ok"])
-        self.assertFalse(record["semantic_ok"])
-        self.assertFalse(record["passed"])
-        self.assertEqual(record["missing_answer_facts"], ["5"])
+        self.assertTrue(record["semantic_ok"])
+        self.assertTrue(record["passed"])
+        self.assertEqual(record["missing_answer_facts"], [])
+        self.assertEqual(record["answer_review_status"], "pending")
 
     def test_semantic_failure_keeps_ui_stage_trace(self):
         from week5.new_implementation.online import pipeline
@@ -168,7 +168,7 @@ class AcceptanceCliTests(unittest.TestCase):
             "Count synthetic work days.",
             "answered",
             expected_answer_groups=(("5 days",),),
-            expected_result_groups=(("4",),),
+            expected_result_groups=(("5",),),
         )
 
         def traced_answer(request):
@@ -190,7 +190,7 @@ class AcceptanceCliTests(unittest.TestCase):
             record["reference_trace"]["sql_planner_1"], "SELECT 4 AS worked_days"
         )
 
-    def test_answer_fact_matching_uses_word_boundaries_and_is_case_insensitive(self):
+    def test_answer_reference_facts_are_not_an_automated_gate(self):
         step = acceptance.AcceptanceStep(
             "Summarize synthetic work days.",
             "answered",
@@ -216,6 +216,7 @@ class AcceptanceCliTests(unittest.TestCase):
 
         self.assertTrue(record["semantic_ok"])
         self.assertEqual(record["missing_answer_facts"], [])
+        self.assertEqual(record["answer_review_status"], "pending")
 
     def test_answered_turn_with_wrong_database_value_does_not_pass(self):
         step = acceptance.AcceptanceStep(
@@ -256,7 +257,7 @@ class AcceptanceCliTests(unittest.TestCase):
         self.assertFalse(record["semantic_ok"])
         self.assertEqual(record["missing_sql_facts"], ["2026-09-01", "2026-09-30"])
 
-    def test_absence_sql_oracle_rejects_unrequested_worked_hours_filter(self):
+    def test_projected_column_is_not_mistaken_for_a_filter(self):
         step = acceptance.AcceptanceStep(
             "Show absence dates.",
             "answered",
@@ -270,8 +271,8 @@ class AcceptanceCliTests(unittest.TestCase):
         )
         turn = outcome.state.verified_turns[-1].model_copy(
             update={
-                "executed_sql": "SELECT 4 FROM attendance_records "
-                "WHERE exception = 'Absent' OR total_worked_hrs = 0"
+                "executed_sql": "SELECT total_worked_hrs FROM attendance_records "
+                "WHERE exception = 'Absent'"
             }
         )
         outcome = outcome.model_copy(
@@ -285,11 +286,9 @@ class AcceptanceCliTests(unittest.TestCase):
         ):
             record, _state, _history = acceptance.run_scenario_turn("long", 0)
 
-        self.assertEqual(
-            record["missing_sql_facts"],
-            ["forbidden SQL term: total_worked_hrs"],
-        )
-        self.assertFalse(record["passed"])
+        self.assertEqual(record["missing_sql_facts"], [])
+        self.assertTrue(record["passed"])
+        self.assertTrue(record["automated_checks_only"])
 
     def test_grouped_result_rejects_swapped_values_and_wrong_order(self):
         step = acceptance.AcceptanceStep(
@@ -317,7 +316,7 @@ class AcceptanceCliTests(unittest.TestCase):
         self.assertIn("same result row: Engineering, 56", missing_result)
         self.assertIn("result order: Finance", missing_result)
 
-    def test_grouped_answer_rejects_values_assigned_to_wrong_group(self):
+    def test_swapped_answer_values_require_review_even_when_result_is_correct(self):
         step = acceptance.AcceptanceStep(
             "Group hours by department.",
             "answered",
@@ -338,8 +337,8 @@ class AcceptanceCliTests(unittest.TestCase):
             result,
             None,
         )
-        self.assertFalse(passed)
-        self.assertIn("same answer row: Engineering, 56", missing_answer)
+        self.assertTrue(passed)
+        self.assertEqual(missing_answer, [])
 
         passed, missing_answer, _missing_result = acceptance._semantic_answer_check(
             step,
@@ -358,8 +357,24 @@ class AcceptanceCliTests(unittest.TestCase):
             result,
             None,
         )
-        self.assertFalse(passed)
-        self.assertIn("same answer row: Engineering, 56", missing_answer)
+        self.assertTrue(passed)
+        self.assertEqual(missing_answer, [])
+
+    def test_forbidden_answer_phrase_is_reference_only(self):
+        step = acceptance.AcceptanceStep(
+            "Count synthetic work days.",
+            "answered",
+            expected_result_groups=(("4",),),
+            forbidden_answer_terms=("worked 4 days",),
+        )
+        with (
+            patch.dict(acceptance.SCENARIOS, {"long": (step,)}),
+            patch.object(acceptance, "run_turn", side_effect=answered_for),
+        ):
+            record, _state, _history = acceptance.run_scenario_turn("long", 0)
+
+        self.assertTrue(record["passed"])
+        self.assertEqual(record["answer_review_status"], "pending")
 
     def test_result_rejects_extra_rows_when_exact_count_is_expected(self):
         step = acceptance.AcceptanceStep(
@@ -472,6 +487,8 @@ class AcceptanceCliTests(unittest.TestCase):
 
             second = json.loads(output.read_text(encoding="utf-8"))
             self.assertEqual(second["completed_turns"], 2)
+            self.assertTrue(second["automated_checks_only"])
+            self.assertEqual(second["answer_review_status"], "pending")
             self.assertEqual(len(second["history"]), 4)
             self.assertEqual(len(second["state"]["verified_turns"]), 2)
             self.assertEqual(second["turns"][-1]["turn_number"], 2)

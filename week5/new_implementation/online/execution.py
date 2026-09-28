@@ -10,6 +10,8 @@ import re
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from sqlglot import exp, parse
+from sqlglot.errors import ParseError
 
 from .limits import MAX_EMPLOYEE_CANDIDATES
 
@@ -101,6 +103,75 @@ def _json_value(value: object) -> object:
     return str(value)
 
 
+def validate_read_query(
+    sql: str, *, allowed_tables: tuple[str, ...] | None = None
+) -> None:
+    """Accept one read query over the exposed tables; the DB role remains read only."""
+
+    try:
+        statements = parse(sql, read="postgres")
+    except ParseError as exc:
+        raise ValueError("SQL is not valid PostgreSQL") from exc
+    if len(statements) != 1 or not isinstance(
+        statements[0], (exp.Select, exp.Union, exp.Intersect, exp.Except)
+    ):
+        raise ValueError("SQL must be one SELECT query")
+    statement = statements[0]
+    if any(
+        isinstance(node, (exp.Insert, exp.Update, exp.Delete, exp.Create, exp.Drop))
+        for node in statement.walk()
+    ) or any(
+        select.args.get("into") or select.args.get("locks")
+        for select in statement.find_all(exp.Select)
+    ):
+        raise ValueError("SQL must be a read-only SELECT query")
+    if allowed_tables is None:
+        return
+    allowed = {table.casefold() for table in allowed_tables}
+    allowed_unqualified = {table.rsplit(".", 1)[-1] for table in allowed}
+    cte_names = {
+        cte.alias.casefold() for cte in statement.find_all(exp.CTE) if cte.alias
+    }
+    for table in statement.find_all(exp.Table):
+        name = table.name.casefold()
+        if not table.db and name in cte_names:
+            continue
+        available = (
+            f"{table.db}.{name}".casefold() in allowed
+            if table.db
+            else name in allowed_unqualified
+        )
+        if not available:
+            raise ValueError(f"SQL references an unavailable table: {table.sql()}")
+
+
+def _scoped_sql(
+    sql: str, *, employee_ids: tuple[str, ...], allowed_tables: tuple[str, ...]
+) -> str:
+    """Restrict each exposed base table before any model-selected aggregation or join."""
+
+    statement = parse(sql, read="postgres")[0]
+    cte_names = {
+        cte.alias.casefold() for cte in statement.find_all(exp.CTE) if cte.alias
+    }
+    for table in list(statement.find_all(exp.Table)):
+        if not table.db and table.name.casefold() in cte_names:
+            continue
+        alias = table.alias or table.name
+        restricted = (
+            exp.select("*")
+            .from_(table.copy())
+            .where(
+                exp.column("employee_id").isin(
+                    *(exp.Literal.string(item) for item in employee_ids)
+                )
+            )
+            .subquery(alias=alias)
+        )
+        table.replace(restricted)
+    return statement.sql(dialect="postgres")
+
+
 def execute_sql(
     sql: str,
     *,
@@ -111,11 +182,20 @@ def execute_sql(
     idle_timeout_ms: int = 30000,
     result_limit: int = 1000,
     max_response_bytes: int = 1000000,
+    allowed_tables: tuple[str, ...] | None = None,
+    scope_employee_ids: tuple[str, ...] | None = None,
 ) -> SqlExecutionResult:
-    """Execute the exact model SQL; PostgreSQL and the read-only role are the boundary."""
+    """Execute one bounded read query with any authorized row scope."""
 
     if not sql.strip():
         raise ValueError("SQL must not be empty")
+    validate_read_query(sql, allowed_tables=allowed_tables)
+    if scope_employee_ids is not None:
+        if not scope_employee_ids or allowed_tables is None:
+            raise ValueError("employee row scope requires IDs and allowed tables")
+        sql = _scoped_sql(
+            sql, employee_ids=scope_employee_ids, allowed_tables=allowed_tables
+        )
 
     import psycopg
     from psycopg.rows import dict_row

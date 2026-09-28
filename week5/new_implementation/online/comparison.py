@@ -130,7 +130,10 @@ def build_grouped_month_comparison(
     columns = {column.name for column in schema.columns}
     if "attendance_date" not in columns:
         return None
-    if any(column.name not in columns for column in query.find_all(exp.Column)):
+    if any(
+        column.name not in columns and column.find_ancestor(exp.Order) is None
+        for column in query.find_all(exp.Column)
+    ):
         return None
     where_clause = query.args.get("where")
     if where_clause is not None and any(
@@ -144,16 +147,47 @@ def build_grouped_month_comparison(
         for item in query.expressions
         if (item.this if isinstance(item, exp.Alias) else item) == group_column
     ]
+
+    def aggregate_core(item: exp.Expression) -> exp.Expression | None:
+        if isinstance(item, (exp.Sum, exp.Count)):
+            return item
+        if (
+            isinstance(item, exp.Coalesce)
+            and isinstance(item.this, (exp.Sum, exp.Count))
+            and len(item.expressions) == 1
+            and isinstance(item.expressions[0], exp.Literal)
+            and item.expressions[0].is_number
+            and float(item.expressions[0].this) == 0
+        ):
+            return item.this
+        return None
+
     aggregates = [
         item
         for item in query.expressions
-        if isinstance(item, exp.Alias) and isinstance(item.this, (exp.Sum, exp.Count))
+        if isinstance(item, exp.Alias) and aggregate_core(item.this) is not None
     ]
-    if len(query.expressions) != 2 or len(matching_group) != 1 or len(aggregates) != 1:
+    window_columns = [
+        item
+        for item in query.expressions
+        if isinstance(item, exp.Alias) and isinstance(item.this, exp.Window)
+    ]
+    if (
+        len(query.expressions) != 2 + len(window_columns)
+        or len(matching_group) != 1
+        or len(aggregates) != 1
+        or len(window_columns) > 1
+        or any(
+            item.alias_or_name != "matched_count"
+            or not isinstance(item.this.this, exp.Count)
+            or item.this.args.get("partition_by")
+            or item.this.args.get("order")
+            for item in window_columns
+        )
+    ):
         return None
-    if any(isinstance(item, exp.Window) for item in query.find_all(exp.Window)):
-        return None
-    aggregate = aggregates[0].this
+    aggregate = aggregate_core(aggregates[0].this)
+    assert aggregate is not None
     group_name = matching_group[0].alias_or_name
     if not group_name or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", group_name):
         return None
@@ -174,16 +208,24 @@ def build_grouped_month_comparison(
         f"attendance_date >= DATE '{first_current.isoformat()}' "
         f"AND attendance_date <= DATE '{today.isoformat()}'"
     )
+    previous_count = f"COUNT(*) FILTER (WHERE {previous_filter})"
+    current_count = f"COUNT(*) FILTER (WHERE {current_filter})"
     sql = (
         f"WITH eligible_groups AS ({query.sql(dialect='postgres')}), "
         "period_values AS ("
         f"SELECT {group_sql} AS group_key, "
-        f"COALESCE({aggregate_sql} FILTER (WHERE {previous_filter}), 0) "
+        f"{previous_count} AS previous_period_record_count, "
+        f"{current_count} AS current_period_record_count, "
+        f"CASE WHEN {previous_count} > 0 THEN "
+        f"{aggregate_sql} FILTER (WHERE {previous_filter}) END "
         "AS previous_period_value, "
-        f"COALESCE({aggregate_sql} FILTER (WHERE {current_filter}), 0) "
+        f"CASE WHEN {current_count} > 0 THEN "
+        f"{aggregate_sql} FILTER (WHERE {current_filter}) END "
         f"AS current_period_value {source_sql}{where_sql} "
         f"GROUP BY {group_sql}) "
         f"SELECT eligible_groups.{group_identifier} AS {group_identifier}, "
+        "period_values.previous_period_record_count, "
+        "period_values.current_period_record_count, "
         "period_values.previous_period_value, period_values.current_period_value, "
         "period_values.current_period_value - period_values.previous_period_value "
         "AS difference, COUNT(*) OVER() AS matched_count "

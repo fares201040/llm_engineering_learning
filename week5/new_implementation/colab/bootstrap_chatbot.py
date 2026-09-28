@@ -113,8 +113,7 @@ def ensure_ollama() -> None:
     else:
         raise RuntimeError("Ollama did not become ready within 60 seconds")
 
-    run(["ollama", "pull", "qwen3.5:4b"])
-    run(["ollama", "pull", "gpt-oss:20b"])
+    run(["ollama", "pull", "qwen3.5:2b"])
 
 
 def prepare_private_data() -> dict[str, str]:
@@ -140,7 +139,7 @@ def prepare_private_data() -> dict[str, str]:
 
     prepare_private_runtime()
     settings = json.loads(PRIVATE_RUNTIME.read_text(encoding="utf-8"))
-    settings["LLM_PLANNER_MODEL"] = "ollama_chat/gpt-oss:20b"
+    settings["LLM_PLANNER_MODEL"] = "openai/gpt-5-nano"
     PRIVATE_RUNTIME.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     PRIVATE_RUNTIME.chmod(0o600)
     return settings

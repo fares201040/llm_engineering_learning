@@ -28,6 +28,7 @@ PRIVATE_PAYLOAD = Path("/content/attendance_private_payload.zip")
 PRIVATE_DIRECTORY = Path("/content/attendance_private_payload")
 RUNTIME_CONFIG = Path("/content/.attendance_private_runtime.json")
 SYNTHETIC_RUNTIME_CONFIG = Path("/content/.attendance_phase3_runtime.json")
+OPENAI_KEY_FILE = Path("/content/.attendance_openai_api_key")
 
 TABLE_SQL = """
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
@@ -78,6 +79,8 @@ CREATE INDEX idx_attendance_date ON public.attendance_records(attendance_date);
 CREATE INDEX idx_attendance_department ON public.attendance_records(department);
 CREATE INDEX idx_attendance_exception ON public.attendance_records(exception);
 CREATE INDEX idx_attendance_shift ON public.attendance_records(shift);
+COMMENT ON COLUMN public.attendance_records.work_location IS
+    'Work-location group within the employee department. A department can contain multiple work-location groups; this field is distinct from department.';
 """
 
 
@@ -205,25 +208,28 @@ def write_runtime_config(path: Path, settings: dict[str, str]) -> None:
 
 def _model_settings() -> dict[str, str]:
     defaults = {
-        "LLM_REFERENCE_MODEL": "ollama_chat/qwen3.5:4b",
+        "LLM_REFERENCE_MODEL": "ollama_chat/qwen3.5:2b",
         "LLM_REFERENCE_TIMEOUT_SECONDS": "180",
-        "LLM_PLANNER_MODEL": "ollama_chat/gpt-oss:20b",
+        "LLM_PLANNER_MODEL": "openai/gpt-5-nano",
         "LLM_PLANNER_TIMEOUT_SECONDS": "180",
         "LLM_PLANNER_MAX_OUTPUT_TOKENS": "6000",
-        "LLM_ANSWER_MODEL": "ollama_chat/qwen3.5:4b",
-        "LLM_ANSWER_TIMEOUT_SECONDS": "180",
         "OLLAMA_API_BASE": "http://127.0.0.1:11434",
         "OLLAMA_HOST": "127.0.0.1:11434",
     }
     if SYNTHETIC_RUNTIME_CONFIG.is_file():
         prior = json.loads(SYNTHETIC_RUNTIME_CONFIG.read_text(encoding="utf-8"))
-        for key in tuple(defaults):
+        if isinstance(prior.get("OPENAI_API_KEY"), str):
+            defaults["OPENAI_API_KEY"] = prior["OPENAI_API_KEY"]
+        for key in ("OLLAMA_API_BASE", "OLLAMA_HOST"):
             if isinstance(prior.get(key), str):
                 defaults[key] = prior[key]
         for stage in ("REFERENCE", "PLANNER", "ANSWER"):
             key = f"LLM_{stage}_TIMEOUT_SECONDS"
             if isinstance(prior.get(key), str):
                 defaults[key] = prior[key]
+    if OPENAI_KEY_FILE.is_file():
+        defaults["OPENAI_API_KEY"] = OPENAI_KEY_FILE.read_text(encoding="utf-8").strip()
+        OPENAI_KEY_FILE.unlink()
     return defaults
 
 
@@ -236,6 +242,11 @@ def main() -> None:
         raise FileNotFoundError("The sanitized source snapshot is not prepared")
     if RUNTIME_CONFIG.exists():
         raise RuntimeError("Private runtime config already exists; clean it up first")
+    model_settings = _model_settings()
+    if not model_settings.get("OPENAI_API_KEY"):
+        raise RuntimeError(
+            "The private runtime requires OPENAI_API_KEY for the GPT SQL planner"
+        )
 
     run(["service", "postgresql", "start"])
     with ZipFile(PRIVATE_PAYLOAD) as archive:
@@ -253,7 +264,7 @@ def main() -> None:
 
     database = create_private_database(attendance_bytes)
     settings = {
-        **_model_settings(),
+        **model_settings,
         "ATTENDANCE_PHASE2_SOURCE_ROOT": str(SOURCE_ROOT),
         "ATTENDANCE_PRIVATE_CASE_FILE": str(case_path),
         "ATTENDANCE_PRIVATE_DATABASE": database["database"],

@@ -173,6 +173,8 @@ def _content(response: object, stage: str) -> str:
 
 
 def _local_model_options(model: str, stage: str) -> dict[str, object]:
+    if model in {"openai/gpt-5-nano", "gpt-5-nano"} and stage == "sql_planner":
+        return {"reasoning_effort": "low"}
     if model.startswith(("ollama/", "ollama_chat/")):
         local_model = model.rsplit("/", 1)[-1].casefold()
         return {
@@ -180,11 +182,7 @@ def _local_model_options(model: str, stage: str) -> dict[str, object]:
                 "medium" if local_model.startswith("gpt-oss:") else "none"
             ),
             "temperature": 0,
-            "num_ctx": (
-                65536
-                if stage in {"sql_planner", "answer_writer", "answer_verifier"}
-                else 8192
-            ),
+            "num_ctx": 32768,
         }
     return {}
 

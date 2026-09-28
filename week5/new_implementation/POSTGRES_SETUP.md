@@ -90,29 +90,40 @@ versions are implementation details, not deployment settings. For the current Ph
 local run, configure the model roles as follows:
 
 ```env
-LLM_REFERENCE_MODEL=ollama_chat/qwen3.5:4b
-LLM_PLANNER_MODEL=ollama_chat/gpt-oss:20b
-LLM_ANSWER_MODEL=ollama_chat/qwen3.5:4b
-LLM_PLANNER_MAX_OUTPUT_TOKENS=512
+LLM_REFERENCE_MODEL=ollama_chat/qwen3.5:2b
+LLM_PLANNER_MODEL=openai/gpt-5-nano
+LLM_PLANNER_MAX_OUTPUT_TOKENS=6000
 ```
 
-Install the planner model in Ollama with `ollama pull gpt-oss:20b`. The Ollama tag is
-`gpt-oss:20b`; the LiteLLM configuration name is `ollama_chat/gpt-oss:20b`.
+Install the local reference model with `ollama pull qwen3.5:2b`.
+Set `OPENAI_API_KEY` for the planner's `gpt-5-nano` SQL, final-answer, and review calls.
 
-For local Ollama calls, the provider sets `reasoning_effort="medium"` for GPT-OSS,
-`reasoning_effort="none"` for the other configured models, and `temperature=0`.
-The SQL planner, answer writer, and answer verifier use
-`num_ctx=65536`; the reference call uses `num_ctx=8192`. The answer model is used for
-separate writer and verifier calls. The maximum provider-call budget is eight. Keep
+For local Ollama calls, the provider sets `reasoning_effort="none"` and
+`temperature=0`; the reference call uses `num_ctx=32768`. The planner uses GPT
+for SQL, answering from executed rows, and reviewing the answer. The maximum
+provider-call budget is eight. Keep
 `POSTGRES_READONLY_DSN` configured independently from the ingestion writer DSN.
 
 The SQL planner receives the complete typed column catalog and descriptions plus all
 58 described `record_json` fields on every planner request. Typed relational columns
-remain preferred over equivalent JSON fallbacks. The answer writer and verifier receive the current question,
-history, trusted context, date-coverage summary, executed SQL, result, and authoritative
-employees, but not the schema. Prior complete answers, raw results, and executed SQL
-remain persisted in application state and are omitted from later model-facing trusted
-context.
+remain preferred over equivalent JSON fallbacks. The planner's answer and review
+calls receive the current question, history, trusted context, full schema, executed
+SQL, typed result, and authoritative employees. Prior complete answers and results
+remain in application state; older conversation text is compacted only when it
+exceeds the shared history budget.
+
+PostgreSQL `COMMENT ON COLUMN` and `COMMENT ON TABLE` descriptions take precedence
+over compatibility descriptions in the application. New physical columns require a
+column comment so the planner is not asked to guess their business meaning. For example:
+
+```sql
+COMMENT ON COLUMN attendance_records.department IS
+  'Organizational department assigned on this attendance row.';
+COMMENT ON COLUMN attendance_records.work_location IS
+  'Work-location group within the employee department. A department can contain multiple work-location groups; this field is distinct from department.';
+```
+
+Low-cardinality standard values are read from the database at runtime.
 
 Employee lookup uses the authorized PostgreSQL directory first. A written name that
 does not match exactly gets whole-name trigram candidates, followed by first-name
@@ -126,7 +137,7 @@ department, group, criteria, or all-authorized request continues to the SQL plan
 even when the reference model incorrectly reports `missing_employee`. If the schema
 and verified context cannot resolve the request's business meaning, the planner emits
 a one-row `clarification_required` result; the runtime returns that question without
-calling the answer model. The existing `unsupported_capability` result remains the
+calling the planner's final-answer stage. The existing `unsupported_capability` result remains the
 parallel protocol for concepts the supplied schema cannot represent.
 
 The default embedding provider is local Hugging Face with
@@ -159,13 +170,11 @@ column cannot hold OpenAI's default 3072-dimensional vectors.
 
 ## Direct-SQL limitation
 
-The online runtime executes the model's SQL directly. It does not yet parse an AST,
-enforce one read-only statement structurally, validate returned identifiers/functions/
-operators/joins, inject row authorization, inject limits, or parameterize model
-literals. Read-only permissions prevent writes but do not prevent unauthorized reads
-within the granted objects, expensive valid SQL, or prompt-injected SQL. Grant the
-reader role only the minimum attendance objects and use the configured timeouts and
-bounds. The structural safeguards are explicitly deferred future work.
+The online runtime parses model SQL as one read-only statement, allowlists exposed
+tables, and injects authoritative employee row scope into base tables when needed.
+It uses a read-only transaction and bounds execution time, fetched rows, and response
+size. It does not yet allowlist every column, function, operator, or join, nor bind
+model-authored literals. Grant the reader role only the approved attendance objects.
 
 ## Colab test workflow
 

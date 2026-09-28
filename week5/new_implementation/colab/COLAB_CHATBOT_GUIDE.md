@@ -1,8 +1,10 @@
 # Run the attendance chatbot in Colab
 
 The launcher rebuilds the source package every time, so edits to the current local
-application files are included automatically. It uses Qwen 3.5 4B for reference and
-answering and `gpt-oss:20b` for SQL planning.
+application files are included automatically. It uses Qwen 3.5 2B for reference
+resolution and `gpt-5-nano` through the OpenAI API for SQL planning, final
+answering, and answer review. The reviewer can request another bounded query
+when a materially wrong answer needs evidence available in the database.
 
 ## One-time requirements
 
@@ -11,7 +13,7 @@ Before the first run, confirm that:
 1. The chatbot already works locally and the PostgreSQL attendance database is running.
 2. The project virtual environment exists at `.venv`.
 3. The Colab CLI and its Google login are configured in `Ubuntu-24.04` under WSL.
-4. Your Colab account can create an A100 runtime.
+4. Your Colab account can create the runtime you select (CPU is available without a GPU allocation).
 
 The existing [`COLAB_CLI_GUIDE.md`](COLAB_CLI_GUIDE.md) explains the Colab CLI login
 if it has not already been configured.
@@ -28,14 +30,17 @@ The script automatically:
 
 - packages the current local app code;
 - exports the authorized attendance data;
-- creates or reuses the `attendance-chatbot` A100 session;
+- prompts for CPU, T4, L4, G4, A100, or H100, then creates or reuses the
+  `attendance-chatbot` session (Enter keeps A100 as the default);
 - uploads the code and data;
 - installs PostgreSQL, Ollama, and Python dependencies;
-- downloads `qwen3.5:4b` and `gpt-oss:20b` when needed;
+- downloads `qwen3.5:2b` when needed;
 - starts the chatbot and prints a public Gradio URL.
 
-The first run on a new Colab session takes several minutes because GPT-OSS is about
-13 GB. Later starts in the same live session reuse the downloaded models.
+The first run on a new Colab session downloads Qwen; later starts in the same
+live session reuse it. The SQL planner also requires an OpenAI API key.
+If the named session already exists, the script asks whether to reuse its current
+hardware or stop it and create a new session with your selected runtime.
 
 The command prints a generated login password followed by a URL that looks similar
 to this:
@@ -76,10 +81,10 @@ environment files, result reports, and unrelated private files from being upload
 Run the login steps in [`COLAB_CLI_GUIDE.md`](COLAB_CLI_GUIDE.md), then start the
 chatbot again.
 
-### A100 is unavailable
+### The selected GPU is unavailable
 
-Wait for Colab capacity or use an account with A100 access. GPT-OSS 20B needs about
-16 GB of accelerator or unified memory, and CPU execution is very slow.
+Choose another GPU or CPU on the next run. Availability depends on your Colab
+subscription and current capacity. CPU inference can be very slow.
 
 ### No Gradio URL appears
 

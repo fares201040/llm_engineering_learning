@@ -1,0 +1,39 @@
+---
+description: Put attendance planner guidance in schema or system prompts and debug wrong answers from model context
+alwaysApply: true
+---
+
+# Attendance planner guidance
+
+For work in `week5/new_implementation` and `week5/new_evaluation`, give the planner
+all relevant database meanings and query guidance through the schema payload in
+`online/context.py` or the system prompts and schema-derived examples in
+`online/planner.py` and `online/planner_examples.py`. Field descriptions, observed
+standard values, JSON field expressions, and business meanings belong in the schema.
+Keep prompt variants aligned with those same descriptions and examples.
+Use "effective swipe" for clerk-adjustable `From_*`/`To_*` fields and "device swipe"
+for immutable `Actual_*` fields. The current database has no separate payroll
+dataset; do not suggest one is present.
+
+When a model-generated SQL query or final answer is wrong, inspect the exact model
+input: current question, conversation history, resolved scope, schema descriptions,
+system prompt, examples, SQL, executed rows, draft answer, and reviewed answer.
+Identify missing, incomplete, conflicting, or misleading guidance. Improve it in the
+schema or system prompt; add a valid general SQL or answer example when useful.
+Then rerun the failed case and related cases and manually check answer correctness.
+
+Treat system prompt changes as high impact: a small instruction can alter SQL
+planning, answer wording, follow-up scope, or independent review across unrelated
+questions. Before editing, trace the failing question through the actual model
+input and identify the specific gap or conflict. Make the smallest general change,
+keep planner prompt variants and examples consistent, and check for contradictory
+instructions. After editing, test the failed case plus representative related and
+unrelated cases; inspect generated SQL, rows, and final answers by hand. Do not
+approve a prompt solely because automated checks pass or one example improves.
+
+Avoid request-word patterns, hardcoded employee/date values, hidden business rules in
+validators, and answer-text matching as repairs for model understanding. Runtime code
+may still enforce SQL safety, authorization, and structurally verified scope.
+For follow-ups and new topics, use `scope_provenance` to check where carried
+people, locations, dates, and categories came from. Do not turn a value mentioned
+only in an earlier result or answer into a filter for a new request.

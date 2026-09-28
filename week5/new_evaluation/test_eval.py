@@ -10,6 +10,7 @@ from week5.new_evaluation.eval import (
     BehaviorEval,
     _answer_fact_matches,
     _expected_subset,
+    _group_values_by_shape,
     _plan_matches,
     _write,
     evaluate_outcome,
@@ -31,6 +32,52 @@ from week5.new_implementation.online.state import ConversationState, VerifiedTur
 
 
 class EvaluatorTests(unittest.TestCase):
+    def test_plan_matcher_accepts_quoted_postgres_identifiers(self):
+        sql = (
+            'SELECT COUNT(DISTINCT "attendance_date") FROM '
+            '"public"."attendance_records" WHERE "day_type" = \'Working Day\''
+        )
+        expected = {
+            "aggregation": "distinct_count",
+            "aggregation_field": "Date",
+            "required_filter": {
+                "field": "Day_Type",
+                "operator": "eq",
+                "value": "Working Day",
+            },
+        }
+        self.assertTrue(_plan_matches(sql, expected))
+
+    def test_plan_matcher_accepts_postgres_date_literal_bounds(self):
+        sql = (
+            'SELECT COUNT(DISTINCT "attendance_date") '
+            'FROM "public"."attendance_records" '
+            "WHERE \"attendance_date\" BETWEEN DATE '2026-09-01' "
+            "AND DATE '2026-09-30'"
+        )
+        expected = {
+            "aggregation": "distinct_count",
+            "required_filters": [
+                {"field": "Date", "operator": "gte", "value": "2026-09-01"},
+                {"field": "Date", "operator": "lte", "value": "2026-09-30"},
+            ],
+        }
+        self.assertTrue(_plan_matches(sql, expected))
+
+    def test_grouped_numeric_measure_allows_equivalent_sql_alias(self):
+        shaped = _group_values_by_shape(
+            [
+                {"department": "Engineering", "total_worked_hours": 56},
+                {"department": "Finance", "total_worked_hours": 36},
+            ],
+            [
+                {"department": "Engineering", "worked_hours": 56},
+                {"department": "Finance", "worked_hours": 36},
+            ],
+        )
+        self.assertIsNotNone(shaped)
+        self.assertTrue(_expected_subset(*shaped))
+
     @staticmethod
     def _write_cases(path: Path, count: int = 2) -> None:
         path.write_text(

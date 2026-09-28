@@ -16,13 +16,16 @@ from sqlglot import exp, parse
 from sqlglot.errors import ParseError
 
 from ..config import settings
-from .answering import Result, generate_answer
+from .evidence import Result
 from .comparison import (
     build_grouped_month_comparison,
     is_grouped_month_comparison_question,
-    render_grouped_month_comparison,
 )
-from .context import DatabaseContext, SharedModelContext, load_database_context
+from .context import (
+    DatabaseContext,
+    SharedModelContext,
+    load_database_context,
+)
 from .execution import (
     AccessContext,
     AuthorizationError,
@@ -31,9 +34,12 @@ from .execution import (
     execute_sql,
     load_employee_directory,
     search_employee_directory_postgres,
+    validate_read_query,
 )
+from .history import model_history
 from .limits import MAX_EMPLOYEE_CANDIDATES
-from .planner import request_sql
+from .planner import ReplanRequest, answer_result, request_sql
+from .query_paths import boolean_paths, contributing_where_paths
 from .provider import (
     CallBudget,
     ProviderFailure,
@@ -54,18 +60,18 @@ from .reference import (
     bind_references,
     complete_confirmation,
     has_malformed_identifier,
+    has_unknown_identifier,
     request_references,
     search_employee_candidates,
 )
 from .running_total import (
     build_running_total,
     is_running_total_question,
-    render_running_total,
 )
 from .state import ConversationState, VerifiedTurn
 
 
-SQL_EXECUTION_ATTEMPT_LIMIT = 3
+SQL_EXECUTION_ATTEMPT_LIMIT = 4
 _MONTH_NUMBERS = {
     month.casefold(): number
     for number, month in enumerate(
@@ -167,7 +173,7 @@ class RuntimeDependencies:
         context_loader: Callable[..., DatabaseContext] = load_database_context,
         planner: Callable[..., str] = request_sql,
         executor: Callable[..., SqlExecutionResult] = execute_sql,
-        answer_writer: Callable[..., str] = generate_answer,
+        answerer: Callable[..., str | ReplanRequest] = answer_result,
     ):
         self.reference_writer = reference_writer
         self.directory_loader = directory_loader
@@ -176,7 +182,7 @@ class RuntimeDependencies:
         self.context_loader = context_loader
         self.planner = planner
         self.executor = executor
-        self.answer_writer = answer_writer
+        self.answerer = answerer
 
 
 DEPENDENCIES = RuntimeDependencies()
@@ -194,230 +200,10 @@ def _locale(question: str) -> Literal["en", "ar"]:
     return "ar" if any("\u0600" <= char <= "\u06ff" for char in question) else "en"
 
 
-def _attendance_meaning(
-    question: str,
-) -> Literal["explicit_absence", "not_absent"] | None:
-    if re.search(
-        r"\bexception\s+equal\s+to\s+[\"“][^\"”]+[\"”]",
-        question,
-        flags=re.IGNORECASE,
-    ):
-        # The quoted text is an exact schema value, not a request to reinterpret
-        # every value containing the word "absence" as the canonical Absent state.
-        return None
-    if re.search(r"\bnot\s+absent\b", question, flags=re.IGNORECASE):
-        return "not_absent"
-    if re.search(r"\babsen(?:t|ce)\b", question, flags=re.IGNORECASE):
-        return "explicit_absence"
-    return None
-
-
-_MANUAL_SWIPE_PAIRS = frozenset(
-    {
-        frozenset({"From_Date", "Actual_From_Date"}),
-        frozenset({"From_Time", "Actual_From_Time"}),
-        frozenset({"To_Date", "Actual_To_Date"}),
-        frozenset({"To_Time", "Actual_To_Time"}),
-    }
-)
-
-
-def _manual_swipe_intent(*requests: str) -> bool:
-    text = "\n".join(requests)
-    folded = text.casefold()
-    english = re.search(
-        r"\b(?:manual(?:ly)?|modified|adjusted|edited|clerk[ -]entered|"
-        r"clerk[ -]adjusted)\b",
-        folded,
-    ) and re.search(r"\b(?:swipe|clock|punch|check[ -]?(?:in|out))s?\b", folded)
-    arabic = re.search(
-        r"(?:يدوي(?:ا|اً)?|معدل(?:ة|ه)?|تعديل|تعديلات|تغيير)", text
-    ) and re.search(r"(?:بصم|دخول|خروج|دوام)", text)
-    return bool(english or arabic)
-
-
 def _unwrap_parentheses(node: exp.Expression) -> exp.Expression:
     while isinstance(node, exp.Paren):
         node = node.this
     return node
-
-
-def _flatten_or(node: exp.Expression) -> tuple[exp.Expression, ...]:
-    node = _unwrap_parentheses(node)
-    if isinstance(node, exp.Or):
-        return _flatten_or(node.this) + _flatten_or(node.expression)
-    return (node,)
-
-
-def _manual_swipe_pair(node: exp.Expression) -> frozenset[str] | None:
-    node = _unwrap_parentheses(node)
-    if not isinstance(node, exp.NullSafeNEQ):
-        return None
-    names = frozenset(
-        re.findall(
-            r"\b(?:Actual_)?(?:From|To)_(?:Date|Time)\b",
-            node.sql(dialect="postgres"),
-        )
-    )
-    return names if names in _MANUAL_SWIPE_PAIRS else None
-
-
-def _has_complete_manual_swipe_filter(sql: str) -> bool:
-    try:
-        statements = parse(sql, read="postgres")
-    except ParseError:
-        return False
-    for statement in statements:
-        for where in statement.find_all(exp.Where):
-            for candidate in where.this.walk():
-                if not isinstance(candidate, exp.Or):
-                    continue
-                leaves = _flatten_or(candidate)
-                pairs = tuple(_manual_swipe_pair(leaf) for leaf in leaves)
-                if (
-                    len(pairs) == 4
-                    and None not in pairs
-                    and frozenset(pairs) == _MANUAL_SWIPE_PAIRS
-                ):
-                    return True
-    return False
-
-
-_CATEGORY_ALIAS_STOP_WORDS = frozenset(
-    {"as", "at", "by", "in", "is", "it", "no", "of", "ok", "on", "or", "to"}
-)
-
-
-def _category_tokens(value: str) -> tuple[str, ...]:
-    return tuple(re.findall(r"[A-Za-z0-9]+", value.casefold()))
-
-
-def _required_categorical_values(
-    request: str, database_context: DatabaseContext
-) -> dict[str, frozenset[str]]:
-    """Resolve unambiguous request terms from database-observed categorical values."""
-
-    request_tokens = _category_tokens(request)
-    request_words = set(request_tokens)
-    candidates: list[tuple[str, str, tuple[str, ...], str | None]] = []
-    for table in database_context.tables:
-        for column in table.columns:
-            for value in column.standard_values:
-                tokens = _category_tokens(value)
-                if not tokens:
-                    continue
-                acronym = "".join(token[0] for token in tokens) if len(tokens) > 1 else None
-                candidates.append((column.name, value, tokens, acronym))
-
-    exact_aliases: dict[tuple[str, ...], list[tuple[str, str]]] = {}
-    acronym_aliases: dict[str, list[tuple[str, str]]] = {}
-    for column, value, tokens, acronym in candidates:
-        exact_aliases.setdefault(tokens, []).append((column, value))
-        if acronym and acronym not in _CATEGORY_ALIAS_STOP_WORDS:
-            acronym_aliases.setdefault(acronym, []).append((column, value))
-
-    resolved: dict[str, set[str]] = {}
-    for tokens, matches in exact_aliases.items():
-        if len(matches) != 1:
-            continue
-        is_present = any(
-            request_tokens[index : index + len(tokens)] == tokens
-            for index in range(len(request_tokens) - len(tokens) + 1)
-        )
-        if not is_present:
-            continue
-        if len(tokens) == 1 and (
-            len(tokens[0]) < 4 or tokens[0] in _CATEGORY_ALIAS_STOP_WORDS
-        ):
-            continue
-        column, value = matches[0]
-        resolved.setdefault(column, set()).add(value)
-    for acronym, matches in acronym_aliases.items():
-        if acronym not in request_words or len(matches) != 1:
-            continue
-        column, value = matches[0]
-        resolved.setdefault(column, set()).add(value)
-    return {column: frozenset(values) for column, values in resolved.items()}
-
-
-def _boolean_paths(node: exp.Expression) -> tuple[tuple[exp.Expression, ...], ...]:
-    """Return bounded disjunctive paths through a WHERE Boolean expression."""
-
-    node = _unwrap_parentheses(node)
-    if isinstance(node, exp.Or):
-        paths = _boolean_paths(node.this) + _boolean_paths(node.expression)
-        return paths[:256]
-    if isinstance(node, exp.And):
-        left = _boolean_paths(node.this)
-        right = _boolean_paths(node.expression)
-        return tuple(
-            left_path + right_path
-            for left_path in left
-            for right_path in right
-        )[:256]
-    return ((node,),)
-
-
-def _categorical_predicate_values(
-    node: exp.Expression, column_name: str
-) -> frozenset[str]:
-    node = _unwrap_parentheses(node)
-    if isinstance(node, exp.EQ):
-        sides = ((node.this, node.expression), (node.expression, node.this))
-        for column, literal in sides:
-            if (
-                isinstance(column, exp.Column)
-                and column.name.casefold() == column_name.casefold()
-                and isinstance(literal, exp.Literal)
-                and literal.is_string
-            ):
-                return frozenset({str(literal.this)})
-    if isinstance(node, exp.In):
-        column = node.this
-        if isinstance(column, exp.Column) and column.name.casefold() == column_name.casefold():
-            literals = tuple(node.expressions)
-            if literals and all(
-                isinstance(item, exp.Literal) and item.is_string for item in literals
-            ):
-                return frozenset(str(item.this) for item in literals)
-    return frozenset()
-
-
-def _has_required_categorical_filters(
-    sql: str, requirements: dict[str, frozenset[str]]
-) -> bool:
-    if not requirements:
-        return True
-    try:
-        statements = parse(sql, read="postgres")
-    except ParseError:
-        return False
-    where_nodes = tuple(
-        where.this for statement in statements for where in statement.find_all(exp.Where)
-    )
-    for column_name, required_values in requirements.items():
-        requirement_satisfied = False
-        for where_node in where_nodes:
-            paths = _boolean_paths(where_node)
-            path_values = tuple(
-                frozenset().union(
-                    *(
-                        _categorical_predicate_values(predicate, column_name)
-                        for predicate in path
-                    )
-                )
-                for path in paths
-            )
-            if (
-                paths
-                and all(values and values <= required_values for values in path_values)
-                and required_values <= frozenset().union(*path_values)
-            ):
-                requirement_satisfied = True
-                break
-        if not requirement_satisfied:
-            return False
-    return True
 
 
 def _has_required_date_scope(
@@ -425,22 +211,44 @@ def _has_required_date_scope(
 ) -> bool:
     if required_date_scope is None:
         return True
+    paths = contributing_where_paths(sql)
+    return bool(paths) and all(
+        _date_scope_for_path(path) == required_date_scope for path in paths
+    )
+
+
+def _has_self_membership_filter(sql: str) -> bool:
+    """Find an unrequested column-in-itself filter with no narrowing subquery."""
+
     try:
         statements = parse(sql, read="postgres")
     except ParseError:
         return False
     for statement in statements:
-        for where in statement.find_all(exp.Where):
-            paths = _boolean_paths(where.this)
-            if paths and all(
-                _sql_date_scope(
-                    "SELECT 1 WHERE "
-                    + " AND ".join(
-                        predicate.sql(dialect="postgres") for predicate in path
-                    )
-                )
-                == required_date_scope
-                for path in paths
+        for node in statement.find_all(exp.In):
+            if not isinstance(node.this, exp.Column):
+                continue
+            query = node.args.get("query")
+            select = query.this if isinstance(query, exp.Subquery) else query
+            if not isinstance(select, exp.Select) or select.args.get("where"):
+                continue
+            if len(select.expressions) != 1 or not isinstance(
+                select.expressions[0], exp.Column
+            ):
+                continue
+            if select.expressions[0].name.casefold() != node.this.name.casefold():
+                continue
+            outer = node.find_ancestor(exp.Select)
+            if outer is None:
+                continue
+            outer_from = outer.args.get("from_")
+            inner_from = select.args.get("from_")
+            if (
+                isinstance(outer_from, exp.From)
+                and isinstance(inner_from, exp.From)
+                and isinstance(outer_from.this, exp.Table)
+                and isinstance(inner_from.this, exp.Table)
+                and outer_from.this.name.casefold() == inner_from.this.name.casefold()
             ):
                 return True
     return False
@@ -451,11 +259,66 @@ def _sql_semantic_issue(
     sql: str,
     *,
     rewritten_request: str = "",
+    allow_rewritten_contracts: bool = True,
     database_context: DatabaseContext | None = None,
     required_date_scope: tuple[str, str] | None = None,
 ) -> str | None:
     if _planner_control_alias(sql) is not None:
         return None
+    if _has_self_membership_filter(sql):
+        return "self_membership_filter"
+    try:
+        statements = parse(sql, read="postgres")
+    except ParseError:
+        statements = ()
+    running_total_found = False
+    for statement in statements:
+        if statement is None:
+            continue
+        if any(True for _ in statement.find_all(exp.ArrayAgg)):
+            return "nested_result_shape"
+        for alias in statement.find_all(exp.Alias):
+            if alias.alias.casefold() != "running_total":
+                continue
+            running_total_found = True
+            if not (
+                isinstance(alias.this, exp.Window)
+                and isinstance(alias.this.this, exp.Sum)
+                and alias.this.args.get("order") is not None
+            ):
+                return "invalid_running_total_expression"
+            if not any(True for _ in statement.find_all(exp.Group)):
+                return "running_total_requires_daily_grouping"
+        for select_node in statement.find_all(exp.Select):
+            if not (select_node.args.get("group") and select_node.args.get("limit")):
+                continue
+            matched = [
+                item
+                for item in select_node.expressions
+                if item.alias_or_name.casefold() == "matched_count"
+            ]
+            if not matched or not all(
+                isinstance(item, exp.Alias)
+                and isinstance(item.this, exp.Window)
+                and isinstance(item.this.this, exp.Count)
+                for item in matched
+            ):
+                return "invalid_grouped_matched_count"
+            if not any(
+                aggregate.find_ancestor(exp.Window) is None
+                for item in select_node.expressions
+                for aggregate in item.find_all(exp.AggFunc)
+            ):
+                return "missing_group_measure"
+            order = select_node.args.get("order")
+            if order is not None and any(
+                isinstance(column, exp.Column)
+                and column.name.casefold() == "matched_count"
+                for column in order.find_all(exp.Column)
+            ):
+                return "group_order_uses_total_count"
+    if is_running_total_question(question) and not running_total_found:
+        return "missing_running_total_expression"
     folded = question.casefold()
     detail_noun = re.search(
         r"\b(?:attendance|details?|entries|records?|rows?)\b", folded
@@ -479,41 +342,48 @@ def _sql_semantic_issue(
         and not re.search(r"\brecord_id\b", select_list, re.IGNORECASE)
     ):
         return "detail_request_requires_rows"
-    if _manual_swipe_intent(question, rewritten_request) and not (
-        _has_complete_manual_swipe_filter(sql)
-    ):
-        return "incomplete_manual_swipe_comparison"
-    if database_context is not None:
-        required_categories = _required_categorical_values(
-            "\n".join((question, rewritten_request)), database_context
-        )
-        if not _has_required_categorical_filters(sql, required_categories):
-            return "missing_required_categorical_filter"
     if not _has_required_date_scope(sql, required_date_scope):
         return "date_scope_mismatch"
-    meaning = _attendance_meaning(question)
-    if meaning == "not_absent" and not re.search(
-        r"\bexception\s+IS\s+DISTINCT\s+FROM\s+'Absent'", sql, flags=re.IGNORECASE
-    ):
-        return "wrong_absence_polarity"
-    if meaning == "explicit_absence":
-        if not re.search(r"\bexception\s*=\s*'Absent'", sql, re.IGNORECASE):
-            return "wrong_absence_semantics"
-        where = re.search(
-            r"\bWHERE\b(.*?)(?:\bGROUP\s+BY\b|\bORDER\s+BY\b|\bLIMIT\b|$)",
-            sql,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        filters = where.group(1) if where else ""
-        if not re.search(r"\b(?:hours?|work(?:ed|ing)?)\b", question, re.IGNORECASE):
-            if re.search(r"\btotal_worked_hrs\b", filters, re.IGNORECASE):
-                return "wrong_absence_semantics"
-        if not re.search(
-            r"\b(?:schedul(?:e|ed)|working\s+day)\b", question, re.IGNORECASE
-        ):
-            if re.search(r"\bday_type\b", filters, re.IGNORECASE):
-                return "wrong_absence_semantics"
     return None
+
+
+def _repair_group_order(sql: str) -> str:
+    """Order bounded groups by their sole measure when total-count sort is inert."""
+
+    try:
+        statements = parse(sql, read="postgres")
+    except ParseError:
+        return sql
+    if len(statements) != 1 or statements[0] is None:
+        return sql
+    statement = statements[0]
+    changed = False
+    for select_node in statement.find_all(exp.Select):
+        if not (select_node.args.get("group") and select_node.args.get("limit")):
+            continue
+        measures = [
+            item.alias
+            for item in select_node.expressions
+            if isinstance(item, exp.Alias)
+            and item.alias.casefold() != "matched_count"
+            and any(
+                aggregate.find_ancestor(exp.Window) is None
+                for aggregate in item.find_all(exp.AggFunc)
+            )
+        ]
+        if len(measures) != 1:
+            continue
+        order = select_node.args.get("order")
+        if order is None:
+            continue
+        for ordered in order.expressions:
+            if (
+                isinstance(ordered.this, exp.Column)
+                and ordered.this.name.casefold() == "matched_count"
+            ):
+                ordered.set("this", exp.column(measures[0]))
+                changed = True
+    return statement.sql(dialect="postgres") if changed else sql
 
 
 def _planner_control_alias(sql: str) -> str | None:
@@ -542,23 +412,6 @@ def _planner_control_alias(sql: str) -> str | None:
     return alias
 
 
-def _unrequested_date_filter(sql: str) -> bool:
-    """Find attendance-date predicates, including nested or computed bounds."""
-
-    try:
-        statements = parse(sql, read="postgres")
-    except ParseError:
-        return False
-    for statement in statements:
-        for predicate in statement.find_all(exp.Predicate):
-            if any(
-                column.name.casefold() == "attendance_date"
-                for column in predicate.find_all(exp.Column)
-            ):
-                return True
-    return False
-
-
 def _mentions_time_period(question: str) -> bool:
     folded = question.casefold()
     if re.search(r"\b(?:19|20)\d{2}\b", folded):
@@ -577,51 +430,80 @@ def _mentions_time_period(question: str) -> bool:
     )
 
 
-def _sql_date_scope(sql: str) -> tuple[str, str] | None:
-    where = re.search(
-        r"\bWHERE\b(.*?)(?=\bGROUP\s+BY\b|\bHAVING\b|\bORDER\s+BY\b|\bLIMIT\b|$)",
-        sql,
-        flags=re.IGNORECASE | re.DOTALL,
-    )
-    if where is None:
+def _date_literal(node: exp.Expression) -> date | None:
+    while isinstance(node, (exp.Paren, exp.Cast, exp.TryCast)):
+        node = node.this
+    if not isinstance(node, exp.Literal) or not node.is_string:
         return None
-    filters = where.group(1)
-    field = r'\battendance_date"?'
-    literal = r"(?:DATE\s*)?'(\d{4}-\d{2}-\d{2})'"
-    between = re.search(
-        rf"{field}\s+BETWEEN\s+{literal}\s+AND\s+{literal}",
-        filters,
-        flags=re.IGNORECASE,
-    )
-    if between:
-        start_text, end_text = between.groups()
-    else:
-        lower = re.search(
-            rf"{field}\s*(>=|>)\s*{literal}", filters, flags=re.IGNORECASE
-        )
-        upper = re.search(
-            rf"{field}\s*(<=|<)\s*{literal}", filters, flags=re.IGNORECASE
-        )
-        if lower is None or upper is None:
-            return None
-        start_text = lower.group(2)
-        end_text = upper.group(2)
-        try:
-            start = date.fromisoformat(start_text) + timedelta(
-                days=1 if lower.group(1) == ">" else 0
-            )
-            end = date.fromisoformat(end_text) - timedelta(
-                days=1 if upper.group(1) == "<" else 0
-            )
-        except ValueError:
-            return None
-        start_text, end_text = start.isoformat(), end.isoformat()
     try:
-        if date.fromisoformat(start_text) > date.fromisoformat(end_text):
-            return None
+        return date.fromisoformat(str(node.this))
     except ValueError:
         return None
-    return start_text, end_text
+
+
+def _is_attendance_date(node: exp.Expression) -> bool:
+    while isinstance(node, (exp.Paren, exp.Cast, exp.TryCast)):
+        node = node.this
+    return isinstance(node, exp.Column) and node.name.casefold() == "attendance_date"
+
+
+def _date_scope_for_path(
+    path: tuple[exp.Expression, ...],
+) -> tuple[str, str] | None:
+    lower: date | None = None
+    upper: date | None = None
+    for predicate in path:
+        predicate = _unwrap_parentheses(predicate)
+        if isinstance(predicate, exp.Between) and _is_attendance_date(predicate.this):
+            start = _date_literal(predicate.args["low"])
+            end = _date_literal(predicate.args["high"])
+        elif isinstance(predicate, (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ)):
+            column, literal = predicate.this, predicate.expression
+            reversed_sides = not _is_attendance_date(column)
+            if reversed_sides:
+                column, literal = literal, column
+            if not _is_attendance_date(column):
+                continue
+            value = _date_literal(literal)
+            if value is None:
+                continue
+            start = end = None
+            if isinstance(predicate, exp.EQ):
+                start = end = value
+            elif isinstance(predicate, (exp.GT, exp.GTE)):
+                if reversed_sides:
+                    end = value - timedelta(days=isinstance(predicate, exp.GT))
+                else:
+                    start = value + timedelta(days=isinstance(predicate, exp.GT))
+            elif reversed_sides:
+                start = value + timedelta(days=isinstance(predicate, exp.LT))
+            else:
+                end = value - timedelta(days=isinstance(predicate, exp.LT))
+        else:
+            continue
+        if start is not None:
+            lower = max(lower, start) if lower is not None else start
+        if end is not None:
+            upper = min(upper, end) if upper is not None else end
+    if lower is None or upper is None or lower > upper:
+        return None
+    return lower.isoformat(), upper.isoformat()
+
+
+def _sql_date_scope(sql: str) -> tuple[str, str] | None:
+    if sql.lstrip().upper().startswith("WHERE "):
+        try:
+            statement = parse("SELECT 1 " + sql, read="postgres")[0]
+            where = statement.find(exp.Where)
+            paths = boolean_paths(where.this) if where is not None else None
+        except ParseError:
+            return None
+    else:
+        paths = contributing_where_paths(sql)
+    if not paths:
+        return None
+    scopes = {_date_scope_for_path(path) for path in paths}
+    return next(iter(scopes)) if len(scopes) == 1 else None
 
 
 def _previous_having(sql: str) -> str:
@@ -665,156 +547,6 @@ def _unsupported_value(locale: str) -> str:
     return "The request contains an invalid date or numeric value. Please correct it."
 
 
-def _unsupported_domain(locale: str) -> str:
-    if locale == "ar":
-        return "يدعم هذا المساعد أسئلة الحضور المصرح بها فقط."
-    return "This assistant supports authorized attendance questions only."
-
-
-def _missing_join_target(question: str, database_context: DatabaseContext) -> bool:
-    """Recognize an explicit join to a table absent from the allowed schema."""
-
-    match = re.fullmatch(
-        r"join\s+(.+?)\s+(?:to|with)\s+(.+?)\s*[.?!]*",
-        question.strip(),
-        flags=re.IGNORECASE,
-    )
-    if match is None:
-        return False
-
-    def known_table(phrase: str) -> bool:
-        words = set(re.findall(r"[a-z0-9]+", phrase.casefold()))
-        return bool(words) and any(
-            words <= set(re.findall(r"[a-z0-9]+", table.table_name.casefold()))
-            or words
-            == set(
-                re.findall(
-                    r"[a-z0-9]+",
-                    f"{table.schema_name} {table.table_name}".casefold(),
-                )
-            )
-            for table in database_context.tables
-        )
-
-    left_known, right_known = (known_table(phrase) for phrase in match.groups())
-    return left_known != right_known
-
-
-def _schema_grounded_analytic_question(
-    question: str,
-    database_context: DatabaseContext,
-    employees: tuple[Employee, ...] = (),
-) -> bool:
-    """Confirm an independent aggregate request uses only known schema concepts."""
-
-    def normalized_words(value: str) -> set[str]:
-        words = re.findall(r"[a-z]+", value.casefold())
-        return {
-            "hour"
-            if word in {"hours", "hrs"}
-            else word[:-1]
-            if len(word) > 1 and word.endswith("s")
-            else word
-            for word in words
-        }
-
-    words = normalized_words(question)
-    if words.intersection({"that", "those", "previous", "last", "instead", "same"}):
-        return False
-    analytic_words = {
-        "rank",
-        "ranking",
-        "group",
-        "grouped",
-        "sum",
-        "average",
-        "avg",
-        "count",
-        "total",
-    }
-    if not words.intersection(analytic_words):
-        return False
-    grammar_words = {
-        "a",
-        "an",
-        "and",
-        "are",
-        "by",
-        "did",
-        "do",
-        "does",
-        "each",
-        "for",
-        "had",
-        "has",
-        "have",
-        "is",
-        "of",
-        "per",
-        "please",
-        "s",
-        "show",
-        "the",
-        "was",
-        "were",
-        "what",
-        "with",
-    }
-    employee_words = {
-        word
-        for employee in employees
-        for value in (employee.employee_id, employee.name)
-        for word in normalized_words(value)
-    }
-    concepts = words - analytic_words - grammar_words - employee_words
-    if len(concepts) < 2:
-        return False
-    schema_words: set[str] = set()
-    for table in database_context.tables:
-        schema_words.update(normalized_words(table.table_name.replace("_", " ")))
-        for column in table.columns:
-            schema_words.update(normalized_words(column.name.replace("_", " ")))
-    return concepts <= schema_words
-
-
-def _attendance_semantic_question(question: str) -> bool:
-    """Recognize high-level attendance analysis without treating it as a person."""
-
-    folded = " ".join(re.findall(r"[a-z0-9]+", question.casefold()))
-    if re.search(
-        r"\b(?:incomplete clocking|repeated lateness|chronic lateness|"
-        r"early departures?|absence issues?|overtime behavior|"
-        r"unscheduled deviation|hr review)\b",
-        folded,
-    ):
-        return True
-    qualifier = re.search(
-        r"\b(?:unusual|problematic|abnormal|suspicious|concerning|irregular|"
-        r"anomal(?:y|ies|ous)|issues?|incomplete|repeated|chronic|unscheduled|"
-        r"deviation|concerns?)\b",
-        folded,
-    )
-    attendance_concept = re.search(
-        r"\b(?:attendance|timekeeping|clocking|lateness|late|early departures?|"
-        r"overtime|absence|absent|records?|employees?|behavior|patterns?|"
-        r"summaries)\b",
-        folded,
-    )
-    return qualifier is not None and attendance_concept is not None
-
-
-def _grouped_schema_calculation_syntax(question: str) -> bool:
-    return (
-        re.fullmatch(
-            r"\s*(?:what is\s+(?:the\s+)?)?(?:average|avg|sum)\s+(?:of\s+)?"
-            r"[A-Za-z_]+\s+by\s+[A-Za-z_]+[?.]?\s*",
-            question,
-            flags=re.IGNORECASE,
-        )
-        is not None
-    )
-
-
 def _requested_month_scope(question: str) -> tuple[str, str] | None:
     month_pattern = "|".join(_MONTH_NUMBERS)
     match = re.search(
@@ -828,357 +560,6 @@ def _requested_month_scope(question: str) -> tuple[str, str] | None:
     return (
         date(year, month, 1).isoformat(),
         date(year, month, calendar.monthrange(year, month)[1]).isoformat(),
-    )
-
-
-def _build_native_employee_day_count_sql(
-    question: str,
-    database_context: DatabaseContext,
-    employees: tuple[Employee, ...],
-) -> str | None:
-    """Build stable scalar counts for common employee/date attendance measures."""
-
-    if not employees or not re.search(r"\bhow many\b", question, re.IGNORECASE):
-        return None
-    folded = " ".join(question.casefold().split())
-    if re.search(r"\b(?:days?|dates?|attendance records?)\b", folded) is None:
-        return None
-    month_scope = _requested_month_scope(question)
-    if month_scope is None:
-        return None
-    table = next(
-        (
-            item
-            for item in database_context.tables
-            if item.table_name.casefold().endswith("attendance_records")
-        ),
-        database_context.tables[0],
-    )
-    if not re.fullmatch(
-        r"[A-Za-z_][A-Za-z0-9_]*", table.schema_name
-    ) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table.table_name):
-        return None
-    columns = {column.name.casefold(): column.name for column in table.columns}
-    required = {"employee_id", "attendance_date", "total_worked_hrs"}
-    if not required <= set(columns):
-        return None
-    relation = f'"{table.schema_name}"."{table.table_name}"'
-    ids = ", ".join(
-        "'" + employee.employee_id.replace("'", "''") + "'" for employee in employees
-    )
-    start, end = month_scope
-    filters = [
-        f"employee_id IN ({ids})",
-        f"attendance_date >= '{start}'",
-        f"attendance_date <= '{end}'",
-    ]
-    aggregate = "COUNT(DISTINCT attendance_date)"
-    alias = "matched_count"
-    if "attendance records" in folded:
-        aggregate = "COUNT(*)"
-    elif re.search(r"\boff days?\b", folded):
-        if "day_type" not in columns:
-            return None
-        filters.append("day_type IN ('OFF Day', 'OFF Day (ZAS)')")
-    elif re.search(r"\babsent\b", folded):
-        if "exception" not in columns:
-            return None
-        filters.append("exception = 'Absent'")
-    elif "zero worked hours" in folded:
-        filters.append("COALESCE(total_worked_hrs, 0) <= 0")
-    elif "did not attend" in folded or re.search(r"\bnot work\b", folded):
-        if "day_type" not in columns:
-            return None
-        filters.extend(
-            (
-                "day_type = 'Working Day'",
-                "COALESCE(total_worked_hrs, 0) <= 0",
-            )
-        )
-    elif re.search(r"\b(?:attend|worked?|work)\b", folded):
-        filters.append("COALESCE(total_worked_hrs, 0) > 0")
-    else:
-        return None
-    return f"SELECT {aggregate} AS {alias} FROM {relation} WHERE " + " AND ".join(
-        filters
-    )
-
-
-def _build_native_schema_aggregate_sql(
-    question: str,
-    database_context: DatabaseContext,
-    employees: tuple[Employee, ...],
-) -> str | None:
-    """Build deterministic SQL for explicit schema counts, percentages, and groups."""
-
-    table = next(
-        (
-            item
-            for item in database_context.tables
-            if item.table_name.casefold().endswith("attendance_records")
-        ),
-        database_context.tables[0],
-    )
-    if not re.fullmatch(
-        r"[A-Za-z_][A-Za-z0-9_]*", table.schema_name
-    ) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table.table_name):
-        return None
-    relation = f'"{table.schema_name}"."{table.table_name}"'
-    columns = {
-        re.sub(r"[^a-z0-9]", "", column.name.casefold()): column.name
-        for column in table.columns
-    }
-
-    def column_for(label: str) -> str | None:
-        return columns.get(re.sub(r"[^a-z0-9]", "", label.casefold()))
-
-    scope = ""
-    if employees:
-        ids = ", ".join(
-            "'" + employee.employee_id.replace("'", "''") + "'"
-            for employee in employees
-        )
-        scope = f"employee_id IN ({ids})"
-
-    exact = re.fullmatch(
-        r"\s*(how many|what percentage of all) attendance records have "
-        r"([A-Za-z_ ]+?) equal to [\"“](.+?)[\"”]\?\s*",
-        question,
-        flags=re.IGNORECASE,
-    )
-    if exact is not None:
-        operation, field_label, value = exact.groups()
-        field = column_for(field_label)
-        if field is None:
-            return None
-        literal = value.replace("'", "''")
-        predicate = f"{field} = '{literal}'"
-        if operation.casefold() == "how many":
-            filters = " AND ".join(item for item in (scope, predicate) if item)
-            return f"SELECT COUNT(*) AS matched_count FROM {relation} WHERE {filters}"
-        where = f" WHERE {scope}" if scope else ""
-        return (
-            "SELECT ROUND((100.0 * COUNT(*) FILTER (WHERE "
-            f"{predicate}) / NULLIF(COUNT(*), 0))::numeric, 2)::double precision "
-            f"AS percentage FROM {relation}{where}"
-        )
-
-    employee_status_count = re.fullmatch(
-        r"\s*how many (authorized|draft) attendance records([^?]*)\?\s*",
-        question,
-        flags=re.IGNORECASE,
-    )
-    if employee_status_count is not None:
-        status_field = column_for("Status")
-        trailing_scope = employee_status_count.group(2).strip()
-        if status_field is None or (trailing_scope and not scope):
-            return None
-        status = employee_status_count.group(1).title()
-        filters = " AND ".join(
-            item for item in (scope, f"{status_field} = '{status}'") if item
-        )
-        return f"SELECT COUNT(*) AS matched_count FROM {relation} WHERE {filters}"
-
-    distinct_status_employees = re.fullmatch(
-        r"\s*count distinct employees with (authorized|draft) attendance records\.?\s*",
-        question,
-        flags=re.IGNORECASE,
-    )
-    if distinct_status_employees is not None:
-        employee_field = column_for("Employee_ID")
-        status_field = column_for("Status")
-        if employee_field is None or status_field is None:
-            return None
-        status = distinct_status_employees.group(1).title()
-        filters = " AND ".join(
-            item for item in (scope, f"{status_field} = '{status}'") if item
-        )
-        return (
-            f"SELECT COUNT(DISTINCT {employee_field}) AS matched_count "
-            f"FROM {relation} WHERE {filters}"
-        )
-
-    threshold = re.fullmatch(
-        r"\s*how many attendance records have ([A-Za-z_ ]+?) "
-        r"(greater than|more than|less than|at least|at most|above|below) "
-        r"([-+]?(?:\d+(?:\.\d*)?|\.\d+))\?\s*",
-        question,
-        flags=re.IGNORECASE,
-    )
-    if threshold is not None:
-        field_label, comparison, value = threshold.groups()
-        field = column_for(field_label)
-        if field is None:
-            return None
-        operator = {
-            "greater than": ">",
-            "more than": ">",
-            "above": ">",
-            "less than": "<",
-            "below": "<",
-            "at least": ">=",
-            "at most": "<=",
-        }[comparison.casefold()]
-        predicate = f"{field} {operator} {value}"
-        filters = " AND ".join(item for item in (scope, predicate) if item)
-        return f"SELECT COUNT(*) AS matched_count FROM {relation} WHERE {filters}"
-
-    grouped = re.fullmatch(
-        r"\s*(?:what is\s+(?:the\s+)?)?(average|avg|sum)\s+"
-        r"(?:of\s+)?([A-Za-z_]+)\s+by\s+"
-        r"([A-Za-z_]+)[?.]?\s*",
-        question,
-        flags=re.IGNORECASE,
-    )
-    if grouped is None:
-        return None
-    operation, metric_label, group_label = grouped.groups()
-    metric = column_for(metric_label)
-    group = column_for(group_label)
-    if metric is None or group is None:
-        return None
-    function = "AVG" if operation.casefold() in {"average", "avg"} else "SUM"
-    alias_prefix = "average" if function == "AVG" else "total"
-    where = f" WHERE {scope}" if scope else ""
-    return (
-        f"SELECT {group}, {function}({metric}) AS {alias_prefix}_{metric}, "
-        f"COUNT(*) OVER() AS matched_count FROM {relation}{where} "
-        f"GROUP BY {group} ORDER BY {group} LIMIT 100"
-    )
-
-
-def _build_native_attendance_observation_sql(
-    question: str,
-    database_context: DatabaseContext,
-    employees: tuple[Employee, ...],
-) -> str | None:
-    """Build stable SQL for qualitative attendance observations and simple statuses."""
-
-    folded = " ".join(question.casefold().split())
-    semantic = _attendance_semantic_question(question)
-    status_match = re.search(
-        r"\b(authorized|draft)(?:\s+attendance)?\s+records?\b", folded
-    )
-    month_scope = _requested_month_scope(question)
-    general_date_detail = bool(
-        month_scope
-        and re.search(r"\b(?:show|list|give|display)\b", folded)
-        and re.search(r"\battendance\b", folded)
-    )
-    if not semantic and status_match is None and not general_date_detail:
-        return None
-    table = database_context.tables[0]
-    for candidate in database_context.tables:
-        if candidate.table_name.casefold().endswith("attendance_records"):
-            table = candidate
-            break
-    if not re.fullmatch(
-        r"[A-Za-z_][A-Za-z0-9_]*", table.schema_name
-    ) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", table.table_name):
-        return None
-    relation = f'"{table.schema_name}"."{table.table_name}"'
-
-    filters: list[str] = []
-    if employees:
-        literals = ", ".join(
-            "'" + employee.employee_id.replace("'", "''") + "'"
-            for employee in employees
-        )
-        filters.append(f"employee_id IN ({literals})")
-    if month_scope is not None:
-        filters.extend(
-            (
-                f"attendance_date >= '{month_scope[0]}'",
-                f"attendance_date <= '{month_scope[1]}'",
-            )
-        )
-    iso_date = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", question)
-    if iso_date is not None:
-        filters.append(f"attendance_date = '{iso_date.group(1)}'")
-    if status_match is not None:
-        status = "Authorized" if status_match.group(1) == "authorized" else "Draft"
-        filters.append(f"status = '{status}'")
-    if "working day" in folded:
-        filters.append("day_type = 'Working Day'")
-
-    threshold = re.search(
-        r"\b(?:more than|greater than|above)\s+(\d+(?:\.\d+)?)\s+"
-        r"lateness\s+hours?\b",
-        folded,
-    )
-    if threshold is not None:
-        filters.append(f"lateness_hrs > {threshold.group(1)}")
-    elif "repeated lateness" in folded or "chronic lateness" in folded:
-        filters.append("COALESCE(lateness_hrs, 0) > 0")
-    elif "incomplete clocking" in folded:
-        filters.append(
-            "(exception ILIKE '%Missing In%' OR exception ILIKE '%Missing Out%')"
-        )
-    elif "early departure" in folded or "early departures" in folded:
-        filters.append("COALESCE(early_out_hrs, 0) > 0")
-    elif "absence" in folded or "absent" in folded:
-        filters.append("exception = 'Absent'")
-    elif "overtime" in folded:
-        filters.append("COALESCE(ot_not_authorized, 0) > 0")
-    elif semantic:
-        filters.append(
-            "(NULLIF(BTRIM(exception), '') IS NOT NULL "
-            "OR COALESCE(lateness_hrs, 0) > 0 "
-            "OR COALESCE(early_out_hrs, 0) > 0 "
-            "OR COALESCE(overbreak_hrs, 0) > 0 "
-            "OR COALESCE(ot_not_authorized, 0) > 0)"
-        )
-    where = " WHERE " + " AND ".join(filters) if filters else ""
-
-    detail_request = bool(
-        re.search(r"\b(?:records?|rows?|details?|entries)\b", folded)
-        or (iso_date is not None and re.search(r"\b(?:show|find|which)\b", folded))
-        or status_match is not None
-        or general_date_detail
-    )
-    if detail_request:
-        return (
-            "SELECT record_id, employee_id, name, attendance_date, day_type, status, "
-            "exception, total_worked_hrs, lateness_hrs, early_out_hrs, overbreak_hrs, "
-            "total_ot, ot_authorized, ot_not_authorized, leave_type, leave_hrs, "
-            f"COUNT(*) OVER() AS matched_count FROM {relation}{where} "
-            "ORDER BY attendance_date, employee_id, record_id LIMIT 100"
-        )
-
-    employee_summary = bool(
-        re.search(r"\bemployees?\b", folded)
-        or "repeated lateness" in folded
-        or "chronic lateness" in folded
-        or "early departure" in folded
-        or employees
-    )
-    if employee_summary:
-        having = (
-            " HAVING COUNT(*) > 1"
-            if "repeated lateness" in folded or "chronic lateness" in folded
-            else ""
-        )
-        return (
-            "SELECT employee_id, name, COUNT(*) AS indicator_records, "
-            "SUM(COALESCE(lateness_hrs, 0)) AS lateness_hours, "
-            "SUM(COALESCE(early_out_hrs, 0)) AS early_out_hours, "
-            "SUM(COALESCE(overbreak_hrs, 0)) AS overbreak_hours, "
-            "SUM(COALESCE(ot_not_authorized, 0)) AS unauthorized_overtime_hours, "
-            f"COUNT(*) OVER() AS matched_count FROM {relation}{where} "
-            f"GROUP BY employee_id, name{having} "
-            "ORDER BY indicator_records DESC, employee_id LIMIT 100"
-        )
-
-    indicator = (
-        "CASE WHEN NULLIF(BTRIM(exception), '') IS NOT NULL "
-        "AND UPPER(BTRIM(exception)) <> 'OK' THEN exception "
-        "ELSE 'Metric indicator' END"
-    )
-    return (
-        f"SELECT {indicator} AS attendance_indicator, "
-        f"COUNT(*) AS occurrence_count, COUNT(*) OVER() AS matched_count "
-        f"FROM {relation}{where} GROUP BY {indicator} "
-        "ORDER BY occurrence_count DESC, attendance_indicator LIMIT 100"
     )
 
 
@@ -1343,7 +724,19 @@ def _pending_response(response: str, pending: PendingEmployeeConfirmation):
     ]
     if len(matches) == 1:
         return "selected", matches[0]
-    if normalized in {"yes", "y", "correct", "confirm", "نعم", "صحيح", "أجل"}:
+    if normalized in {
+        "yes",
+        "y",
+        "correct",
+        "confirm",
+        "all",
+        "both",
+        "نعم",
+        "صحيح",
+        "أجل",
+        "الكل",
+        "كلاهما",
+    }:
         return "invalid_selection", None
     return "new_request", None
 
@@ -1407,6 +800,7 @@ def run_turn(
 ) -> TurnOutcome:
     deps = dependencies or DEPENDENCIES
     previous = ConversationState.from_untrusted(request.state)
+    conversation_history = model_history(request.history)
     locale = _locale(request.question)
     budget = CallBudget(limit=settings.llm_turn_provider_call_limit)
     question = request.question
@@ -1414,9 +808,6 @@ def run_turn(
     try:
         native_comparison = None
         native_running_total = None
-        native_attendance_observation = None
-        native_employee_day_count = None
-        native_schema_aggregate = None
         database_context = None
         loaded_directory = deps.directory_loader(
             dsn=settings.postgres_readonly_dsn,
@@ -1434,7 +825,9 @@ def run_turn(
         authoritative = {item.employee_id: item for item in directory}
         pending = previous.pending_employee_confirmation
         pending_response = (
-            _pending_response(request.question, pending) if pending is not None else None
+            _pending_response(request.question, pending)
+            if pending is not None
+            else None
         )
         if pending is not None and pending_response is not None:
             status, _selected_option = pending_response
@@ -1459,7 +852,9 @@ def run_turn(
                     },
                 )
                 return Clarification(
-                    reply=_confirmation_reply(pending, _locale(pending.original_question)),
+                    reply=_confirmation_reply(
+                        pending, _locale(pending.original_question)
+                    ),
                     state=previous,
                     reason="employee_confirmation",
                 )
@@ -1502,6 +897,12 @@ def run_turn(
                     state=previous,
                     capability="malformed_identifier",
                 )
+            if has_unknown_identifier(question, directory):
+                return Clarification(
+                    reply=_clarification("unknown_employee_id", locale),
+                    state=previous,
+                    reason="unknown_employee_id",
+                )
             request_issue = _request_value_issue(question)
             if request_issue is not None:
                 log_layer_output(
@@ -1516,45 +917,6 @@ def run_turn(
                     state=previous,
                     capability=request_issue,
                 )
-            if _grouped_schema_calculation_syntax(question):
-                database_context = deps.context_loader(
-                    dsn=settings.postgres_readonly_dsn,
-                    attendance_objects=(settings.postgres_attendance_table,),
-                    connect_timeout=settings.postgres_connect_timeout_seconds,
-                )
-                if (
-                    _build_native_schema_aggregate_sql(question, database_context, ())
-                    is None
-                ):
-                    log_layer_output(
-                        "unsupported",
-                        {
-                            "capability": "unsupported_calculation",
-                            "reason": "unknown_schema_metric_or_group",
-                        },
-                    )
-                    return Unsupported(
-                        reply=_unsupported_value(locale),
-                        state=previous,
-                        capability="unsupported_calculation",
-                    )
-            if re.match(r"\s*join\b", question, flags=re.IGNORECASE):
-                database_context = deps.context_loader(
-                    dsn=settings.postgres_readonly_dsn,
-                    attendance_objects=(settings.postgres_attendance_table,),
-                    connect_timeout=settings.postgres_connect_timeout_seconds,
-                )
-                if _missing_join_target(question, database_context):
-                    reply = (
-                        "جدول الربط المطلوب غير موجود في مخطط الحضور المصرح به."
-                        if locale == "ar"
-                        else "The requested join target is not in the authorized attendance schema."
-                    )
-                    log_layer_output(
-                        "unsupported",
-                        {"capability": "schema", "reason": "missing_join_target"},
-                    )
-                    return Unsupported(reply=reply, state=previous, capability="schema")
             active = tuple(
                 authoritative[item]
                 for item in previous.active_employee_ids
@@ -1610,7 +972,7 @@ def run_turn(
             else:
                 reference = deps.reference_writer(
                     question,
-                    history=request.history[-2:],
+                    history=conversation_history,
                     trusted_context=previous.trusted_context(),
                     active_employees=active,
                     as_of_date=as_of_date,
@@ -1621,21 +983,12 @@ def run_turn(
                     observer=observer,
                 )
                 if isinstance(reference.decision, UnsupportedReference):
-                    database_context = deps.context_loader(
-                        dsn=settings.postgres_readonly_dsn,
-                        attendance_objects=(settings.postgres_attendance_table,),
-                        connect_timeout=settings.postgres_connect_timeout_seconds,
-                    )
-                    explicit_schema_aggregate = (
-                        _build_native_schema_aggregate_sql(
-                            question, database_context, ()
-                        )
-                        is not None
-                    )
                     deterministic = bind_references(
                         ReferenceResponse(
                             decision=AmbiguousReference(
-                                rewritten_request=question,
+                                rewritten_request=(
+                                    reference.decision.rewritten_request or question
+                                ),
                                 locale=reference.decision.locale,
                                 reason="missing_employee",
                             )
@@ -1645,46 +998,25 @@ def run_turn(
                         active_employees=active,
                         has_verified_turns=bool(previous.verified_turns),
                     )
-                    if deterministic.employees and (
-                        _build_native_schema_aggregate_sql(
-                            question, database_context, deterministic.employees
-                        )
-                        is not None
-                        or _schema_grounded_analytic_question(
-                            question, database_context, deterministic.employees
-                        )
-                        or _attendance_semantic_question(question)
+                    if (
+                        deterministic.employees
+                        or deterministic.confirmation is not None
+                        or deterministic.unresolved_mention is not None
                     ):
                         bound = deterministic
-                        log_layer_output("schema_grounded_reference", question)
-                    elif (
-                        explicit_schema_aggregate
-                        or _schema_grounded_analytic_question(
-                            question, database_context
-                        )
-                        or _attendance_semantic_question(question)
-                    ):
+                    else:
                         bound = BoundReferences(
-                            rewritten_request=question,
-                            updated_request=attach_resolved_employees(question, ()),
-                            locale=locale,
+                            rewritten_request=(
+                                reference.decision.rewritten_request or question
+                            ),
+                            updated_request=attach_resolved_employees(
+                                reference.decision.rewritten_request or question, ()
+                            ),
+                            locale=reference.decision.locale,
                             request_relationship="new",
                             subject_relationship="all_authorized",
                         )
-                        log_layer_output("schema_grounded_reference", question)
-                    else:
-                        log_layer_output(
-                            "unsupported",
-                            {
-                                "capability": reference.decision.capability,
-                                "rewritten_request": reference.decision.rewritten_request,
-                            },
-                        )
-                        return Unsupported(
-                            reply=_unsupported_domain(reference.decision.locale),
-                            state=previous,
-                            capability=reference.decision.capability,
-                        )
+                    log_layer_output("planner_owned_capability", bound.updated_request)
                 else:
                     bound = bind_references(
                         reference,
@@ -1772,6 +1104,12 @@ def run_turn(
                     state=state,
                     reason="employee_confirmation",
                 )
+            if bound.reason == "unknown_employee_id":
+                return Clarification(
+                    reply=_clarification("unknown_employee_id", bound.locale),
+                    state=previous,
+                    reason="unknown_employee_id",
+                )
             rewritten_request = bound.rewritten_request or question
             bound = BoundReferences(
                 rewritten_request=rewritten_request,
@@ -1805,11 +1143,11 @@ def run_turn(
                 reason=bound.reason,
             )
 
-        if bound.request_relationship == "new" and not _mentions_time_period(question):
-            # The reference model may resolve a nonexistent relative date against
-            # today. For an independent request with no time expression, preserve
-            # the user's scope verbatim while retaining only authoritative identity
-            # resolution.
+        if bound.request_relationship == "new":
+            # For an independent request, the current question is the authority
+            # for its scope. A reference rewrite may accidentally carry filters
+            # from an older turn, especially when the new question has a date.
+            # Retain only identities resolved against the directory.
             bound = bound.model_copy(
                 update={
                     "rewritten_request": question,
@@ -1836,76 +1174,91 @@ def run_turn(
                 connect_timeout=settings.postgres_connect_timeout_seconds,
             )
         log_layer_output("database_context", database_context)
-        required_categorical_filters = _required_categorical_values(
-            "\n".join((question, bound.updated_request)), database_context
-        )
-        downstream_history = (
-            tuple(item for item in request.history[-2:] if item.get("role") == "user")
-            if bound.request_relationship == "follow_up"
-            else ()
-        )
+        downstream_history = conversation_history
+        trusted_context = previous.trusted_context()
+        previous_turn = previous.verified_turns[-1] if previous.verified_turns else None
+        scope_provenance = {
+            "current_original_question": question,
+            "previous_original_question": (
+                previous_turn.original_question if previous_turn is not None else None
+            ),
+            "carried_employee_ids_source": [
+                {
+                    "employee_id": employee.employee_id,
+                    "mentioned_by_id_in_current_question": bool(
+                        re.search(
+                            rf"(?<!\w){re.escape(employee.employee_id)}(?!\w)",
+                            question,
+                            flags=re.IGNORECASE,
+                        )
+                    ),
+                    "mentioned_by_exact_name_in_current_question": bool(
+                        re.search(
+                            rf"(?<!\w){re.escape(employee.name)}(?!\w)",
+                            question,
+                            flags=re.IGNORECASE,
+                        )
+                    ),
+                    "present_in_previous_verified_subject": (
+                        employee.employee_id in previous.active_employee_ids
+                    ),
+                }
+                for employee in bound.employees
+            ],
+            "carried_filter_source": {
+                "reference_rewrite": bound.rewritten_request or question,
+                "previous_user_question": (
+                    previous_turn.original_question
+                    if previous_turn is not None
+                    else None
+                ),
+                "previous_executed_sql": (
+                    previous_turn.executed_sql if previous_turn is not None else None
+                ),
+            },
+        }
         downstream_trusted_context = (
-            previous.trusted_context()
+            {
+                **trusted_context,
+                "verified_turns": [
+                    {
+                        **turn,
+                        "executed_sql": previous.verified_turns[-1].executed_sql,
+                    }
+                    for turn in trusted_context["verified_turns"]
+                ],
+            }
             if bound.request_relationship == "follow_up"
             else {}
         )
         shared_context = SharedModelContext(
             current_question=question,
             as_of_date=as_of_date,
-            updated_request=(
-                "Immediately previous verified request:\n"
-                f"{previous.verified_turns[-1].rewritten_request}\n"
-                "Its verified SQL defines the grouping and eligibility:\n"
-                f"{previous.verified_turns[-1].executed_sql}\n"
-                "Previous HAVING clause, if still applicable:\n"
-                f"{_previous_having(previous.verified_turns[-1].executed_sql)}\n"
-                "Current follow-up change:\n"
-                f"{bound.updated_request}"
+            updated_request=bound.updated_request,
+            previous_verified_turn=(
+                {
+                    "request": previous.verified_turns[-1].rewritten_request,
+                    "sql": previous.verified_turns[-1].executed_sql,
+                    "having": _previous_having(
+                        previous.verified_turns[-1].executed_sql
+                    ),
+                    "date_scope": previous.verified_turns[-1].date_scope,
+                }
                 if bound.request_relationship == "follow_up" and previous.verified_turns
-                else bound.updated_request
+                else None
             ),
             request_relationship=bound.request_relationship,
             subject_relationship=bound.subject_relationship,
             resolved_employee_ids=bound.employee_ids,
-            required_categorical_filters={
-                column: tuple(sorted(values))
-                for column, values in sorted(required_categorical_filters.items())
-            },
             required_date_scope=required_date_scope,
             request_has_date_period=(
                 _mentions_time_period(question) or required_date_scope is not None
             ),
-            attendance_meaning=_attendance_meaning(question),
             conversation_history=downstream_history,
             trusted_context=downstream_trusted_context,
+            scope_provenance=scope_provenance,
             database_context=database_context,
         )
-        native_attendance_observation = _build_native_attendance_observation_sql(
-            question,
-            database_context,
-            bound.employees,
-        )
-        native_employee_day_count = _build_native_employee_day_count_sql(
-            question,
-            database_context,
-            bound.employees,
-        )
-        native_schema_aggregate = _build_native_schema_aggregate_sql(
-            question,
-            database_context,
-            bound.employees,
-        )
-        if native_schema_aggregate is not None:
-            log_layer_output("native_schema_aggregate_plan", native_schema_aggregate)
-        if native_employee_day_count is not None:
-            log_layer_output(
-                "native_employee_day_count_plan", native_employee_day_count
-            )
-        if native_attendance_observation is not None:
-            log_layer_output(
-                "native_attendance_observation_plan",
-                native_attendance_observation,
-            )
         sql_execution_failure: dict[str, object] | None = None
         for attempt in range(1, SQL_EXECUTION_ATTEMPT_LIMIT + 1):
             planner_args: dict[str, object] = {
@@ -1924,46 +1277,93 @@ def run_turn(
                 if native_comparison is not None and attempt == 1
                 else native_running_total.sql
                 if native_running_total is not None and attempt == 1
-                else native_schema_aggregate
-                if native_schema_aggregate is not None and attempt == 1
-                else native_employee_day_count
-                if native_employee_day_count is not None and attempt == 1
-                else native_attendance_observation
-                if native_attendance_observation is not None and attempt == 1
                 else deps.planner(**planner_args)
             )
+            sql = _repair_group_order(sql)
             log_layer_output("sql_planner", sql, attempt=attempt)
-            if not shared_context.request_has_date_period and _unrequested_date_filter(
-                sql
+            if (
+                _planner_control_alias(sql) == "unsupported_capability"
+                and attempt < SQL_EXECUTION_ATTEMPT_LIMIT
             ):
-                issue = "unrequested_date_filter"
-                if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
-                    raise ProviderFailure("sql_semantics", issue, issue)
                 sql_execution_failure = {
                     "retry_number": attempt,
                     "failed_sql": sql,
-                    "error_type": "sql_semantics",
+                    "error_type": "capability_reconsideration",
                     "database_error": (
-                        "The user did not request a date interval, but this SQL filters "
-                        "attendance_date. Remove the invented date restriction and "
-                        "answer over all authorized rows."
+                        "Recheck the complete supplied schema and business_meanings "
+                        "before declaring the request unsupported. A broad request "
+                        "can be answered with observable field indicators even if "
+                        "the schema has no single judgment label. Match the requested "
+                        "output shape, include the user's explicit filters, and bound "
+                        "multi-row output with LIMIT and matched_count. If the "
+                        "required concept truly has no representation, return the "
+                        "same unsupported_capability protocol."
                     ),
                 }
                 log_layer_output(
                     "sql_execution_failure", sql_execution_failure, attempt=attempt
                 )
                 continue
+            try:
+                parse(sql, read="postgres")
+            except ParseError as exc:
+                if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
+                    raise ProviderFailure(
+                        "sql_planner", "invalid_sql_syntax", str(exc)
+                    ) from exc
+                sql_execution_failure = {
+                    "retry_number": attempt,
+                    "failed_sql": sql,
+                    "error_type": "invalid_sql_syntax",
+                    "database_error": (
+                        "The SQL could not be parsed as PostgreSQL. Fix syntax, "
+                        "preserve the complete request and verified scope, and "
+                        "return one simple bounded SELECT statement. "
+                        f"Parser detail: {str(exc)[:1000]}"
+                    ),
+                }
+                log_layer_output(
+                    "sql_execution_failure", sql_execution_failure, attempt=attempt
+                )
+                continue
+            try:
+                validate_read_query(
+                    sql,
+                    allowed_tables=tuple(
+                        f"{table.schema_name}.{table.table_name}"
+                        for table in database_context.tables
+                    ),
+                )
+            except ValueError as exc:
+                if str(exc).startswith("SQL references an unavailable table:"):
+                    reason = (
+                        "The requested concept is not represented by the "
+                        "attendance schema."
+                    )
+                    log_layer_output(
+                        "unsupported", {"capability": "schema", "reason": reason}
+                    )
+                    return Unsupported(
+                        reply=reason, state=previous, capability="schema"
+                    )
             semantic_issue = _sql_semantic_issue(
                 question,
                 sql,
                 rewritten_request=bound.updated_request,
+                allow_rewritten_contracts=(bound.request_relationship == "follow_up"),
                 database_context=database_context,
                 required_date_scope=required_date_scope,
             )
             if semantic_issue in {
+                "nested_result_shape",
                 "detail_request_requires_rows",
-                "incomplete_manual_swipe_comparison",
-                "missing_required_categorical_filter",
+                "invalid_grouped_matched_count",
+                "missing_group_measure",
+                "group_order_uses_total_count",
+                "invalid_running_total_expression",
+                "missing_running_total_expression",
+                "running_total_requires_daily_grouping",
+                "self_membership_filter",
                 "date_scope_mismatch",
             }:
                 if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
@@ -1971,33 +1371,68 @@ def run_turn(
                         "sql_semantics", semantic_issue, semantic_issue
                     )
                 database_error = semantic_issue
-                if semantic_issue == "detail_request_requires_rows":
+                if semantic_issue == "nested_result_shape":
+                    database_error = (
+                        "Return flat relational columns and bounded rows rather than "
+                        "an array aggregate. Include the requested date or detail "
+                        "column on each row and COUNT(*) OVER() AS matched_count."
+                    )
+                elif semantic_issue == "detail_request_requires_rows":
                     database_error = (
                         "The user requested attendance detail rows, but this SQL "
                         "returns only an aggregate. Return bounded matching rows with "
                         "record_id and COUNT(*) OVER() AS matched_count."
                     )
-                elif semantic_issue == "incomplete_manual_swipe_comparison":
+                elif semantic_issue == "invalid_grouped_matched_count":
                     database_error = (
-                        "Manual swipe detection must compare all four payroll-effective "
-                        "From_Date, From_Time, To_Date, and To_Time values with their "
-                        "corresponding Actual_* device values using IS DISTINCT FROM, "
-                        "joining all four comparisons with OR."
+                        "A bounded grouped result must include COUNT(*) OVER() "
+                        "AS matched_count for the number of returned groups. "
+                        "Do not use COUNT(*) AS matched_count for each group's "
+                        "indicator rows; give that measure a distinct alias."
                     )
-                elif semantic_issue == "missing_required_categorical_filter":
-                    required_categories = _required_categorical_values(
-                        "\n".join((question, bound.updated_request)),
-                        database_context,
-                    )
-                    required_text = "; ".join(
-                        f"{column} IN ({', '.join(sorted(values))})"
-                        for column, values in sorted(required_categories.items())
-                    )
+                elif semantic_issue == "missing_group_measure":
                     database_error = (
-                        "The SQL omitted or incorrectly scoped a categorical filter "
-                        "resolved from exact database values. Include each required "
-                        "filter so it applies to every OR branch: "
-                        f"{required_text}."
+                        "The grouped query selects group keys and a total group "
+                        "count but no measure for each group. Add the requested "
+                        "per-group aggregate, such as COUNT(*) AS indicator_count "
+                        "over qualifying rows. Keep COUNT(*) OVER() AS "
+                        "matched_count for the number of groups."
+                    )
+                elif semantic_issue == "group_order_uses_total_count":
+                    database_error = (
+                        "The grouped query orders by matched_count, which is the "
+                        "same total number of groups on every row. Order by the "
+                        "requested per-group measure or a meaningful group key."
+                    )
+                elif semantic_issue == "invalid_running_total_expression":
+                    database_error = (
+                        "The running_total expression is an ordinary aggregate, "
+                        "not a cumulative value. First aggregate daily values, "
+                        "then calculate SUM(daily_value) OVER (ORDER BY "
+                        "the requested date column ROWS BETWEEN UNBOUNDED "
+                        "PRECEDING AND "
+                        "CURRENT ROW) AS running_total."
+                    )
+                elif semantic_issue == "missing_running_total_expression":
+                    database_error = (
+                        "The request asks for a cumulative running total, but the "
+                        "SQL returns only daily values. Aggregate the requested "
+                        "measure by date, then select SUM(daily_value) OVER "
+                        "(ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND "
+                        "CURRENT ROW) AS running_total."
+                    )
+                elif semantic_issue == "running_total_requires_daily_grouping":
+                    database_error = (
+                        "The cumulative window runs over raw attendance rows, "
+                        "so a date can appear more than once. Aggregate the "
+                        "requested measure by date first, then apply the ordered "
+                        "running SUM to those daily values."
+                    )
+                elif semantic_issue == "self_membership_filter":
+                    database_error = (
+                        "The SQL added a column IN (SELECT the same column FROM "
+                        "the same unfiltered table) predicate. It does not implement "
+                        "a requested restriction. Remove that predicate."
                     )
                 elif semantic_issue == "date_scope_mismatch":
                     database_error = (
@@ -2025,10 +1460,27 @@ def run_turn(
                     idle_timeout_ms=settings.postgres_idle_transaction_timeout_ms,
                     result_limit=min(settings.max_exact_results, 1000),
                     max_response_bytes=settings.max_sql_result_bytes,
+                    allowed_tables=tuple(
+                        f"{table.schema_name}.{table.table_name}"
+                        for table in database_context.tables
+                    ),
+                    scope_employee_ids=allowed_employee_ids,
                 )
-                break
-            except (psycopg.ProgrammingError, psycopg.DataError) as exc:
+            except (psycopg.ProgrammingError, psycopg.DataError, ValueError) as exc:
                 log_layer_failure("sql_execution", "query_rejected", exc)
+                if isinstance(exc, ValueError) and str(exc).startswith(
+                    "SQL references an unavailable table:"
+                ):
+                    reason = (
+                        "The requested concept is not represented by the "
+                        "attendance schema."
+                    )
+                    log_layer_output(
+                        "unsupported", {"capability": "schema", "reason": reason}
+                    )
+                    return Unsupported(
+                        reply=reason, state=previous, capability="schema"
+                    )
                 if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
                     raise
                 sql_execution_failure = {
@@ -2042,75 +1494,118 @@ def run_turn(
                     sql_execution_failure,
                     attempt=attempt,
                 )
-        log_layer_output("sql_execution", result)
-        semantic_issue = _sql_semantic_issue(
-            question,
-            sql,
-            rewritten_request=bound.updated_request,
-            database_context=database_context,
-            required_date_scope=required_date_scope,
-        )
-        if semantic_issue is not None:
-            raise ProviderFailure("sql_semantics", semantic_issue, semantic_issue)
-        clarification_reason = _planner_clarification_reason(result)
-        if clarification_reason is not None:
-            log_layer_output(
-                "clarification",
-                {"reason": "planner_clarification", "reply": clarification_reason},
+                continue
+            except RuntimeError as exc:
+                if str(exc) not in {
+                    "result row bound exceeded",
+                    "result response-size bound exceeded",
+                }:
+                    raise
+                if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
+                    raise
+                sql_execution_failure = {
+                    "retry_number": attempt,
+                    "failed_sql": sql,
+                    "error_type": "result_bound",
+                    "database_error": (
+                        "The result exceeded the configured row or response-size "
+                        "bound. Return bounded rows with LIMIT and COUNT(*) OVER() "
+                        "AS matched_count so the answer can state the full match "
+                        "count and identify returned rows as a sample."
+                    ),
+                }
+                log_layer_output(
+                    "sql_execution_failure",
+                    sql_execution_failure,
+                    attempt=attempt,
+                )
+                continue
+            log_layer_output("sql_execution", result)
+            semantic_issue = _sql_semantic_issue(
+                question,
+                sql,
+                rewritten_request=bound.updated_request,
+                allow_rewritten_contracts=(bound.request_relationship == "follow_up"),
+                database_context=database_context,
+                required_date_scope=required_date_scope,
             )
-            return Clarification(
-                reply=clarification_reason,
-                state=previous,
-                reason="planner_clarification",
+            if semantic_issue is not None:
+                raise ProviderFailure("sql_semantics", semantic_issue, semantic_issue)
+            clarification_reason = _planner_clarification_reason(result)
+            unsupported_reason = _unsupported_schema_reason(result)
+            control_result = (
+                clarification_reason is not None or unsupported_reason is not None
             )
-        unsupported_reason = _unsupported_schema_reason(result)
-        if unsupported_reason is not None:
-            log_layer_output(
-                "unsupported",
-                {"capability": "schema", "reason": unsupported_reason},
+            native_comparison_used = (
+                native_comparison is not None and sql == native_comparison.sql
             )
-            return Unsupported(
-                reply=unsupported_reason,
-                state=previous,
-                capability="schema",
+            native_running_total_used = (
+                native_running_total is not None and sql == native_running_total.sql
             )
-        native_comparison_used = (
-            native_comparison is not None and sql == native_comparison.sql
-        )
-        native_running_total_used = (
-            native_running_total is not None and sql == native_running_total.sql
-        )
-        date_scope = (
-            None
-            if native_comparison_used or native_running_total_used
-            else _sql_date_scope(sql)
-        )
-        if required_date_scope is not None and date_scope != required_date_scope:
-            raise ProviderFailure(
-                "sql_semantics", "date_scope_mismatch", "date_scope_mismatch"
+            date_scope = (
+                None
+                if native_comparison_used or native_running_total_used
+                else _sql_date_scope(sql)
             )
-        if native_comparison_used:
-            answer = render_grouped_month_comparison(
-                native_comparison, result, locale=bound.locale
-            )
-        elif native_running_total_used:
-            answer = render_running_total(
-                native_running_total, result, locale=bound.locale
-            )
-        else:
-            answer = deps.answer_writer(
+            if (
+                not control_result
+                and required_date_scope is not None
+                and date_scope != required_date_scope
+            ):
+                raise ProviderFailure(
+                    "sql_semantics", "date_scope_mismatch", "date_scope_mismatch"
+                )
+            answer = deps.answerer(
                 shared_context=shared_context,
                 sql=sql,
                 result=result,
                 employees=bound.employees,
                 locale=bound.locale,
-                model=settings.llm_answer_model,
+                model=settings.llm_planner_model,
                 budget=budget,
-                timeout=settings.llm_answer_timeout_seconds,
-                max_output_tokens=settings.llm_answer_max_output_tokens,
+                timeout=settings.llm_planner_timeout_seconds,
+                max_output_tokens=settings.llm_planner_max_output_tokens,
                 observer=observer,
             )
-        log_layer_output("answer", answer)
+            if isinstance(answer, ReplanRequest):
+                if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
+                    raise ProviderFailure(
+                        "sql_answer_review",
+                        "replan_limit_exceeded",
+                        "review still requires a new query after the final SQL attempt",
+                    )
+                sql_execution_failure = {
+                    "retry_number": attempt,
+                    "failed_sql": sql,
+                    "error_type": "answer_review_requery",
+                    "database_error": answer.reason,
+                }
+                log_layer_output(
+                    "sql_execution_failure", sql_execution_failure, attempt=attempt
+                )
+                continue
+            log_layer_output("answer", answer)
+            if clarification_reason is not None:
+                log_layer_output(
+                    "clarification",
+                    {"reason": "planner_clarification", "reply": answer},
+                )
+                return Clarification(
+                    reply=answer,
+                    state=previous,
+                    reason="planner_clarification",
+                )
+            if unsupported_reason is not None:
+                log_layer_output(
+                    "unsupported",
+                    {"capability": "schema", "reason": answer},
+                )
+                return Unsupported(
+                    reply=answer,
+                    state=previous,
+                    capability="schema",
+                )
+            break
         verified = VerifiedTurn(
             turn_id=uuid4().hex,
             original_question=question,

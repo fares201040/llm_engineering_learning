@@ -14,6 +14,7 @@ from week5.new_implementation.online.execution import (
     execute_sql,
     load_employee_directory,
     search_employee_directory_postgres,
+    validate_read_query,
 )
 from week5.new_implementation.online.reference import EmployeeOption
 
@@ -70,6 +71,40 @@ def fake_psycopg(connection):
 
 
 class DirectExecutionTests(unittest.TestCase):
+    def test_query_boundary_accepts_ctes_and_rejects_other_statements(self):
+        validate_read_query(
+            "WITH a AS (SELECT * FROM attendance_records) SELECT * FROM a",
+            allowed_tables=("public.attendance_records",),
+        )
+        for sql in (
+            "SELECT 1; SELECT 2",
+            "DELETE FROM attendance_records",
+            "SELECT * FROM private.payroll",
+            "SELECT * FROM pg_catalog.pg_tables",
+            "SELECT 1 INTO new_table",
+            "SELECT * FROM attendance_records FOR UPDATE",
+        ):
+            with self.subTest(sql=sql), self.assertRaises(ValueError):
+                validate_read_query(sql, allowed_tables=("public.attendance_records",))
+
+    def test_employee_scope_applies_inside_aggregate_cte_and_join(self):
+        sql = (
+            "WITH totals AS (SELECT employee_id, COUNT(*) n FROM attendance_records "
+            "GROUP BY employee_id) SELECT * FROM totals JOIN attendance_records ar "
+            "ON totals.employee_id = ar.employee_id"
+        )
+        connection = Connection(Cursor(description=(Description("n", 23),)))
+        with fake_psycopg(connection):
+            execute_sql(
+                sql,
+                dsn="postgresql://test",
+                allowed_tables=("public.attendance_records",),
+                scope_employee_ids=("A1", "A'2"),
+            )
+        query = next(item[0] for item in connection.calls if "WITH totals" in item[0])
+        self.assertEqual(query.count("employee_id IN"), 2)
+        self.assertIn("A''2", query)
+
     def test_access_context_still_scopes_employee_directory_resolution(self):
         scope = authorize_access(
             AccessContext(

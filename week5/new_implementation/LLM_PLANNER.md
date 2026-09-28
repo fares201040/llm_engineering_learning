@@ -2,7 +2,7 @@
 
 `attendance-online/v1` is the only online attendance runtime. It preserves the small
 application facade and offline ingestion while executing one initial PostgreSQL query
-per turn, with at most two eligible retries after PostgreSQL programming or data errors.
+per turn, with at most three eligible planner repairs.
 
 ## Active modules
 
@@ -16,7 +16,8 @@ per turn, with at most two eligible retries after PostgreSQL programming or data
 | `online/planner.py` | Complete schema payload, SQL-only prompt, and raw text response |
 | `online/comparison.py` | Schema-checked relative-month comparison of a previous verified grouped aggregate |
 | `online/execution.py` | Access check, ID/name directory lookup, bounded read-only direct SQL execution |
-| `online/answering.py` | Same-model answer writing and independent verification |
+| `online/planner_examples.py` | Valid SQL examples generated from discovered schema fields |
+| `online/evidence.py` | Typed execution evidence supplied to the planner's answer and review calls |
 | `online/state.py` | Minimal verified turns and pending confirmation |
 | `online/pipeline.py` | Stage order, failure mapping, and atomic publication |
 | `online/provider.py` | Structured/text calls, zero transport retries, call budget, stage events |
@@ -27,16 +28,12 @@ query, witness query, narrative query route, shadow/canary path, or old state ad
 
 ## Model roles and payloads
 
-For the current Phase 2 local configuration, reference and answer use
-`ollama_chat/qwen3.5:4b`, while SQL planning uses
-`ollama_chat/gpt-oss:20b`. The provider sends GPT-OSS calls with
-`reasoning_effort="medium"`, other local calls with `reasoning_effort="none"`, and
-all local calls with `temperature=0`. The SQL planner uses
-`num_ctx=65536`; the answer writer and verifier also use `num_ctx=65536`, while the
-reference stage uses `num_ctx=8192`. Set
-`LLM_PLANNER_MAX_OUTPUT_TOKENS=512` for planner output.
+The reference model uses `ollama_chat/qwen3.5:2b`. The query planner uses
+`openai/gpt-5-nano` for SQL planning, answering from executed rows, and reviewing
+its answer. Local Qwen calls use `reasoning_effort="none"`, `temperature=0`, and
+`num_ctx=32768`. Set `LLM_PLANNER_MAX_OUTPUT_TOKENS=6000`.
 
-There are exactly three configured roles:
+There are two configured model roles:
 
 1. The reference/rewriter model receives the current question, conversation history,
    trusted conversation context, and verified active employees. It returns a complete
@@ -57,34 +54,41 @@ There are exactly three configured roles:
    exact SQL expression and normalized type. It must preserve authoritative employee
    IDs and return no JSON, Markdown, explanation, or mapping. Joins, nested queries,
    aggregates, and CTEs are permitted. The initial request has no extra SQL-review
-   pass. Only after an eligible PostgreSQL error does the planner receive
-   `sql_execution_failure`; it then reviews the failed SQL and database error against
-   the unchanged request and schema and returns corrected SQL without exposing its
+   pass. On a retry, the planner receives `sql_execution_failure` with the prior SQL
+   and the execution, validation, or answer-review issue. It corrects the query
+   against the unchanged request and schema without exposing its
    reasoning. An unrepresentable request should become a safe SQL `SELECT` result
    stating that it is unsupported. If schema and verified context still leave multiple
    materially different meanings, it returns a safe `clarification_required` SQL
    result containing the question to show the user.
-3. The answer model is invoked in two independent calls with distinct complete system
-   prompts. The writer grounds a complete answer only in the executed result and must
-   name authoritative employees. The verifier independently checks attribution,
-   values, dates, units, polarity, coverage, omissions, unsupported claims, injection,
-   and consistency. One rejected draft may be rewritten and verified once more.
 
-The pipeline reuses one `SharedModelContext` instance. Its model payloads differ by
-stage so the full attendance schema is sent only to the SQL planner:
+After SQL executes, the planner receives the original question, rewritten request,
+conversation history, full schema, SQL, typed rows, result coverage, and authoritative
+employee identities. It writes a focused answer. A second call to the same GPT model
+independently reviews the current question, draft answer, scope, SQL, and rows. It
+may correct the answer directly when the rows support it. It requests another SQL
+query only when the proposed answer is materially wrong or unrelated and different
+SQL against the available database can correct it. In that case the same bounded
+loop replans, executes, and drafts and reviews another answer. Missing calendar
+rows cannot be recovered by replanning. No draft is published before review accepts
+its evidence. Both prompts include generic examples of turning rows into answers;
+the review prompt also includes correction and requery examples.
+
+The pipeline reuses one `SharedModelContext` instance. Its full schema is sent to
+each planner call, including the post-query answer and review calls:
 
 1. explicit current question;
 2. updated rewritten request;
 3. untrusted conversation history;
 4. labelled trusted context;
 5. database type;
-6. for the planner only, the complete allowlisted attendance schema/tables; and
+6. the complete allowlisted attendance schema/tables; and
 7. an explicit statement that rewriting and employee resolution are complete.
 
 Model-facing trusted context includes the latest verified request, locale, employees,
-and inherited date scope. The complete prior answer, raw SQL result, and executed SQL
-remain in application state but are omitted from later model payloads so a large
-bounded answer cannot overflow the next reference or answer call.
+and inherited date scope. Older conversation text is compacted only when it exceeds
+the shared history budget. The full executed result is supplied for the current
+answer and review calls.
 
 The planner receives every typed relational column and all 58 described
 `record_json.json_fields` entries, including exact SQL expressions, normalized types,
@@ -93,15 +97,13 @@ represent the same concept. The schema is included once in each planner request 
 sent again only when a planner retry is required; it is never duplicated within one
 request.
 
-A narrow, generic grouped-aggregate follow-up is planned from the previous verified
-SQL without another model rewrite. The prior query must be a single grouped SUM/COUNT
-over an allowlisted table, with one group column, one aggregate, and no prior date
-scope. The comparison keeps the prior query as the eligibility CTE and calculates
-the previous and current calendar-month values from PostgreSQL rows. Its deterministic
-answer checks each group, numeric difference, result count, and available date range.
-Requests outside that supported shape use the normal model path.
+A narrow, generic grouped-aggregate follow-up can be planned from the previous
+verified SQL without another SQL-planning model call. The planner still receives the
+executed comparison rows and reviews the final answer. Requests outside that
+supported shape use normal SQL planning.
 
-For follow-ups, the model sees the latest verified turn and the previous user question.
+For follow-ups, both the reference and SQL models see the full available conversation
+history, with older text compacted when it exceeds the shared history budget.
 The current follow-up change and previous verified SQL are made explicit in the
 planner request. The SQL planner receives calendar-month boundaries calculated from
 the turn date. An inherited single date interval is checked against executed SQL;
@@ -109,30 +111,51 @@ grouped comparisons with conditional dates are not stored as a single inherited
 date scope. The answer payload includes exact table availability overlap for the
 previous calendar month when a comparison needs it.
 
-The writer and verifier receive the current question, rewritten request, conversation
-history, trusted context, database type, resolution statement, database date-coverage
-summary, exact executed SQL, typed result and execution coverage, authoritative
-employee IDs/names, and locale. They do not receive the attendance schema. The verifier
-also receives the proposed answer.
-The writer's coverage-bound check accepts exact ISO dates and equivalent spelled-out
-English dates; the verifier still judges whether the coverage statement is accurate.
+The planner's answer and review calls receive the current question, rewritten
+request, conversation history, trusted context, full schema, exact executed SQL,
+typed result and execution coverage, authoritative employee IDs/names, and locale.
+The review call also receives the proposed answer.
 
 Every physical column in an allowlisted attendance object must have an authored
-description in `online/context.py`. Context loading fails with the missing column names
-instead of sending a generic or undescribed field to the SQL planner.
+description. PostgreSQL column comments override compatibility descriptions in
+`online/context.py`; a new column needs a database comment. Context loading fails
+with the missing column names instead of sending an undescribed field to the SQL planner.
 
 The `record_json` column carries nested descriptions for the normalized source
 attendance fields. The descriptions distinguish immutable original device swipes
 (`Actual_From_*`/`Actual_To_*`) from the corresponding clerk-adjustable,
-payroll-effective swipe values (`From_*`/`To_*`). They also define positive
+effective swipe values (`From_*`/`To_*`). They also define positive
 `Total_Worked_Hrs` as attendance evidence and direct the planner to leave and exception
 fields when worked hours are null, empty, or zero.
+The `work_location` description identifies a group within a department; one
+department may contain several such groups. A department-wide request should not
+inherit a work-location value from an earlier result.
 
-For manual-swipe requests, the runtime parses the proposed SQL and requires one filter
-whose four effective-versus-device comparisons are joined with `OR`. Comparisons
-joined only with `AND`, emitted outside a filter, or missing a pair trigger a planner
-retry. Detection uses both the original and self-contained rewritten request, including
-supported Arabic manual-swipe wording and inherited follow-up intent.
+The schema descriptions explain manual swipe comparisons, explicit absence, and
+null-safe negation to the planner. The retired `online/semantic_contracts.py` contains
+no active checks; the runtime no longer matches request words to prescribed SQL
+predicates for these meanings. SQL safety, authorization, and independently verified
+scope checks remain in the pipeline.
+`scope_provenance` shows the current and prior original user questions alongside
+carried employees and the prior SQL, so the planner can distinguish user-requested
+filters from values that appeared only in a prior answer or result.
+
+## Where planner guidance belongs
+
+For any new or corrected field meaning, standard value, nullable comparison, or
+business interpretation, update the schema metadata in `online/context.py` or the
+system prompts and schema-generated examples in `online/planner.py` and
+`online/planner_examples.py`. PostgreSQL column comments are authoritative for new
+columns; compatibility descriptions and JSON field descriptions support existing
+data. Do not encode model-facing clarification in a request-word regex, a semantic
+SQL validator, answer post-processing, or an evaluation assertion. Keep both SQL
+prompt variants aligned with the same schema examples.
+
+Examples should illustrate valid general SQL shapes. They must not contain invalid
+placeholders or sample values that the planner might treat as this turn's filters.
+Review an answer against the requested period, observed table dates, executed SQL,
+rows, and any missing data. Literal wording checks and embedding similarity cannot
+alone establish answer correctness.
 
 The planner counts distinct attendance dates when a request asks for a number of
 days, unless the request explicitly asks for records or rows. Attendance detail-row
@@ -140,7 +163,7 @@ queries include `record_id` so returned evidence retains a stable traceable iden
 Scheduled work dates use `day_type = 'Working Day'`; generic off-day requests include
 both `OFF Day` and `OFF Day (ZAS)`. Positive `total_worked_hrs` proves attendance,
 while zero or null alone does not prove absence. Explicit absence is
-`exception = 'Absent'`. Payroll calculations use clerk-adjustable `From_*`/`To_*`
+`exception = 'Absent'`. Worked-time calculations use clerk-adjustable `From_*`/`To_*`
 values; immutable `Actual_From_*`/`Actual_To_*` values are for device-swipe questions.
 
 ## Employee authority
@@ -187,24 +210,25 @@ system/auth/config or private-ingestion objects, migration tables, or credential
 
 ## Direct execution and bounds
 
-The planner string is checked for an unrequested attendance-date predicate, then
-passed to `connection.execute(sql)` without parameters, general structural
-authorization, limit injection, or literal conversion. Execution starts
+The planner string is parsed as one read-only SQL query, checked against the
+allowlisted attendance tables and request-scope guards, and then executed. When
+employee row scope applies, each base table is wrapped with the authoritative
+employee-ID filter before execution. Execution starts
 `REPEATABLE READ READ ONLY`, applies local
 statement/lock/idle-transaction timeouts, fetches at most `result_limit + 1`, bounds
 the serialized response size, records column type codes and row coverage, and rolls
 back on both success and failure. Database/provider/size/timeout failures return a safe
 failed outcome and preserve the exact prior trusted state.
 
-A PostgreSQL `ProgrammingError`, `DataError`, or an unrequested date filter triggers
-at most two planner retries after the initial query: no more than three planning
-attempts. Each retry receives
+A PostgreSQL `ProgrammingError`, `DataError`, invalid SQL syntax, semantic scope
+failure, result bound, or tentative unsupported-schema decision can trigger a
+planner retry: no more than four planning attempts. Each retry receives
 the failed SQL, error type, database error text capped at 4,000 characters, retry
-number, and the same `SharedModelContext` with the same complete schema. Connection,
-timeout, result-bound, authorization, provider, and answer failures do not trigger SQL
-repair. A third eligible rejection fails safely without publishing conversation
-state. The maximum provider-call budget remains 8; a third planner call consumes one
-of the calls otherwise available for answer writing or verification.
+number, and the same `SharedModelContext` with the same complete schema. An
+unavailable table stops as unsupported before a retry can silently drop the requested
+relation. Connection, timeout, authorization, provider, and answer failures do not
+trigger SQL repair. A fourth eligible rejection fails safely without publishing
+conversation state. The maximum provider-call budget remains 8.
 
 Malformed employee identifier shapes and recognized impossible dates or
 non-finite/malformed numeric comparisons are rejected before planning. An unknown
@@ -212,70 +236,42 @@ standalone ID receives no candidate alternatives. Unresolved names can produce
 confirmation-only candidates after authorized-directory checks. Unsupported concepts,
 including non-attendance requests, use the planner's `unsupported_capability` SQL-result
 protocol and return an explicit unsupported outcome. Genuine business ambiguity uses
-the parallel `clarification_required` protocol and returns the planner's concise
-question without calling the answer writer or publishing a verified turn. Both control
-protocols accept only a single literal text expression with no table reference, so
-manual-swipe and other semantic guards do not block the safe control result.
+the parallel `clarification_required` protocol. Both control protocols accept only a
+single literal text expression with no table reference. The same planner answer and
+review calls present the request-specific explanation or question; no verified turn
+is published for a control result.
 Empty/malformed provider responses and planner Markdown fences fail safely.
-The narrow date-predicate check uses SQL parsing; it does not provide general SQL
-authorization.
+Read-only database permissions remain a separate defense if a validator misses a
+query form.
 
 ## Security limitation and deferred safeguards
 
-This implementation is intentionally not secure against unauthorized reads available
-to the database role, expensive valid SQL, or prompt-injected SQL. Read-only database
-permissions prevent writes but do not provide structural query authorization.
+The runtime checks that the query is a single read-only statement over exposed
+tables and applies authoritative employee row scope. It also bounds execution time,
+returned rows, and response bytes. These controls do not yet allowlist every SQL
+function, operator, or column, so the database role should expose only approved data.
 
 Deferred work:
 
-1. parse PostgreSQL SQL into an AST;
-2. require exactly one read-only statement;
-3. allowlist every table, column, function, operator, and join;
-4. inject authoritative row authorization outside model control;
-5. enforce result/complexity limits structurally in SQL; and
-6. replace model-authored literals with bound parameters.
+1. expand the AST checks to allowlist columns, functions, operators, and joins;
+2. add a database-side query complexity budget; and
+3. use bound parameters for model-authored literal values where practical.
 
 ## State and outcomes
 
-Only a passing verifier publishes a `VerifiedTurn` containing original and rewritten
+Only a completed planner answer review publishes a `VerifiedTurn` containing original and rewritten
 requests, answer, locale, authoritative employees, exact executed SQL, and typed
 result. A clarification may store one pending employee confirmation. All provider,
 SQL, bound, and verification failures preserve prior state. State from another runtime
 version resets safely.
 
-## Verification record (2026-09-27)
+## Verification record (2026-09-28)
 
-The current sanitized archive SHA-256 is
-`6336d4d7a6f4a86ddce7916876b8d283c05f4948a928229f0b56b734cc2cbac5`.
-The local deterministic suite passed **250 tests and 10 subtests** after the
-planner-owned ambiguity and clarification-protocol fixes. The archive has a generated 311-line
-placeholder manifest, but excludes the private evaluation corpus and all credentials
-and attendance exports. The source [Colab notebook](colab/attendance_phase2_tests.ipynb)
-contains the current hash and is ready for a new Colab execution.
-
-The last [executed Colab notebook](colab/attendance_phase2_tests_output.ipynb) remains
-the A100 record for the preceding archive
-`c77544ccf51f9805267dd568b03c5a4478f9eb0a1beeab238895dc4afd7b36c1`; it validated
-48 allowlisted files and passed **245 deterministic tests**, Ruff lint and formatting
-for 29 files, and Python compilation. The synthetic database has 16 rows and three
-employees; the temporary model is Qwen 3.5 4B.
-
-On that preceding snapshot, the private A100 evaluator passed cases 100–149 (50/50), the 25-case fixed-case
-conversation replay including employee confirmations (25/25), and cases 150–199
-(50/50). The exact manual-swipe question produced all 65 returned employees from one
-planner attempt, with no answer truncation.
-
-The synthetic UI conversation passed turns 1–7 on the preceding source snapshot.
-Turn 8 was rerun against that A100 archive from its verified seven-turn checkpoint;
-the running total, result arithmetic, answer facts, and state checks passed. The
-checkpoint reports eight completed turns. The native grouped relative-month plan
-corrected turn 5's eligibility and date-coverage errors. The native running-total
-plan derives its metric from the previous verified grouped SQL.
-
-The live synthetic evaluator completed four cases with no failed flags on that
-archive. A prior run found that the planner invented September/August filters for a
-date-unbounded department ranking. The SQL date-predicate guard now rejects that
-plan before execution and retries against the unchanged request. See
-[the sync guide](colab/LOCAL_COLAB_SYNC_GUIDE.md) and
-[the phase handoff](../../docs/superpowers/reports/2026-09-26-attendance-colab-evaluation-handoff.md)
-for issue classes and run details. The private 311 cases have not been run in Colab.
+The current sanitized source archive has SHA-256
+`b7c9afd1cc0a520a1e8fbc1ea461f7439f6136936e4a9822d715d229cec72ffc`.
+The Colab CPU notebook validated its 55 allowlisted source files, passed 266
+deterministic tests, and passed Ruff lint, formatting, and Python compilation.
+The archive contains a generated 311-line placeholder manifest; the private
+evaluation corpus, credentials, and attendance exports are supplied separately
+in the authorized Colab runtime. Prompt comparisons and the remaining private
+cases are evaluated separately from this deterministic gate.

@@ -58,6 +58,10 @@ def evaluator_command(
 
 def main() -> int:
     settings = json.loads(RUNTIME_CONFIG.read_text(encoding="utf-8"))
+    if not settings.get("OPENAI_API_KEY"):
+        raise RuntimeError(
+            "The private evaluator requires OPENAI_API_KEY for the GPT SQL planner"
+        )
     source = Path(settings["ATTENDANCE_PHASE2_SOURCE_ROOT"])
     cases = Path(settings["ATTENDANCE_PRIVATE_CASE_FILE"])
     batch_size = int(os.environ.get("PRIVATE_EVAL_BATCH_SIZE", "10"))

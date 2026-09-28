@@ -82,9 +82,6 @@ class Settings:
     llm_planner_model: str
     llm_planner_timeout_seconds: float
     llm_planner_max_output_tokens: int
-    llm_answer_model: str
-    llm_answer_timeout_seconds: float
-    llm_answer_max_output_tokens: int
     postgres_statement_timeout_ms: int
     postgres_lock_timeout_ms: int
     postgres_idle_transaction_timeout_ms: int
@@ -128,9 +125,8 @@ class Settings:
         global_model = (
             global_model.strip() if global_model and global_model.strip() else None
         )
-        reference_default_model = global_model or "openai/gpt-4.1-mini"
-        planner_default_model = global_model or "ollama_chat/gpt-oss:20b"
-        answer_default_model = global_model or "openai/gpt-4.1"
+        reference_default_model = global_model or "ollama_chat/qwen3.5:2b"
+        planner_default_model = global_model or "openai/gpt-5-nano"
         postgres_dsn = _text("POSTGRES_DSN", "")
         embedding_provider = _text("EMBEDDING_PROVIDER", "huggingface").lower()
         if embedding_provider not in {"huggingface", "openai"}:
@@ -169,11 +165,6 @@ class Settings:
             ),
             llm_planner_max_output_tokens=_integer(
                 "LLM_PLANNER_MAX_OUTPUT_TOKENS", 6000, 256
-            ),
-            llm_answer_model=_text("LLM_ANSWER_MODEL", answer_default_model),
-            llm_answer_timeout_seconds=_number("LLM_ANSWER_TIMEOUT_SECONDS", 60.0, 0.1),
-            llm_answer_max_output_tokens=_integer(
-                "LLM_ANSWER_MAX_OUTPUT_TOKENS", 3000, 128
             ),
             postgres_statement_timeout_ms=_integer(
                 "POSTGRES_STATEMENT_TIMEOUT_MS", 30000, 1

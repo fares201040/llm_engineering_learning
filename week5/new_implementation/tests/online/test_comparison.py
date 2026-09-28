@@ -52,6 +52,64 @@ def attendance_schema():
 
 
 class GroupedComparisonTests(unittest.TestCase):
+    def test_accepts_zero_coalesced_grouped_measure(self):
+        plan = build_grouped_month_comparison(
+            question="Compare that with last month.",
+            previous_sql=(
+                "SELECT department, COALESCE(SUM(total_worked_hrs), 0) "
+                "AS total_worked_hours FROM attendance_records "
+                "GROUP BY department "
+                "HAVING COALESCE(SUM(total_worked_hrs), 0) > 10"
+            ),
+            previous_date_scope=None,
+            as_of_date="2026-09-27",
+            database_context=attendance_schema(),
+        )
+        self.assertIsNotNone(plan)
+        self.assertIn("eligible_groups", plan.sql)
+        self.assertIn("previous_period_record_count", plan.sql)
+        self.assertIn("current_period_record_count", plan.sql)
+        self.assertIn("CASE WHEN COUNT(*) FILTER", plan.sql)
+        self.assertNotIn("COALESCE(SUM(total_worked_hrs) FILTER", plan.sql)
+
+    def test_accepts_verified_aggregate_alias_in_order_by(self):
+        plan = build_grouped_month_comparison(
+            question="Compare that with last month.",
+            previous_sql=(
+                "SELECT department, SUM(CASE WHEN COALESCE(total_worked_hrs, 0) > 0 "
+                "THEN total_worked_hrs ELSE 0 END) AS total_hours, "
+                "COUNT(*) OVER() AS matched_count FROM attendance_records "
+                "GROUP BY department HAVING SUM(CASE WHEN "
+                "COALESCE(total_worked_hrs, 0) > 0 THEN total_worked_hrs "
+                "ELSE 0 END) > 10 ORDER BY total_hours DESC"
+            ),
+            previous_date_scope=None,
+            as_of_date="2026-09-27",
+            database_context=attendance_schema(),
+        )
+        self.assertIsNotNone(plan)
+        self.assertIn("eligible_groups", plan.sql)
+        self.assertIn("2026-08-31", plan.sql)
+
+    def test_accepts_grouped_result_with_standard_match_count(self):
+        plan = build_grouped_month_comparison(
+            question="Compare that with last month.",
+            previous_sql=(
+                "SELECT department, SUM(CASE WHEN total_worked_hrs > 0 THEN "
+                "total_worked_hrs ELSE 0 END) AS total_hours, "
+                "COUNT(*) OVER() AS matched_count FROM attendance_records "
+                "GROUP BY department HAVING SUM(CASE WHEN total_worked_hrs > 0 "
+                "THEN total_worked_hrs ELSE 0 END) > 10"
+            ),
+            previous_date_scope=None,
+            as_of_date="2026-09-25",
+            database_context=attendance_schema(),
+        )
+        self.assertIsNotNone(plan)
+        self.assertIn("eligible_groups", plan.sql)
+        self.assertIn("2026-08-31", plan.sql)
+        self.assertIn("2026-09-01", plan.sql)
+
     def test_renders_verified_period_values_and_partial_coverage(self):
         plan = build_grouped_month_comparison(
             question="Compare that with last month.",

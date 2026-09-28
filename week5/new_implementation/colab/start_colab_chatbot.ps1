@@ -40,6 +40,25 @@ function Convert-ToWslPath {
     return ($converted | Select-Object -Last 1).Trim()
 }
 
+$GpuChoices = @{
+    "1" = $null # CPU
+    "2" = "T4"
+    "3" = "L4"
+    "4" = "G4"
+    "5" = "A100"
+    "6" = "H100"
+}
+Write-Host "Choose a Colab runtime:"
+Write-Host "  1) CPU    2) T4    3) L4    4) G4    5) A100    6) H100"
+while ($true) {
+    $choice = (Read-Host "Runtime [1-6, Enter=A100]").Trim()
+    if ($choice -eq "") { $choice = "5" }
+    if ($GpuChoices.ContainsKey($choice)) { break }
+    Write-Host "Enter a number from 1 to 6."
+}
+$Gpu = $GpuChoices[$choice]
+$RuntimeLabel = if ($null -eq $Gpu) { "CPU" } else { $Gpu }
+
 if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
     throw "Project Python environment not found at $Python"
 }
@@ -57,12 +76,27 @@ $SourceWsl = Convert-ToWslPath $SourceArchive
 $PayloadWsl = Convert-ToWslPath $PrivatePayload
 $BootstrapWsl = Convert-ToWslPath $Bootstrap
 
-Write-Host "3/6 Creating or reusing the Colab A100 session..."
+Write-Host "3/6 Creating or reusing the Colab session ($RuntimeLabel requested)..."
 $sessions = Invoke-Colab -CommandArguments @("sessions") -Capture
 $escapedName = [regex]::Escape($SessionName)
 $reused = $sessions -match "\[$escapedName\]"
+if ($reused) {
+    Write-Host "Session '$SessionName' already exists. Reusing it keeps its current hardware."
+    while ($true) {
+        $action = (Read-Host "[R]euse it or [N]ew session with $RuntimeLabel (stops the existing session) [R/N, Enter=R]").Trim().ToUpperInvariant()
+        if ($action -eq "" -or $action -eq "R") { break }
+        if ($action -eq "N") {
+            Invoke-Colab -CommandArguments @("stop", "--session", $SessionName)
+            $reused = $false
+            break
+        }
+        Write-Host "Enter R or N."
+    }
+}
 if (-not $reused) {
-    Invoke-Colab -CommandArguments @("new", "--session", $SessionName, "--gpu", "A100")
+    $newArguments = @("new", "--session", $SessionName)
+    if ($null -ne $Gpu) { $newArguments += @("--gpu", $Gpu) }
+    Invoke-Colab -CommandArguments $newArguments
 }
 
 Write-Host "4/6 Uploading the current code and attendance payload..."

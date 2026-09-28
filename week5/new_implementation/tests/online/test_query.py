@@ -99,6 +99,20 @@ class DatabaseContextTests(unittest.TestCase):
 
         self.assertEqual(values, ())
 
+    def test_json_field_standard_values_follow_database_observations(self):
+        fields = {
+            field.name: field
+            for field in context._record_json_fields(
+                {
+                    "day_type": ("Observed Schedule",),
+                    "exception": ("Observed Exception",),
+                }
+            )
+        }
+        self.assertEqual(fields["Day_Type"].standard_values, ("Observed Schedule",))
+        self.assertEqual(fields["Exception"].standard_values, ("Observed Exception",))
+        self.assertEqual(fields["Status"].standard_values, ())
+
     def test_all_record_json_source_fields_have_queryable_semantic_descriptions(self):
         expected_fields = {
             "Actual_From_Date",
@@ -175,7 +189,7 @@ class DatabaseContextTests(unittest.TestCase):
             "admin clerk may modify it manually", fields["From_Time"].description
         )
         self.assertIn("same swipe", fields["From_Time"].description)
-        self.assertIn("salary", fields["From_Time"].description)
+        self.assertIn("worked-time calculations", fields["From_Time"].description)
         self.assertIn("positive number proves", fields["Total_Worked_Hrs"].description)
         self.assertIn("leave, absent", fields["Total_Worked_Hrs"].description)
         self.assertEqual(
@@ -235,6 +249,16 @@ class DatabaseContextTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "invented_column"):
             context._require_column_descriptions(("employee_id", "invented_column"))
+        context._require_column_descriptions(
+            ("employee_id", "invented_column"),
+            {"invented_column": "Meaning defined by the database schema."},
+        )
+        self.assertEqual(
+            context._column_description(
+                "day_type", "Updated meaning supplied by PostgreSQL COMMENT."
+            ),
+            "Updated meaning supplied by PostgreSQL COMMENT.",
+        )
         self.assertIn(
             "total_worked_hrs > 0",
             context._COLUMN_DESCRIPTIONS["total_worked_hrs"],
@@ -250,8 +274,26 @@ class DatabaseContextTests(unittest.TestCase):
             context._COLUMN_DESCRIPTIONS["status"],
         )
         self.assertIn(
-            "'Absent' is explicit absence evidence",
+            "explicitly marked absent, filter exception = 'Absent'",
             context._COLUMN_DESCRIPTIONS["exception"],
+        )
+        self.assertIn(
+            "IS DISTINCT FROM 'Absent'",
+            context._COLUMN_DESCRIPTIONS["exception"],
+        )
+        self.assertIn("all four pairs", context._COLUMN_DESCRIPTIONS["record_json"])
+        self.assertIn(
+            "One department can contain multiple work-location groups",
+            context._COLUMN_DESCRIPTIONS["work_location"],
+        )
+        json_descriptions = {
+            field.name: field.description for field in context._record_json_fields()
+        }
+        self.assertIn("IS DISTINCT FROM", json_descriptions["From_Date"])
+        self.assertIn("Actual_To_Time", json_descriptions["To_Time"])
+        self.assertIn(
+            "One department can contain multiple work-location groups",
+            json_descriptions["Work_Location"],
         )
 
     def test_context_uses_exact_physical_metadata_and_is_immutable(self):
@@ -280,29 +322,58 @@ class DatabaseContextTests(unittest.TestCase):
                 "as_of_date",
                 "last_calendar_month",
                 "updated_request",
+                "previous_verified_turn",
                 "request_relationship",
                 "subject_relationship",
                 "resolved_employee_ids",
-                "required_categorical_filters",
                 "required_date_scope",
+                "requested_period_vs_observed_rows",
                 "request_has_date_period",
-                "attendance_meaning",
                 "conversation_history",
                 "trusted_context",
+                "scope_provenance",
                 "database_type",
                 "database_context",
+                "observed_date_ranges",
+                "calendar_month_date_extent",
                 "resolution_statement",
             },
         )
         serialized = json.dumps(shared.model_payload())
+        self.assertNotIn("semantic_contracts", serialized)
+        self.assertEqual(
+            list(shared.model_payload())[-9:],
+            [
+                "current_question",
+                "updated_request",
+                "previous_verified_turn",
+                "request_relationship",
+                "subject_relationship",
+                "resolved_employee_ids",
+                "required_date_scope",
+                "requested_period_vs_observed_rows",
+                "request_has_date_period",
+            ],
+        )
         self.assertEqual(
             shared.model_payload()["current_question"], "Show total hours."
         )
-        september = shared.model_copy(update={"as_of_date": "2026-09-25"})
+        self.assertEqual(shared.model_payload()["calendar_month_date_extent"], [])
+        self.assertIsNone(shared.model_payload()["last_calendar_month"])
+        september = shared.model_copy(
+            update={"as_of_date": "2026-09-25", "request_has_date_period": True}
+        )
         self.assertEqual(
             september.model_payload()["last_calendar_month"],
             {"start": "2026-08-01", "end": "2026-08-31"},
         )
+        month_extents = september.model_payload()["calendar_month_date_extent"]
+        self.assertEqual(
+            [item["period"] for item in month_extents],
+            ["previous_calendar_month", "current_calendar_month_to_as_of_date"],
+        )
+        self.assertTrue(month_extents[0]["observed_extent_starts_after_period_start"])
+        self.assertTrue(month_extents[1]["observed_extent_ends_before_period_end"])
         self.assertEqual(
             shared.model_payload()["conversation_history"],
             [{"role": "user", "content": "hours"}],
@@ -372,7 +443,7 @@ class DatabaseContextTests(unittest.TestCase):
 
         self.assertEqual(captured["reasoning_effort"], "none")
         self.assertEqual(captured["temperature"], 0)
-        self.assertEqual(captured["num_ctx"], 65536)
+        self.assertEqual(captured["num_ctx"], 32768)
 
     def test_ollama_gpt_oss_uses_supported_reasoning_effort(self):
         captured = {}
@@ -403,7 +474,7 @@ class DatabaseContextTests(unittest.TestCase):
 
         self.assertEqual(captured["reasoning_effort"], "medium")
         self.assertEqual(captured["temperature"], 0)
-        self.assertEqual(captured["num_ctx"], 65536)
+        self.assertEqual(captured["num_ctx"], 32768)
 
     def test_ollama_structured_provider_disables_reasoning(self):
         captured = {}
@@ -436,39 +507,7 @@ class DatabaseContextTests(unittest.TestCase):
         self.assertEqual(result.value, "ok")
         self.assertEqual(captured["reasoning_effort"], "none")
         self.assertEqual(captured["temperature"], 0)
-        self.assertEqual(captured["num_ctx"], 8192)
-
-    def test_ollama_answer_stages_use_64k_context(self):
-        for stage in ("answer_writer", "answer_verifier"):
-            with self.subTest(stage=stage):
-                captured = {}
-
-                class Message:
-                    content = '{"value":"ok"}'
-
-                class Choice:
-                    message = Message()
-
-                class Response:
-                    choices = [Choice()]
-
-                def complete(**kwargs):
-                    captured.update(kwargs)
-                    return Response()
-
-                call_structured(
-                    stage=stage,
-                    model="ollama_chat/qwen3.5:2b",
-                    system="system",
-                    payload={"current_question": "test"},
-                    response_model=StructuredProbe,
-                    budget=CallBudget(limit=1),
-                    timeout=1,
-                    max_output_tokens=100,
-                    completion_fn=complete,
-                )
-
-                self.assertEqual(captured["num_ctx"], 65536)
+        self.assertEqual(captured["num_ctx"], 32768)
 
     def test_layer_logger_emits_summary_and_exact_debug_output(self):
         with self.assertLogs(

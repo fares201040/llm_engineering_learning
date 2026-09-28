@@ -15,6 +15,7 @@ from urllib.request import Request, urlopen
 
 SOURCE_ROOT = Path("/content/attendance_phase2_source")
 RUNTIME_CONFIG = Path("/content/.attendance_phase3_runtime.json")
+OPENAI_KEY_FILE = Path("/content/.attendance_openai_api_key")
 OLLAMA_LOG = Path("/content/ollama-phase3.log")
 
 
@@ -154,9 +155,9 @@ def install_ollama() -> None:
     else:
         raise RuntimeError("Ollama server did not become ready within 60 seconds.")
 
-    run(["ollama", "pull", "qwen3.5:4b"])
+    run(["ollama", "pull", "qwen3.5:2b"])
     smoke_payload = json.dumps(
-        {"model": "qwen3.5:4b", "prompt": "Reply with the word ready.", "stream": False}
+        {"model": "qwen3.5:2b", "prompt": "Reply with the word ready.", "stream": False}
     ).encode("utf-8")
     request = Request(
         "http://127.0.0.1:11434/api/generate",
@@ -200,15 +201,20 @@ def main() -> None:
             "ATTENDANCE_PHASE2_SOURCE_ROOT": str(SOURCE_ROOT),
             "POSTGRES_READONLY_DSN": dsn,
             "POSTGRES_ATTENDANCE_TABLE": "attendance_records",
-            "LLM_REFERENCE_MODEL": "ollama_chat/qwen3.5:4b",
-            "LLM_PLANNER_MODEL": "ollama_chat/qwen3.5:4b",
-            "LLM_PLANNER_MAX_OUTPUT_TOKENS": "512",
-            "LLM_ANSWER_MODEL": "ollama_chat/qwen3.5:4b",
+            "LLM_REFERENCE_MODEL": "ollama_chat/qwen3.5:2b",
+            "LLM_PLANNER_MODEL": "openai/gpt-5-nano",
+            "LLM_PLANNER_MAX_OUTPUT_TOKENS": "6000",
             "OLLAMA_API_BASE": "http://127.0.0.1:11434",
             "OLLAMA_HOST": "127.0.0.1:11434",
         }
+    settings["LLM_PLANNER_MODEL"] = "openai/gpt-5-nano"
+    settings["LLM_PLANNER_MAX_OUTPUT_TOKENS"] = "6000"
+    settings["LLM_REFERENCE_MODEL"] = "ollama_chat/qwen3.5:2b"
+    if OPENAI_KEY_FILE.is_file():
+        settings["OPENAI_API_KEY"] = OPENAI_KEY_FILE.read_text(encoding="utf-8").strip()
+        OPENAI_KEY_FILE.unlink()
     timeout = model_stage_timeout_seconds()
-    for stage in ("REFERENCE", "PLANNER", "ANSWER"):
+    for stage in ("REFERENCE", "PLANNER"):
         settings[f"LLM_{stage}_TIMEOUT_SECONDS"] = timeout
     RUNTIME_CONFIG.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     RUNTIME_CONFIG.chmod(0o600)

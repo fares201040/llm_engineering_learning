@@ -122,6 +122,35 @@ BUSINESS_MEANINGS = (
         ),
     ),
     DatabaseBusinessMeaning(
+        name="overtime_type_breakdown",
+        description=(
+            "Current overtime comes from the mutable type/value pairs in "
+            "record_json, not from OT_Authorized. OT_Type_1 can be 'Normal OT' "
+            "or 'Week Off OT' and its current amount is OT_Value_1. OT_Type_2 "
+            "can only be 'Night OT' and its current amount is OT_Value_2. The "
+            "current overtime total for each row is COALESCE(OT_Value_1, 0) + "
+            "COALESCE(OT_Value_2, 0), casting nonempty JSON text to numeric; "
+            "sum that row expression across the requested employee/date scope "
+            "for a total. Normal OT totals sum OT_Value_1 only where OT_Type_1 "
+            "= 'Normal OT'; Week Off OT totals sum OT_Value_1 only where "
+            "OT_Type_1 = 'Week Off OT'; Night OT totals sum OT_Value_2 only "
+            "where OT_Type_2 = 'Night OT'. For an unqualified employee overtime request, "
+            "give the current Normal OT, Week Off OT, and Night OT totals plus "
+            "their current overall overtime total for the requested period; "
+            "do not substitute pre/post-shift or audit fields. An employee attendance report "
+            "requesting these kinds must include their separate current values "
+            "and the current overtime total when requested. OT_Authorized, also "
+            "exposed as typed ot_authorized, is an immutable pre-adjustment "
+            "snapshot of the original OT_Value_1 + OT_Value_2 total for "
+            "security, audit, and tracing. It does not change when the mutable "
+            "type/value pairs are adjusted; current values may therefore differ. "
+            "Use OT_Authorized only for a requested original/authorized baseline "
+            "or adjustment comparison, never as the current overtime total. "
+            "The typed total_ot pre/post-shift measure is separate from this "
+            "category-based current overtime total."
+        ),
+    ),
+    DatabaseBusinessMeaning(
         name="off_day",
         description=(
             "A generic off day includes all observed off-day categories in the "
@@ -178,9 +207,10 @@ class SharedModelContext(_Strict):
     updated_request: str = Field(min_length=1, max_length=60000)
     previous_verified_turn: dict[str, object] | None = None
     request_relationship: Literal["new", "follow_up"] = "new"
-    subject_relationship: Literal[
-        "employees", "criteria", "union", "intersection", "all_authorized"
-    ] = "all_authorized"
+    subject_relationship: (
+        Literal["employees", "criteria", "union", "intersection", "all_authorized"]
+        | None
+    ) = "all_authorized"
     resolved_employee_ids: tuple[str, ...] = ()
     required_date_scope: tuple[str, str] | None = None
     request_has_date_period: bool = False
@@ -323,8 +353,8 @@ _COLUMN_DESCRIPTIONS = {
     "regular_units": "Regular attendance units credited on the row; do not assume the unit is hours unless the request or source semantics establish it.",
     "pre_ot_hrs": "Overtime hours before the shift.",
     "post_ot_hrs": "Overtime hours after the shift.",
-    "total_ot": "Total overtime hours.",
-    "ot_authorized": "Authorized overtime hours.",
+    "total_ot": "Source pre/post-shift overtime measure. It is separate from the category-based current overtime total, which sums the mutable OT_Value_1 and OT_Value_2 values in record_json. Use this column only when the request specifically concerns that pre/post-shift measure.",
+    "ot_authorized": "Typed copy of immutable source OT_Authorized: the original pre-adjustment total of OT_Value_1 + OT_Value_2 retained for security and audit tracing. It is not the current overtime total after the mutable values change; calculate that from current OT_Value_1 and OT_Value_2.",
     "ot_not_authorized": "Unauthorized overtime hours.",
     "leave_type": "Recorded leave category when the employee is on leave; an empty value means no leave category is recorded, not that the employee attended.",
     "leave_hrs": "Recorded leave duration in hours. Use with leave_type when worked hours are empty or zero.",
@@ -378,6 +408,11 @@ _RECORD_JSON_FIELD_TYPES = {
     "pre_ot_hrs": "number",
 }
 
+_RECORD_JSON_STANDARD_VALUES = {
+    "OT_Type_1": ("Normal OT", "Week Off OT"),
+    "OT_Type_2": ("Night OT",),
+}
+
 _RECORD_JSON_FIELD_DESCRIPTIONS = {
     "Actual_From_Date": "Immutable date of the first actual swipe received from the swipe device. Admin clerks cannot modify this device fact. Use with Actual_From_Time for audit or device-swipe questions, not calculations based on effective swipes.",
     "Actual_From_Time": "Immutable clock time of the first actual swipe received from the swipe device. Admin clerks cannot modify it. Pair with Actual_From_Date; use From_Date and From_Time for calculations based on effective swipes.",
@@ -402,15 +437,15 @@ _RECORD_JSON_FIELD_DESCRIPTIONS = {
     "Leave_Hrs": "Recorded leave duration in hours. Use with Leave_Type to interpret leave; zero or empty worked hours alone does not distinguish leave from absence.",
     "Leave_Type": "Recorded leave category when the employee is on leave. Use with Leave_Hrs; an empty value means no leave category is recorded, not necessarily that the employee attended.",
     "Name": "Authoritative employee name stored on the source attendance record.",
-    "OT_Authorized": "Overtime hours authorized for overtime calculations.",
+    "OT_Authorized": "Immutable original pre-adjustment total of OT_Value_1 + OT_Value_2, retained for security, audit, and tracing; the typed copy is ot_authorized. It does not change when mutable OT_Type_1/OT_Value_1 or OT_Type_2/OT_Value_2 are edited. Do not use it for the current overtime total; sum the current OT_Value_1 and OT_Value_2 instead.",
     "OT_Not_Authorized": "Overtime hours recorded but not authorized for overtime calculations.",
-    "OT_Type_1": "First source overtime category or rate label; interpret together with OT_Value_1.",
-    "OT_Type_2": "Second source overtime category or rate label; interpret together with OT_Value_2.",
+    "OT_Type_1": "Mutable overtime category for OT_Value_1. It can contain 'Normal OT' or 'Week Off OT'; only the matching category receives that row's current OT_Value_1 in a type-specific total.",
+    "OT_Type_2": "Mutable overtime category for OT_Value_2. It can contain only 'Night OT'; only Night OT receives that row's current OT_Value_2 in a type-specific total.",
     "OT_Type_3": "Third source overtime category or rate label; interpret together with OT_Value_3.",
     "OT_Type_4": "Fourth source overtime category or rate label; interpret together with OT_Value_4.",
     "OT_Type_5": "Fifth source overtime category or rate label; interpret together with OT_Value_5.",
-    "OT_Value_1": "Numeric overtime amount associated with OT_Type_1; do not assume it is payable hours without considering the overtime category and authorization fields.",
-    "OT_Value_2": "Numeric overtime amount associated with OT_Type_2; do not assume it is payable hours without considering the overtime category and authorization fields.",
+    "OT_Value_1": "Mutable numeric overtime value paired with OT_Type_1: Normal OT when OT_Type_1 = 'Normal OT', or Week Off OT when OT_Type_1 = 'Week Off OT'. Cast nonempty JSON text to numeric for totals.",
+    "OT_Value_2": "Mutable numeric Night OT value paired with OT_Type_2 when OT_Type_2 = 'Night OT'. Cast nonempty JSON text to numeric for totals.",
     "OT_Value_3": "Numeric overtime amount associated with OT_Type_3; do not assume it is payable hours without considering the overtime category and authorization fields.",
     "OT_Value_4": "Numeric overtime amount associated with OT_Type_4; do not assume it is payable hours without considering the overtime category and authorization fields.",
     "OT_Value_5": "Numeric overtime amount associated with OT_Type_5; do not assume it is payable hours without considering the overtime category and authorization fields.",
@@ -432,7 +467,7 @@ _RECORD_JSON_FIELD_DESCRIPTIONS = {
     "Status": "Workflow approval status. It is not proof that work occurred and must not be added to worked-day queries unless authorization or workflow status is requested.",
     "To_Date": "Effective end-date copy of Actual_To_Date for the same swipe. An admin clerk may modify it manually; worked-time calculations use this adjusted field. Compare with Actual_To_Date using IS DISTINCT FROM to detect a nullable change; inspect all corresponding From/To date and time pairs for any adjusted swipe.",
     "To_Time": "Effective end-time copy of Actual_To_Time for the same swipe. An admin clerk may modify it manually; worked-time calculations use this adjusted field. Compare with Actual_To_Time using IS DISTINCT FROM to detect a nullable change; inspect all corresponding From/To date and time pairs for any adjusted swipe.",
-    "Total_OT": "Total overtime hours recorded for the row, combining relevant pre-shift and post-shift overtime before separating authorized and unauthorized portions.",
+    "Total_OT": "Source pre/post-shift overtime measure for the row. It is separate from the category-based current overtime total, which is the sum of the mutable OT_Value_1 and OT_Value_2 values.",
     "Total_Worked_Hrs": "Effective worked hours recorded from attendance for the attendance date. A positive number proves the employee attended work. Empty, null, or zero means the row has no work-attendance evidence; inspect Leave_Type, Leave_Hrs, and Exception to determine whether the employee was on leave, absent, or otherwise not working.",
     "Work_Location": "Work-location group within the employee's department. One department can contain multiple work-location groups. Use the typed department column for department-wide questions and the typed work_location column for work-location questions.",
     "last_Updated_date": "Source-system timestamp for the last workflow or attendance update to this record; it is not the attendance date.",
@@ -450,7 +485,10 @@ def _record_json_fields(
             json_type=_RECORD_JSON_FIELD_TYPES.get(name, "string"),
             sql_text_expression=f"record_json ->> '{name}'",
             description=description,
-            standard_values=observed_values.get(name.casefold(), ()),
+            standard_values=(
+                observed_values.get(name.casefold())
+                or _RECORD_JSON_STANDARD_VALUES.get(name, ())
+            ),
         )
         for name, description in _RECORD_JSON_FIELD_DESCRIPTIONS.items()
     )

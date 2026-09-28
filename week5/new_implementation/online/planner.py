@@ -62,6 +62,14 @@ implementation only when the user asks about those details.
 For an unsupported request, one clear sentence is usually enough. Do not add an
 example query, hypothetical data structure, or speculative path to an answer.
 Choose a concise sentence, list, or table that answers every requested part.
+For an unqualified request for an employee's overtime, give the current Normal OT,
+Week Off OT, and Night OT totals and their current overall total for the requested
+period. An unspecified period covers the available records for that employee.
+When an employee attendance report requests Normal OT, Week Off OT, or Night OT,
+include each requested kind and its value from the corresponding result columns.
+For current total overtime, use current OT_Value_1 + OT_Value_2 from the result.
+The immutable OT_Authorized value is the pre-adjustment security/audit baseline;
+do not present it as the current total or as a category-specific value.
 You may report the result directly, combine repeated observations, summarize a
 group, or explain a limitation. For an attribute
 question, give the requested values once when rows agree; preserve distinct values
@@ -112,6 +120,13 @@ correct person, department, work location, period, and measure. Check that SQL
 retains the requested people, filters, period, and measures. Ask whether the answer
 fulfills every requested part and whether its values, dates, units, grouping, and
 coverage match the evidence. Do not assume the proposed answer or query is correct.
+For a requested attendance report with overtime kinds, check that SQL retrieves
+the requested Normal OT, Week Off OT, and Night OT values and that the answer
+includes them. Check that a current overtime total comes from current
+OT_Value_1 + OT_Value_2, not immutable OT_Authorized or the separate total_ot
+measure. Requery if requested current category or total evidence is missing.
+For an unqualified employee overtime request, check all three current category
+totals and the current overall total are present; requery if SQL omitted them.
 Judge completeness from SQL, matched_count when present, and
 execution coverage, observed_date_ranges, calendar_month_date_extent, and
 requested_period_vs_observed_rows together. Check each claim about available dates
@@ -330,7 +345,9 @@ mentioned them. If the rewritten scope conflicts with this provenance and the
 current request, plan for the current request; retain genuinely requested
 follow-up constraints and authoritative identities.
 subject_relationship identifies employees, criteria, their union or intersection,
-or all authorized employees. Use resolved_employee_ids only for the employee side;
+or all authorized employees. When it is null, determine the subject from the
+current question and trusted context; return clarification_required if a person
+reference remains unresolved. Use resolved_employee_ids only for the employee side;
 global date and attendance conditions apply to the whole subject expression.
 required_date_scope is the resolved date interval for this turn; apply it
 throughout the relevant query. Use as_of_date for relative
@@ -355,6 +372,15 @@ categorical predicates to the entire relevant condition, including OR branches.
 For a requested recorded category, filter its own field by the exact stored value;
 a zero or NULL in another measure does not itself establish that category. Combine
 alternative categories or conditions when the request asks for their union.
+For an employee attendance report that requests overtime kinds, include the
+requested Normal OT, Week Off OT, and Night OT values as separately labelled
+calculated result columns from their mutable type/value pairs. For current
+total overtime, sum the current OT_Value_1 and OT_Value_2 values over the
+requested scope. Use immutable ot_authorized only when the user asks for the
+original authorized value, security/audit trace, or adjustment comparison.
+An unqualified request for an employee's overtime asks for the current totals
+of all three kinds and the current overall total. Apply any requested employee
+and date scope; without a date period, use all available records for that employee.
 For a negated follow-up, negate the previous recorded category predicate and handle
 NULL according to the schema; do not replace that negation with another measure.
 

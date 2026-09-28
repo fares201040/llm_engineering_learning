@@ -14,6 +14,7 @@ Before the first run, confirm that:
 2. The project virtual environment exists at `.venv`.
 3. The Colab CLI and its Google login are configured in `Ubuntu-24.04` under WSL.
 4. Your Colab account can create the runtime you select (CPU is available without a GPU allocation).
+5. `OPENAI_API_KEY` is set in the PowerShell environment or in the repository root `.env`.
 
 The existing [`COLAB_CLI_GUIDE.md`](COLAB_CLI_GUIDE.md) explains the Colab CLI login
 if it has not already been configured.
@@ -33,12 +34,14 @@ The script automatically:
 - prompts for CPU, T4, L4, G4, A100, or H100, then creates or reuses the
   `attendance-chatbot` session (Enter keeps A100 as the default);
 - uploads the code and data;
+- uploads the OpenAI API key to a temporary private file that the Colab setup consumes;
 - installs PostgreSQL, Ollama, and Python dependencies;
 - downloads `qwen3.5:2b` when needed;
 - starts the chatbot and prints a public Gradio URL.
 
 The first run on a new Colab session downloads Qwen; later starts in the same
-live session reuse it. The SQL planner also requires an OpenAI API key.
+live session reuse it. The SQL planner uses the OpenAI API key from your
+PowerShell environment or the repository root `.env`.
 If the named session already exists, the script asks whether to reuse its current
 hardware or stop it and create a new session with your selected runtime.
 

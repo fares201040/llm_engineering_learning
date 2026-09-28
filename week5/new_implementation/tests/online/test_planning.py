@@ -42,6 +42,140 @@ def response(**updates):
 
 
 class ReferenceAndPlanningTests(unittest.TestCase):
+    def test_ready_criteria_is_not_changed_to_a_person_by_name_words(self):
+        bound = bind_references(
+            response(
+                rewritten_request="Compare records in the Ali Mohammed group.",
+                subject_relationship="criteria",
+                employee_names=(),
+                employee_criteria=("Ali Mohammed group",),
+            ),
+            (Employee(employee_id="A1", name="Ali Mohammed"),),
+            original_question="Compare records in the Ali Mohammed group.",
+        )
+
+        self.assertFalse(bound.ambiguous)
+        self.assertEqual(bound.subject_relationship, "criteria")
+        self.assertEqual(bound.employee_ids, ())
+
+    def test_person_scope_does_not_add_directory_name_from_criteria(self):
+        bound = bind_references(
+            response(
+                rewritten_request="Show A1 records in the Ali Mohammed group.",
+                employee_ids=("A1",),
+                employee_names=(),
+                employee_criteria=("Ali Mohammed group",),
+            ),
+            (
+                Employee(employee_id="A1", name="Wail Ali"),
+                Employee(employee_id="A2", name="Ali Mohammed"),
+            ),
+            original_question="Show A1 records in the Ali Mohammed group.",
+        )
+
+        self.assertFalse(bound.ambiguous)
+        self.assertEqual(bound.employee_ids, ("A1",))
+
+    def test_ambiguous_person_is_not_changed_to_general_by_wording(self):
+        bound = bind_references(
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    locale="en",
+                    reason="ambiguous_reference",
+                    rewritten_request="Which employees are like Ahmed in Operations?",
+                    employee_mention="Ahmed",
+                )
+            ),
+            (),
+            original_question="Which employees are like Ahmed in Operations?",
+        )
+
+        self.assertTrue(bound.ambiguous)
+        self.assertEqual(bound.unresolved_mention, "Ahmed")
+
+    def test_reference_decision_controls_general_scope_across_wordings(self):
+        questions = (
+            "Which employees were absent?",
+            "Group worked hours by department.",
+            "Show a running total over dates.",
+            "Find unusual attendance patterns.",
+            "Show attendance before 2026-09-05.",
+        )
+        for question in questions:
+            with self.subTest(question=question):
+                general = bind_references(
+                    ReferenceResponse(
+                        decision=ReadyReference(
+                            rewritten_request=question,
+                            locale="en",
+                            request_relationship="new",
+                            subject_relationship="all_authorized",
+                        )
+                    ),
+                    (Employee(employee_id="A1", name="Wail Ali"),),
+                    original_question=question,
+                )
+                self.assertFalse(general.ambiguous)
+                self.assertEqual(general.employee_ids, ())
+                self.assertEqual(general.subject_relationship, "all_authorized")
+
+                unresolved = bind_references(
+                    ReferenceResponse(
+                        decision=AmbiguousReference(
+                            rewritten_request=question,
+                            locale="en",
+                            reason="missing_employee",
+                        )
+                    ),
+                    (Employee(employee_id="A1", name="Wail Ali"),),
+                    original_question=question,
+                )
+                self.assertTrue(unresolved.ambiguous)
+                self.assertIsNone(unresolved.updated_request)
+
+    def test_model_ready_follow_up_can_reuse_verified_employee(self):
+        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
+        bound = bind_references(
+            ReferenceResponse(
+                decision=ReadyReference(
+                    rewritten_request="Show dates that are not absent for A11017.",
+                    locale="en",
+                    request_relationship="follow_up",
+                    subject_relationship="employees",
+                    employee_ids=("A11017",),
+                )
+            ),
+            (employee,),
+            original_question="Show dates that are not absent.",
+            active_employees=(employee,),
+        )
+
+        self.assertEqual(bound.employee_ids, ("A11017",))
+        self.assertEqual(bound.request_relationship, "follow_up")
+        self.assertIn("not absent", bound.updated_request)
+
+    def test_ambiguous_follow_up_keeps_relationship_for_confirmation(self):
+        employee = Employee(employee_id="A1", name="Wail Ali")
+        bound = bind_references(
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    rewritten_request="Show Wail Ali's September absences.",
+                    locale="en",
+                    reason="ambiguous_reference",
+                    request_relationship="follow_up",
+                    employee_mention="Wail Ali",
+                )
+            ),
+            (employee,),
+            original_question="Show Wail Ali's absences instead.",
+            active_employees=(employee,),
+        )
+
+        self.assertIsNotNone(bound.confirmation)
+        self.assertEqual(
+            bound.confirmation.resolution.request_relationship, "follow_up"
+        )
+
     def test_singular_follow_up_cannot_be_redirected_to_unmentioned_employee(self):
         mukhtar = Employee(employee_id="A11000", name="Mukhtar Ahmed Meer")
         other = Employee(employee_id="A10194", name="Hisham Sadeq Ismael")
@@ -61,11 +195,9 @@ class ReferenceAndPlanningTests(unittest.TestCase):
             has_verified_turns=True,
         )
 
-        self.assertFalse(bound.ambiguous)
-        self.assertEqual(bound.employee_ids, ("A11000",))
-        self.assertEqual(bound.request_relationship, "follow_up")
-        self.assertIn("department and his position", bound.updated_request)
-        self.assertNotIn(other.name, bound.updated_request)
+        self.assertTrue(bound.ambiguous)
+        self.assertEqual(bound.employee_ids, ())
+        self.assertIsNone(bound.unresolved_mention)
 
     def test_schema_examples_never_reference_absent_json_columns(self):
         examples = planner_examples(database_context())
@@ -146,6 +278,86 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertIn("WHERE \"category\" = 'A'", examples)
         self.assertIn("WHERE \"category\" IS DISTINCT FROM 'A'", examples)
         self.assertNotIn("<requested_", examples)
+
+    def test_schema_examples_derive_three_overtime_report_columns_and_totals(self):
+        schema = DatabaseContext(
+            server_version="17.2",
+            tables=(
+                DatabaseTable(
+                    schema_name="public",
+                    table_name="attendance_records",
+                    object_type="BASE TABLE",
+                    description="Attendance records.",
+                    date_coverage=context.DatabaseDateCoverage(field="attendance_date"),
+                    columns=(
+                        DatabaseColumn(
+                            name="record_id",
+                            data_type="text",
+                            nullable=False,
+                            description="Stable unique identifier for a row.",
+                        ),
+                        DatabaseColumn(
+                            name="employee_id",
+                            data_type="text",
+                            nullable=False,
+                            description="Employee identifier.",
+                        ),
+                        DatabaseColumn(
+                            name="name",
+                            data_type="text",
+                            nullable=False,
+                            description="Employee name.",
+                        ),
+                        DatabaseColumn(
+                            name="attendance_date",
+                            data_type="date",
+                            nullable=False,
+                            description="Attendance date.",
+                        ),
+                        DatabaseColumn(
+                            name="ot_authorized",
+                            data_type="double precision",
+                            nullable=True,
+                            description="Recorded authorized overtime total.",
+                        ),
+                        DatabaseColumn(
+                            name="record_json",
+                            data_type="jsonb",
+                            nullable=False,
+                            description="Source fields.",
+                            json_fields=context._record_json_fields(),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        examples = planner_examples(schema)
+
+        self.assertIn("Unqualified employee overtime request", examples)
+        self.assertIn("AS normal_ot", examples)
+        self.assertIn("AS week_off_ot", examples)
+        self.assertIn("AS night_ot", examples)
+        self.assertIn("AS current_ot", examples)
+        self.assertIn(
+            "SUM(CASE WHEN record_json ->> 'OT_Type_1' = 'Normal OT'", examples
+        )
+        self.assertIn(
+            "SUM(CASE WHEN record_json ->> 'OT_Type_1' = 'Week Off OT'", examples
+        )
+        self.assertIn(
+            "SUM(CASE WHEN record_json ->> 'OT_Type_2' = 'Night OT'", examples
+        )
+        self.assertIn("NULLIF(record_json ->> 'OT_Value_1', '')::numeric", examples)
+        self.assertIn("NULLIF(record_json ->> 'OT_Value_2', '')::numeric", examples)
+        self.assertIn('"employee_id", "name", "attendance_date"', examples)
+        self.assertIn("AS original_authorized_ot", examples)
+        self.assertIn("AS adjustment_delta", examples)
+        self.assertNotIn('SUM("ot_authorized") AS authorized_ot', examples)
+        current_report = examples.split(
+            "Attendance report with the requested overtime kinds:", 1
+        )[1].split("Overtime type totals", 1)[0]
+        self.assertNotIn('"ot_authorized"', current_report)
 
     def test_reference_schema_uses_openai_supported_union_shape(self):
         schema = ReferenceResponse.model_json_schema()
@@ -233,27 +445,6 @@ class ReferenceAndPlanningTests(unittest.TestCase):
             "Request:\nCompare their total hours in September 2026.",
         )
 
-    def test_exact_authorized_id_overrides_incorrect_model_missing_employee(self):
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="missing_employee",
-                    rewritten_request=(
-                        "Count attendance days for employee A11017 in September 2026."
-                    ),
-                )
-            ),
-            (Employee(employee_id="A11017", name="Faris Nasser Ali"),),
-            original_question=(
-                "How many days did A11017 attend during September 2026?"
-            ),
-        )
-
-        self.assertFalse(bound.ambiguous)
-        self.assertEqual(bound.employee_ids, ("A11017",))
-        self.assertIn("Faris Nasser Ali (A11017)", bound.updated_request)
-
     def test_model_cannot_add_unmentioned_employee_to_independent_request(self):
         bound = bind_references(
             ReferenceResponse(
@@ -269,162 +460,17 @@ class ReferenceAndPlanningTests(unittest.TestCase):
             has_verified_turns=True,
         )
 
-        self.assertEqual(bound.subject_relationship, "all_authorized")
-        self.assertEqual(bound.rewritten_request, "Join attendance to payroll.")
-        self.assertFalse(bound.ambiguous)
-
-    def test_single_active_employee_survives_incorrect_missing_employee_decision(self):
-        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="missing_employee",
-                    rewritten_request=(
-                        "Show the absence dates for Synthetic Employee One (A11017)."
-                    ),
-                    employee_mention="Synthetic Employee One",
-                )
-            ),
-            (employee,),
-            original_question="Show the absence dates instead.",
-            active_employees=(employee,),
-        )
-
-        self.assertFalse(bound.ambiguous)
-        self.assertEqual(bound.employee_ids, ("A11017",))
-        self.assertIn("Synthetic Employee One (A11017)", bound.updated_request)
-
-    def test_inherited_identity_in_model_mention_does_not_break_follow_up(self):
-        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="missing_employee",
-                    rewritten_request=(
-                        "Show dates that are not absent for "
-                        "Synthetic Employee One (A11017)."
-                    ),
-                    employee_mention="Synthetic Employee One (A11017)",
-                )
-            ),
-            (employee,),
-            original_question="Show dates that are not absent.",
-            active_employees=(employee,),
-            has_verified_turns=True,
-        )
-        self.assertFalse(bound.ambiguous)
-        self.assertEqual(bound.request_relationship, "follow_up")
-        self.assertEqual(bound.employee_ids, ("A11017",))
-
-    def test_general_scope_does_not_inherit_active_employee(self):
-        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="missing_employee",
-                    rewritten_request="Which employees were absent?",
-                )
-            ),
-            (employee,),
-            original_question="Which employees were absent?",
-            active_employees=(employee,),
-        )
-
-        self.assertEqual(bound.employee_ids, ())
-        self.assertEqual(bound.subject_relationship, "all_authorized")
-
-    def test_grouped_aggregate_without_person_uses_general_scope(self):
-        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="ambiguous_reference",
-                    rewritten_request="Group worked hours by department.",
-                )
-            ),
-            (employee,),
-            original_question="Group worked hours by department.",
-            active_employees=(employee,),
-        )
-
-        self.assertFalse(bound.ambiguous)
-        self.assertEqual(bound.employee_ids, ())
-        self.assertEqual(bound.subject_relationship, "all_authorized")
-
-    def test_date_aggregate_without_person_uses_general_scope(self):
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="missing_employee",
-                    rewritten_request="Show a running total over dates.",
-                )
-            ),
-            (),
-            original_question="Show a running total over dates.",
-            has_verified_turns=True,
-        )
-
-        self.assertFalse(bound.ambiguous)
-        self.assertEqual(bound.subject_relationship, "all_authorized")
-        self.assertEqual(
-            bound.updated_request, "Request:\nShow a running total over dates."
-        )
-
-    def test_grouped_aggregate_ignores_person_copied_only_from_history(self):
-        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="missing_employee",
-                    rewritten_request=(
-                        "Group Synthetic Employee One's worked hours by department."
-                    ),
-                    employee_mention="Synthetic Employee One",
-                )
-            ),
-            (employee,),
-            original_question="Group worked hours by department.",
-            active_employees=(employee,),
-        )
-
-        self.assertEqual(bound.employee_ids, ())
-        self.assertEqual(bound.subject_relationship, "all_authorized")
-        self.assertEqual(
-            bound.updated_request, "Request:\nGroup worked hours by department."
-        )
-
-    def test_grouped_hours_with_person_pronoun_keeps_active_employee(self):
-        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="missing_employee",
-                    rewritten_request="Group his hours by department.",
-                    employee_mention="Synthetic Employee One",
-                )
-            ),
-            (employee,),
-            original_question="Group his hours by department.",
-            active_employees=(employee,),
-        )
-
-        self.assertEqual(bound.employee_ids, ("A11017",))
+        self.assertTrue(bound.ambiguous)
+        self.assertIsNone(bound.unresolved_mention)
 
     def test_ready_grouping_does_not_inherit_an_unmentioned_person(self):
         employee = Employee(employee_id="A11017", name="Synthetic Employee One")
         bound = bind_references(
             response(
-                rewritten_request="Group Synthetic Employee One's hours by department.",
-                request_relationship="follow_up",
-                employee_names=("Synthetic Employee One",),
-                employee_ids=("A11017",),
+                rewritten_request="Group worked hours by department.",
+                request_relationship="new",
+                subject_relationship="all_authorized",
+                employee_names=(),
             ),
             (employee,),
             original_question="Group worked hours by department.",
@@ -433,91 +479,6 @@ class ReferenceAndPlanningTests(unittest.TestCase):
 
         self.assertEqual(bound.employee_ids, ())
         self.assertEqual(bound.subject_relationship, "all_authorized")
-
-    def test_that_follow_up_inherits_latest_general_scope_not_older_person(self):
-        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="missing_employee",
-                    rewritten_request="Compare Synthetic Employee One with last month.",
-                    employee_mention="Synthetic Employee One",
-                )
-            ),
-            (employee,),
-            original_question="Compare that with last month.",
-            active_employees=(),
-            has_verified_turns=True,
-        )
-
-        self.assertEqual(bound.employee_ids, ())
-        self.assertEqual(bound.request_relationship, "follow_up")
-        self.assertEqual(bound.subject_relationship, "all_authorized")
-        self.assertEqual(
-            bound.updated_request, "Request:\nCompare that with last month."
-        )
-
-    def test_that_is_not_an_employee_mention(self):
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="ambiguous_reference",
-                    rewritten_request="The subject of that is unclear.",
-                    employee_mention="that",
-                )
-            ),
-            (),
-            original_question="Compare that with last month.",
-            has_verified_turns=True,
-        )
-
-        self.assertEqual(bound.request_relationship, "follow_up")
-        self.assertEqual(bound.subject_relationship, "all_authorized")
-        self.assertFalse(bound.ambiguous)
-
-    def test_active_employee_fallback_keeps_current_question_polarity(self):
-        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="missing_employee",
-                    rewritten_request=(
-                        "Show absence dates for Synthetic Employee One (A11017)."
-                    ),
-                    employee_mention="Synthetic Employee One",
-                )
-            ),
-            (employee,),
-            original_question="Show dates that are not absent.",
-            active_employees=(employee,),
-        )
-
-        self.assertEqual(bound.employee_ids, ("A11017",))
-        self.assertIn("Show dates that are not absent.", bound.updated_request)
-        self.assertNotIn("Show absence dates for", bound.updated_request)
-
-    def test_short_follow_up_inherits_single_active_employee_when_model_is_uncertain(
-        self,
-    ):
-        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="ambiguous_reference",
-                    rewritten_request="Show the absence dates instead.",
-                )
-            ),
-            (employee,),
-            original_question="Show the absence dates instead.",
-            active_employees=(employee,),
-        )
-
-        self.assertEqual(bound.employee_ids, ("A11017",))
-        self.assertEqual(bound.request_relationship, "follow_up")
 
     def test_short_follow_up_does_not_replace_an_explicit_unknown_name(self):
         employee = Employee(employee_id="A11017", name="Synthetic Employee One")
@@ -536,21 +497,6 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         )
 
         self.assertTrue(bound.ambiguous)
-
-    def test_short_ready_request_for_active_employee_is_follow_up(self):
-        employee = Employee(employee_id="A11017", name="Synthetic Employee One")
-        bound = bind_references(
-            response(
-                rewritten_request="Show dates that are not absent.",
-                request_relationship="new",
-                employee_names=("Synthetic Employee One",),
-            ),
-            (employee,),
-            original_question="Show dates that are not absent.",
-            active_employees=(employee,),
-        )
-
-        self.assertEqual(bound.request_relationship, "follow_up")
 
     def test_identity_claim_uses_id_first_and_mismatch_requires_confirmation(self):
         bound = bind_references(
@@ -644,24 +590,6 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertFalse(bound.ambiguous)
         self.assertEqual(bound.employee_ids, ("A10029",))
 
-    def test_exact_authorized_name_is_resolved_even_if_model_omits_references(self):
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="missing_employee",
-                    rewritten_request="Count records with Authorized status.",
-                )
-            ),
-            (Employee(employee_id="A10017", name="Iftikhar Hasson Ismail"),),
-            original_question=(
-                "Count Iftikhar Hasson Ismail's records with Authorized status."
-            ),
-        )
-
-        self.assertFalse(bound.ambiguous)
-        self.assertEqual(bound.employee_ids, ("A10017",))
-
     def test_duplicate_exact_authorized_name_requires_direct_confirmation(self):
         bound = bind_references(
             ReferenceResponse(
@@ -669,6 +597,7 @@ class ReferenceAndPlanningTests(unittest.TestCase):
                     locale="en",
                     reason="ambiguous_reference",
                     rewritten_request="Show attendance for Adel Mohammed Abdulla.",
+                    employee_mention="Adel Mohammed Abdulla",
                 )
             ),
             (
@@ -754,42 +683,27 @@ class ReferenceAndPlanningTests(unittest.TestCase):
 
         self.assertEqual(bound.employee_ids, ("A10017", "A10029"))
 
-    def test_general_pattern_question_overrides_model_missing_employee(self):
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="missing_employee",
-                    rewritten_request="Find employees with unusual attendance patterns.",
-                )
-            ),
-            (),
-            original_question="Which employees show unusual attendance patterns?",
-        )
-
-        self.assertFalse(bound.ambiguous)
-        self.assertEqual(bound.subject_relationship, "all_authorized")
-        self.assertIsNotNone(bound.updated_request)
-
-    def test_general_pattern_question_ignores_model_generated_employee_mention(self):
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="missing_employee",
-                    rewritten_request="Find unusual attendance patterns.",
-                    employee_mention="unusual attendance patterns",
-                )
-            ),
-            (Employee(employee_id="A1", name="Wail Ali"),),
-            original_question="Which employees show unusual attendance patterns?",
-        )
-
-        self.assertFalse(bound.ambiguous)
-        self.assertEqual(bound.subject_relationship, "all_authorized")
-        self.assertIsNotNone(bound.updated_request)
-
     def test_partial_name_shared_by_multiple_employees_requires_confirmation(self):
+        bound = bind_references(
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    rewritten_request="Count Mukhtar Ahmed's attendance records.",
+                    locale="en",
+                    reason="ambiguous_reference",
+                    employee_mention="Mukhtar Ahmed",
+                )
+            ),
+            (
+                Employee(employee_id="A1", name="Mukhtar Ahmed Ali"),
+                Employee(employee_id="A2", name="Mukhtar Ahmed Meer"),
+            ),
+            original_question="Count Mukhtar Ahmed's attendance records.",
+        )
+
+        self.assertTrue(bound.ambiguous)
+        self.assertEqual(bound.unresolved_mention, "Mukhtar Ahmed")
+
+    def test_model_expansion_of_shared_partial_name_cannot_choose_one_identity(self):
         bound = bind_references(
             response(
                 employee_names=("Mukhtar Ahmed Meer",),
@@ -804,17 +718,22 @@ class ReferenceAndPlanningTests(unittest.TestCase):
             original_question="Count Mukhtar Ahmed's attendance records.",
         )
 
-        self.assertTrue(bound.ambiguous)
+        self.assertIsNotNone(bound.confirmation)
+        self.assertEqual(bound.confirmation.mention, "Mukhtar Ahmed")
         self.assertEqual(
-            tuple(option.employee_id for option in bound.fallback_options),
+            tuple(option.employee_id for option in bound.confirmation.options),
             ("A1", "A2"),
         )
 
     def test_unknown_written_person_is_not_converted_to_general_record_scope(self):
         bound = bind_references(
-            response(
-                subject_relationship="criteria",
-                employee_criteria=("authorized records for Unknown Human",),
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    rewritten_request="Count authorized records for Unknown Human.",
+                    locale="en",
+                    reason="ambiguous_reference",
+                    employee_mention="Unknown Human",
+                )
             ),
             (Employee(employee_id="A1", name="Wail Ali"),),
             original_question="Count authorized records for Unknown Human.",
@@ -822,38 +741,6 @@ class ReferenceAndPlanningTests(unittest.TestCase):
 
         self.assertTrue(bound.ambiguous)
         self.assertEqual(bound.unresolved_mention, "Unknown Human")
-
-    def test_unusual_attendance_criteria_override_model_missing_employee(self):
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="missing_employee",
-                    rewritten_request="Find unusual Working Day attendance.",
-                )
-            ),
-            (),
-            original_question="Find unusual Working Day attendance.",
-        )
-
-        self.assertFalse(bound.ambiguous)
-        self.assertEqual(bound.subject_relationship, "all_authorized")
-
-    def test_plural_record_filter_overrides_model_missing_employee(self):
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="missing_employee",
-                    rewritten_request="Count records on September 31, 2026.",
-                )
-            ),
-            (),
-            original_question="Count records on September 31, 2026.",
-        )
-
-        self.assertFalse(bound.ambiguous)
-        self.assertEqual(bound.subject_relationship, "all_authorized")
 
     def test_subjectless_single_employee_request_remains_ambiguous(self):
         bound = bind_references(
@@ -869,22 +756,6 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         )
 
         self.assertTrue(bound.ambiguous)
-
-    def test_temporally_scoped_attendance_request_is_general_scope(self):
-        bound = bind_references(
-            ReferenceResponse(
-                decision=AmbiguousReference(
-                    locale="en",
-                    reason="missing_employee",
-                    rewritten_request="Show attendance before September 5, 2026.",
-                )
-            ),
-            (),
-            original_question="Show attendance before 2026-09-05.",
-        )
-
-        self.assertFalse(bound.ambiguous)
-        self.assertEqual(bound.subject_relationship, "all_authorized")
 
     def test_ambiguous_reference_preserves_typed_unresolved_name_for_search(self):
         bound = bind_references(
@@ -924,7 +795,7 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertEqual(bound.unresolved_mention, "Mukhtar Ahmed")
         self.assertIsNotNone(bound.pending_resolution)
 
-    def test_inconsistent_model_relationship_is_normalized_by_authoritative_binder(
+    def test_model_criteria_relationship_with_name_field_needs_review(
         self,
     ):
         decision = ReferenceResponse.model_validate_json(
@@ -954,9 +825,9 @@ class ReferenceAndPlanningTests(unittest.TestCase):
             original_question="Show Mukhtar Ahmed attendance.",
         )
 
-        self.assertEqual(bound.subject_relationship, "employees")
-        self.assertEqual(bound.unresolved_mention, "Mukhtar Ahmed")
-        self.assertIsNotNone(bound.pending_resolution)
+        self.assertTrue(bound.ambiguous)
+        self.assertEqual(bound.employee_ids, ())
+        self.assertIsNone(bound.updated_request)
 
     def test_exact_name_misclassified_as_employee_id_still_resolves_by_name(self):
         bound = bind_references(
@@ -1028,15 +899,6 @@ class ReferenceAndPlanningTests(unittest.TestCase):
 
                 self.assertTrue(bound.ambiguous)
                 self.assertEqual(bound.reason, "malformed_identifier")
-
-    def test_punctuated_unknown_identifier_is_rejected_before_model_resolution(self):
-        directory = (Employee(employee_id="A10029", name="Suhail Mustafa Yousuf"),)
-
-        self.assertTrue(
-            reference.has_malformed_identifier(
-                "Show attendance for NOBODY-123.", directory
-            )
-        )
 
     def test_general_criteria_remain_natural_language(self):
         bound = bind_references(

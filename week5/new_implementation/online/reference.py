@@ -28,28 +28,6 @@ _IDENTITY_LABEL_WORDS = {
     "معرف",
     "موظف",
 }
-_GENERAL_SCOPE_MARKERS = (
-    "which employees",
-    "which attendance records",
-    "which records",
-    "find employees",
-    "attendance behavior",
-    "attendance patterns",
-    "attendance summaries",
-    "attendance issues",
-    "attendance anomalies",
-    "common attendance",
-    "patterns of",
-    "patterns involving",
-    "records suggest",
-    "unusual attendance",
-    "problematic attendance",
-    "abnormal attendance",
-    "suspicious attendance",
-    "concerning attendance",
-    "incomplete clocking",
-    "repeated lateness",
-)
 
 
 class _Strict(BaseModel):
@@ -92,6 +70,7 @@ class AmbiguousReference(_Strict):
     locale: Literal["en", "ar"]
     reason: Literal["missing_employee", "ambiguous_reference"]
     rewritten_request: str = Field(min_length=1, max_length=50000)
+    request_relationship: Literal["new", "follow_up"] = "new"
     employee_mention: str | None = Field(default=None, min_length=1, max_length=256)
 
 
@@ -198,6 +177,17 @@ conversation text and trusted_context only as labelled application-verified cont
 The current_question field is the only request to classify and rewrite now. Previous
 questions and answers provide context, but their requested output and filters are
 not part of a new request.
+Decide the subject from the user's intent: a particular person or people, a
+natural-language employee criterion, or all authorized records. For criteria or
+general requests, return ready with criteria or all_authorized; do not require a
+named employee. Use ambiguous only when a person-specific reference cannot be
+resolved from trusted context and the authorized employee directory. If the
+written person is unmatched or shared by multiple employees, include the exact
+written person phrase in employee_mention. Do not put a department, status,
+metric, or other business criterion in employee_mention. The application will
+verify IDs and names but will not reinterpret person-versus-criteria intent.
+For an ambiguous follow-up, mark request_relationship as follow_up so confirmed
+employee selection retains the prior user-requested scope.
 Return every explicit employee ID, every explicit employee name, each name-and-ID pair
 that claims one identity, every general natural-language criterion describing
 employees, whether the request is new or a follow-up, and whether employees and
@@ -342,168 +332,17 @@ def _identifier_shape(value: str) -> str:
     return "".join(shape)
 
 
-def has_malformed_identifier(
-    question: str,
-    directory: tuple[Employee, ...],
-) -> bool:
-    """Detect explicit identifier tokens whose structure cannot match the directory."""
-
-    if not directory:
-        return False
-    expected_shapes = {_identifier_shape(item.employee_id) for item in directory}
-    known_ids = {_normalize(item.employee_id) for item in directory}
-    punctuated_tokens = re.findall(
-        r"(?<![A-Za-z0-9_])[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)+(?![A-Za-z0-9_])",
-        question,
-    )
-    for token in punctuated_tokens:
-        if _normalize(token) in known_ids:
-            continue
-        if (
-            any(char.isalpha() for char in token)
-            and any(char.isdigit() for char in token)
-            and _identifier_shape(token) not in expected_shapes
-        ):
-            return True
-    words = _words(question)
-    for index, word in enumerate(words):
-        if _normalize(word) in known_ids:
-            continue
-        has_letter = any(char.isalpha() for char in word)
-        has_digit = any(char.isdigit() for char in word)
-        preceded_by_identifier_label = index > 0 and words[index - 1] in {
-            "employee",
-            "id",
-            "identifier",
-        }
-        if not (has_letter and has_digit) and not preceded_by_identifier_label:
-            continue
-        if _identifier_shape(word) not in expected_shapes:
-            return True
-    return False
-
-
-def has_unknown_identifier(question: str, directory: tuple[Employee, ...]) -> bool:
-    """Find a clearly stated employee ID with a valid shape but no directory match."""
-
-    if not directory:
-        return False
-    shapes = {_identifier_shape(item.employee_id) for item in directory}
-    known = {_normalize(item.employee_id) for item in directory}
-    words = _words(question)
-    for index, word in enumerate(words):
-        if _normalize(word) in known or _identifier_shape(word) not in shapes:
-            continue
-        mixed = any(char.isalpha() for char in word) and any(
-            char.isdigit() for char in word
-        )
-        labelled = index > 0 and words[index - 1] in {
-            "employee",
-            "id",
-            "identifier",
-            "الموظف",
-            "رقم",
-            "معرف",
-        }
-        if mixed or (labelled and any(char.isdigit() for char in word)):
-            return True
-    return False
-
-
-def _requests_general_scope(question: str) -> bool:
-    normalized = " ".join(_words(question))
-    has_person_reference = bool(
-        re.search(r"\b(?:his|her|their|those|them|same)\b", normalized)
-    )
-    if any(marker in normalized for marker in _GENERAL_SCOPE_MARKERS):
-        return True
-    if re.search(r"\bgroup\b.*\bby\b", normalized) and not has_person_reference:
-        return True
-    words = set(normalized.split())
-    if (
-        not has_person_reference
-        and words.intersection({"date", "dates"})
-        and words.intersection({"running", "cumulative", "total", "sum", "count"})
-    ):
-        return True
-    if words.intersection({"records", "employees"}) or (
-        "departments" in words and not has_person_reference
-    ):
-        return True
-    if "attendance" in words and words.intersection(
-        {"unusual", "problematic", "abnormal", "suspicious", "concerning"}
-    ):
-        return True
-    if any(
-        comparison in normalized
-        for comparison in (
-            " greater than ",
-            " more than ",
-            " less than ",
-            " at least ",
-            " at most ",
-            " above ",
-            " below ",
-        )
-    ):
-        return True
-    return "attendance" in normalized and (
-        any(
-            marker in normalized
-            for marker in (" before ", " after ", " between ", " during ")
-        )
-        or re.search(r"\b\d{4}\s+\d{1,2}\s+\d{1,2}\b", normalized) is not None
-    )
-
-
-_FOLLOWUP_REFERENCES = frozenset(
-    {
-        "that",
-        "those",
-        "them",
-        "this",
-        "same",
-        "it",
-        "he",
-        "him",
-        "his",
-        "she",
-        "her",
-        "hers",
-        "هذه",
-        "هذا",
-        "نفس",
-        "هو",
-        "هي",
-        "له",
-        "لها",
-    }
-)
-
-_SINGULAR_PERSON_REFERENCES = frozenset(
-    {"he", "him", "his", "she", "her", "hers", "هو", "هي", "له", "لها"}
-)
-
-
-def _has_followup_reference(question: str) -> bool:
-    words = set(_words(question))
-    return bool(words.intersection(_FOLLOWUP_REFERENCES))
-
-
 def _pending(
     ready: ReadyReference,
     resolved: list[Employee],
     *,
     identity_claim: IdentityClaim | None = None,
 ) -> PendingResolution:
-    relationship = _normalized_subject_relationship(ready)
-    if relationship not in {"employees", "union", "intersection"}:
-        relationship = "union" if ready.employee_criteria else "employees"
     return PendingResolution(
         rewritten_request=ready.rewritten_request,
         locale=ready.locale,
         request_relationship=ready.request_relationship,
-        subject_relationship=relationship,
+        subject_relationship=ready.subject_relationship,
         resolved_employees=tuple(
             {item.employee_id: item for item in resolved}.values()
         ),
@@ -523,49 +362,6 @@ def _options_for_name(
     )
 
 
-def _written_person_mention(question: str) -> str | None:
-    """Extract a clearly written person phrase even if the model labels it criteria."""
-
-    match = re.search(
-        r"\b(?:for|of)\s+([A-Z][A-Za-z'’-]+(?:\s+[A-Z][A-Za-z'’-]+){1,5})"
-        r"(?=[?.!,]|$)",
-        question,
-    )
-    if match is None:
-        return None
-    phrase = match.group(1).strip()
-    domain_words = {
-        "attendance",
-        "day",
-        "department",
-        "early",
-        "human resources",
-        "lateness",
-        "missing in",
-        "missing out",
-        "overtime",
-        "records",
-        "working day",
-    }
-    return None if _normalize(phrase) in domain_words else phrase
-
-
-def _normalized_subject_relationship(ready: ReadyReference):
-    explicit = bool(ready.employee_ids or ready.employee_names or ready.identity_claims)
-    criteria = bool(ready.employee_criteria)
-    if explicit and criteria:
-        return (
-            ready.subject_relationship
-            if ready.subject_relationship in {"union", "intersection"}
-            else "union"
-        )
-    if explicit:
-        return "employees"
-    if criteria:
-        return "criteria"
-    return "all_authorized"
-
-
 def bind_references(
     decision: ReferenceResponse,
     directory: tuple[Employee, ...],
@@ -576,337 +372,80 @@ def bind_references(
 ) -> BoundReferences:
     if isinstance(decision.decision, UnsupportedReference):
         raise ValueError("unsupported reference decisions must stop before binding")
-    ordered_question_words = _words(original_question)
-    question_tokens = set(_words(original_question))
-    explicit_id_employees = tuple(
-        item for item in directory if _normalize(item.employee_id) in question_tokens
-    )
-    all_mentioned_names: dict[str, list[Employee]] = {}
-    for item in directory:
-        if _contains_words(ordered_question_words, _words(item.name)):
-            all_mentioned_names.setdefault(_normalize(item.name), []).append(item)
-    by_mentioned_name = {
-        normalized_name: matches
-        for normalized_name, matches in all_mentioned_names.items()
-        if not any(
-            other_name != normalized_name
-            and _contains_words(_words(other_name), _words(normalized_name))
-            for other_name in all_mentioned_names
-        )
-    }
-    unique_name_employees = tuple(
-        matches[0] for matches in by_mentioned_name.values() if len(matches) == 1
-    )
-    explicit_directory_employees = tuple(
-        {
-            item.employee_id: item
-            for item in explicit_id_employees + unique_name_employees
-        }.values()
-    )
-    model_references = (
-        (
-            *decision.decision.employee_ids,
-            *decision.decision.employee_names,
-            *(claim.employee_name for claim in decision.decision.identity_claims),
-        )
-        if isinstance(decision.decision, ReadyReference)
-        else ()
-    )
-    # An established single-person reference is authoritative. If the current
-    # message contains only a singular reference to that person, a model-produced
-    # name or ID from older text must not redirect the request to someone else.
-    if (
-        len(active_employees) == 1
-        and set(ordered_question_words).intersection(_SINGULAR_PERSON_REFERENCES)
-        and not explicit_directory_employees
-        and not any(
-            _contains_words(ordered_question_words, _words(reference))
-            for reference in model_references
-        )
-        and not _requests_general_scope(original_question)
-        and active_employees[0] in directory
-        and not (
-            isinstance(decision.decision, AmbiguousReference)
-            and decision.decision.employee_mention is not None
-            and _contains_words(
-                ordered_question_words, _words(decision.decision.employee_mention)
+    if isinstance(decision.decision, AmbiguousReference):
+        ambiguous = decision.decision
+        mention = ambiguous.employee_mention
+        if mention is not None and not (
+            _contains_words(_words(original_question), _words(mention))
+            or any(
+                _normalize(mention)
+                in {_normalize(item.name), _normalize(item.employee_id)}
+                for item in active_employees
             )
-        )
-    ):
-        employee = active_employees[0]
-        return BoundReferences(
-            rewritten_request=original_question,
-            updated_request=attach_resolved_employees(original_question, (employee,)),
-            locale=decision.decision.locale,
-            request_relationship="follow_up",
-            subject_relationship="employees",
-            employees=(employee,),
-        )
-    partial_name_groups: dict[str, list[Employee]] = {}
-    for item in directory:
-        name_words = _words(item.name)
-        for start in range(len(name_words) - 1):
-            for end in range(start + 2, len(name_words) + 1):
-                phrase_words = name_words[start:end]
-                if _contains_words(ordered_question_words, phrase_words):
-                    phrase = " ".join(phrase_words)
-                    partial_name_groups.setdefault(phrase, []).append(item)
-    ambiguous_partial_names = {
-        phrase: tuple({item.employee_id: item for item in matches}.values())
-        for phrase, matches in partial_name_groups.items()
-        if len({item.employee_id for item in matches}) > 1
-    }
-    normalized_ambiguous_mention = max(
-        ambiguous_partial_names,
-        key=lambda item: (len(_words(item)), len(item)),
-        default=None,
-    )
-    exact_directory_name_is_present = any(
-        _contains_words(ordered_question_words, _words(item.name))
-        for item in explicit_directory_employees
-    )
-    if exact_directory_name_is_present:
-        normalized_ambiguous_mention = None
-    deterministic_ambiguous_mention = normalized_ambiguous_mention
-    if normalized_ambiguous_mention is not None:
-        surface_match = re.search(
-            r"\b"
-            + r"\W+".join(
-                re.escape(word) for word in _words(normalized_ambiguous_mention)
-            )
-            + r"\b",
-            original_question,
-            flags=re.IGNORECASE,
-        )
-        if surface_match is not None:
-            deterministic_ambiguous_mention = surface_match.group(0)
-    deterministic_ambiguous_options = (
-        tuple(
-            EmployeeOption(employee_id=item.employee_id, employee_name=item.name)
-            for item in ambiguous_partial_names[normalized_ambiguous_mention][
-                :MAX_EMPLOYEE_CANDIDATES
-            ]
-        )
-        if normalized_ambiguous_mention is not None
-        else ()
-    )
-    if deterministic_ambiguous_mention is not None:
-        options = deterministic_ambiguous_options
-        if isinstance(decision.decision, ReadyReference):
-            resolution = _pending(
-                decision.decision,
-                list(explicit_id_employees),
-            )
-            request_relationship = decision.decision.request_relationship
-        else:
-            resolution = PendingResolution(
-                rewritten_request=decision.decision.rewritten_request,
-                locale=decision.decision.locale,
-                request_relationship="new",
-                subject_relationship="employees",
-                resolved_employees=explicit_id_employees,
-            )
-            request_relationship = "new"
-        if (
-            normalized_ambiguous_mention in by_mentioned_name
-            and len(by_mentioned_name[normalized_ambiguous_mention]) > 1
         ):
-            return BoundReferences(
-                rewritten_request=decision.decision.rewritten_request,
-                locale=decision.decision.locale,
-                request_relationship=request_relationship,
+            mention = None
+        pending = (
+            PendingResolution(
+                rewritten_request=ambiguous.rewritten_request,
+                locale=ambiguous.locale,
+                request_relationship=ambiguous.request_relationship,
                 subject_relationship="employees",
+            )
+            if mention is not None
+            else None
+        )
+        exact_options = (
+            tuple(
+                EmployeeOption(employee_id=item.employee_id, employee_name=item.name)
+                for item in directory
+                if _normalize(item.name) == _normalize(mention)
+            )[:MAX_EMPLOYEE_CANDIDATES]
+            if mention is not None
+            else ()
+        )
+        if exact_options and pending is not None:
+            return BoundReferences(
+                rewritten_request=ambiguous.rewritten_request,
+                locale=ambiguous.locale,
+                request_relationship=ambiguous.request_relationship,
                 confirmation=PendingEmployeeConfirmation(
                     original_question=original_question,
-                    mention=deterministic_ambiguous_mention,
-                    options=options,
-                    resolution=resolution,
+                    mention=mention,
+                    options=exact_options,
+                    resolution=pending,
                 ),
             )
         return BoundReferences(
-            rewritten_request=decision.decision.rewritten_request,
-            locale=decision.decision.locale,
-            request_relationship=request_relationship,
-            subject_relationship="employees",
+            rewritten_request=ambiguous.rewritten_request,
+            locale=ambiguous.locale,
+            request_relationship=ambiguous.request_relationship,
             ambiguous=True,
-            reason="ambiguous_reference",
-            unresolved_mention=deterministic_ambiguous_mention,
-            pending_resolution=resolution,
-            fallback_options=options,
-        )
-    written_person = _written_person_mention(original_question)
-    if (
-        written_person is not None
-        and not explicit_directory_employees
-        and deterministic_ambiguous_mention is None
-        and not any(
-            _contains_words(_words(item.name), _words(written_person))
-            for item in directory
-        )
-    ):
-        if isinstance(decision.decision, ReadyReference):
-            pending_resolution = _pending(decision.decision, [])
-        else:
-            pending_resolution = PendingResolution(
-                rewritten_request=decision.decision.rewritten_request,
-                locale=decision.decision.locale,
-                request_relationship="new",
-                subject_relationship="employees",
-            )
-        return BoundReferences(
-            rewritten_request=decision.decision.rewritten_request,
-            locale=decision.decision.locale,
-            request_relationship="new",
-            subject_relationship="employees",
-            ambiguous=True,
-            reason="unknown_employee_id",
-            unresolved_mention=written_person,
-            pending_resolution=pending_resolution,
-        )
-    if isinstance(decision.decision, AmbiguousReference):
-        if explicit_directory_employees and deterministic_ambiguous_mention is None:
-            return BoundReferences(
-                rewritten_request=decision.decision.rewritten_request,
-                updated_request=attach_resolved_employees(
-                    decision.decision.rewritten_request,
-                    explicit_directory_employees,
-                ),
-                locale=decision.decision.locale,
-                request_relationship="new",
-                subject_relationship="employees",
-                employees=explicit_directory_employees,
-            )
-        mention = decision.decision.employee_mention
-        if (
-            mention is not None
-            and not _contains_words(ordered_question_words, _words(mention))
-            and not explicit_directory_employees
-            and not active_employees
-            and not _has_followup_reference(original_question)
-        ):
-            return BoundReferences(
-                rewritten_request=original_question,
-                updated_request=attach_resolved_employees(original_question, ()),
-                locale=decision.decision.locale,
-                request_relationship="new",
-                subject_relationship="all_authorized",
-            )
-        if (
-            has_verified_turns
-            and not active_employees
-            and _has_followup_reference(original_question)
-            and (
-                mention is None
-                or not _contains_words(ordered_question_words, _words(mention))
-                or _normalize(mention) in _FOLLOWUP_REFERENCES
-            )
-        ):
-            return BoundReferences(
-                rewritten_request=original_question,
-                updated_request=attach_resolved_employees(original_question, ()),
-                locale=decision.decision.locale,
-                request_relationship="follow_up",
-                subject_relationship="all_authorized",
-            )
-        if (
-            _requests_general_scope(original_question)
-            and not explicit_directory_employees
-        ):
-            return BoundReferences(
-                rewritten_request=original_question,
-                updated_request=attach_resolved_employees(original_question, ()),
-                locale=decision.decision.locale,
-                request_relationship="new",
-                subject_relationship="all_authorized",
-            )
-        if len(active_employees) == 1 and not _requests_general_scope(
-            original_question
-        ):
-            employee = active_employees[0]
-            mention = decision.decision.employee_mention
-            if employee in directory and (
-                mention is None
-                or _normalize(mention)
-                in {_normalize(employee.name), _normalize(employee.employee_id)}
-                or not _contains_words(ordered_question_words, _words(mention))
-            ):
-                return BoundReferences(
-                    rewritten_request=original_question,
-                    updated_request=attach_resolved_employees(
-                        original_question, (employee,)
-                    ),
-                    locale=decision.decision.locale,
-                    request_relationship="follow_up",
-                    subject_relationship="employees",
-                    employees=(employee,),
-                )
-        unresolved_mention = (
-            decision.decision.employee_mention or deterministic_ambiguous_mention
-        )
-        if unresolved_mention is not None:
-            return BoundReferences(
-                rewritten_request=decision.decision.rewritten_request,
-                locale=decision.decision.locale,
-                request_relationship="new",
-                subject_relationship="employees",
-                ambiguous=True,
-                reason=decision.decision.reason,
-                unresolved_mention=unresolved_mention,
-                pending_resolution=PendingResolution(
-                    rewritten_request=decision.decision.rewritten_request,
-                    locale=decision.decision.locale,
-                    request_relationship="new",
-                    subject_relationship="employees",
-                ),
-            )
-        return BoundReferences(
-            rewritten_request=decision.decision.rewritten_request,
-            locale=decision.decision.locale,
-            ambiguous=True,
-            reason=decision.decision.reason,
+            reason=ambiguous.reason,
+            unresolved_mention=mention,
+            pending_resolution=pending,
         )
     ready = decision.decision
-    if (
-        has_verified_turns
-        and not active_employees
-        and _has_followup_reference(original_question)
-        and not explicit_directory_employees
-        and not any(_normalize(item) in question_tokens for item in ready.employee_ids)
-        and not any(
-            _contains_words(ordered_question_words, _words(item))
-            for item in ready.employee_names
-        )
-    ):
+    if ready.subject_relationship in {"criteria", "all_authorized"}:
+        if ready.employee_ids or ready.employee_names or ready.identity_claims:
+            return BoundReferences(
+                rewritten_request=ready.rewritten_request,
+                locale=ready.locale,
+                request_relationship=ready.request_relationship,
+                ambiguous=True,
+                reason="ambiguous_reference",
+            )
         return BoundReferences(
-            rewritten_request=original_question,
-            updated_request=attach_resolved_employees(original_question, ()),
+            rewritten_request=ready.rewritten_request,
+            updated_request=attach_resolved_employees(ready.rewritten_request, ()),
             locale=ready.locale,
-            request_relationship="follow_up",
-            subject_relationship="all_authorized",
-        )
-    if (
-        _requests_general_scope(original_question)
-        and not explicit_directory_employees
-        and not any(_normalize(item) in question_tokens for item in ready.employee_ids)
-        and not any(
-            _contains_words(ordered_question_words, _words(item))
-            for item in ready.employee_names
-        )
-        and not any(
-            _normalize(item.employee_id) in question_tokens
-            or _contains_words(ordered_question_words, _words(item.employee_name))
-            for item in ready.identity_claims
-        )
-    ):
-        return BoundReferences(
-            rewritten_request=original_question,
-            updated_request=attach_resolved_employees(original_question, ()),
-            locale=ready.locale,
-            request_relationship="new",
-            subject_relationship="all_authorized",
+            request_relationship=ready.request_relationship,
+            subject_relationship=ready.subject_relationship,
             employee_criteria=ready.employee_criteria,
         )
-    normalized_subject_relationship = _normalized_subject_relationship(ready)
+    ordered_question_words = _words(original_question)
+    question_tokens = set(ordered_question_words)
+    ready = decision.decision
+    normalized_subject_relationship = ready.subject_relationship
     base = {
         "rewritten_request": ready.rewritten_request,
         "locale": ready.locale,
@@ -919,16 +458,74 @@ def bind_references(
     by_name: dict[str, list[Employee]] = {}
     for employee in directory:
         by_name.setdefault(_normalize(employee.name), []).append(employee)
-    resolved: list[Employee] = list(explicit_directory_employees)
-    normalized_explicit_ids = {_normalize(item) for item in ready.employee_ids} | {
-        _normalize(item.employee_id) for item in explicit_directory_employees
-    }
-    ignored_invented_ids: list[str] = []
-    unresolved_names: list[str] = (
-        [deterministic_ambiguous_mention]
-        if deterministic_ambiguous_mention is not None
-        else []
+    model_names = tuple(
+        dict.fromkeys(
+            (
+                *ready.employee_names,
+                *(claim.employee_name for claim in ready.identity_claims),
+            )
+        )
     )
+    for name in model_names:
+        if _contains_words(ordered_question_words, _words(name)) or (
+            ready.request_relationship == "follow_up"
+            and any(
+                _normalize(item.name) == _normalize(name) for item in active_employees
+            )
+        ):
+            continue
+        if any(
+            _normalize(claim.employee_name) == _normalize(name)
+            and _normalize(claim.employee_id) in question_tokens
+            for claim in ready.identity_claims
+        ):
+            continue
+        name_words = _words(name)
+        for length in range(len(name_words) - 1, 0, -1):
+            matching_phrase = next(
+                (
+                    name_words[start : start + length]
+                    for start in range(len(name_words) - length + 1)
+                    if _contains_words(
+                        ordered_question_words, name_words[start : start + length]
+                    )
+                ),
+                None,
+            )
+            if matching_phrase is None:
+                continue
+            options = tuple(
+                EmployeeOption(employee_id=item.employee_id, employee_name=item.name)
+                for item in directory
+                if _contains_words(_words(item.name), matching_phrase)
+            )[:MAX_EMPLOYEE_CANDIDATES]
+            if len(options) > 1:
+                surface = re.search(
+                    r"\b" + r"\W+".join(map(re.escape, matching_phrase)) + r"\b",
+                    original_question,
+                    flags=re.IGNORECASE,
+                )
+                mention = surface.group(0) if surface else " ".join(matching_phrase)
+                resolved_ids = [
+                    by_id[_normalize(employee_id)]
+                    for employee_id in ready.employee_ids
+                    if _normalize(employee_id) in question_tokens
+                    and _normalize(employee_id) in by_id
+                ]
+                return BoundReferences(
+                    **base,
+                    confirmation=PendingEmployeeConfirmation(
+                        original_question=original_question,
+                        mention=mention,
+                        options=options,
+                        resolution=_pending(ready, resolved_ids),
+                    ),
+                )
+            break
+    resolved: list[Employee] = []
+    normalized_explicit_ids = {_normalize(item) for item in ready.employee_ids}
+    ignored_invented_ids: list[str] = []
+    unresolved_names: list[str] = []
     for employee_id in ready.employee_ids:
         normalized_reference = _normalize(employee_id)
         reference_words = _words(employee_id)
@@ -967,6 +564,21 @@ def bind_references(
             name, normalized_explicit_ids
         ):
             continue
+        name_words = set(_words(name)) - _IDENTITY_LABEL_WORDS
+        partially_mentioned = bool(name_words.intersection(ordered_question_words))
+        trusted_follow_up = ready.request_relationship == "follow_up" and any(
+            _normalize(item.name) == _normalize(name) for item in active_employees
+        )
+        if not (partially_mentioned or trusted_follow_up):
+            continue
+        shadowed_by_longer_name = any(
+            _normalize(other) != _normalize(name)
+            and _contains_words(_words(other), _words(name))
+            and _contains_words(ordered_question_words, _words(other))
+            for other in ready.employee_names
+        )
+        if shadowed_by_longer_name:
+            continue
         if re.fullmatch(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_-]+", name):
             return BoundReferences(
                 **base,
@@ -975,40 +587,21 @@ def bind_references(
             )
         exact = by_name.get(_normalize(name), ())
         if len(exact) == 1:
-            name_words = set(_words(name)) - _IDENTITY_LABEL_WORDS
-            partially_mentioned = bool(name_words.intersection(ordered_question_words))
-            shadowed_by_longer_name = (
-                _normalize(name) in all_mentioned_names
-                and _normalize(name) not in by_mentioned_name
-            )
-            if (
-                ready.request_relationship == "follow_up"
-                or _normalize(name) in by_mentioned_name
-                or (partially_mentioned and not shadowed_by_longer_name)
-            ):
-                resolved.append(exact[0])
+            resolved.append(exact[0])
         else:
             unresolved_names.append(name)
     for claim in ready.identity_claims:
         claim_id_mentioned = _normalize(claim.employee_id) in question_tokens
         normalized_claim_name = _normalize(claim.employee_name)
-        claim_name_is_exact = normalized_claim_name in by_name
-        claim_name_shadowed = (
-            normalized_claim_name in all_mentioned_names
-            and normalized_claim_name not in by_mentioned_name
-        )
-        claim_name_mentioned = (
-            normalized_claim_name in by_mentioned_name
-            or (
-                not claim_name_shadowed
-                and bool(
-                    (
-                        set(_words(claim.employee_name)) - _IDENTITY_LABEL_WORDS
-                    ).intersection(ordered_question_words)
+        claim_name_mentioned = _contains_words(
+            ordered_question_words, _words(claim.employee_name)
+        ) or (
+            normalized_claim_name in by_name
+            and bool(
+                (set(_words(claim.employee_name)) - _IDENTITY_LABEL_WORDS).intersection(
+                    ordered_question_words
                 )
             )
-            if claim_name_is_exact
-            else _contains_words(ordered_question_words, _words(claim.employee_name))
         )
         if (
             ready.request_relationship == "new"
@@ -1024,6 +617,17 @@ def bind_references(
                 continue
         if _normalize(claim.employee_name) == _normalize(claim.employee_id):
             if id_owner is None:
+                options = _options_for_name(claim.employee_name, by_name)
+                if options:
+                    return BoundReferences(
+                        **base,
+                        confirmation=PendingEmployeeConfirmation(
+                            original_question=original_question,
+                            mention=claim.employee_name,
+                            options=options,
+                            resolution=_pending(ready, resolved, identity_claim=claim),
+                        ),
+                    )
                 return BoundReferences(
                     **base, ambiguous=True, reason="unknown_employee_id"
                 )
@@ -1105,9 +709,8 @@ def bind_references(
         not resolved
         and len(active_employees) == 1
         and normalized_subject_relationship == "employees"
-        and not explicit_directory_employees
+        and ready.request_relationship == "follow_up"
         and not unresolved_names
-        and not _requests_general_scope(original_question)
         and all(
             _normalize(item) == _normalize(active_employees[0].employee_id)
             for item in ignored_invented_ids
@@ -1118,14 +721,8 @@ def bind_references(
     if ignored_invented_ids and not resolved:
         return BoundReferences(**base, ambiguous=True, reason="unknown_employee_id")
     unique = tuple({item.employee_id: item for item in resolved}.values())
-    if (
-        ready.request_relationship == "new"
-        and unique
-        and unique == active_employees
-        and not explicit_directory_employees
-        and not _requests_general_scope(original_question)
-    ):
-        base["request_relationship"] = "follow_up"
+    if not unique:
+        return BoundReferences(**base, ambiguous=True, reason="missing_employee")
     return BoundReferences(
         **base,
         updated_request=attach_resolved_employees(ready.rewritten_request, unique),
@@ -1252,8 +849,6 @@ __all__ = [
     "attach_resolved_employees",
     "bind_references",
     "complete_confirmation",
-    "has_malformed_identifier",
-    "has_unknown_identifier",
     "request_references",
     "search_employee_candidates",
 ]

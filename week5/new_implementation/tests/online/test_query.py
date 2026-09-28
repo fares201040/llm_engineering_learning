@@ -296,6 +296,44 @@ class DatabaseContextTests(unittest.TestCase):
             json_descriptions["Work_Location"],
         )
 
+    def test_overtime_schema_defines_each_type_value_pair_and_report_meaning(self):
+        fields = {item.name: item for item in context._record_json_fields()}
+        meanings = {item.name: item.description for item in context.BUSINESS_MEANINGS}
+
+        self.assertIn("Normal OT", fields["OT_Type_1"].description)
+        self.assertIn("Week Off OT", fields["OT_Type_1"].description)
+        self.assertEqual(
+            fields["OT_Type_1"].standard_values, ("Normal OT", "Week Off OT")
+        )
+        self.assertIn("OT_Value_1", fields["OT_Type_1"].description)
+        self.assertIn("Night OT", fields["OT_Type_2"].description)
+        self.assertEqual(fields["OT_Type_2"].standard_values, ("Night OT",))
+        self.assertIn("OT_Value_2", fields["OT_Type_2"].description)
+        self.assertIn("Normal OT", meanings["overtime_type_breakdown"])
+        self.assertIn("Week Off OT", meanings["overtime_type_breakdown"])
+        self.assertIn("Night OT", meanings["overtime_type_breakdown"])
+        self.assertIn("attendance report", meanings["overtime_type_breakdown"])
+        self.assertIn("OT_Value_1", fields["OT_Authorized"].description)
+        self.assertIn("OT_Value_2", fields["OT_Authorized"].description)
+        self.assertIn("immutable", fields["OT_Authorized"].description.casefold())
+        self.assertIn("mutable", fields["OT_Type_1"].description.casefold())
+        self.assertIn("mutable", fields["OT_Value_1"].description.casefold())
+        self.assertIn("mutable", fields["OT_Type_2"].description.casefold())
+        self.assertIn("mutable", fields["OT_Value_2"].description.casefold())
+        self.assertIn("OT_Value_1", meanings["overtime_type_breakdown"])
+        self.assertIn("OT_Value_2", meanings["overtime_type_breakdown"])
+        self.assertIn("immutable", meanings["overtime_type_breakdown"].casefold())
+        self.assertIn("mutable", meanings["overtime_type_breakdown"])
+        self.assertIn("current overtime total", meanings["overtime_type_breakdown"])
+        self.assertIn(
+            "unqualified employee overtime request", meanings["overtime_type_breakdown"]
+        )
+        self.assertIn("audit", meanings["overtime_type_breakdown"])
+        self.assertIn(
+            "current overtime total", context._COLUMN_DESCRIPTIONS["ot_authorized"]
+        )
+        self.assertIn("category-based", context._COLUMN_DESCRIPTIONS["total_ot"])
+
     def test_context_uses_exact_physical_metadata_and_is_immutable(self):
         context = database_context()
 

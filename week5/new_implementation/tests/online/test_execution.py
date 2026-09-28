@@ -13,10 +13,11 @@ from week5.new_implementation.online.execution import (
     authorize_access,
     execute_sql,
     load_employee_directory,
+    rank_employee_candidates,
     search_employee_directory_postgres,
     validate_read_query,
 )
-from week5.new_implementation.online.reference import EmployeeOption
+from week5.new_implementation.online.reference import Employee, EmployeeOption
 
 
 class Description:
@@ -71,6 +72,84 @@ def fake_psycopg(connection):
 
 
 class DirectExecutionTests(unittest.TestCase):
+    def test_two_ordered_fuzzy_name_parts_select_one_confirmation(self):
+        options = (
+            EmployeeOption(employee_id="A10218", employee_name="Wael Nageeb Mahmoud"),
+            EmployeeOption(employee_id="A11026", employee_name="Wail Saleh Awadh"),
+            EmployeeOption(employee_id="A10771", employee_name="Waheeb Saleh Mohammed"),
+            EmployeeOption(employee_id="A10044", employee_name="Adel Abdulla Saleh"),
+        )
+
+        self.assertEqual(
+            rank_employee_candidates("Wael Saleh", options),
+            (options[1],),
+        )
+
+    def test_shared_fuzzy_first_and_second_names_remain_ambiguous(self):
+        options = (
+            EmployeeOption(employee_id="A1", employee_name="Wail Saleh Awadh"),
+            EmployeeOption(employee_id="A2", employee_name="Wael Saleh Ahmed"),
+            EmployeeOption(employee_id="A3", employee_name="Adel Saleh"),
+        )
+
+        self.assertEqual(
+            rank_employee_candidates("Wael Saleh", options),
+            (options[1], options[0]),
+        )
+
+    def test_third_name_mismatch_does_not_select_single_confirmation(self):
+        options = (
+            EmployeeOption(employee_id="A1", employee_name="Wail Saleh Awadh"),
+            EmployeeOption(employee_id="A2", employee_name="Wael Saleh Ahmed"),
+        )
+
+        self.assertEqual(
+            rank_employee_candidates("Wael Saleh Omar", options),
+            (options[1], options[0]),
+        )
+
+    def test_first_name_candidates_outrank_surname_only_matches(self):
+        options = (
+            EmployeeOption(employee_id="A1", employee_name="Wael Nageeb Mahmoud"),
+            EmployeeOption(employee_id="A2", employee_name="Adel Abdulla Saleh"),
+            EmployeeOption(employee_id="A3", employee_name="Waheeb Saleh Mohammed"),
+        )
+
+        self.assertEqual(
+            rank_employee_candidates("Wael Saleh", options),
+            (options[0],),
+        )
+
+    def test_unmatched_name_returns_short_closest_list(self):
+        options = tuple(
+            EmployeeOption(employee_id=f"A{index}", employee_name=f"Person {index}")
+            for index in range(20)
+        )
+
+        self.assertEqual(
+            len(rank_employee_candidates("Unknown Name", options)),
+            5,
+        )
+
+    def test_authorized_directory_is_ranked_without_second_database_connection(self):
+        directory = (
+            Employee(employee_id="A1", name="Wail Saleh Awadh"),
+            Employee(employee_id="A2", name="Wael Nageeb Mahmoud"),
+        )
+        with patch("psycopg.connect", side_effect=AssertionError("unexpected DB call")):
+            options = search_employee_directory_postgres(
+                "Wael Saleh",
+                dsn="postgresql://test",
+                table="attendance_records",
+                allowed_employee_ids=("A1",),
+                directory=directory,
+            )
+
+        self.assertEqual(
+            options,
+            (EmployeeOption(employee_id="A1", employee_name="Wail Saleh Awadh"),),
+        )
+
     def test_query_boundary_accepts_ctes_and_rejects_other_statements(self):
         validate_read_query(
             "WITH a AS (SELECT * FROM attendance_records) SELECT * FROM a",
@@ -184,7 +263,7 @@ class DirectExecutionTests(unittest.TestCase):
         self.assertNotIn("total_worked_hrs", sql)
         self.assertEqual(directory[0].name, "Wail Ali")
 
-    def test_fuzzy_directory_search_runs_in_postgres_with_scope_and_ordering(self):
+    def test_fuzzy_directory_search_loads_only_authorized_names(self):
         connection = Connection(
             Cursor(rows=({"employee_id": "A1", "name": "Wail Ali"},))
         )
@@ -196,24 +275,23 @@ class DirectExecutionTests(unittest.TestCase):
                 allowed_employee_ids=("A1",),
             )
 
-        sql, params = next(item for item in connection.calls if "similarity" in item[0])
-        self.assertIn("ORDER BY match_score DESC", sql)
+        sql, params = next(
+            item for item in connection.calls if item[0].startswith("SELECT DISTINCT")
+        )
+        self.assertNotIn("similarity", sql)
         self.assertIn('"employee_id" = ANY(%s)', sql)
-        self.assertEqual(params[3], ["A1"])
-        self.assertEqual(params[-1], 20)
+        self.assertIn(["A1"], params)
         self.assertEqual(options[0].employee_id, "A1")
 
-    def test_fuzzy_directory_search_offers_shortened_misspelled_name(self):
+    def test_fuzzy_directory_search_always_returns_closest_options(self):
         class CandidateConnection(Connection):
             def execute(self, sql, params=None):
                 self.calls.append((sql, params))
                 if sql.startswith("BEGIN"):
                     return Cursor()
-                if "split_part" in sql:
-                    return Cursor(
-                        rows=({"employee_id": "A1", "name": "Faris Synthetic One"},)
-                    )
-                return Cursor()
+                return Cursor(
+                    rows=({"employee_id": "A1", "name": "Faris Synthetic One"},)
+                )
 
         connection = CandidateConnection(Cursor())
         with fake_psycopg(connection):
@@ -227,6 +305,22 @@ class DirectExecutionTests(unittest.TestCase):
         self.assertEqual(
             options,
             (EmployeeOption(employee_id="A1", employee_name="Faris Synthetic One"),),
+        )
+        searches = [
+            sql for sql, _ in connection.calls if sql.startswith("SELECT DISTINCT")
+        ]
+        self.assertEqual(len(searches), 1)
+        self.assertNotIn("similarity", searches[0])
+
+    def test_fuzzy_directory_search_includes_third_and_later_given_names(self):
+        options = (
+            EmployeeOption(employee_id="A1", employee_name="Wail Ahmed Saleh Mahmoud"),
+            EmployeeOption(employee_id="A2", employee_name="Wail Ahmed Saleh Omar"),
+        )
+
+        self.assertEqual(
+            rank_employee_candidates("Wael Ahmed Saleh Mahmoud", options),
+            (options[0],),
         )
 
 

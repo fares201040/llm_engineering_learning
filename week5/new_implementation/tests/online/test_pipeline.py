@@ -11,6 +11,7 @@ from week5.new_implementation.online.execution import (
     ExecutionCoverage,
     LOCAL_DEMO_ACCESS,
     SqlExecutionResult,
+    search_employee_directory_postgres,
 )
 from week5.new_implementation.online.pipeline import (
     Answered,
@@ -128,6 +129,42 @@ def database_context_with_locations():
 
 
 class PipelineTests(unittest.TestCase):
+    def test_two_fuzzy_name_parts_offer_one_employee_for_confirmation(self):
+        dependencies = self.dependencies()
+        dependencies.directory_loader = lambda **_kwargs: (
+            Employee(employee_id="A10218", name="Wael Nageeb Mahmoud"),
+            Employee(employee_id="A11026", name="Wail Saleh Awadh"),
+            Employee(employee_id="A10771", name="Waheeb Saleh Mohammed"),
+            Employee(employee_id="A10044", name="Adel Abdulla Saleh"),
+        )
+        dependencies.reference_writer = lambda question, **_kwargs: ReferenceResponse(
+            decision=AmbiguousReference(
+                rewritten_request=question,
+                locale="en",
+                reason="ambiguous_reference",
+                employee_mention="wael saleh",
+            )
+        )
+        dependencies.employee_fuzzy_search = search_employee_directory_postgres
+
+        outcome = run_turn(
+            TurnRequest(
+                question=(
+                    "Tell me the attendance from 1 to 7 September for employee "
+                    "wael saleh."
+                ),
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Clarification)
+        self.assertEqual(outcome.reply, "Did you mean Wail Saleh Awadh (A11026)?")
+        self.assertEqual(
+            outcome.state.pending_employee_confirmation.options,
+            (EmployeeOption(employee_id="A11026", employee_name="Wail Saleh Awadh"),),
+        )
+
     def test_adjusted_swipe_lookup_keeps_selected_employee_without_prior_location(self):
         employee = Employee(employee_id="A1", name="Wail Ali")
         prior = VerifiedTurn(
@@ -242,13 +279,11 @@ class PipelineTests(unittest.TestCase):
         bound = bind_references(
             ReferenceResponse(
                 decision=ReadyReference(
-                    rewritten_request=(
-                        "Compare departments at North Yard during September 2026."
-                    ),
+                    rewritten_request=question,
                     locale="en",
                     request_relationship="new",
                     subject_relationship="criteria",
-                    employee_criteria=("North Yard",),
+                    employee_criteria=("South Dock",),
                 )
             ),
             (Employee(employee_id="A1", name="Wail Ali"),),
@@ -256,7 +291,7 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(bound.request_relationship, "new")
-        self.assertEqual(bound.subject_relationship, "all_authorized")
+        self.assertEqual(bound.subject_relationship, "criteria")
         self.assertEqual(bound.updated_request, f"Request:\n{question}")
 
     def test_new_department_comparison_ignores_old_employee_and_location(self):
@@ -277,14 +312,11 @@ class PipelineTests(unittest.TestCase):
         dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
             decision=ReadyReference(
                 rewritten_request=(
-                    "Compare overtime by department at North Yard "
-                    "during September 2026 for A1."
+                    "Now compare overtime between departments during September 2026."
                 ),
                 locale="en",
-                request_relationship="follow_up",
-                subject_relationship="employees",
-                employee_ids=("A1",),
-                employee_criteria=("North Yard",),
+                request_relationship="new",
+                subject_relationship="all_authorized",
             )
         )
         seen = []
@@ -857,14 +889,15 @@ class PipelineTests(unittest.TestCase):
             outcome.state.verified_turns[-1].executed_sql,
         )
 
-    def test_missing_employee_cannot_veto_explicit_grouped_schema_aggregate(self):
+    def test_general_grouped_schema_aggregate_reaches_planner(self):
         dependencies = self.dependencies()
         dependencies.context_loader = lambda **_kwargs: attendance_schema()
         dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
-            decision=AmbiguousReference(
+            decision=ReadyReference(
                 rewritten_request="Sum Total_Worked_Hrs by Department.",
                 locale="en",
-                reason="missing_employee",
+                request_relationship="new",
+                subject_relationship="all_authorized",
             )
         )
         dependencies.planner = lambda **_kwargs: (
@@ -900,14 +933,15 @@ class PipelineTests(unittest.TestCase):
             outcome.state.verified_turns[-1].executed_sql,
         )
 
-    def test_missing_employee_cannot_veto_general_month_attendance_details(self):
+    def test_general_month_attendance_details_reach_planner(self):
         dependencies = self.dependencies()
         dependencies.context_loader = lambda **_kwargs: attendance_schema()
         dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
-            decision=AmbiguousReference(
+            decision=ReadyReference(
                 rewritten_request="Show attendance in September 2026.",
                 locale="en",
-                reason="missing_employee",
+                request_relationship="new",
+                subject_relationship="all_authorized",
             )
         )
         dependencies.planner = lambda **_kwargs: (
@@ -937,15 +971,16 @@ class PipelineTests(unittest.TestCase):
             outcome.state.verified_turns[-1].executed_sql,
         )
 
-    def test_missing_employee_general_scope_is_delegated_to_sql_planner(self):
+    def test_general_scope_is_delegated_to_sql_planner(self):
         dependencies = self.dependencies()
         dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
-            decision=AmbiguousReference(
+            decision=ReadyReference(
                 rewritten_request=(
                     "list all employees in the hr department who have manual swipe access"
                 ),
                 locale="en",
-                reason="missing_employee",
+                request_relationship="new",
+                subject_relationship="all_authorized",
             )
         )
         planned_contexts = []
@@ -1006,18 +1041,34 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(planned_contexts[0].subject_relationship, "all_authorized")
 
-    def test_unmatched_reference_mention_is_delegated_to_sql_planner(self):
+    def test_business_criterion_misread_as_person_is_reconsidered_by_planner_model(
+        self,
+    ):
         dependencies = self.dependencies()
-        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
-            decision=AmbiguousReference(
-                rewritten_request=(
-                    "How many total worked hours are in the Finance department?"
-                ),
-                locale="en",
-                reason="ambiguous_reference",
-                employee_mention="Finance department",
+        reference_models = []
+
+        def reference_writer(question, **kwargs):
+            reference_models.append(kwargs["model"])
+            if len(reference_models) == 1:
+                return ReferenceResponse(
+                    decision=AmbiguousReference(
+                        rewritten_request=question,
+                        locale="en",
+                        reason="ambiguous_reference",
+                        employee_mention="Finance department",
+                    )
+                )
+            return ReferenceResponse(
+                decision=ReadyReference(
+                    rewritten_request=question,
+                    locale="en",
+                    request_relationship="new",
+                    subject_relationship="criteria",
+                    employee_criteria=("Finance department",),
+                )
             )
-        )
+
+        dependencies.reference_writer = reference_writer
         dependencies.employee_fuzzy_search = lambda *_args, **_kwargs: ()
         dependencies.employee_fallback_search = lambda *_args, **_kwargs: self.fail(
             "unmatched business wording must not be mapped to arbitrary employees"
@@ -1049,8 +1100,9 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertIsInstance(outcome, Answered)
+        self.assertEqual(len(reference_models), 2)
         self.assertEqual(len(planned_contexts), 1)
-        self.assertEqual(planned_contexts[0].subject_relationship, "all_authorized")
+        self.assertEqual(planned_contexts[0].subject_relationship, "criteria")
         self.assertIn("Finance department", planned_contexts[0].updated_request)
 
     def test_unknown_grouped_metric_reaches_planner_capability_protocol(self):
@@ -1088,13 +1140,29 @@ class PipelineTests(unittest.TestCase):
 
     def test_unsupported_reference_cannot_veto_named_employee_aggregate(self):
         dependencies = self.dependencies()
-        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
-            decision=UnsupportedReference(
-                rewritten_request="What were Wail Ali's total worked hours?",
-                locale="en",
-                capability="outside_attendance_domain",
+        reference_calls = []
+
+        def reference_writer(_question, **kwargs):
+            reference_calls.append(kwargs["model"])
+            if len(reference_calls) == 1:
+                return ReferenceResponse(
+                    decision=UnsupportedReference(
+                        rewritten_request="What were Wail Ali's total worked hours?",
+                        locale="en",
+                        capability="outside_attendance_domain",
+                    )
+                )
+            return ReferenceResponse(
+                decision=ReadyReference(
+                    rewritten_request="What were Wail Ali's total worked hours?",
+                    locale="en",
+                    request_relationship="new",
+                    subject_relationship="employees",
+                    employee_names=("Wail Ali",),
+                )
             )
-        )
+
+        dependencies.reference_writer = reference_writer
         dependencies.planner = lambda **_kwargs: (
             "SELECT SUM(total_worked_hrs) AS worked_hours "
             "FROM attendance_records WHERE employee_id = 'A1'"
@@ -1117,6 +1185,7 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertIsInstance(outcome, Answered)
+        self.assertEqual(len(reference_calls), 2)
         self.assertEqual(outcome.state.verified_turns[-1].employee_ids, ("A1",))
 
     def test_unsupported_reference_cannot_veto_employee_status_count(self):
@@ -1263,8 +1332,13 @@ class PipelineTests(unittest.TestCase):
         )
         state = ConversationState(verified_turns=(previous_turn,))
         dependencies = self.dependencies()
-        dependencies.reference_writer = lambda *_args, **_kwargs: self.fail(
-            "clear grouped comparison must use verified state"
+        dependencies.reference_writer = lambda question, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request=question,
+                locale="en",
+                request_relationship="follow_up",
+                subject_relationship="all_authorized",
+            )
         )
         dependencies.planner = lambda **_kwargs: self.fail(
             "clear grouped comparison must not be model-replanned"
@@ -1324,9 +1398,20 @@ class PipelineTests(unittest.TestCase):
         )
         dependencies = self.dependencies()
         dependencies.context_loader = lambda **_kwargs: attendance_schema()
-        dependencies.reference_writer = lambda *_args, **_kwargs: self.fail(
-            "verified running total must not use reference model"
-        )
+        reference_questions = []
+
+        def reference_writer(question, **_kwargs):
+            reference_questions.append(question)
+            return ReferenceResponse(
+                decision=ReadyReference(
+                    rewritten_request=question,
+                    locale="en",
+                    request_relationship="follow_up",
+                    subject_relationship="all_authorized",
+                )
+            )
+
+        dependencies.reference_writer = reference_writer
         dependencies.planner = lambda **_kwargs: self.fail(
             "verified running total must not be model-replanned"
         )
@@ -1367,6 +1452,7 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertIsInstance(outcome, Answered)
+        self.assertEqual(reference_questions, ["Show a running total over dates."])
         self.assertIn("2026-08-04: 36", outcome.reply)
         self.assertIsNone(outcome.state.verified_turns[-1].date_scope)
 
@@ -1667,6 +1753,15 @@ class PipelineTests(unittest.TestCase):
             active_employees=(employee,),
         )
         dependencies = self.dependencies()
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request="Show A1 absence dates in September 2026.",
+                locale="en",
+                request_relationship="follow_up",
+                subject_relationship="employees",
+                employee_ids=("A1",),
+            )
+        )
         seen = []
 
         def planner(**kwargs):
@@ -1692,7 +1787,9 @@ class PipelineTests(unittest.TestCase):
         self.assertIsInstance(outcome, Failed)
         self.assertEqual(outcome.code, "date_scope_mismatch")
         self.assertEqual(outcome.state, previous)
-        self.assertIn("Show absence dates for employee A1.", seen[0].updated_request)
+        self.assertIn(
+            "Show A1 absence dates in September 2026.", seen[0].updated_request
+        )
         self.assertEqual(
             seen[0].previous_verified_turn["request"],
             "Show A1 in September 2026.",
@@ -1782,14 +1879,30 @@ class PipelineTests(unittest.TestCase):
 
     def test_follow_up_recovers_active_employee_when_rewriter_calls_it_missing(self):
         dependencies = self.dependencies()
-        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
-            decision=AmbiguousReference(
-                rewritten_request="Show the absence dates for Wail Ali (A1).",
-                locale="en",
-                reason="missing_employee",
-                employee_mention="Wail Ali",
+        reference_calls = []
+
+        def reference_writer(_question, **kwargs):
+            reference_calls.append(kwargs["model"])
+            if len(reference_calls) == 1:
+                return ReferenceResponse(
+                    decision=AmbiguousReference(
+                        rewritten_request="Show the absence dates for Wail Ali (A1).",
+                        locale="en",
+                        reason="missing_employee",
+                        employee_mention="Wail Ali",
+                    )
+                )
+            return ReferenceResponse(
+                decision=ReadyReference(
+                    rewritten_request="Show the absence dates for Wail Ali (A1).",
+                    locale="en",
+                    request_relationship="follow_up",
+                    subject_relationship="employees",
+                    employee_ids=("A1",),
+                )
             )
-        )
+
+        dependencies.reference_writer = reference_writer
         employee = Employee(employee_id="A1", name="Wail Ali")
         previous = ConversationState(
             active_employee_ids=("A1",), active_employees=(employee,)
@@ -1818,6 +1931,7 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertIsInstance(outcome, Answered)
+        self.assertEqual(len(reference_calls), 2)
         self.assertEqual(seen[0].request_relationship, "follow_up")
         self.assertEqual(
             seen[0].conversation_history,
@@ -2304,35 +2418,233 @@ class PipelineTests(unittest.TestCase):
         self.assertIsInstance(outcome, Unsupported)
         self.assertEqual(outcome.capability, "malformed_identifier")
 
-    def test_well_formed_unknown_employee_id_stops_before_reference(self):
+    def test_unknown_id_is_classified_by_reference_before_directory_rejection(self):
         dependencies = self.dependencies()
         dependencies.directory_loader = lambda **_kwargs: (
             Employee(employee_id="A11017", name="Known Person"),
         )
-        dependencies.reference_writer = lambda *_args, **_kwargs: self.fail(
-            "unknown explicit ID must stop before reference rewriting"
-        )
-        state = ConversationState()
+        seen = []
+
+        def reference_writer(question, **_kwargs):
+            seen.append(question)
+            return ReferenceResponse(
+                decision=ReadyReference(
+                    rewritten_request=question,
+                    locale="en",
+                    request_relationship="new",
+                    subject_relationship="employees",
+                    employee_ids=("A99999",),
+                )
+            )
+
+        dependencies.reference_writer = reference_writer
+        dependencies.planner = lambda **_kwargs: self.fail("unresolved ID reached SQL")
         outcome = run_turn(
             TurnRequest(
                 question="Show attendance for employee A99999.",
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertEqual(seen, ["Show attendance for employee A99999."])
+        self.assertIsInstance(outcome, Clarification)
+        self.assertEqual(outcome.reason, "unknown_employee_id")
+
+    def test_planner_model_rechecks_uncertain_reference_before_clarification(self):
+        dependencies = self.dependencies()
+        models = []
+
+        def reference_writer(question, **kwargs):
+            models.append(kwargs["model"])
+            if len(models) == 1:
+                return ReferenceResponse(
+                    decision=AmbiguousReference(
+                        rewritten_request=question,
+                        locale="en",
+                        reason="missing_employee",
+                    )
+                )
+            return ReferenceResponse(
+                decision=ReadyReference(
+                    rewritten_request=question,
+                    locale="en",
+                    request_relationship="new",
+                    subject_relationship="criteria",
+                    employee_criteria=("absent employees",),
+                )
+            )
+
+        dependencies.reference_writer = reference_writer
+        dependencies.planner = lambda **_kwargs: (
+            "SELECT COUNT(*) AS absent_count FROM attendance_records "
+            "WHERE exception = 'Absent'"
+        )
+        outcome = run_turn(
+            TurnRequest(
+                question="Count absent employees.",
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(len(models), 2)
+        self.assertNotEqual(models[0], models[1])
+
+    def test_planner_model_rechecks_conflicting_reference_fields(self):
+        dependencies = self.dependencies()
+        models = []
+
+        def reference_writer(question, **kwargs):
+            models.append(kwargs["model"])
+            if len(models) == 1:
+                return ReferenceResponse(
+                    decision=ReadyReference(
+                        rewritten_request=question,
+                        locale="en",
+                        request_relationship="new",
+                        subject_relationship="criteria",
+                        employee_names=("Wail Ali",),
+                    )
+                )
+            return ReferenceResponse(
+                decision=ReadyReference(
+                    rewritten_request=question,
+                    locale="en",
+                    request_relationship="new",
+                    subject_relationship="employees",
+                    employee_ids=("A1",),
+                )
+            )
+
+        dependencies.reference_writer = reference_writer
+        outcome = run_turn(
+            TurnRequest(
+                question="Show attendance for Wail Ali A1.",
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(len(models), 2)
+        self.assertNotEqual(models[0], models[1])
+        self.assertEqual(outcome.state.active_employee_ids, ("A1",))
+
+    def test_unclassified_reference_leaves_subject_for_sql_planner(self):
+        dependencies = self.dependencies()
+        dependencies.reference_writer = lambda question, **_kwargs: ReferenceResponse(
+            decision=UnsupportedReference(
+                rewritten_request=question,
+                locale="en",
+                capability="outside_attendance_domain",
+            )
+        )
+        subjects = []
+
+        def planner(**kwargs):
+            subjects.append(kwargs["shared_context"].subject_relationship)
+            return "SELECT COUNT(*) AS record_count FROM attendance_records"
+
+        dependencies.planner = planner
+        outcome = run_turn(
+            TurnRequest(
+                question="How many attendance records exist?",
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(subjects, [None])
+
+    def test_confirmed_ambiguous_follow_up_reaches_planner_with_prior_period(self):
+        pending = PendingEmployeeConfirmation(
+            original_question="Show Wail Ali's absence dates instead.",
+            mention="Wail Ali",
+            options=(EmployeeOption(employee_id="A1", employee_name="Wail Ali"),),
+            resolution=PendingResolution(
+                rewritten_request="Show Wail Ali's absence dates instead.",
+                locale="en",
+                request_relationship="follow_up",
+                subject_relationship="employees",
+            ),
+        )
+        state = ConversationState(
+            verified_turns=(
+                VerifiedTurn(
+                    turn_id="prior",
+                    original_question="Show September 2026 attendance.",
+                    rewritten_request="Show September 2026 attendance.",
+                    answer="One date.",
+                    locale="en",
+                    executed_sql=(
+                        "SELECT attendance_date FROM attendance_records "
+                        "WHERE attendance_date >= '2026-09-01' "
+                        "AND attendance_date < '2026-10-01'"
+                    ),
+                    date_scope=("2026-09-01", "2026-09-30"),
+                ),
+            ),
+            pending_employee_confirmation=pending,
+        )
+        dependencies = self.dependencies()
+        seen = []
+
+        def planner(**kwargs):
+            seen.append(kwargs["shared_context"].required_date_scope)
+            return (
+                "SELECT attendance_date FROM attendance_records "
+                "WHERE employee_id = 'A1' AND exception = 'Absent' "
+                "AND attendance_date >= '2026-09-01' "
+                "AND attendance_date < '2026-10-01'"
+            )
+
+        dependencies.planner = planner
+        outcome = run_turn(
+            TurnRequest(
+                question="1",
                 state=state,
                 access_context=LOCAL_DEMO_ACCESS,
             ),
             dependencies=dependencies,
         )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(seen, [("2026-09-01", "2026-09-30")])
+
+    def test_unresolved_person_without_candidates_does_not_reach_sql_planner(self):
+        dependencies = self.dependencies()
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=AmbiguousReference(
+                rewritten_request="Show overtime for Unknown Human.",
+                locale="en",
+                reason="ambiguous_reference",
+                employee_mention="Unknown Human",
+            )
+        )
+        dependencies.employee_fuzzy_search = lambda *_args, **_kwargs: ()
+        dependencies.planner = lambda **_kwargs: self.fail("person reached SQL")
+        outcome = run_turn(
+            TurnRequest(
+                question="Show overtime for Unknown Human.",
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+
         self.assertIsInstance(outcome, Clarification)
-        self.assertEqual(outcome.reason, "unknown_employee_id")
-        self.assertEqual(outcome.state, state)
+        self.assertEqual(outcome.reason, "ambiguous_reference")
 
     def test_unknown_written_person_stops_after_empty_directory_search(self):
         dependencies = self.dependencies()
         dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
-            decision=ReadyReference(
+            decision=AmbiguousReference(
                 rewritten_request="Count authorized records for Unknown Human.",
                 locale="en",
-                request_relationship="new",
-                subject_relationship="all_authorized",
+                reason="ambiguous_reference",
+                employee_mention="Unknown Human",
             )
         )
         dependencies.employee_fuzzy_search = lambda *_args, **_kwargs: ()
@@ -2347,7 +2659,7 @@ class PipelineTests(unittest.TestCase):
             dependencies=dependencies,
         )
         self.assertIsInstance(outcome, Clarification)
-        self.assertEqual(outcome.reason, "unknown_employee_id")
+        self.assertEqual(outcome.reason, "ambiguous_reference")
 
     def test_non_finite_numeric_comparison_is_unsupported_before_reference(self):
         dependencies = self.dependencies()
@@ -2387,29 +2699,6 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertIsInstance(outcome, Answered)
-
-    def test_malformed_id_is_rejected_before_reference_or_fuzzy_search(self):
-        dependencies = self.dependencies()
-        dependencies.directory_loader = lambda **_kwargs: (
-            Employee(employee_id="A10017", name="Iftikhar Hasson Ismail"),
-        )
-        dependencies.reference_writer = lambda *_args, **_kwargs: self.fail(
-            "reference resolution must not run"
-        )
-        dependencies.employee_fuzzy_search = lambda *_args, **_kwargs: self.fail(
-            "fuzzy search must not run"
-        )
-
-        outcome = run_turn(
-            TurnRequest(
-                question="Show attendance for A10.",
-                access_context=LOCAL_DEMO_ACCESS,
-            ),
-            dependencies=dependencies,
-        )
-
-        self.assertIsInstance(outcome, Unsupported)
-        self.assertEqual(outcome.capability, "malformed_identifier")
 
     def test_impossible_calendar_date_is_unsupported_before_reference(self):
         dependencies = self.dependencies()

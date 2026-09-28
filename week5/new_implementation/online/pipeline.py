@@ -54,13 +54,12 @@ from .reference import (
     Employee,
     EmployeeOption,
     PendingEmployeeConfirmation,
+    ReadyReference,
     ReferenceResponse,
     UnsupportedReference,
     attach_resolved_employees,
     bind_references,
     complete_confirmation,
-    has_malformed_identifier,
-    has_unknown_identifier,
     request_references,
     search_employee_candidates,
 )
@@ -823,6 +822,11 @@ def run_turn(
             [item.model_dump(mode="json") for item in directory],
         )
         authoritative = {item.employee_id: item for item in directory}
+        active = tuple(
+            authoritative[item]
+            for item in previous.active_employee_ids
+            if item in authoritative
+        )
         pending = previous.pending_employee_confirmation
         pending_response = (
             _pending_response(request.question, pending)
@@ -884,25 +888,6 @@ def run_turn(
                 {"status": "selected", "employee": selected.model_dump(mode="json")},
             )
         else:
-            if has_malformed_identifier(question, directory):
-                log_layer_output(
-                    "unsupported",
-                    {
-                        "capability": "malformed_identifier",
-                        "state": previous.model_dump(mode="json"),
-                    },
-                )
-                return Unsupported(
-                    reply=_unsupported_identifier(locale),
-                    state=previous,
-                    capability="malformed_identifier",
-                )
-            if has_unknown_identifier(question, directory):
-                return Clarification(
-                    reply=_clarification("unknown_employee_id", locale),
-                    state=previous,
-                    reason="unknown_employee_id",
-                )
             request_issue = _request_value_issue(question)
             if request_issue is not None:
                 log_layer_output(
@@ -917,139 +902,73 @@ def run_turn(
                     state=previous,
                     capability=request_issue,
                 )
-            active = tuple(
-                authoritative[item]
-                for item in previous.active_employee_ids
-                if item in authoritative
+            reference = deps.reference_writer(
+                question,
+                history=conversation_history,
+                trusted_context=previous.trusted_context(),
+                active_employees=active,
+                as_of_date=as_of_date,
+                model=settings.llm_reference_model,
+                budget=budget,
+                timeout=settings.llm_reference_timeout_seconds,
+                max_output_tokens=settings.llm_reference_max_output_tokens,
+                observer=observer,
             )
-            if previous.verified_turns and is_grouped_month_comparison_question(
-                question
-            ):
-                database_context = deps.context_loader(
-                    dsn=settings.postgres_readonly_dsn,
-                    attendance_objects=(settings.postgres_attendance_table,),
-                    connect_timeout=settings.postgres_connect_timeout_seconds,
+            decision = reference.decision
+            needs_reconsideration = isinstance(
+                decision, (AmbiguousReference, UnsupportedReference)
+            )
+            if isinstance(decision, ReadyReference):
+                has_employee_references = bool(
+                    decision.employee_ids
+                    or decision.employee_names
+                    or decision.identity_claims
                 )
-                native_comparison = build_grouped_month_comparison(
-                    question=question,
-                    previous_sql=previous.verified_turns[-1].executed_sql,
-                    previous_date_scope=previous.verified_turns[-1].date_scope,
-                    as_of_date=as_of_date,
-                    database_context=database_context,
+                needs_reconsideration = (
+                    decision.subject_relationship in {"criteria", "all_authorized"}
+                    and has_employee_references
+                ) or (
+                    decision.subject_relationship
+                    in {"employees", "union", "intersection"}
+                    and not has_employee_references
+                    and not (decision.request_relationship == "follow_up" and active)
                 )
             if (
-                previous.verified_turns
-                and not active
-                and is_running_total_question(question)
+                needs_reconsideration
+                and settings.llm_planner_model != settings.llm_reference_model
             ):
-                if database_context is None:
-                    database_context = deps.context_loader(
-                        dsn=settings.postgres_readonly_dsn,
-                        attendance_objects=(settings.postgres_attendance_table,),
-                        connect_timeout=settings.postgres_connect_timeout_seconds,
-                    )
-                native_running_total = build_running_total(
-                    question=question,
-                    previous_sql=previous.verified_turns[-1].executed_sql,
-                    previous_date_scope=previous.verified_turns[-1].date_scope,
-                    database_context=database_context,
-                )
-            if native_comparison is not None or native_running_total is not None:
-                bound = BoundReferences(
-                    rewritten_request=question,
-                    updated_request=attach_resolved_employees(question, active),
-                    locale=locale,
-                    request_relationship="follow_up",
-                    subject_relationship="employees" if active else "all_authorized",
-                    employees=active,
-                )
-                if native_comparison is not None:
-                    log_layer_output("native_comparison_plan", native_comparison.sql)
-                else:
-                    log_layer_output(
-                        "native_running_total_plan", native_running_total.sql
-                    )
-            else:
                 reference = deps.reference_writer(
                     question,
                     history=conversation_history,
                     trusted_context=previous.trusted_context(),
                     active_employees=active,
                     as_of_date=as_of_date,
-                    model=settings.llm_reference_model,
+                    model=settings.llm_planner_model,
                     budget=budget,
-                    timeout=settings.llm_reference_timeout_seconds,
+                    timeout=settings.llm_planner_timeout_seconds,
                     max_output_tokens=settings.llm_reference_max_output_tokens,
                     observer=observer,
                 )
-                if isinstance(reference.decision, UnsupportedReference):
-                    deterministic = bind_references(
-                        ReferenceResponse(
-                            decision=AmbiguousReference(
-                                rewritten_request=(
-                                    reference.decision.rewritten_request or question
-                                ),
-                                locale=reference.decision.locale,
-                                reason="missing_employee",
-                            )
-                        ),
-                        directory,
-                        original_question=question,
-                        active_employees=active,
-                        has_verified_turns=bool(previous.verified_turns),
-                    )
-                    if (
-                        deterministic.employees
-                        or deterministic.confirmation is not None
-                        or deterministic.unresolved_mention is not None
-                    ):
-                        bound = deterministic
-                    else:
-                        bound = BoundReferences(
-                            rewritten_request=(
-                                reference.decision.rewritten_request or question
-                            ),
-                            updated_request=attach_resolved_employees(
-                                reference.decision.rewritten_request or question, ()
-                            ),
-                            locale=reference.decision.locale,
-                            request_relationship="new",
-                            subject_relationship="all_authorized",
-                        )
-                    log_layer_output("planner_owned_capability", bound.updated_request)
-                else:
-                    bound = bind_references(
-                        reference,
-                        directory,
-                        original_question=question,
-                        active_employees=active,
-                        has_verified_turns=bool(previous.verified_turns),
-                    )
+                log_layer_output("reference_reconsidered", reference)
+            if isinstance(reference.decision, UnsupportedReference):
+                bound = BoundReferences(
+                    rewritten_request=question,
+                    updated_request=attach_resolved_employees(question, ()),
+                    locale=reference.decision.locale,
+                    request_relationship="new",
+                    subject_relationship=None,
+                )
+                log_layer_output("planner_owned_capability", bound.updated_request)
+            else:
+                bound = bind_references(
+                    reference,
+                    directory,
+                    original_question=question,
+                    active_employees=active,
+                    has_verified_turns=bool(previous.verified_turns),
+                )
 
         bound = bound.model_copy(update={"locale": _locale(question)})
-
-        if (
-            bound.ambiguous
-            and bound.unresolved_mention is None
-            and bound.subject_relationship is None
-            and not (previous.active_employee_ids and not active)
-        ):
-            rewritten_request = bound.rewritten_request or question
-            bound = BoundReferences(
-                rewritten_request=rewritten_request,
-                updated_request=attach_resolved_employees(
-                    rewritten_request, bound.employees
-                ),
-                locale=bound.locale,
-                request_relationship=bound.request_relationship,
-                subject_relationship=(
-                    bound.subject_relationship
-                    or ("employees" if bound.employees else "all_authorized")
-                ),
-                employee_criteria=bound.employee_criteria,
-                employees=bound.employees,
-            )
-            log_layer_output("planner_owned_ambiguity", rewritten_request)
 
         log_layer_output("employee_resolution", bound)
 
@@ -1071,6 +990,7 @@ def run_turn(
                     dsn=settings.postgres_readonly_dsn,
                     table=settings.postgres_attendance_table,
                     allowed_employee_ids=allowed_employee_ids,
+                    directory=directory,
                     connect_timeout=settings.postgres_connect_timeout_seconds,
                 )
                 log_layer_output("employee_fuzzy_search", postgres_options)
@@ -1110,15 +1030,11 @@ def run_turn(
                     state=previous,
                     reason="unknown_employee_id",
                 )
-            rewritten_request = bound.rewritten_request or question
-            bound = BoundReferences(
-                rewritten_request=rewritten_request,
-                updated_request=attach_resolved_employees(rewritten_request, ()),
-                locale=bound.locale,
-                request_relationship=bound.request_relationship,
-                subject_relationship="all_authorized",
+            return Clarification(
+                reply=_clarification(bound.reason, bound.locale),
+                state=previous,
+                reason=bound.reason,
             )
-            log_layer_output("planner_owned_ambiguity", rewritten_request)
         if bound.reason == "malformed_identifier":
             log_layer_output(
                 "unsupported",
@@ -1142,6 +1058,43 @@ def run_turn(
                 state=previous,
                 reason=bound.reason,
             )
+
+        native_scope_eligible = (
+            bound.request_relationship == "follow_up"
+            and bound.subject_relationship in {"employees", "all_authorized"}
+            and bound.employee_ids == tuple(item.employee_id for item in active)
+            and bool(previous.verified_turns)
+        )
+        if native_scope_eligible and is_grouped_month_comparison_question(question):
+            database_context = deps.context_loader(
+                dsn=settings.postgres_readonly_dsn,
+                attendance_objects=(settings.postgres_attendance_table,),
+                connect_timeout=settings.postgres_connect_timeout_seconds,
+            )
+            native_comparison = build_grouped_month_comparison(
+                question=question,
+                previous_sql=previous.verified_turns[-1].executed_sql,
+                previous_date_scope=previous.verified_turns[-1].date_scope,
+                as_of_date=as_of_date,
+                database_context=database_context,
+            )
+            if native_comparison is not None:
+                log_layer_output("native_comparison_plan", native_comparison.sql)
+        if native_scope_eligible and not active and is_running_total_question(question):
+            if database_context is None:
+                database_context = deps.context_loader(
+                    dsn=settings.postgres_readonly_dsn,
+                    attendance_objects=(settings.postgres_attendance_table,),
+                    connect_timeout=settings.postgres_connect_timeout_seconds,
+                )
+            native_running_total = build_running_total(
+                question=question,
+                previous_sql=previous.verified_turns[-1].executed_sql,
+                previous_date_scope=previous.verified_turns[-1].date_scope,
+                database_context=database_context,
+            )
+            if native_running_total is not None:
+                log_layer_output("native_running_total_plan", native_running_total.sql)
 
         if bound.request_relationship == "new":
             # For an independent request, the current question is the authority

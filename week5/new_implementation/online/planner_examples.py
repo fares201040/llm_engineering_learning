@@ -212,6 +212,88 @@ def planner_examples(context: DatabaseContext) -> str:
                 f"SELECT SUM(NULLIF({expression}, '')::numeric) "
                 f"AS numeric_total FROM {source};"
             )
+    overtime_fields = {
+        field.name: field
+        for column in table.columns
+        for field in column.json_fields
+        if field.name in {"OT_Type_1", "OT_Value_1", "OT_Type_2", "OT_Value_2"}
+    }
+    if len(overtime_fields) == 4:
+        type_1 = overtime_fields["OT_Type_1"].sql_text_expression
+        value_1 = overtime_fields["OT_Value_1"].sql_text_expression
+        type_2 = overtime_fields["OT_Type_2"].sql_text_expression
+        value_2 = overtime_fields["OT_Value_2"].sql_text_expression
+
+        def overtime_value(
+            type_expression: str, value_expression: str, label: str
+        ) -> str:
+            return (
+                f"CASE WHEN {type_expression} = '{label}' "
+                f"THEN COALESCE(NULLIF({value_expression}, '')::numeric, 0) "
+                "ELSE 0 END"
+            )
+
+        category_values = (
+            ("normal_ot", overtime_value(type_1, value_1, "Normal OT")),
+            ("week_off_ot", overtime_value(type_1, value_1, "Week Off OT")),
+            ("night_ot", overtime_value(type_2, value_2, "Night OT")),
+        )
+        current_total = (
+            f"COALESCE(NULLIF({value_1}, '')::numeric, 0) + "
+            f"COALESCE(NULLIF({value_2}, '')::numeric, 0)"
+        )
+        report_columns = [
+            _identifier(name)
+            for name in ("record_id", "employee_id", "name", "attendance_date")
+            if name in columns
+        ]
+        report_columns.extend(
+            f"{expression} AS {alias}" for alias, expression in category_values
+        )
+        report_columns.append(f"({current_total}) AS current_ot")
+        report_columns.append("COUNT(*) OVER() AS matched_count")
+        order_by = f" ORDER BY {date_field}" if date_field else ""
+        examples.append(
+            "Attendance report with the requested overtime kinds: use the "
+            "same type/value conditions with the current employee and date "
+            "filters; current_ot is the sum of the two mutable values. These "
+            "aliases are calculated result columns, not physical table columns:\n"
+            f"SELECT {', '.join(report_columns)} FROM {source}"
+            f"{order_by} LIMIT 100;"
+        )
+        total_columns = [
+            f"SUM({expression}) AS {alias}" for alias, expression in category_values
+        ]
+        total_columns.append(f"SUM({current_total}) AS current_ot")
+        examples.append(
+            "Overtime type totals. Unqualified employee overtime request: return "
+            "all three current kinds and their overall current total over the "
+            "requested employee, date, and group "
+            "scope. Use current mutable values for the total, not the immutable "
+            "OT_Authorized audit baseline:\n"
+            f"SELECT {', '.join(total_columns)} FROM {source};"
+        )
+        if "ot_authorized" in columns:
+            audit_columns = [
+                _identifier(name)
+                for name in ("record_id", "employee_id", "attendance_date")
+                if name in columns
+            ]
+            audit_columns.extend(
+                (
+                    '"ot_authorized" AS original_authorized_ot',
+                    f"({current_total}) AS current_ot",
+                    f'({current_total}) - "ot_authorized" AS adjustment_delta',
+                    "COUNT(*) OVER() AS matched_count",
+                )
+            )
+            examples.append(
+                "Overtime adjustment audit only when requested: compare the "
+                "immutable original authorized total with the current mutable "
+                "values. Retain requested employee/date filters:\n"
+                f"SELECT {', '.join(audit_columns)} FROM {source}"
+                f"{order_by} LIMIT 100;"
+            )
     if context.relationships:
         relation = context.relationships[0]
         if relation.from_columns and relation.to_columns:

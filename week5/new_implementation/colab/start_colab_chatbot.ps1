@@ -19,7 +19,15 @@ function Invoke-Colab {
         [Parameter(Mandatory)] [string[]]$CommandArguments,
         [switch]$Capture
     )
-    $output = & wsl.exe -d $WslDistro -- $ColabBinary --auth=adc @CommandArguments 2>&1
+    # Windows PowerShell turns native stderr into terminating errors under Stop.
+    # Keep the complete Colab traceback so the actual failure remains visible.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $output = & wsl.exe -d $WslDistro -- $ColabBinary --auth=adc @CommandArguments 2>&1
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
     if ($LASTEXITCODE -ne 0) {
         throw ($output | Out-String)
     }
@@ -61,6 +69,15 @@ $RuntimeLabel = if ($null -eq $Gpu) { "CPU" } else { $Gpu }
 
 if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
     throw "Project Python environment not found at $Python"
+}
+
+$OpenAiApiKey = $env:OPENAI_API_KEY
+if ([string]::IsNullOrWhiteSpace($OpenAiApiKey)) {
+    $OpenAiApiKey = & $Python -c "from dotenv import dotenv_values; import sys; sys.stdout.write(dotenv_values(sys.argv[1]).get('OPENAI_API_KEY') or '')" (Join-Path $RepoRoot ".env")
+    if ($LASTEXITCODE -ne 0) { throw "Could not read OPENAI_API_KEY from the project .env file." }
+}
+if ([string]::IsNullOrWhiteSpace($OpenAiApiKey)) {
+    throw "OPENAI_API_KEY is required. Set it in the PowerShell environment or the project .env file."
 }
 
 Write-Host "1/6 Packaging the current application code..."
@@ -108,6 +125,18 @@ Invoke-Colab -CommandArguments @(
     "upload", "--session", $SessionName,
     $PayloadWsl, "/content/attendance_private_payload.next.zip"
 )
+$ApiKeyFile = [System.IO.Path]::GetTempFileName()
+try {
+    [System.IO.File]::WriteAllText($ApiKeyFile, $OpenAiApiKey)
+    $ApiKeyWsl = Convert-ToWslPath $ApiKeyFile
+    Invoke-Colab -CommandArguments @(
+        "upload", "--session", $SessionName,
+        $ApiKeyWsl, "/content/.attendance_openai_api_key"
+    )
+} finally {
+    Remove-Item -LiteralPath $ApiKeyFile -Force -ErrorAction SilentlyContinue
+    $OpenAiApiKey = $null
+}
 
 if ($reused) {
     Write-Host "5/6 Restarting the reused Colab kernel..."

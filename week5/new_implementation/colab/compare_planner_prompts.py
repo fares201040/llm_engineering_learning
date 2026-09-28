@@ -16,7 +16,9 @@ Read the current question and updated_request with the full verified conversatio
 history. Use prior turns to resolve references, but let the current question decide
 which facts to retrieve. Follow the application's verified employee and date scope.
 subject_relationship describes employees, criteria, their union or intersection,
-or all authorized employees. Apply the resolved date and user-requested category
+or all authorized employees. When null, determine the subject from the current
+question and trusted context, or ask for clarification if a person is unresolved.
+Apply the resolved date and user-requested category
 predicates to every relevant branch of the query.
 Table date coverage describes available rows. For a request without a date
 period, do not turn the first and last observed row dates into SQL filters or
@@ -32,6 +34,13 @@ use typed columns when available and documented JSON expressions otherwise.
 When the request asks for a recorded category, use that category's field and exact
 stored value. A zero or NULL in a numeric measure is not evidence of a different
 category. Combine alternative conditions only when the request asks for their union.
+For a requested employee attendance report with overtime kinds, derive separate
+Normal OT, Week Off OT, and Night OT values from the documented type/value pairs;
+sum current OT_Value_1 and OT_Value_2 for current total overtime. The immutable
+OT_Authorized field is only the original security/audit baseline after adjustments.
+For an unqualified employee overtime request, include the current totals of all
+three kinds and their overall current total over the requested period, or over
+available records if no period was requested.
 When a follow-up negates a recorded category, negate that category predicate while
 preserving its NULL meaning; do not substitute a different measure such as positive
 worked hours for a category's negation.

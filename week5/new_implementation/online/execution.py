@@ -5,15 +5,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
+from difflib import SequenceMatcher
 import json
 import re
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlglot import exp, parse
 from sqlglot.errors import ParseError
 
 from .limits import MAX_EMPLOYEE_CANDIDATES
+
+if TYPE_CHECKING:
+    from .reference import Employee, EmployeeOption
 
 
 @dataclass(frozen=True)
@@ -301,39 +305,116 @@ def load_employee_directory(
     )
 
 
+def _name_parts(value: str) -> tuple[str, ...]:
+    return tuple(re.findall(r"[^\W_]+", value.casefold()))
+
+
+def _name_similarity(left: str, right: str) -> float:
+    if left == right:
+        return 1.0
+    score = SequenceMatcher(None, left, right).ratio()
+    return score if left[0] == right[0] else score * 0.6
+
+
+def rank_employee_candidates(
+    mention: str,
+    options: tuple[EmployeeOption, ...],
+    *,
+    part_threshold: float = 0.7,
+    limit: int = MAX_EMPLOYEE_CANDIDATES,
+) -> tuple[EmployeeOption, ...]:
+    """Prefer ordered given-name matches; offer a short fallback when none exist."""
+
+    requested = _name_parts(mention)
+    if not requested or limit < 1:
+        return ()
+    scored: list[tuple[int, float, float, float, EmployeeOption]] = []
+    for option in options:
+        candidate = _name_parts(option.employee_name)
+        if not candidate:
+            continue
+        positional = tuple(
+            _name_similarity(part, candidate[index]) if index < len(candidate) else 0.0
+            for index, part in enumerate(requested)
+        )
+        prefix_matches = 0
+        for score in positional:
+            if score < part_threshold:
+                break
+            prefix_matches += 1
+        ordered_score = sum(positional) / len(requested)
+        coverage_score = sum(
+            max(_name_similarity(part, name_part) for name_part in candidate)
+            for part in requested
+        ) / len(requested)
+        full_score = _name_similarity(" ".join(requested), " ".join(candidate))
+        scored.append(
+            (prefix_matches, ordered_score, coverage_score, full_score, option)
+        )
+    scored.sort(
+        key=lambda item: (
+            -item[0],
+            -item[1],
+            -item[2],
+            -item[3],
+            item[4].employee_id,
+        )
+    )
+    if not scored:
+        return ()
+    display_limit = min(limit, 5)
+    best_prefix = scored[0][0]
+    if len(requested) >= 2 and best_prefix == len(requested):
+        return tuple(item[4] for item in scored if item[0] == best_prefix)[
+            :display_limit
+        ]
+    if len(requested) >= 2 and best_prefix:
+        scored = [item for item in scored if item[0] == best_prefix]
+    return tuple(item[4] for item in scored[:display_limit])
+
+
 def search_employee_directory_postgres(
     mention: str,
     *,
     dsn: str,
     table: str,
     allowed_employee_ids: tuple[str, ...] | None,
-    threshold: float = 0.62,
-    token_threshold: float = 0.3,
+    directory: tuple[Employee, ...] | None = None,
     limit: int = MAX_EMPLOYEE_CANDIDATES,
     connect_timeout: int = 5,
 ):
-    """Return deterministic pg_trgm candidates from the authorized directory."""
+    """Rank authorized directory names, loading PostgreSQL only when needed."""
 
     if limit < 1 or allowed_employee_ids == ():
         return ()
+    from .reference import EmployeeOption
+
+    if directory is not None:
+        allowed = (
+            set(allowed_employee_ids) if allowed_employee_ids is not None else None
+        )
+        options = tuple(
+            EmployeeOption(employee_id=item.employee_id, employee_name=item.name)
+            for item in directory
+            if allowed is None or item.employee_id in allowed
+        )
+        return rank_employee_candidates(mention, options, limit=limit)
+
     import psycopg
     from psycopg.rows import dict_row
 
-    from .reference import EmployeeOption
-
-    params: list[object] = [mention, mention, threshold]
+    if not _name_parts(mention):
+        return ()
+    params: list[object] = []
     scope_sql = ""
     if allowed_employee_ids is not None:
         scope_sql = ' AND "employee_id" = ANY(%s)'
         params.append(list(allowed_employee_ids))
-    params.append(limit)
     sql = (
-        'SELECT DISTINCT "employee_id", "name", '
-        'similarity(lower("name"), lower(%s)) AS match_score '
+        'SELECT DISTINCT "employee_id", "name" '
         f"FROM {_identifier(table)} "
-        'WHERE "employee_id" IS NOT NULL AND "name" IS NOT NULL '
-        'AND similarity(lower("name"), lower(%s)) >= %s'
-        f'{scope_sql} ORDER BY match_score DESC, "employee_id" ASC LIMIT %s'
+        'WHERE "employee_id" IS NOT NULL AND "name" IS NOT NULL'
+        f'{scope_sql} ORDER BY "employee_id"'
     )
     with psycopg.connect(
         dsn,
@@ -345,40 +426,18 @@ def search_employee_directory_postgres(
                 "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
             )
             rows = connection.execute(sql, tuple(params)).fetchall()
-            if not rows:
-                token_sql = (
-                    'SELECT DISTINCT "employee_id", "name", '
-                    "similarity(lower(split_part(\"name\", ' ', 1)), "
-                    "lower(split_part(%s, ' ', 1))) AS match_score, "
-                    'similarity(lower("name"), lower(%s)) AS full_match_score '
-                    f"FROM {_identifier(table)} "
-                    'WHERE "employee_id" IS NOT NULL AND "name" IS NOT NULL '
-                    "AND similarity(lower(split_part(\"name\", ' ', 1)), "
-                    "lower(split_part(%s, ' ', 1))) >= %s"
-                    f"{scope_sql} ORDER BY match_score DESC, full_match_score DESC, "
-                    '"employee_id" ASC LIMIT %s'
-                )
-                token_params: list[object] = [
-                    mention,
-                    mention,
-                    mention,
-                    token_threshold,
-                ]
-                if allowed_employee_ids is not None:
-                    token_params.append(list(allowed_employee_ids))
-                token_params.append(limit)
-                rows = connection.execute(token_sql, tuple(token_params)).fetchall()
             connection.rollback()
         except Exception:
             connection.rollback()
             raise
-    return tuple(
+    options = tuple(
         EmployeeOption(
             employee_id=str(row["employee_id"]),
             employee_name=str(row["name"]),
         )
         for row in rows
     )
+    return rank_employee_candidates(mention, options, limit=limit)
 
 
 __all__ = [
@@ -392,5 +451,6 @@ __all__ = [
     "authorize_access",
     "execute_sql",
     "load_employee_directory",
+    "rank_employee_candidates",
     "search_employee_directory_postgres",
 ]

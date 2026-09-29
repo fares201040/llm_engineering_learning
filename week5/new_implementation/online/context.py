@@ -35,7 +35,7 @@ class DatabaseJsonField(_Strict):
 
 
 class DatabaseDateCoverage(_Strict):
-    """Observed inclusive bounds for a table's authoritative business date."""
+    """Inclusive observed bounds within the caller's accessible rows."""
 
     field: str = Field(min_length=1, max_length=128)
     available_start: str | None = None
@@ -217,6 +217,9 @@ class SharedModelContext(_Strict):
     """The exact context reused downstream without reconstruction."""
 
     current_question: str = Field(min_length=1, max_length=50000)
+    latest_user_message: str | None = Field(
+        default=None, min_length=1, max_length=50000
+    )
     as_of_date: str = Field(default_factory=lambda: date.today().isoformat())
     updated_request: str = Field(min_length=1, max_length=60000)
     previous_verified_turn: dict[str, object] | None = None
@@ -329,6 +332,7 @@ class SharedModelContext(_Strict):
             ),
             "resolution_statement": self.resolution_statement,
             "current_question": self.current_question,
+            "latest_user_message": self.latest_user_message or self.current_question,
             "updated_request": self.updated_request,
             "previous_verified_turn": self.previous_verified_turn,
             "request_relationship": self.request_relationship,
@@ -542,24 +546,35 @@ def _discover_standard_values(
     schema_name: str,
     table_name: str,
     column_name: str,
+    allowed_employee_ids: tuple[str, ...] | None = None,
 ) -> tuple[str, ...]:
-    """Return bounded exact values for a low-cardinality categorical column."""
+    """Return bounded exact values from the caller's accessible rows."""
 
     from psycopg import sql
 
-    rows = connection.execute(
-        sql.SQL(
-            "SELECT DISTINCT btrim({column}::text) AS value "
-            "FROM {schema}.{table} "
-            "WHERE {column} IS NOT NULL AND btrim({column}::text) <> '' "
-            "ORDER BY value LIMIT {limit}"
-        ).format(
-            column=sql.Identifier(column_name),
-            schema=sql.Identifier(schema_name),
-            table=sql.Identifier(table_name),
-            limit=sql.Literal(_STANDARD_VALUE_LIMIT + 1),
-        )
-    ).fetchall()
+    scope = (
+        sql.SQL(" AND employee_id = ANY(%s)")
+        if allowed_employee_ids is not None
+        else sql.SQL("")
+    )
+    query = sql.SQL(
+        "SELECT DISTINCT btrim({column}::text) AS value "
+        "FROM {schema}.{table} "
+        "WHERE {column} IS NOT NULL AND btrim({column}::text) <> '' "
+        "{scope} "
+        "ORDER BY value LIMIT {limit}"
+    ).format(
+        column=sql.Identifier(column_name),
+        schema=sql.Identifier(schema_name),
+        table=sql.Identifier(table_name),
+        scope=scope,
+        limit=sql.Literal(_STANDARD_VALUE_LIMIT + 1),
+    )
+    rows = (
+        connection.execute(query, (list(allowed_employee_ids),)).fetchall()
+        if allowed_employee_ids is not None
+        else connection.execute(query).fetchall()
+    )
     values = tuple(str(row["value"]) for row in rows if row.get("value") is not None)
     return values if len(values) <= _STANDARD_VALUE_LIMIT else ()
 
@@ -569,8 +584,9 @@ def load_database_context(
     dsn: str,
     attendance_objects: tuple[str, ...],
     connect_timeout: int = 5,
+    allowed_employee_ids: tuple[str, ...] | None = None,
 ) -> DatabaseContext:
-    """Inspect only explicitly allowlisted attendance tables/views."""
+    """Inspect allowlisted objects and observations from accessible rows."""
 
     if not attendance_objects:
         raise ValueError("at least one attendance database object is required")
@@ -638,6 +654,7 @@ def load_database_context(
                         schema_name=schema_name,
                         table_name=table_name,
                         column_name=column_name,
+                        allowed_employee_ids=allowed_employee_ids,
                     )
                     for row in rows
                     for column_name in (str(row["column_name"]),)
@@ -669,19 +686,27 @@ def load_database_context(
                 )
                 date_coverage = None
                 if any(column.name == "attendance_date" for column in columns):
+                    coverage_query = sql.SQL(
+                        "SELECT MIN({field}) AS available_start, "
+                        "MAX({field}) AS available_end FROM {schema}.{table} "
+                        "{scope}"
+                    ).format(
+                        field=sql.Identifier("attendance_date"),
+                        schema=sql.Identifier(schema_name),
+                        table=sql.Identifier(table_name),
+                        scope=(
+                            sql.SQL("WHERE employee_id = ANY(%s)")
+                            if allowed_employee_ids is not None
+                            else sql.SQL("")
+                        ),
+                    )
                     coverage_row = (
                         connection.execute(
-                            sql.SQL(
-                                "SELECT MIN({field}) AS available_start, "
-                                "MAX({field}) AS available_end FROM {schema}.{table}"
-                            ).format(
-                                field=sql.Identifier("attendance_date"),
-                                schema=sql.Identifier(schema_name),
-                                table=sql.Identifier(table_name),
-                            )
-                        ).fetchone()
-                        or {}
-                    )
+                            coverage_query, (list(allowed_employee_ids),)
+                        )
+                        if allowed_employee_ids is not None
+                        else connection.execute(coverage_query)
+                    ).fetchone() or {}
                     available_start = coverage_row.get("available_start")
                     available_end = coverage_row.get("available_end")
                     date_coverage = DatabaseDateCoverage(

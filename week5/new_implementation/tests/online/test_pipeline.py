@@ -2665,6 +2665,7 @@ class PipelineTests(unittest.TestCase):
             set(seen["planner"].model_payload()),
             {
                 "current_question",
+                "latest_user_message",
                 "as_of_date",
                 "last_calendar_month",
                 "updated_request",
@@ -2686,6 +2687,7 @@ class PipelineTests(unittest.TestCase):
             },
         )
         self.assertEqual(seen["planner"].current_question, "show A1 dates")
+        self.assertEqual(seen["planner"].latest_user_message, "show A1 dates")
         self.assertEqual(
             seen["planner"].conversation_history,
             ({"role": "user", "content": "attendance for A1"},),
@@ -2716,6 +2718,31 @@ class PipelineTests(unittest.TestCase):
             "publication",
         ):
             self.assertIn(f"layer={layer}", combined)
+
+    def test_restricted_access_scopes_schema_observations(self):
+        dependencies = self.dependencies()
+        seen = []
+
+        def load_context(**kwargs):
+            seen.append(kwargs["allowed_employee_ids"])
+            return database_context()
+
+        dependencies.context_loader = load_context
+        outcome = run_turn(
+            TurnRequest(
+                question="Show A1 absence dates.",
+                access_context=AccessContext(
+                    principal_id="restricted",
+                    domain="attendance",
+                    allowed_domains=frozenset({"attendance"}),
+                    attendance_scope=AttendanceRowScope("employee_ids", ("A1",)),
+                ),
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(seen, [("A1",)])
 
     def test_provider_or_verifier_failure_preserves_exact_prior_state(self):
         state = ConversationState(active_employee_ids=("A1",))
@@ -3253,7 +3280,7 @@ class PipelineTests(unittest.TestCase):
         seen = []
 
         def planner(**kwargs):
-            seen.append(kwargs["shared_context"].required_date_scope)
+            seen.append(kwargs["shared_context"])
             return (
                 "SELECT attendance_date FROM attendance_records "
                 "WHERE employee_id = 'A1' AND exception = 'Absent' "
@@ -3272,7 +3299,10 @@ class PipelineTests(unittest.TestCase):
         )
 
         self.assertIsInstance(outcome, Answered)
-        self.assertEqual(seen, [("2026-09-01", "2026-09-30")])
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0].current_question, pending.original_question)
+        self.assertEqual(seen[0].latest_user_message, "1")
+        self.assertEqual(seen[0].required_date_scope, ("2026-09-01", "2026-09-30"))
 
     def test_unresolved_person_without_candidates_does_not_reach_sql_planner(self):
         dependencies = self.dependencies()

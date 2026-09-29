@@ -89,6 +89,103 @@ class DatabaseContextTests(unittest.TestCase):
 
         self.assertEqual(values, ("Finance", "Human Resource", "Operations"))
 
+    def test_standard_values_respect_employee_access_scope(self):
+        seen = []
+
+        class Result:
+            def fetchall(self):
+                return [{"value": "Finance"}]
+
+        class Connection:
+            def execute(self, query, params=None):
+                seen.append((str(query), params))
+                return Result()
+
+        values = context._discover_standard_values(
+            Connection(),
+            schema_name="public",
+            table_name="attendance_records",
+            column_name="department",
+            allowed_employee_ids=("A1",),
+        )
+
+        self.assertEqual(values, ("Finance",))
+        self.assertIn("employee_id", seen[0][0])
+        self.assertEqual(seen[0][1], (["A1"],))
+
+    def test_date_coverage_respects_employee_access_scope(self):
+        from unittest.mock import patch
+
+        class Result:
+            def __init__(self, rows):
+                self.rows = rows
+
+            def fetchone(self):
+                return self.rows[0] if self.rows else None
+
+            def fetchall(self):
+                return self.rows
+
+        class Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def rollback(self):
+                pass
+
+            def execute(self, query, params=None):
+                statement = str(query)
+                if "server_version" in statement:
+                    return Result([{"server_version": "16"}])
+                if "information_schema.columns" in statement:
+                    return Result(
+                        [
+                            {
+                                "column_name": name,
+                                "data_type": data_type,
+                                "udt_name": data_type,
+                                "is_nullable": "NO",
+                                "table_type": "BASE TABLE",
+                                "column_comment": None,
+                                "table_comment": None,
+                            }
+                            for name, data_type in (
+                                ("employee_id", "text"),
+                                ("attendance_date", "date"),
+                            )
+                        ]
+                    )
+                if "SELECT DISTINCT" in statement:
+                    return Result([{"value": "A1"}])
+                if "MIN(" in statement:
+                    assert "employee_id" in statement
+                    self.assert_scoped(params)
+                    return Result(
+                        [
+                            {
+                                "available_start": "2026-09-02",
+                                "available_end": "2026-09-05",
+                            }
+                        ]
+                    )
+                return Result([])
+
+            @staticmethod
+            def assert_scoped(params):
+                assert params == (["A1"],)
+
+        with patch("psycopg.connect", return_value=Connection()):
+            loaded = context.load_database_context(
+                dsn="unused",
+                attendance_objects=("public.attendance_records",),
+                allowed_employee_ids=("A1",),
+            )
+
+        self.assertEqual(loaded.tables[0].date_coverage.available_end, "2026-09-05")
+
     def test_high_cardinality_text_is_not_sent_as_standard_values(self):
         class Result:
             def fetchall(self):
@@ -363,6 +460,7 @@ class DatabaseContextTests(unittest.TestCase):
             set(shared.model_payload()),
             {
                 "current_question",
+                "latest_user_message",
                 "as_of_date",
                 "last_calendar_month",
                 "updated_request",
@@ -386,9 +484,10 @@ class DatabaseContextTests(unittest.TestCase):
         serialized = json.dumps(shared.model_payload())
         self.assertNotIn("semantic_contracts", serialized)
         self.assertEqual(
-            list(shared.model_payload())[-9:],
+            list(shared.model_payload())[-10:],
             [
                 "current_question",
+                "latest_user_message",
                 "updated_request",
                 "previous_verified_turn",
                 "request_relationship",
@@ -401,6 +500,9 @@ class DatabaseContextTests(unittest.TestCase):
         )
         self.assertEqual(
             shared.model_payload()["current_question"], "Show total hours."
+        )
+        self.assertEqual(
+            shared.model_payload()["latest_user_message"], "Show total hours."
         )
         self.assertEqual(shared.model_payload()["calendar_month_date_extent"], [])
         self.assertIsNone(shared.model_payload()["last_calendar_month"])

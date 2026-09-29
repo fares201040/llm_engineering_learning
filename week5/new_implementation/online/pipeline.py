@@ -1629,6 +1629,7 @@ def run_turn(
                 dsn=settings.postgres_readonly_dsn,
                 attendance_objects=(settings.postgres_attendance_table,),
                 connect_timeout=settings.postgres_connect_timeout_seconds,
+                allowed_employee_ids=allowed_employee_ids,
             )
             native_comparison = build_grouped_month_comparison(
                 question=question,
@@ -1645,6 +1646,7 @@ def run_turn(
                     dsn=settings.postgres_readonly_dsn,
                     attendance_objects=(settings.postgres_attendance_table,),
                     connect_timeout=settings.postgres_connect_timeout_seconds,
+                    allowed_employee_ids=allowed_employee_ids,
                 )
             native_running_total = build_running_total(
                 question=question,
@@ -1687,6 +1689,7 @@ def run_turn(
                 dsn=settings.postgres_readonly_dsn,
                 attendance_objects=(settings.postgres_attendance_table,),
                 connect_timeout=settings.postgres_connect_timeout_seconds,
+                allowed_employee_ids=allowed_employee_ids,
             )
         log_layer_output("database_context", database_context)
         downstream_history = conversation_history
@@ -1752,6 +1755,7 @@ def run_turn(
         )
         shared_context = SharedModelContext(
             current_question=question,
+            latest_user_message=request.question,
             as_of_date=as_of_date,
             updated_request=bound.updated_request,
             previous_verified_turn=(

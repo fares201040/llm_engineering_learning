@@ -77,7 +77,8 @@ The pipeline reuses one `SharedModelContext` instance. Its full schema is sent t
 each planner call, including the post-query answer and review calls:
 
 1. explicit current question;
-2. updated rewritten request;
+2. updated request (the original question for a new request, or a resolved
+   rewrite for a follow-up);
 3. untrusted conversation history;
 4. labelled trusted context;
 5. database type;
@@ -135,9 +136,16 @@ null-safe negation to the planner. The retired `online/semantic_contracts.py` co
 no active checks; the runtime no longer matches request words to prescribed SQL
 predicates for these meanings. SQL safety, authorization, and independently verified
 scope checks remain in the pipeline.
-`scope_provenance` shows the current and prior original user questions alongside
-carried employees and the prior SQL, so the planner can distinguish user-requested
-filters from values that appeared only in a prior answer or result.
+`scope_provenance` shows the current and prior original user questions, the
+reference model's separately labelled interpretation, carried employees, and the
+prior SQL. The planner checks the interpretation against the current question so a
+new multi-clause request cannot silently import an earlier filter.
+
+An explicitly requested single date or range is checked against contributing SQL
+source paths. Several requested periods are not collapsed to the last month;
+independent clauses can retain separate periods. Employee antecedents are kept only
+when the prior employee ID filters a contributing source row path, rather than
+appearing solely in a scalar lookup subquery.
 
 ## Where planner guidance belongs
 
@@ -264,9 +272,27 @@ result. A clarification may store one pending employee confirmation. All provide
 SQL, bound, and verification failures preserve prior state. State from another runtime
 version resets safely.
 
-## Verification record (2026-09-28)
+## Gradio publication
 
-The current sanitized source archive has SHA-256
+`week5/new_app.py` renders reviewed answers as sanitized Markdown. The question
+appears immediately and a verification status appears below the textbox. Once the
+pipeline returns a reviewed final answer, the UI reveals it in cumulative chunks;
+this is progressive display after review, not live provider-token streaming. Clear
+and Submit sequence numbers prevent obsolete work from repopulating a cleared chat.
+
+## Current local verification (2026-09-29)
+
+At commit `e5e9dadc`, local discovery in `week5/new_implementation` passed 254
+tests, `week5/test_new_app.py` passed 20 tests, and Ruff lint/format and staged
+diff checks passed. A live model/database question with Authorized counts by
+country and all-HR people by work location produced independent SQL branches and
+the checked 770/4/1 country counts plus 9 HR people. This is local evidence, not
+a Colab or private-evaluation pass for the current commit. The exact manual prompts
+are listed in `docs/superpowers/reports/2026-09-29-attendance-manual-conversation-reference.md`.
+
+## Historical verification record (2026-09-28)
+
+The then-current sanitized source archive had SHA-256
 `b7c9afd1cc0a520a1e8fbc1ea461f7439f6136936e4a9822d715d229cec72ffc`.
 The Colab CPU notebook validated its 55 allowlisted source files, passed 266
 deterministic tests, and passed Ruff lint, formatting, and Python compilation.

@@ -1,5 +1,11 @@
 # Local and Colab source sync and testing
 
+> Current implementation status (2026-09-29): see
+> [`2026-09-28-attendance-planner-handoff.md`](../../../docs/superpowers/reports/2026-09-28-attendance-planner-handoff.md).
+> The archive hashes and pass counts in the dated section below describe older
+> snapshots. Rebuild the package before testing commit `e5e9dadc`; no Colab gate
+> for that commit is recorded yet.
+
 This guide makes the local project checkout the source of truth and sends a
 deterministic, sanitized source snapshot to Google Colab for testing. Colab does not
 edit or synchronize the local Python files back into the checkout. Apply code changes
@@ -9,9 +15,9 @@ For the WSL, Google Cloud SDK, Colab CLI installation, and ADC login steps, see
 [`COLAB_CLI_GUIDE.md`](COLAB_CLI_GUIDE.md). The commands below assume those tools are
 installed in Ubuntu 24.04 under WSL2 and ADC is already available there.
 
-## Current handoff status (2026-09-27)
+## Historical handoff status (2026-09-27)
 
-- The current sanitized 48-file ZIP has SHA-256
+- The then-current sanitized 48-file ZIP had SHA-256
   `6336d4d7a6f4a86ddce7916876b8d283c05f4948a928229f0b56b734cc2cbac5`.
   The local deterministic suite passed 250 tests and 10 subtests. The source notebook
   contains this hash and is ready for a new Colab execution.
@@ -22,10 +28,10 @@ installed in Ubuntu 24.04 under WSL2 and ADC is already available there.
 - The authorized private evaluator completed all 311 cases on the same runtime and
   evaluator fingerprints with zero failures. The separate 25-case regression replay,
   including its employee-confirmation follow-up, also completed with no failures.
-- The current source moves business and scope ambiguity to the SQL planner. Only an
+- That source moved business and scope ambiguity to the SQL planner. Only an
   unresolved written employee identity remains in the pre-planner confirmation flow;
   the planner can return a safe `clarification_required` control row in parallel with
-  `unsupported_capability`. The current archive and deterministic count include these
+  `unsupported_capability`. That archive and deterministic count include these
   changes.
 - On that preceding snapshot, the A100 rerun passed cases 100–149 (50/50), the 25 recently fixed cases
   with their confirmation turns (25/25), and cases 150–199 (50/50). The exact manual-

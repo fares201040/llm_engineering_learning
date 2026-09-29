@@ -195,8 +195,9 @@ Google credential is needed. The generated test DSN remains in a mode-0600 runti
 file inside the temporary Colab VM and is not placed in the source archive or a
 repository `.env` file.
 
-The 2026-09-25 synthetic Colab runs confirmed the helper's PostgreSQL fixture. Later
-Gradio callback acceptance verified turns 1–4, then stopped at an incorrect grouped
-relative-month comparison on turn 5. The runtime expired, and Colab returned
-`Service Unavailable` when creating a replacement T4. See the Colab sync guide for
-the pending source hash and resume checkpoint before live acceptance continues.
+The 2026-09-25 synthetic Colab runs confirmed the helper's PostgreSQL fixture.
+Those early Gradio acceptance results and later Colab results are historical
+snapshots. See the current
+[`attendance planner handoff`](../../docs/superpowers/reports/2026-09-28-attendance-planner-handoff.md)
+before resuming; rebuild the source package rather than reusing an older archive
+hash or checkpoint as proof of the current code.

@@ -4,7 +4,7 @@ Updated: 2026-09-29
 
 Branch: `main`
 
-Current code: `e5e9dadc3b0ed0fd3cfc6b9370ce7df8840461db`
+Conversation logic baseline: `e5e9dadc3b0ed0fd3cfc6b9370ce7df8840461db`
 
 ## Current runtime
 
@@ -18,9 +18,10 @@ answer against executed rows. Review can request a bounded requery. Only the rev
 answer and verified state are published.
 
 The Gradio chatbot renders Markdown with HTML sanitization. It shows the user's
-question immediately, keeps verification status below the textbox, and progressively
-reveals the **reviewed final answer** in cumulative chunks. This is display pacing
-after review, not provider-token streaming during model generation. Clear and Submit
+question immediately, shows a short `Thinking ...` assistant message while the
+answer is prepared, and progressively replaces it with the **reviewed final answer**
+in cumulative chunks. This display pacing happens after review, not during model
+generation. Clear and Submit
 events use client sequence numbers and a per-session gate so obsolete work cannot
 repopulate a cleared chat. A running local server must be restarted to load a new
 commit.
@@ -51,7 +52,7 @@ review. They do not encode a test employee, an answer value, or a special respon
 for one request phrase. The governing instructions are in
 `week5/new_implementation/AGENTS.md`.
 
-## Verification on this commit
+## Verification on the conversation logic baseline
 
 - `.venv\Scripts\python.exe -m unittest discover -s week5/new_implementation -p 'test_*.py'`:
   **254 tests, OK**.

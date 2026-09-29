@@ -54,8 +54,8 @@ Open it and sign in with the printed user and password. You can then ask attenda
 questions in English or Arabic. The Colab session must remain active for the chatbot
 link to work.
 
-The chat displays a verification status below the input while the SQL and answer
-review run. It renders the reviewed answer as Markdown and reveals longer answers
+The chat displays `Thinking ...` while the SQL and answer review run. It renders
+the reviewed answer as Markdown and reveals longer answers
 progressively after review. This display progression is not live model-token
 streaming. Clearing the chat resets its conversation state; start a fresh chat when
 testing a question that should not inherit earlier employee or date scope.

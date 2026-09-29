@@ -46,12 +46,13 @@ class LaunchModeTests(unittest.TestCase):
             "payload.clear_input && message === payload.submitted_message",
             display["js"],
         )
-        self.assertIn("payload.status", display["js"])
+        self.assertNotIn("payload.status", display["js"])
         self.assertFalse(display["queue"])
         self.assertEqual(display["inputs"][0], submitted["outputs"][0])
         self.assertNotIn(display["outputs"][0], submitted["outputs"])
         self.assertNotIn(display["outputs"][2], submitted["outputs"])
-        self.assertEqual(display["outputs"][3], clear_handlers[0]["outputs"][1])
+        self.assertEqual(len(display["outputs"]), 3)
+        self.assertEqual(len(clear_handlers[0]["outputs"]), 1)
         self.assertTrue(any(fn.concurrency_limit == 2 for fn in ui.fns.values()))
 
     def test_default_launch_mode_opens_the_local_browser(self):
@@ -151,13 +152,12 @@ class SessionStateTests(unittest.TestCase):
             "answer_question_with_state",
             return_value=("New answer", [], state),
         ) as complete:
-            cleared_context, cleared_status = new_app.reset_session(gate, 2)
+            cleared_context = new_app.reset_session(gate, 2)
             old = list(new_app.submit_chat("old question", gate, 1))
             new = list(new_app.submit_chat("new question", gate, 3))
 
         self.assertEqual(old, [])
         self.assertIn("Relevant Context", cleared_context)
-        self.assertEqual(cleared_status, "")
         complete.assert_called_once()
         self.assertEqual(new[-1]["history"][-1]["content"], "New answer")
 
@@ -173,7 +173,7 @@ class SessionStateTests(unittest.TestCase):
             stale_clear = new_app.reset_session(gate, 2)
 
         self.assertEqual(gate.current(), 3)
-        self.assertEqual(stale_clear, (new_app.gr.skip(), new_app.gr.skip()))
+        self.assertEqual(stale_clear, new_app.gr.skip())
         self.assertEqual(new[-1]["history"][-1]["content"], "New answer")
 
     def test_submit_after_clear_resets_canonical_history_before_clear_reaches_backend(
@@ -196,7 +196,7 @@ class SessionStateTests(unittest.TestCase):
             updates = list(new_app.submit_chat("New question", gate, 3, 2))
             delayed_clear = new_app.reset_session(gate, 2)
 
-        self.assertEqual(delayed_clear, (new_app.gr.skip(), new_app.gr.skip()))
+        self.assertEqual(delayed_clear, new_app.gr.skip())
         self.assertEqual(updates[0]["history"][0]["content"], "New question")
         self.assertEqual(len(updates[-1]["history"]), 2)
         self.assertEqual(complete.call_args.args[1], [])
@@ -239,8 +239,10 @@ class SessionStateTests(unittest.TestCase):
         self.assertGreater(len(updates), 2)
         self.assertTrue(updates[0]["clear_input"])
         self.assertEqual(updates[0]["submitted_message"], "question")
-        self.assertIn("verifying", updates[0]["status"].lower())
-        self.assertTrue(all(item["status"] == "" for item in updates[1:]))
+        self.assertEqual(
+            updates[0]["history"][-1], {"role": "assistant", "content": "Thinking ..."}
+        )
+        self.assertTrue(all("status" not in item for item in updates))
         self.assertTrue(all(not item["clear_input"] for item in updates[1:]))
 
     def test_clear_then_immediate_submit_keeps_new_reply_and_suppresses_old(self):
@@ -261,7 +263,7 @@ class SessionStateTests(unittest.TestCase):
             old = new_app.chat_with_state_stream(
                 [{"role": "user", "content": "old question"}], state, gate, 1
             )
-            self.assertEqual(next(old)[0][-1]["role"], "user")
+            self.assertEqual(next(old)[0][-1]["content"], "Thinking ...")
             thread = Thread(target=lambda: old_outputs.extend(old))
             thread.start()
             self.assertTrue(old_started.wait(timeout=5))
@@ -300,7 +302,12 @@ class SessionStateTests(unittest.TestCase):
         self.assertEqual(
             original_history, [{"role": "user", "content": "Summarize attendance"}]
         )
-        self.assertEqual(progress[0][-1]["role"], "user")
+        self.assertEqual(
+            progress[0][-1], {"role": "assistant", "content": "Thinking ..."}
+        )
+        self.assertTrue(
+            all(item[0][-1]["content"] != "Thinking ..." for item in snapshots)
+        )
         self.assertGreater(len(snapshots), 1)
         self.assertLessEqual(len(snapshots), new_app._MAX_REVEAL_STEPS)
         self.assertEqual(paced_sleep.call_count, len(snapshots) - 1)
@@ -335,7 +342,7 @@ class SessionStateTests(unittest.TestCase):
             )
 
         log_error.assert_called_once_with("APDC attendance answer failed safely")
-        self.assertEqual(snapshots[0][0][-1]["role"], "user")
+        self.assertEqual(snapshots[0][0][-1]["content"], "Thinking ...")
         self.assertIn("try again", snapshots[-1][0][-1]["content"].lower())
         self.assertNotIn("password", snapshots[-1][0][-1]["content"])
         self.assertIs(snapshots[-1][2], state)

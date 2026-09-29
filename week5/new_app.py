@@ -47,12 +47,12 @@ _CLEAR_WITH_SEQUENCE_JS = (
     return [gate, next];
 }"""
 )
-_DISPLAY_CURRENT_SEQUENCE_JS = """(payload, history, context, message, status) => {
+_DISPLAY_CURRENT_SEQUENCE_JS = """(payload, history, context, message) => {
     if (!payload || payload.sequence !== globalThis.__apdcTurnSequence) {
-        return [history, context, message, status];
+        return [history, context, message];
     }
     const clearInput = payload.clear_input && message === payload.submitted_message;
-    return [payload.history, payload.context, clearInput ? "" : message, payload.status];
+    return [payload.history, payload.context, clearInput ? "" : message];
 }"""
 
 
@@ -150,14 +150,6 @@ def format_context(context):
     return result
 
 
-def verification_status(message: str) -> str:
-    return (
-        "*جارٍ التحقق من الإجابة…*"
-        if any("\u0600" <= char <= "\u06ff" for char in message)
-        else "*Working on your answer and verifying the result…*"
-    )
-
-
 def chat(history):
     updated, context, _state = chat_with_state(history, ConversationState())
     return updated, context
@@ -212,8 +204,8 @@ def chat_with_state_stream(
     arabic = any("\u0600" <= char <= "\u06ff" for char in last_message)
     if gate.current() != generation:
         return
-    yield list(history), format_context([]), current_state
-    display = history + [{"role": "assistant", "content": ""}]
+    display = history + [{"role": "assistant", "content": "Thinking ..."}]
+    yield list(display), format_context([]), current_state
     try:
         reply, context, updated_state = answer_question_with_state(
             last_message,
@@ -285,14 +277,13 @@ def submit_chat(message, gate: _TurnGate, sequence: int, clear_sequence: int = 0
             "context": context,
             "clear_input": index == 0,
             "submitted_message": message,
-            "status": verification_status(message) if index == 0 else "",
         }
 
 
 def reset_session(gate: _TurnGate, sequence: int):
     if not gate.reset(int(sequence)):
-        return gr.skip(), gr.skip()
-    return format_context([]), ""
+        return gr.skip()
+    return format_context([])
 
 
 def reset_conversation(_state=None):
@@ -332,8 +323,6 @@ def main():
                     placeholder="Ask an APDC attendance question...",
                     show_label=False,
                 )
-                status_markdown = gr.Markdown(value="")
-
             with gr.Column(scale=1):
                 context_markdown = gr.Markdown(
                     label="📚 Retrieved Context",
@@ -352,8 +341,8 @@ def main():
         )
         stream_buffer.change(
             fn=None,
-            inputs=[stream_buffer, chatbot, context_markdown, message, status_markdown],
-            outputs=[chatbot, context_markdown, message, status_markdown],
+            inputs=[stream_buffer, chatbot, context_markdown, message],
+            outputs=[chatbot, context_markdown, message],
             js=_DISPLAY_CURRENT_SEQUENCE_JS,
             queue=False,
             trigger_mode="multiple",
@@ -362,7 +351,7 @@ def main():
         chatbot.clear(
             reset_session,
             inputs=[turn_gate, client_sequence],
-            outputs=[context_markdown, status_markdown],
+            outputs=[context_markdown],
             js=_CLEAR_WITH_SEQUENCE_JS,
             queue=False,
             show_progress="hidden",

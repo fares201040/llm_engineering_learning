@@ -275,7 +275,7 @@ version resets safely.
 ## Gradio publication
 
 `week5/new_app.py` renders reviewed answers as sanitized Markdown. The question
-appears immediately and a verification status appears below the textbox. Once the
+appears immediately with a short `Thinking ...` assistant message. Once the
 pipeline returns a reviewed final answer, the UI reveals it in cumulative chunks;
 this is progressive display after review, not live provider-token streaming. Clear
 and Submit sequence numbers prevent obsolete work from repopulating a cleared chat.

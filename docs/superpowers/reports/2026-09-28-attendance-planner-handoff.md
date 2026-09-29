@@ -73,6 +73,8 @@ for one request phrase. The governing instructions are in
 
 The exact checked prompts retained from this work are in
 [`2026-09-29-attendance-manual-conversation-reference.md`](2026-09-29-attendance-manual-conversation-reference.md).
+The local launch, browser conversation, UI checks, and SQL/row review procedure
+are in the [browser test guide](../../../week5/new_implementation/BROWSER_TEST_GUIDE.md).
 
 ## Next work
 

@@ -33,6 +33,7 @@ from week5.new_implementation.online.pipeline import (
     _sql_semantic_issue,
     run_turn,
 )
+from week5.new_implementation.online import pipeline
 from week5.new_implementation.online.planner import ReplanRequest
 from week5.new_implementation.online.provider import ProviderFailure
 from week5.new_implementation.online.reference import (
@@ -132,6 +133,193 @@ def database_context_with_locations():
 
 
 class PipelineTests(unittest.TestCase):
+    def test_explicit_day_and_range_are_not_promoted_to_full_month(self):
+        self.assertEqual(
+            pipeline._requested_date_scope("Show 4 September 2026."),
+            ("2026-09-04", "2026-09-04"),
+        )
+        self.assertEqual(
+            pipeline._requested_date_scope("Show September 1-7, 2026."),
+            ("2026-09-01", "2026-09-07"),
+        )
+        self.assertEqual(
+            pipeline._requested_date_scope("Show September 2026."),
+            ("2026-09-01", "2026-09-30"),
+        )
+
+    def test_iso_and_written_endpoint_ranges_are_single_intervals(self):
+        self.assertEqual(
+            pipeline._requested_date_scope(
+                "Show records from 2026-09-01 to 2026-09-07."
+            ),
+            ("2026-09-01", "2026-09-07"),
+        )
+        self.assertEqual(
+            pipeline._requested_date_scope(
+                "Show records from September 1 to September 7, 2026."
+            ),
+            ("2026-09-01", "2026-09-07"),
+        )
+
+    def test_distinct_explicit_periods_have_no_single_global_date_scope(self):
+        self.assertIsNone(
+            pipeline._requested_date_scope(
+                "Compare September 1, 2026 and September 4, 2026."
+            )
+        )
+        self.assertIsNone(
+            pipeline._requested_date_scope("Compare September and October 2026.")
+        )
+        self.assertIsNone(
+            pipeline._required_date_scope(
+                "Compare Sep & Oct 2026.",
+                request_relationship="new",
+                subject_relationship="all_authorized",
+                previous_scope=None,
+                rewritten_request="Compare attendance in October 2026.",
+            )
+        )
+
+    def test_compound_union_does_not_inherit_one_global_period(self):
+        prior = ("2026-09-01", "2026-09-07")
+        self.assertIsNone(
+            pipeline._required_date_scope(
+                "For that employee, list Draft dates. Separately rank Positions globally.",
+                request_relationship="follow_up",
+                subject_relationship="union",
+                previous_scope=prior,
+            )
+        )
+        self.assertEqual(
+            pipeline._required_date_scope(
+                "Which dates had Status Draft?",
+                request_relationship="follow_up",
+                subject_relationship="employees",
+                previous_scope=prior,
+            ),
+            prior,
+        )
+
+    def test_employee_union_keeps_one_explicit_shared_date(self):
+        self.assertEqual(
+            pipeline._required_date_scope(
+                "Compare A1 and A2 on September 1, 2026.",
+                request_relationship="new",
+                subject_relationship="union",
+                previous_scope=None,
+            ),
+            ("2026-09-01", "2026-09-01"),
+        )
+        self.assertIsNone(
+            pipeline._required_date_scope(
+                "A1 dates on September 1, 2026; all departments across all dates.",
+                request_relationship="new",
+                subject_relationship="union",
+                union_has_criteria=True,
+                previous_scope=None,
+            )
+        )
+
+    def test_short_date_follow_up_uses_resolved_current_date(self):
+        self.assertEqual(
+            pipeline._required_date_scope(
+                "same on sep 2",
+                request_relationship="follow_up",
+                subject_relationship="employees",
+                previous_scope=("2026-09-01", "2026-09-01"),
+                rewritten_request="Show the same measures on September 2, 2026.",
+            ),
+            ("2026-09-02", "2026-09-02"),
+        )
+
+    def test_verified_mixed_sql_preserves_previous_employee_antecedent(self):
+        employee = Employee(employee_id="A11026", name="Wail Saleh Awadh")
+        sql = (
+            "WITH person_rows AS (SELECT attendance_date FROM attendance_records "
+            "WHERE employee_id = 'A11026' AND status = 'Draft'), "
+            "global_counts AS (SELECT position, COUNT(*) AS n FROM "
+            "attendance_records GROUP BY position) "
+            "SELECT CAST(attendance_date AS text) AS value FROM person_rows "
+            "UNION ALL SELECT position FROM global_counts"
+        )
+        self.assertEqual(
+            pipeline._carried_verified_employees(
+                sql, (employee,), request_relationship="follow_up"
+            ),
+            (employee,),
+        )
+        self.assertEqual(
+            pipeline._carried_verified_employees(
+                sql, (employee,), request_relationship="new"
+            ),
+            (),
+        )
+
+    def test_scalar_lookup_employee_does_not_become_active_subject(self):
+        employee = Employee(employee_id="A1", name="Wail Ali")
+        sql = (
+            "SELECT COUNT(*) FROM attendance_records WHERE position = "
+            "(SELECT position FROM attendance_records "
+            "WHERE employee_id = 'A1' LIMIT 1)"
+        )
+        self.assertEqual(
+            pipeline._carried_verified_employees(
+                sql, (employee,), request_relationship="follow_up"
+            ),
+            (),
+        )
+
+    def test_mixed_follow_up_publishes_employee_used_by_verified_sql(self):
+        employee = Employee(employee_id="A1", name="Wail Ali")
+        prior = ConversationState(
+            verified_turns=(
+                VerifiedTurn(
+                    turn_id="prior",
+                    original_question="Show A1 attendance.",
+                    rewritten_request="Show A1 attendance.",
+                    answer="A1 has records.",
+                    locale="en",
+                    employees=(employee,),
+                    executed_sql="SELECT employee_id FROM attendance_records WHERE employee_id = 'A1'",
+                ),
+            ),
+            active_employee_ids=("A1",),
+            active_employees=(employee,),
+        )
+        deps = self.dependencies()
+        deps.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request="Show A1 dates and all Positions.",
+                locale="en",
+                request_relationship="follow_up",
+                subject_relationship="all_authorized",
+            )
+        )
+        deps.planner = lambda **_kwargs: (
+            "SELECT CAST(attendance_date AS text) AS value FROM attendance_records "
+            "WHERE employee_id = 'A1' UNION ALL "
+            "SELECT position AS value FROM attendance_records"
+        )
+        deps.executor = lambda *_args, **_kwargs: SqlExecutionResult(
+            columns=(),
+            rows=({"value": "2026-09-01"},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=30
+            ),
+        )
+        deps.answerer = lambda **_kwargs: "A1 had attendance; a Position was found."
+        outcome = run_turn(
+            TurnRequest(
+                question="Show those dates and all Positions.",
+                state=prior,
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=deps,
+        )
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(outcome.state.active_employee_ids, ("A1",))
+        self.assertEqual(outcome.state.verified_turns[-1].employees, (employee,))
+
     def test_two_fuzzy_name_parts_offer_one_employee_for_confirmation(self):
         dependencies = self.dependencies()
         dependencies.directory_loader = lambda **_kwargs: (
@@ -1558,6 +1746,19 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(_locale("كم يوم اشتغل A1؟ جاوب بالإنجليزية"), "en")
 
     def test_bounded_grouped_result_has_distinct_result_count(self):
+        repaired = pipeline._repair_group_matched_count(
+            "SELECT country, COUNT(*) AS record_count, "
+            "COUNT(*) OVER() AS matched_group_count "
+            "FROM attendance_records GROUP BY country LIMIT 100"
+        )
+        self.assertIn("AS matched_count", repaired)
+        self.assertIsNone(_sql_semantic_issue("by country", repaired))
+        partitioned = (
+            "SELECT country, COUNT(*) AS record_count, "
+            "COUNT(*) OVER(PARTITION BY country) AS local_count "
+            "FROM attendance_records GROUP BY country LIMIT 100"
+        )
+        self.assertEqual(pipeline._repair_group_matched_count(partitioned), partitioned)
         self.assertEqual(
             _sql_semantic_issue(
                 "Show absence dates.",
@@ -1903,6 +2104,51 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(turn.result["rows"][0]["attendance_date"], "2026-09-03")
         self.assertEqual(outcome.state.active_employee_ids, ("A1",))
 
+    def test_new_criteria_union_keeps_reference_interpretation_separate(self):
+        dependencies = self.dependencies()
+        interpretation = (
+            "Count Authorized records by country. Separately count distinct "
+            "Human Resource employees by work location across all HR rows."
+        )
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request=interpretation,
+                locale="en",
+                request_relationship="new",
+                subject_relationship="union",
+                employee_criteria=("Authorized records", "Human Resource employees"),
+            )
+        )
+        seen = []
+        dependencies.planner = lambda **kwargs: (
+            seen.append(kwargs["shared_context"])
+            or "SELECT COUNT(*) AS record_count FROM attendance_records"
+        )
+        dependencies.executor = lambda *_args, **_kwargs: SqlExecutionResult(
+            columns=(),
+            rows=({"record_count": 1},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=20
+            ),
+        )
+        dependencies.answerer = lambda **_kwargs: "One record."
+        outcome = run_turn(
+            TurnRequest(
+                question="auth by country; hr work loc ppl count, all hr",
+                access_context=LOCAL_DEMO_ACCESS,
+            ),
+            dependencies=dependencies,
+        )
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(
+            seen[0].updated_request,
+            "Request:\nauth by country; hr work loc ppl count, all hr",
+        )
+        self.assertEqual(
+            seen[0].scope_provenance["reference_interpretation"],
+            interpretation,
+        )
+
     def test_new_request_rewrite_cannot_invent_an_unrequested_date(self):
         dependencies = self.dependencies()
         dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
@@ -1948,6 +2194,9 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertNotIn("2026-09-26", seen[0].updated_request)
         self.assertIn("How many days did employee A1 work?", seen[0].updated_request)
+        self.assertIn(
+            "2026-09-26", seen[0].scope_provenance["reference_interpretation"]
+        )
 
     def test_follow_up_recovers_active_employee_when_rewriter_calls_it_missing(self):
         dependencies = self.dependencies()

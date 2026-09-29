@@ -42,6 +42,67 @@ def response(**updates):
 
 
 class ReferenceAndPlanningTests(unittest.TestCase):
+    def test_union_of_independent_criteria_needs_no_named_employee(self):
+        bound = bind_references(
+            response(
+                rewritten_request=(
+                    "Count Authorized records by country. Separately count "
+                    "distinct HR employees by work location across all HR rows."
+                ),
+                subject_relationship="union",
+                employee_names=(),
+                employee_criteria=(
+                    "Authorized records by country",
+                    "HR employees by work location",
+                ),
+            ),
+            (),
+            original_question="auth by country; hr work loc ppl count, all hr",
+        )
+        self.assertFalse(bound.ambiguous)
+        self.assertEqual(bound.subject_relationship, "union")
+        self.assertEqual(bound.employee_ids, ())
+
+    def test_follow_up_ignores_unmentioned_invented_id_and_keeps_active_person(self):
+        active = Employee(employee_id="A11026", name="Wail Saleh Awadh")
+        bound = bind_references(
+            response(
+                rewritten_request="Show Draft dates for that employee.",
+                request_relationship="follow_up",
+                employee_ids=("A99999",),
+                employee_names=(),
+            ),
+            (active,),
+            original_question="For that employee, which dates had Status Draft?",
+            active_employees=(active,),
+            has_verified_turns=True,
+        )
+        self.assertFalse(bound.ambiguous)
+        self.assertEqual(bound.employee_ids, ("A11026",))
+
+    def test_follow_up_ignores_unmentioned_invented_identity_claim(self):
+        active = Employee(employee_id="A11026", name="Wail Saleh Awadh")
+        bound = bind_references(
+            response(
+                rewritten_request="Show the same employee's device swipes.",
+                request_relationship="follow_up",
+                subject_relationship="union",
+                employee_ids=(),
+                employee_names=(),
+                identity_claims=(
+                    IdentityClaim(employee_id="A99999", employee_name="A99999"),
+                ),
+            ),
+            (active,),
+            original_question=(
+                "Show the same employee's device swipes. Separately rank Position."
+            ),
+            active_employees=(active,),
+            has_verified_turns=True,
+        )
+        self.assertFalse(bound.ambiguous)
+        self.assertEqual(bound.employee_ids, ("A11026",))
+
     def test_ready_criteria_is_not_changed_to_a_person_by_name_words(self):
         bound = bind_references(
             response(

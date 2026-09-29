@@ -40,11 +40,15 @@ def _combine(
 def _paths_from_scope(
     scope: Scope,
     inherited: tuple[tuple[exp.Expression, ...], ...],
+    *,
+    include_scalar_subqueries: bool,
 ) -> tuple[tuple[exp.Expression, ...], ...] | None:
     if scope.set_operation_scopes:
         branches = []
         for child in scope.set_operation_scopes:
-            paths = _paths_from_scope(child, inherited)
+            paths = _paths_from_scope(
+                child, inherited, include_scalar_subqueries=include_scalar_subqueries
+            )
             if paths is None or len(branches) + len(paths) > MAX_PATHS:
                 return None
             branches.extend(paths)
@@ -59,7 +63,9 @@ def _paths_from_scope(
     for _alias, (_node, source) in scope.selected_sources.items():
         if isinstance(source, Scope):
             source_scopes.add(id(source))
-            contribution = _paths_from_scope(source, combined)
+            contribution = _paths_from_scope(
+                source, combined, include_scalar_subqueries=include_scalar_subqueries
+            )
         elif isinstance(source, exp.Table):
             contribution = combined
         else:
@@ -68,19 +74,24 @@ def _paths_from_scope(
             return None
         paths.extend(contribution)
 
-    for subquery in scope.subquery_scopes:
-        if id(subquery) in source_scopes:
-            continue
-        # A scalar subquery contributes independently of its parent's WHERE.
-        contribution = _paths_from_scope(subquery, ((),))
-        if contribution is None or len(paths) + len(contribution) > MAX_PATHS:
-            return None
-        paths.extend(contribution)
+    if include_scalar_subqueries:
+        for subquery in scope.subquery_scopes:
+            if id(subquery) in source_scopes:
+                continue
+            # A scalar subquery contributes independently of its parent's WHERE.
+            contribution = _paths_from_scope(
+                subquery, ((),), include_scalar_subqueries=True
+            )
+            if contribution is None or len(paths) + len(contribution) > MAX_PATHS:
+                return None
+            paths.extend(contribution)
     return tuple(paths)
 
 
 def contributing_where_paths(
     sql: str,
+    *,
+    include_scalar_subqueries: bool = True,
 ) -> tuple[tuple[exp.Expression, ...], ...] | None:
     """Return every contributing base-table path; None means cannot prove scope."""
 
@@ -90,7 +101,9 @@ def contributing_where_paths(
         return None
     if root is None:
         return None
-    return _paths_from_scope(root, ((),))
+    return _paths_from_scope(
+        root, ((),), include_scalar_subqueries=include_scalar_subqueries
+    )
 
 
 __all__ = ["boolean_paths", "contributing_where_paths"]

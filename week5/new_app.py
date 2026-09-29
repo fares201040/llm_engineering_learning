@@ -1,6 +1,9 @@
 import html
 import logging
 import os
+from math import ceil
+from threading import Lock
+from time import sleep
 
 import gradio as gr
 
@@ -21,6 +24,92 @@ else:
 
 
 logger = logging.getLogger(__name__)
+_REVEAL_INTERVAL_SECONDS = 0.06
+_MAX_REVEAL_STEPS = 40
+_CLIENT_SEQUENCE_BODY_JS = """
+    const next = Math.max((globalThis.__apdcTurnSequence || 0) + 1, Date.now());
+    globalThis.__apdcTurnSequence = next;
+"""
+_SUBMIT_WITH_SEQUENCE_JS = (
+    """(message, gate, sequence, clearSequence) => {
+"""
+    + _CLIENT_SEQUENCE_BODY_JS
+    + """
+    return [message, gate, next, globalThis.__apdcClearSequence || 0];
+}"""
+)
+_CLEAR_WITH_SEQUENCE_JS = (
+    """(gate, sequence) => {
+"""
+    + _CLIENT_SEQUENCE_BODY_JS
+    + """
+    globalThis.__apdcClearSequence = next;
+    return [gate, next];
+}"""
+)
+_DISPLAY_CURRENT_SEQUENCE_JS = """(payload, history, context, message, status) => {
+    if (!payload || payload.sequence !== globalThis.__apdcTurnSequence) {
+        return [history, context, message, status];
+    }
+    const clearInput = payload.clear_input && message === payload.submitted_message;
+    return [payload.history, payload.context, clearInput ? "" : message, payload.status];
+}"""
+
+
+class _TurnGate:
+    """Keep the accepted conversation and invalidate obsolete UI events."""
+
+    def __init__(
+        self, generation: int = 0, history=None, state=None, last_clear: int = 0
+    ):
+        self._generation = generation
+        self._history = list(history or [])
+        self._state = state or ConversationState()
+        self._last_clear = last_clear
+        self._lock = Lock()
+
+    def __deepcopy__(self, _memo):
+        with self._lock:
+            return _TurnGate(
+                self._generation, self._history, self._state, self._last_clear
+            )
+
+    def claim_submit(self, sequence: int, clear_sequence: int) -> bool:
+        with self._lock:
+            if sequence <= self._generation:
+                return False
+            if clear_sequence > self._last_clear:
+                self._history = []
+                self._state = ConversationState()
+                self._last_clear = clear_sequence
+            self._generation = sequence
+            return True
+
+    def current(self) -> int:
+        with self._lock:
+            return self._generation
+
+    def snapshot(self):
+        with self._lock:
+            return list(self._history), self._state
+
+    def commit(self, sequence: int, history, state) -> bool:
+        with self._lock:
+            if sequence != self._generation:
+                return False
+            self._history = list(history)
+            self._state = state
+            return True
+
+    def reset(self, sequence: int) -> bool:
+        with self._lock:
+            if sequence <= self._generation:
+                return False
+            self._generation = sequence
+            self._history = []
+            self._state = ConversationState()
+            self._last_clear = sequence
+            return True
 
 
 def _environment_flag(name: str) -> bool:
@@ -61,6 +150,14 @@ def format_context(context):
     return result
 
 
+def verification_status(message: str) -> str:
+    return (
+        "*جارٍ التحقق من الإجابة…*"
+        if any("\u0600" <= char <= "\u06ff" for char in message)
+        else "*Working on your answer and verifying the result…*"
+    )
+
+
 def chat(history):
     updated, context, _state = chat_with_state(history, ConversationState())
     return updated, context
@@ -94,6 +191,110 @@ def chat_with_state(history, state):
     return history, format_context(context), updated_state
 
 
+def chat_with_state_stream(
+    history,
+    state,
+    gate: _TurnGate | None = None,
+    generation: int | None = None,
+    on_final=None,
+):
+    """Show the question, then reveal only the pipeline's reviewed reply."""
+
+    current_state = state or ConversationState()
+    gate = gate or _TurnGate()
+    generation = gate.current() if generation is None else generation
+    if not history:
+        yield history, format_context([]), current_state
+        return
+
+    history = list(history)
+    last_message = history[-1]["content"]
+    arabic = any("\u0600" <= char <= "\u06ff" for char in last_message)
+    if gate.current() != generation:
+        return
+    yield list(history), format_context([]), current_state
+    display = history + [{"role": "assistant", "content": ""}]
+    try:
+        reply, context, updated_state = answer_question_with_state(
+            last_message,
+            history[:-1],
+            current_state,
+            access_context=LOCAL_DEMO_ACCESS,
+        )
+        # The pipeline has completed its review. Only this accepted reply is
+        # exposed to the browser, in cumulative chunks for progressive display.
+        chunk_size = max(64, ceil(len(reply) / _MAX_REVEAL_STEPS))
+        for end in range(chunk_size, len(reply) + chunk_size, chunk_size):
+            if end > chunk_size:
+                sleep(_REVEAL_INTERVAL_SECONDS)
+            if gate.current() != generation:
+                return
+            final = end >= len(reply)
+            display[-1] = {"role": "assistant", "content": reply[:end]}
+            if final and on_final is not None:
+                on_final(display, updated_state)
+            yield (
+                list(display),
+                format_context(context if final else []),
+                updated_state if final else current_state,
+            )
+        if not reply:
+            if gate.current() != generation:
+                return
+            display[-1] = {"role": "assistant", "content": ""}
+            if on_final is not None:
+                on_final(display, updated_state)
+            yield list(display), format_context(context), updated_state
+    except Exception:
+        if gate.current() != generation:
+            return
+        logger.error("APDC attendance answer failed safely")
+        reply = (
+            "تعذر إكمال هذا الطلب بأمان. يرجى المحاولة مرة أخرى."
+            if arabic
+            else "I couldn't complete that request safely. Please try again."
+        )
+        display[-1] = {"role": "assistant", "content": reply}
+        if on_final is not None:
+            on_final(display, current_state)
+        yield list(display), format_context([]), current_state
+
+
+def submit_chat(message, gate: _TurnGate, sequence: int, clear_sequence: int = 0):
+    """Publish only a submit whose browser sequence is still current."""
+
+    sequence = int(sequence)
+    if not gate.claim_submit(sequence, int(clear_sequence)):
+        return
+    history, state = gate.snapshot()
+    updated_history = list(history or []) + [{"role": "user", "content": message}]
+    for index, (chat_history, context, updated_state) in enumerate(
+        chat_with_state_stream(
+            updated_history,
+            state,
+            gate,
+            sequence,
+            on_final=lambda final_history, final_state: gate.commit(
+                sequence, final_history, final_state
+            ),
+        )
+    ):
+        yield {
+            "sequence": sequence,
+            "history": chat_history,
+            "context": context,
+            "clear_input": index == 0,
+            "submitted_message": message,
+            "status": verification_status(message) if index == 0 else "",
+        }
+
+
+def reset_session(gate: _TurnGate, sequence: int):
+    if not gate.reset(int(sequence)):
+        return gr.skip(), gr.skip()
+    return format_context([]), ""
+
+
 def reset_conversation(_state=None):
     return format_context([]), ConversationState()
 
@@ -104,13 +305,13 @@ def main():
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
 
-    def put_message_in_chatbot(message, history):
-        return "", history + [{"role": "user", "content": message}]
-
     theme = gr.themes.Soft(font=["Inter", "system-ui", "sans-serif"])
 
     with gr.Blocks(title="APDC Attendance Assistant", theme=theme) as ui:
-        conversation_state = gr.State(value=ConversationState())
+        turn_gate = gr.State(value=_TurnGate())
+        client_sequence = gr.Number(value=0, precision=0, visible=False)
+        client_clear_sequence = gr.Number(value=0, precision=0, visible=False)
+        stream_buffer = gr.JSON(visible=False)
         gr.Markdown(
             "# 🏢 APDC Attendance Assistant\n"
             "Ask about employee attendance, worked days, schedules, leave, or overtime."
@@ -123,12 +324,15 @@ def main():
                     height=600,
                     type="messages",
                     show_copy_button=True,
+                    render_markdown=True,
+                    sanitize_html=True,
                 )
                 message = gr.Textbox(
                     label="Your Question",
                     placeholder="Ask an APDC attendance question...",
                     show_label=False,
                 )
+                status_markdown = gr.Markdown(value="")
 
             with gr.Column(scale=1):
                 context_markdown = gr.Markdown(
@@ -139,18 +343,28 @@ def main():
                 )
 
         message.submit(
-            put_message_in_chatbot,
-            inputs=[message, chatbot],
-            outputs=[message, chatbot],
-        ).then(
-            chat_with_state,
-            inputs=[chatbot, conversation_state],
-            outputs=[chatbot, context_markdown, conversation_state],
+            submit_chat,
+            inputs=[message, turn_gate, client_sequence, client_clear_sequence],
+            outputs=[stream_buffer],
+            js=_SUBMIT_WITH_SEQUENCE_JS,
+            concurrency_limit=2,
+            trigger_mode="multiple",
+        )
+        stream_buffer.change(
+            fn=None,
+            inputs=[stream_buffer, chatbot, context_markdown, message, status_markdown],
+            outputs=[chatbot, context_markdown, message, status_markdown],
+            js=_DISPLAY_CURRENT_SEQUENCE_JS,
+            queue=False,
+            trigger_mode="multiple",
+            show_progress="hidden",
         )
         chatbot.clear(
-            reset_conversation,
-            inputs=[conversation_state],
-            outputs=[context_markdown, conversation_state],
+            reset_session,
+            inputs=[turn_gate, client_sequence],
+            outputs=[context_markdown, status_markdown],
+            js=_CLEAR_WITH_SEQUENCE_JS,
+            queue=False,
             show_progress="hidden",
         )
 

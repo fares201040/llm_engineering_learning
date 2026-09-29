@@ -1,6 +1,7 @@
 from pathlib import Path
 import subprocess
 import sys
+from threading import Event, Thread
 import unittest
 from unittest.mock import patch
 
@@ -9,6 +10,50 @@ from week5.new_implementation import answer
 
 
 class LaunchModeTests(unittest.TestCase):
+    def test_submit_and_clear_capture_client_sequence_before_backend_work(self):
+        with patch.object(new_app.gr.Blocks, "launch", autospec=True) as launch:
+            new_app.main()
+        ui = launch.call_args.args[0]
+        dependencies = ui.config["dependencies"]
+        submitted = next(
+            item for item in dependencies if item["targets"][0][1] == "submit"
+        )
+        clear_handlers = [
+            item for item in dependencies if item["targets"][0][1] == "clear"
+        ]
+
+        self.assertEqual(len(dependencies), 3)
+        self.assertEqual(len(clear_handlers), 1)
+        self.assertTrue(submitted["queue"])
+        self.assertEqual(submitted["trigger_mode"], "multiple")
+        self.assertFalse(clear_handlers[0]["queue"])
+        self.assertEqual(clear_handlers[0]["cancels"], [])
+        self.assertIn(
+            "return [message, gate, next, globalThis.__apdcClearSequence || 0]",
+            submitted["js"],
+        )
+        self.assertIn("return [gate, next]", clear_handlers[0]["js"])
+        self.assertIn("globalThis.__apdcClearSequence = next", clear_handlers[0]["js"])
+        self.assertEqual(len(submitted["inputs"]), 4)
+        self.assertEqual(len(clear_handlers[0]["inputs"]), 2)
+        display = next(
+            item for item in dependencies if item["targets"][0][1] == "change"
+        )
+        self.assertIn(
+            "payload.sequence !== globalThis.__apdcTurnSequence", display["js"]
+        )
+        self.assertIn(
+            "payload.clear_input && message === payload.submitted_message",
+            display["js"],
+        )
+        self.assertIn("payload.status", display["js"])
+        self.assertFalse(display["queue"])
+        self.assertEqual(display["inputs"][0], submitted["outputs"][0])
+        self.assertNotIn(display["outputs"][0], submitted["outputs"])
+        self.assertNotIn(display["outputs"][2], submitted["outputs"])
+        self.assertEqual(display["outputs"][3], clear_handlers[0]["outputs"][1])
+        self.assertTrue(any(fn.concurrency_limit == 2 for fn in ui.fns.values()))
+
     def test_default_launch_mode_opens_the_local_browser(self):
         with patch.dict("os.environ", {}, clear=True):
             options = new_app.launch_options()
@@ -97,6 +142,204 @@ class ContextRenderingTests(unittest.TestCase):
 
 
 class SessionStateTests(unittest.TestCase):
+    def test_clear_before_old_submit_starts_rejects_stale_message(self):
+        gate = new_app._TurnGate()
+        state = answer.ConversationState()
+
+        with patch.object(
+            new_app,
+            "answer_question_with_state",
+            return_value=("New answer", [], state),
+        ) as complete:
+            cleared_context, cleared_status = new_app.reset_session(gate, 2)
+            old = list(new_app.submit_chat("old question", gate, 1))
+            new = list(new_app.submit_chat("new question", gate, 3))
+
+        self.assertEqual(old, [])
+        self.assertIn("Relevant Context", cleared_context)
+        self.assertEqual(cleared_status, "")
+        complete.assert_called_once()
+        self.assertEqual(new[-1]["history"][-1]["content"], "New answer")
+
+    def test_delayed_clear_does_not_invalidate_newer_submit(self):
+        gate = new_app._TurnGate()
+        state = answer.ConversationState()
+        with patch.object(
+            new_app,
+            "answer_question_with_state",
+            return_value=("New answer", [], state),
+        ):
+            new = list(new_app.submit_chat("new question", gate, 3))
+            stale_clear = new_app.reset_session(gate, 2)
+
+        self.assertEqual(gate.current(), 3)
+        self.assertEqual(stale_clear, (new_app.gr.skip(), new_app.gr.skip()))
+        self.assertEqual(new[-1]["history"][-1]["content"], "New answer")
+
+    def test_submit_after_clear_resets_canonical_history_before_clear_reaches_backend(
+        self,
+    ):
+        old_state = answer.ConversationState(active_employee_ids=("A11026",))
+        gate = new_app._TurnGate(
+            generation=1,
+            history=[
+                {"role": "user", "content": "Old question"},
+                {"role": "assistant", "content": "Old verified answer"},
+            ],
+            state=old_state,
+        )
+        with patch.object(
+            new_app,
+            "answer_question_with_state",
+            return_value=("New answer", [], answer.ConversationState()),
+        ) as complete:
+            updates = list(new_app.submit_chat("New question", gate, 3, 2))
+            delayed_clear = new_app.reset_session(gate, 2)
+
+        self.assertEqual(delayed_clear, (new_app.gr.skip(), new_app.gr.skip()))
+        self.assertEqual(updates[0]["history"][0]["content"], "New question")
+        self.assertEqual(len(updates[-1]["history"]), 2)
+        self.assertEqual(complete.call_args.args[1], [])
+        self.assertEqual(complete.call_args.args[2].active_employee_ids, ())
+
+    def test_next_turn_uses_only_canonical_verified_history_and_state(self):
+        gate = new_app._TurnGate()
+        verified_state = answer.ConversationState(active_employee_ids=("A11026",))
+        with patch.object(
+            new_app,
+            "answer_question_with_state",
+            side_effect=[
+                ("First verified answer", [], verified_state),
+                ("Second verified answer", [], verified_state),
+            ],
+        ) as complete:
+            list(new_app.submit_chat("First question", gate, 1))
+            second = list(new_app.submit_chat("Follow-up", gate, 2))
+
+        self.assertEqual(
+            complete.call_args.args[1],
+            [
+                {"role": "user", "content": "First question"},
+                {"role": "assistant", "content": "First verified answer"},
+            ],
+        )
+        self.assertIs(complete.call_args.args[2], verified_state)
+        self.assertEqual(second[-1]["history"][-1]["content"], "Second verified answer")
+
+    def test_submit_clears_textbox_once_and_preserves_next_draft(self):
+        gate = new_app._TurnGate()
+        state = answer.ConversationState()
+        with patch.object(
+            new_app,
+            "answer_question_with_state",
+            return_value=("Verified " * 30, [], state),
+        ):
+            updates = list(new_app.submit_chat("question", gate, 1))
+
+        self.assertGreater(len(updates), 2)
+        self.assertTrue(updates[0]["clear_input"])
+        self.assertEqual(updates[0]["submitted_message"], "question")
+        self.assertIn("verifying", updates[0]["status"].lower())
+        self.assertTrue(all(item["status"] == "" for item in updates[1:]))
+        self.assertTrue(all(not item["clear_input"] for item in updates[1:]))
+
+    def test_clear_then_immediate_submit_keeps_new_reply_and_suppresses_old(self):
+        gate = new_app._TurnGate(generation=1)
+        old_started = Event()
+        old_release = Event()
+        old_outputs = []
+        state = answer.ConversationState()
+
+        def complete(question, _history, current_state, **_kwargs):
+            if question == "old question":
+                old_started.set()
+                old_release.wait(timeout=5)
+                return "Old answer", [], current_state
+            return "New answer", [], current_state
+
+        with patch.object(new_app, "answer_question_with_state", side_effect=complete):
+            old = new_app.chat_with_state_stream(
+                [{"role": "user", "content": "old question"}], state, gate, 1
+            )
+            self.assertEqual(next(old)[0][-1]["role"], "user")
+            thread = Thread(target=lambda: old_outputs.extend(old))
+            thread.start()
+            self.assertTrue(old_started.wait(timeout=5))
+
+            new_app.reset_session(gate, 2)
+            new = list(new_app.submit_chat("new question", gate, 3))
+            old_release.set()
+            thread.join(timeout=5)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(old_outputs, [])
+        self.assertEqual(new[-1]["history"][-1]["content"], "New answer")
+
+    def test_streamed_chat_waits_for_review_then_reveals_only_final_markdown(self):
+        original_history = [{"role": "user", "content": "Summarize attendance"}]
+        updated_state = answer.ConversationState(active_employee_ids=("A1",))
+        document = answer.Result(
+            page_content="Rows: 2", metadata={"source": "attendance"}
+        )
+        final_reply = "## Verified summary\n" + "- Three days of attendance.\n" * 12
+        with (
+            patch.object(
+                new_app,
+                "answer_question_with_state",
+                return_value=(final_reply, [document], updated_state),
+            ) as complete,
+            patch.object(new_app, "sleep") as paced_sleep,
+        ):
+            updates = new_app.chat_with_state_stream(
+                original_history, answer.ConversationState()
+            )
+            progress = next(updates)
+            complete.assert_not_called()
+            snapshots = list(updates)
+
+        self.assertEqual(
+            original_history, [{"role": "user", "content": "Summarize attendance"}]
+        )
+        self.assertEqual(progress[0][-1]["role"], "user")
+        self.assertGreater(len(snapshots), 1)
+        self.assertLessEqual(len(snapshots), new_app._MAX_REVEAL_STEPS)
+        self.assertEqual(paced_sleep.call_count, len(snapshots) - 1)
+        paced_sleep.assert_called_with(new_app._REVEAL_INTERVAL_SECONDS)
+        self.assertTrue(
+            all(final_reply.startswith(item[0][-1]["content"]) for item in snapshots)
+        )
+        self.assertEqual(snapshots[-1][0][-1]["content"], final_reply)
+        self.assertTrue(
+            all("Draft answer" not in item[0][-1]["content"] for item in snapshots)
+        )
+        self.assertTrue(
+            all(item[2].active_employee_ids == () for item in snapshots[:-1])
+        )
+        self.assertIn("Rows: 2", snapshots[-1][1])
+        self.assertIs(snapshots[-1][2], updated_state)
+
+    def test_streamed_chat_replaces_progress_after_unexpected_failure(self):
+        state = answer.ConversationState()
+        with (
+            patch.object(
+                new_app,
+                "answer_question_with_state",
+                side_effect=RuntimeError("database password must not leak"),
+            ),
+            patch.object(new_app.logger, "error") as log_error,
+        ):
+            snapshots = list(
+                new_app.chat_with_state_stream(
+                    [{"role": "user", "content": "Show attendance"}], state
+                )
+            )
+
+        log_error.assert_called_once_with("APDC attendance answer failed safely")
+        self.assertEqual(snapshots[0][0][-1]["role"], "user")
+        self.assertIn("try again", snapshots[-1][0][-1]["content"].lower())
+        self.assertNotIn("password", snapshots[-1][0][-1]["content"])
+        self.assertIs(snapshots[-1][2], state)
+
     def test_reset_conversation_clears_context_and_trusted_state(self):
         original = answer.ConversationState(active_employee_ids=("A11017",))
 

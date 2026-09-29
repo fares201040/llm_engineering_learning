@@ -216,6 +216,40 @@ def _has_required_date_scope(
     )
 
 
+def _carried_verified_employees(
+    sql: str,
+    previous_active: tuple[Employee, ...],
+    *,
+    request_relationship: str,
+) -> tuple[Employee, ...]:
+    """Keep a trusted antecedent only if the current SQL uses its exact ID."""
+
+    if request_relationship != "follow_up" or not previous_active:
+        return ()
+    paths = contributing_where_paths(sql, include_scalar_subqueries=False)
+    if not paths:
+        return ()
+    used_ids: set[str] = set()
+    for path in paths:
+        for predicate in path:
+            if not isinstance(predicate, exp.EQ):
+                continue
+            left, right = predicate.this, predicate.expression
+            for column, literal in ((left, right), (right, left)):
+                if (
+                    isinstance(column, exp.Column)
+                    and column.name.casefold() == "employee_id"
+                    and isinstance(literal, exp.Literal)
+                    and literal.is_string
+                ):
+                    used_ids.add(str(literal.this).casefold())
+    return tuple(
+        employee
+        for employee in previous_active
+        if employee.employee_id.casefold() in used_ids
+    )
+
+
 def _has_self_membership_filter(sql: str) -> bool:
     """Find an unrequested column-in-itself filter with no narrowing subquery."""
 
@@ -388,6 +422,45 @@ def _repair_group_order(sql: str) -> str:
     return statement.sql(dialect="postgres") if changed else sql
 
 
+def _repair_group_matched_count(sql: str) -> str:
+    """Give a valid grouped window count the published coverage alias."""
+
+    try:
+        statements = parse(sql, read="postgres")
+    except ParseError:
+        return sql
+    if len(statements) != 1 or not isinstance(statements[0], exp.Select):
+        return sql
+    statement = statements[0]
+    if not (statement.args.get("group") and statement.args.get("limit")):
+        return sql
+    if any(
+        item.alias_or_name.casefold() == "matched_count"
+        for item in statement.expressions
+    ):
+        return sql
+    candidates = [
+        item
+        for item in statement.expressions
+        if isinstance(item, exp.Alias)
+        and isinstance(item.this, exp.Window)
+        and isinstance(item.this.this, exp.Count)
+        and isinstance(item.this.this.this, exp.Star)
+        and not item.this.args.get("partition_by")
+        and not item.this.args.get("order")
+    ]
+    if len(candidates) != 1:
+        return sql
+    old_alias = candidates[0].alias
+    candidates[0].set("alias", exp.to_identifier("matched_count"))
+    order = statement.args.get("order")
+    if order is not None:
+        for column in order.find_all(exp.Column):
+            if column.name.casefold() == old_alias.casefold():
+                column.set("this", exp.to_identifier("matched_count"))
+    return statement.sql(dialect="postgres")
+
+
 def _planner_control_alias(sql: str) -> str | None:
     """Recognize the planner's safe, single-value control protocol."""
 
@@ -418,7 +491,11 @@ def _mentions_time_period(question: str) -> bool:
     folded = question.casefold()
     if re.search(r"\b(?:19|20)\d{2}\b", folded):
         return True
-    if any(re.search(rf"\b{month}\b", folded) for month in _MONTH_NUMBERS):
+    month_names = (
+        *_MONTH_NUMBERS,
+        *(calendar.month_abbr[number].casefold() for number in range(1, 13)),
+    )
+    if any(re.search(rf"\b{month}\b", folded) for month in month_names):
         return True
     if re.search(
         r"\b(?:today|yesterday|tomorrow|this|last|previous|next)\s+"
@@ -549,20 +626,176 @@ def _unsupported_value(locale: str) -> str:
     return "The request contains an invalid date or numeric value. Please correct it."
 
 
-def _requested_month_scope(question: str) -> tuple[str, str] | None:
-    month_pattern = "|".join(_MONTH_NUMBERS)
-    match = re.search(
-        rf"\b({month_pattern})\s+(\d{{4}})\b", question, flags=re.IGNORECASE
-    )
-    if match is None:
+def _explicit_date_scopes(question: str) -> set[tuple[str, str]]:
+    """Collect explicit calendar intervals without collapsing separate periods."""
+
+    months = {
+        **_MONTH_NUMBERS,
+        **{calendar.month_abbr[number].casefold(): number for number in range(1, 13)},
+    }
+    month_pattern = "|".join(sorted(months, key=len, reverse=True))
+    month_day = rf"(?P<m>{month_pattern})\s+(?P<d>\d{{1,2}})(?:st|nd|rd|th)?"
+    day_month = rf"(?P<d>\d{{1,2}})(?:st|nd|rd|th)?\s+(?P<m>{month_pattern})"
+    found: list[tuple[tuple[int, int], tuple[str, str]]] = []
+
+    def add(match: re.Match[str], start: date, end: date) -> None:
+        found.append((match.span(), (start.isoformat(), end.isoformat())))
+
+    # A range is a single scope. Its full span prevents its endpoints from
+    # being counted again as independent day mentions.
+    for match in re.finditer(
+        r"\b(?P<first>\d{4}-\d{1,2}-\d{1,2})\s*"
+        r"(?:to|through|and|[-–—])\s*"
+        r"(?P<last>\d{4}-\d{1,2}-\d{1,2})\b",
+        question,
+        re.IGNORECASE,
+    ):
+        try:
+            add(
+                match,
+                date.fromisoformat(match["first"]),
+                date.fromisoformat(match["last"]),
+            )
+        except ValueError:
+            return set()
+    for match in re.finditer(
+        rf"\b(?P<first_m>{month_pattern})\s+(?P<first_d>\d{{1,2}})\s*"
+        rf"(?:to|through|and|[-–—])\s*"
+        rf"(?P<last_m>{month_pattern})\s+(?P<last_d>\d{{1,2}})\s*,?\s*"
+        rf"(?P<y>\d{{4}})\b",
+        question,
+        re.IGNORECASE,
+    ):
+        try:
+            year = int(match["y"])
+            add(
+                match,
+                date(year, months[match["first_m"].casefold()], int(match["first_d"])),
+                date(year, months[match["last_m"].casefold()], int(match["last_d"])),
+            )
+        except ValueError:
+            return set()
+    for match in re.finditer(
+        rf"\b(?P<m>{month_pattern})\s+(?P<first>\d{{1,2}})\s*[-–—]\s*"
+        rf"(?P<last>\d{{1,2}})\s*,?\s*(?P<y>\d{{4}})\b",
+        question,
+        re.IGNORECASE,
+    ):
+        if any(a <= match.start() and match.end() <= b for (a, b), _ in found):
+            continue
+        try:
+            month = months[match["m"].casefold()]
+            add(
+                match,
+                date(int(match["y"]), month, int(match["first"])),
+                date(int(match["y"]), month, int(match["last"])),
+            )
+        except ValueError:
+            return set()
+    for match in re.finditer(
+        rf"\b(?P<first>\d{{1,2}})\s*[-–—]\s*(?P<last>\d{{1,2}})\s+"
+        rf"(?P<m>{month_pattern})\s+(?P<y>\d{{4}})\b",
+        question,
+        re.IGNORECASE,
+    ):
+        if any(a <= match.start() and match.end() <= b for (a, b), _ in found):
+            continue
+        try:
+            month = months[match["m"].casefold()]
+            add(
+                match,
+                date(int(match["y"]), month, int(match["first"])),
+                date(int(match["y"]), month, int(match["last"])),
+            )
+        except ValueError:
+            return set()
+    for match in re.finditer(r"\b\d{4}-\d{1,2}-\d{1,2}\b", question):
+        if any(a <= match.start() and match.end() <= b for (a, b), _ in found):
+            continue
+        try:
+            day = date.fromisoformat(match.group())
+        except ValueError:
+            return set()
+        add(match, day, day)
+    for pattern in (
+        rf"\b{month_day}\s*,?\s*(?P<y>\d{{4}})\b",
+        rf"\b{day_month}\s*,?\s*(?P<y>\d{{4}})\b",
+    ):
+        for match in re.finditer(pattern, question, re.IGNORECASE):
+            if any(a <= match.start() and match.end() <= b for (a, b), _ in found):
+                continue
+            try:
+                day = date(
+                    int(match["y"]), months[match["m"].casefold()], int(match["d"])
+                )
+            except ValueError:
+                return set()
+            add(match, day, day)
+    month_token = rf"(?:{month_pattern})"
+    separator = r"\s*(?:,|and|or|vs\.?|versus|/|&|[-–—]|to|through)\s*"
+    for match in re.finditer(
+        rf"\b(?P<months>{month_token}(?:{separator}{month_token})+)"
+        rf"\s+(?P<y>\d{{4}})\b",
+        question,
+        re.IGNORECASE,
+    ):
+        year = int(match["y"])
+        for month_match in re.finditer(month_token, match["months"], re.IGNORECASE):
+            month = months[month_match.group().casefold()]
+            add(
+                match,
+                date(year, month, 1),
+                date(year, month, calendar.monthrange(year, month)[1]),
+            )
+    for match in re.finditer(
+        rf"\b(?P<m>{month_pattern})\s+(?P<y>\d{{4}})\b",
+        question,
+        re.IGNORECASE,
+    ):
+        if any(a <= match.start() and match.end() <= b for (a, b), _ in found):
+            continue
+        year, month = int(match["y"]), months[match["m"].casefold()]
+        add(
+            match,
+            date(year, month, 1),
+            date(year, month, calendar.monthrange(year, month)[1]),
+        )
+    return {scope for _, scope in found}
+
+
+def _requested_date_scope(question: str) -> tuple[str, str] | None:
+    """Resolve one explicit interval; leave multiple intervals to the planner."""
+
+    scopes = _explicit_date_scopes(question)
+    return next(iter(scopes)) if len(scopes) == 1 else None
+
+
+def _required_date_scope(
+    question: str,
+    *,
+    request_relationship: str,
+    subject_relationship: str | None,
+    previous_scope: tuple[str, str] | None,
+    union_has_criteria: bool = False,
+    rewritten_request: str | None = None,
+) -> tuple[str, str] | None:
+    # A union can contain independent subjects with independent periods. One
+    # global bound cannot validate that query without corrupting a branch.
+    original_scopes = _explicit_date_scopes(question)
+    if len(original_scopes) > 1:
         return None
-    month_name, year_text = match.groups()
-    year = int(year_text)
-    month = _MONTH_NUMBERS[month_name.casefold()]
-    return (
-        date(year, month, 1).isoformat(),
-        date(year, month, calendar.monthrange(year, month)[1]).isoformat(),
-    )
+    explicit = next(iter(original_scopes)) if original_scopes else None
+    if subject_relationship == "union":
+        return explicit if not union_has_criteria else None
+    if explicit is not None:
+        return explicit
+    if _mentions_time_period(question) and rewritten_request:
+        resolved = _requested_date_scope(rewritten_request)
+        if resolved is not None:
+            return resolved
+    if request_relationship == "follow_up" and not _mentions_time_period(question):
+        return previous_scope
+    return None
 
 
 def _request_value_issue(question: str) -> str | None:
@@ -922,6 +1155,7 @@ def run_turn(
                 decision, (AmbiguousReference, UnsupportedReference)
             )
             inconsistent_ready = False
+            ungrounded_active_new = False
             if isinstance(decision, ReadyReference):
                 has_employee_references = bool(
                     decision.employee_ids
@@ -935,9 +1169,32 @@ def run_turn(
                     decision.subject_relationship
                     in {"employees", "union", "intersection"}
                     and not has_employee_references
+                    and not (
+                        decision.subject_relationship in {"union", "intersection"}
+                        and decision.employee_criteria
+                    )
                     and not (decision.request_relationship == "follow_up" and active)
                 )
-                needs_reconsideration = inconsistent_ready
+                ungrounded_active_new = (
+                    decision.request_relationship == "new"
+                    and decision.subject_relationship
+                    in {"employees", "union", "intersection"}
+                    and any(
+                        employee.employee_id in decision.employee_ids
+                        and not re.search(
+                            rf"(?<!\w){re.escape(employee.employee_id)}(?!\w)",
+                            question,
+                            flags=re.IGNORECASE,
+                        )
+                        and not re.search(
+                            rf"(?<!\w){re.escape(employee.name)}(?!\w)",
+                            question,
+                            flags=re.IGNORECASE,
+                        )
+                        for employee in active
+                    )
+                )
+                needs_reconsideration = inconsistent_ready or ungrounded_active_new
             if needs_reconsideration:
                 feedback = (
                     "The prior decision has an inconsistent subject_relationship "
@@ -945,7 +1202,16 @@ def run_turn(
                     "a person reference needs an employee side, while a criterion "
                     "or all-records request should not claim a named employee."
                     if inconsistent_ready
-                    else None
+                    else (
+                        "The prior decision included a verified employee from the "
+                        "earlier turn but classified this as a new request, while "
+                        "the current message did not explicitly name that employee. "
+                        "Re-evaluate whether it is a shorthand follow-up referring "
+                        "to that employee or a genuinely new broader request. "
+                        "Do not invent an employee reference."
+                        if ungrounded_active_new
+                        else None
+                    )
                 )
                 reference = deps.reference_writer(
                     question,
@@ -1107,6 +1373,7 @@ def run_turn(
             if native_running_total is not None:
                 log_layer_output("native_running_total_plan", native_running_total.sql)
 
+        resolved_rewrite = bound.rewritten_request
         if bound.request_relationship == "new":
             # For an independent request, the current question is the authority
             # for its scope. A reference rewrite may accidentally carry filters
@@ -1121,15 +1388,17 @@ def run_turn(
                 }
             )
 
-        explicit_date_scope = _requested_month_scope(question)
-        required_date_scope = (
-            explicit_date_scope
-            if explicit_date_scope is not None
-            else previous.verified_turns[-1].date_scope
-            if bound.request_relationship == "follow_up"
-            and previous.verified_turns
-            and not _mentions_time_period(question)
-            else None
+        required_date_scope = _required_date_scope(
+            question,
+            request_relationship=bound.request_relationship,
+            subject_relationship=bound.subject_relationship,
+            union_has_criteria=bool(bound.employee_criteria),
+            rewritten_request=resolved_rewrite,
+            previous_scope=(
+                previous.verified_turns[-1].date_scope
+                if previous.verified_turns
+                else None
+            ),
         )
         if database_context is None:
             database_context = deps.context_loader(
@@ -1143,6 +1412,7 @@ def run_turn(
         previous_turn = previous.verified_turns[-1] if previous.verified_turns else None
         scope_provenance = {
             "current_original_question": question,
+            "reference_interpretation": resolved_rewrite,
             "previous_original_question": (
                 previous_turn.original_question if previous_turn is not None else None
             ),
@@ -1243,7 +1513,7 @@ def run_turn(
                 if native_running_total is not None and attempt == 1
                 else deps.planner(**planner_args)
             )
-            sql = _repair_group_order(sql)
+            sql = _repair_group_order(_repair_group_matched_count(sql))
             log_layer_output("sql_planner", sql, attempt=attempt)
             if (
                 _planner_control_alias(sql) == "unsupported_capability"
@@ -1570,13 +1840,16 @@ def run_turn(
                     capability="schema",
                 )
             break
+        published_employees = bound.employees or _carried_verified_employees(
+            sql, active, request_relationship=bound.request_relationship
+        )
         verified = VerifiedTurn(
             turn_id=uuid4().hex,
             original_question=question,
             rewritten_request=bound.updated_request,
             answer=answer,
             locale=bound.locale,
-            employees=bound.employees,
+            employees=published_employees,
             executed_sql=sql,
             date_scope=date_scope,
             result=result.model_dump(mode="json"),
@@ -1584,8 +1857,10 @@ def run_turn(
         new_state = previous.model_copy(
             update={
                 "verified_turns": (previous.verified_turns + (verified,))[-50:],
-                "active_employee_ids": bound.employee_ids,
-                "active_employees": bound.employees,
+                "active_employee_ids": tuple(
+                    item.employee_id for item in published_employees
+                ),
+                "active_employees": published_employees,
                 "pending_employee_confirmation": None,
             }
         )

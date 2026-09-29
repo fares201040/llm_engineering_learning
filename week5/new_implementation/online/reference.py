@@ -155,11 +155,22 @@ output, language, and follow-up intent. Preserve and combine every independently
 answerable clause when the message asks multiple questions or requests; never reduce
 a compound message to only its first or last clause. A weak or qualitative attendance
 request is still valid when its subject is general or explicitly identified; do not
-invent a missing employee requirement. For a follow-up, start with the most recent
+invent a missing employee requirement. A message may ask for one breakdown on a
+filtered population and another breakdown on a broader population. Rewrite those
+as separate, explicitly scoped clauses. For example, "approved by country; HR
+locations n staff count, all HR" asks for approved record counts by country
+across the dataset, and separately distinct people by work location across all
+HR rows. Do not turn those clauses into one country-by-location breakdown or
+apply the approval filter to all HR rows. Preserve informal language's intended
+meaning without treating each abbreviation or spelling error as an unknown field.
+For a follow-up, start with the most recent
 verified request in trusted_context. Carry forward its employee, date interval,
 comparison, and other user-requested filters unless the current question changes
 them. A value seen only in an earlier result or answer is context, not an inherited
 filter; consult the earlier original_question to distinguish the two. Apply the
+current requested output in place of the previous output unless the user explicitly
+asks to include, compare, or continue that earlier output. Reusing a subject or
+period does not imply repeating earlier breakdowns or measures. Apply the
 current question's changes literally, including negation: "not absent" must stay
 negated. A follow-up such as "Show absence dates instead" retains the verified
 employee and date interval while changing the requested output and predicate;
@@ -167,6 +178,20 @@ employee and date interval while changing the requested output and predicate;
 explicit absence. Write inherited constraints explicitly in rewritten_request.
 If the current question starts
 a new topic or changes the time period or subject, do not inherit the replaced scope.
+An explicit correction that broadens the subject to all records replaces the prior
+employee restriction and prior date restriction, even if it follows an employee
+report. Classify that as a new all-records request. Do not turn a correction into
+an employee follow-up merely because trusted_context has an active employee.
+Example: after a report for one employee on a specific day, "No, whole database
+now: status and day-type totals" is new, all_authorized, with no employee IDs,
+names, or inherited date. Its rewritten request asks for two breakdowns over
+all available attendance records. The prior employee and day are context only.
+Short, informal continuations can replace one part of the previous request without
+restating the rest. When the current message asks for the same measures on a new
+day, classify it as a follow_up, retain the verified employee and measures, and
+replace the old day with the new one. Minor spelling errors, abbreviations, and
+missing grammar do not by themselves make a request new or unresolved. Expand
+only meaning supported by the current message and verified context.
 When a prior verified request sought a written name but did not resolve an
 authoritative employee, a follow-up that broadens or changes the search keeps
 that written name as the search target. Do not claim a verified employee ID or
@@ -199,13 +224,19 @@ Return every explicit employee ID, every explicit employee name, each name-and-I
 that claims one identity, every general natural-language criterion describing
 employees, whether the request is new or a follow-up, and whether employees and
 criteria form employees-only, criteria-only, a union, an intersection, or an explicit
-all-authorized scope. Prefer an explicit ID as the lookup key for an identity claim.
+all-authorized scope. A union or intersection may combine multiple general criteria
+without any named employee; do not invent a person or mark it ambiguous merely
+because there are multiple independent criteria. Prefer an explicit ID as the
+lookup key for an identity claim.
 A written personal name remains an employee reference even when it has no exact
 match in active_authoritative_employees. Return the written name in employee_names
 or employee_mention so the application can search for candidates; do not turn a
 question about that person into an all-authorized query merely because exact
 directory lookup fails.
 Preserve every requested output and its level of aggregation in rewritten_request.
+Preserve each distinct requested attribute. A request for a person's department,
+job or position, grade, and gradeset asks for four separate fields; do not merge
+the job position with the grade label.
 For example, a request to compare overall totals and count differing records
 needs both aggregate totals and the differing-record count; do not replace totals
 with individual-record examples or with only the count. An explicit employee ID is
@@ -441,7 +472,15 @@ def bind_references(
             pending_resolution=pending,
         )
     ready = decision.decision
-    if ready.subject_relationship in {"criteria", "all_authorized"}:
+    criteria_only_combination = (
+        ready.subject_relationship in {"union", "intersection"}
+        and bool(ready.employee_criteria)
+        and not (ready.employee_ids or ready.employee_names or ready.identity_claims)
+    )
+    if (
+        ready.subject_relationship in {"criteria", "all_authorized"}
+        or criteria_only_combination
+    ):
         if ready.employee_ids or ready.employee_names or ready.identity_claims:
             return BoundReferences(
                 rewritten_request=ready.rewritten_request,
@@ -549,7 +588,11 @@ def bind_references(
             len(reference_words) > 1
             and _contains_words(ordered_question_words, reference_words)
         )
-        if ready.request_relationship == "new" and not reference_is_grounded:
+        trusted_active_id = ready.request_relationship == "follow_up" and any(
+            _normalize(item.employee_id) == normalized_reference
+            for item in active_employees
+        )
+        if not reference_is_grounded and not trusted_active_id:
             ignored_invented_ids.append(employee_id)
             continue
         employee = by_id.get(normalized_reference)
@@ -619,10 +662,15 @@ def bind_references(
                 )
             )
         )
+        trusted_active_claim = ready.request_relationship == "follow_up" and any(
+            _normalize(item.employee_id) == _normalize(claim.employee_id)
+            and _normalize(item.name) == normalized_claim_name
+            for item in active_employees
+        )
         if (
-            ready.request_relationship == "new"
-            and not claim_id_mentioned
+            not claim_id_mentioned
             and not claim_name_mentioned
+            and not trusted_active_claim
         ):
             continue
         id_owner = by_id.get(_normalize(claim.employee_id))
@@ -730,13 +778,9 @@ def bind_references(
     if (
         not resolved
         and len(active_employees) == 1
-        and normalized_subject_relationship == "employees"
+        and normalized_subject_relationship in {"employees", "union", "intersection"}
         and ready.request_relationship == "follow_up"
         and not unresolved_names
-        and all(
-            _normalize(item) == _normalize(active_employees[0].employee_id)
-            for item in ignored_invented_ids
-        )
         and active_employees[0] in directory
     ):
         resolved.append(active_employees[0])

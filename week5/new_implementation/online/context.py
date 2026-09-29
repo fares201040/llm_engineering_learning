@@ -335,7 +335,7 @@ _COLUMN_DESCRIPTIONS = {
     "country": "Country assigned as the employee's work country on this attendance row.",
     "work_location": "Work-location group within the employee's department. One department can contain multiple work-location groups. Use department for department-wide questions; use work_location only when the question asks about a location or group.",
     "department": "Department assigned to the employee on this attendance row; use for department filtering or grouping.",
-    "position": "Position assigned to the employee on this attendance row.",
+    "position": "Job position or role assigned to the employee on this attendance row; distinct from grade and gradeset.",
     "job": "Job title assigned to the employee on this attendance row.",
     "gradeset": "Compensation or organizational grade-set label assigned to the employee.",
     "grade": "Employee grade label within the grade set.",

@@ -1776,6 +1776,69 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertIn("AS matched_count", repaired)
         self.assertIsNone(_sql_semantic_issue("by country", repaired))
+
+    def test_named_draft_request_requires_status_filter_on_every_source_path(self):
+        missing = (
+            "SELECT day_type, COUNT(*) AS record_count FROM attendance_records "
+            "WHERE attendance_date = '2026-09-05' GROUP BY day_type"
+        )
+        filtered = (
+            "SELECT day_type, COUNT(*) AS record_count FROM attendance_records "
+            "WHERE attendance_date = '2026-09-05' AND status = 'Draft' "
+            "GROUP BY day_type"
+        )
+        self.assertEqual(
+            _sql_semantic_issue("sep 5 draft by day type pls", missing),
+            "missing_workflow_status_filter",
+        )
+        self.assertIsNone(_sql_semantic_issue("sep 5 draft by day type pls", filtered))
+        self.assertIsNone(_sql_semantic_issue("Show counts by status", missing))
+        leaked_branch = (
+            "SELECT COUNT(*) FROM attendance_records WHERE "
+            "(status = 'Draft' AND day_type = 'Working Day') OR "
+            "day_type = 'OFF Day'"
+        )
+        self.assertEqual(
+            _sql_semantic_issue("draft counts by day type", leaked_branch),
+            "missing_workflow_status_filter",
+        )
+        pending = (
+            "SELECT COUNT(*) FROM attendance_records "
+            "WHERE status = 'Pending For Authorization'"
+        )
+        self.assertIsNone(_sql_semantic_issue("pending recs?", pending))
+        mixed_statuses = (
+            "SELECT COUNT(*) FROM attendance_records "
+            "WHERE status IN ('Draft', 'Authorized')"
+        )
+        self.assertEqual(
+            _sql_semantic_issue("Draft recs?", mixed_statuses),
+            "missing_workflow_status_filter",
+        )
+        self.assertEqual(
+            _sql_semantic_issue(
+                "Draft recs?",
+                "SELECT COUNT(*) FROM attendance_records WHERE status = 'Drafted'",
+            ),
+            "missing_workflow_status_filter",
+        )
+        self.assertIsNone(_sql_semantic_issue("authorized overtime hours", missing))
+        self.assertIsNone(
+            _sql_semantic_issue(
+                "Authorized by country; separately all HR employees by location",
+                missing,
+            )
+        )
+        self.assertIsNone(
+            _sql_semantic_issue(
+                "how many Authorized, and countries count all",
+                "SELECT (SELECT COUNT(*) FROM attendance_records "
+                "WHERE status = 'Authorized') AS authorized_count, "
+                "(SELECT COUNT(DISTINCT country) FROM attendance_records) "
+                "AS country_count",
+            )
+        )
+        self.assertIsNone(_sql_semantic_issue("not Draft records", missing))
         partitioned = (
             "SELECT country, COUNT(*) AS record_count, "
             "COUNT(*) OVER(PARTITION BY country) AS local_count "

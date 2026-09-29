@@ -81,10 +81,28 @@ the reviewed answer.
 | L31 | `Draft on Sep 6 2026, count only` | **Pass after prompt repair:** 280 Draft records, one scalar result. The September 1–7 date range and day-type grouping from L30 did not leak. Three additional direct model/database count checks for Draft, Authorized, and Pending For Authorization all used the requested status predicates and matched independent aggregates. |
 | L32 | `Sep 2 2026 status totals pls in bullets` | **Pass in final restarted UI:** Authorized 74, Draft 234, Pending For Authorization 257; the three UI result rows and independent SQL matched. `Thinking ...` appeared first, followed by complete reviewed chunks at observed text lengths 67 and 149. The final Markdown rendered as three actual list items. |
 | L33 | `sep 7 status rec counts as bullets` | **Pass after the last display restart:** Authorized 65, Draft 381, Pending For Authorization 122; UI result rows matched the independent daily-status aggregate, and Markdown rendered three actual list items. |
+| L34 | `sep 5 draft by day type pls` | **Fail before deterministic filter guard:** The UI returned all statuses (OFF Day 6, OFF Day (ZAS) 202, Working Day 360). The exact executed SQL had the September 5 date predicate but no `status = 'Draft'`. |
+| L35 | `sep 5 draft by day type pls` | **Pass after guard:** The planner's corrected executed SQL had `attendance_date = '2026-09-05' AND status = 'Draft'`; OFF Day (ZAS) 40 and Working Day 148. UI rows and answer agreed. |
+| L36 | `nah authorized sep 5 same split` | **Pass:** Exact executed SQL replaced Draft with `status = 'Authorized'` and retained September 5 and day-type grouping. OFF Day (ZAS) 121, Working Day 17; UI rows matched. |
+| L37 | `drop status, sep 7 ppl by country` | **Pass:** SQL used September 7 with no status predicate and `COUNT(DISTINCT employee_id)` by country. Burundi 1, Uganda 1, Yemen 566; UI rows matched. |
+| L38 | `all dates: exception counts for Working Day only top 8` | **Pass:** SQL dropped the date, filtered `day_type = 'Working Day'`, grouped by exception, and limited to eight. The eight UI rows matched the displayed counts; the largest was Absent 811. |
+| L39 | `no Working Day filter, only Draft exception counts all dates` | **Pass:** SQL removed day type and date restrictions and used only `status = 'Draft'` before grouping by exception. Eight UI rows matched, led by Absent 768. |
+| L40 | `all records, by shift how many distinct people?` | **Pass:** SQL had no date, status, or day-type restriction and counted distinct employee IDs by shift. UI rows matched: OFF 566, 1st Shift 428, 2nd Shift 419, 3rd Shift 268, Normal Shift 82. |
+| L41 | `Sep 2 2026 status totals pls in bullets` | **Pass after Markdown spacing repair:** Authorized 74, Draft 234, Pending For Authorization 257. The final browser DOM contained three actual list items. |
+| L42 | `sep 5 draft by day type pls; bullets then one closing sentence` | **Pass after Markdown spacing repair:** Exact UI rows showed OFF Day (ZAS) 40 and Working Day 148. The final browser DOM contained two list items followed by a separate closing paragraph. |
 
 After L31, an idle Clear visibly emptied the chat. The count-guidance repair
 was checked with live model calls and this UI turn; it does not establish that
 every stochastic model run will preserve a category filter.
+
+L34 showed that prompt guidance alone did not reliably enforce a named workflow
+status. For a single-scope request with one explicitly named status, a
+deterministic pre-execution check now rejects a SQL plan when that exact status
+is absent from a contributing WHERE path and asks the planner to retry. The
+check defers mixed-scope requests to the existing answer review. The L35–L40
+sequence was captured with a temporary
+local SQL trace; the log and launcher are outside Git. L41–L42 checked final
+Markdown structure in the browser after the spacing change.
 
 This is a record of **questions actually sent to the attendance chatbot and
 answers checked**, so later manual sessions can choose new cases instead of

@@ -184,6 +184,35 @@ def chat_with_state(history, state):
     return history, format_context(context), updated_state
 
 
+def _normalize_markdown_spacing(reply: str) -> str:
+    """Keep flat lists separate from prose in model-produced Markdown."""
+
+    lines = reply.split("\n")
+    output: list[str] = []
+    fence: str | None = None
+    previous_was_list = False
+    for line in lines:
+        marker = re.match(r"\s*(`{3,}|~{3,})(.*)", line)
+        if marker is not None:
+            if fence is None:
+                fence = marker.group(1)
+            elif (
+                marker.group(1)[0] == fence[0]
+                and len(marker.group(1)) >= len(fence)
+                and not marker.group(2).strip()
+            ):
+                fence = None
+        is_list = fence is None and bool(re.match(r"(?:[-+*]|\d+[.)])\s+", line))
+        if output and output[-1].strip() and line.strip():
+            if (is_list and not previous_was_list) or (
+                previous_was_list and not is_list
+            ):
+                output.append("")
+        output.append(line)
+        previous_was_list = is_list
+    return "\n".join(output)
+
+
 def _markdown_reveal_points(reply: str) -> list[int]:
     """Choose complete Markdown units for the reviewed answer's display pace."""
 
@@ -283,6 +312,7 @@ def chat_with_state_stream(
             current_state,
             access_context=LOCAL_DEMO_ACCESS,
         )
+        reply = _normalize_markdown_spacing(reply)
         # The pipeline has completed its review. Only this accepted reply is
         # exposed to the browser, in cumulative chunks for progressive display.
         for index, end in enumerate(_markdown_reveal_points(reply)):

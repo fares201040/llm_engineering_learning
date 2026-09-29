@@ -216,6 +216,82 @@ def _has_required_date_scope(
     )
 
 
+def _requested_workflow_status(question: str) -> str | None:
+    """Recognize one named category only when the request has a single scope."""
+
+    folded = question.casefold()
+    if re.search(r"\b(?:separately|versus|vs)\b", folded):
+        return None
+    if re.search(
+        r"\b(?:not|without|except|excluding)\s+(?:the\s+)?"
+        r"(?:draft|authorized|pending)\b",
+        folded,
+    ):
+        return None
+    if re.search(r"\b(?:all|every)\s+statuses\b", folded):
+        return None
+    if re.search(r"[;,]|\b(?:and|also|plus)\b", folded) and re.search(
+        r"\b(?:all|every)\b", folded
+    ):
+        return None
+    statuses = {
+        status
+        for status in ("draft", "authorized", "pending")
+        if re.search(rf"\b{status}\b", folded)
+    }
+    if len(statuses) != 1:
+        return None
+    status = statuses.pop()
+    if status == "authorized" and re.search(r"\b(?:ot|overtime|hours?)\b", folded):
+        return None
+    return status
+
+
+def _has_required_workflow_status(sql: str, status: str) -> bool:
+    paths = contributing_where_paths(sql, include_scalar_subqueries=False)
+    if not paths:
+        return False
+
+    def matches(predicate: exp.Expression) -> bool:
+        def status_expression(node: exp.Expression) -> bool:
+            columns = {column.name.casefold() for column in node.find_all(exp.Column)}
+            return "status" in columns or (
+                "record_json" in columns
+                and any(
+                    isinstance(literal, exp.Literal)
+                    and literal.is_string
+                    and str(literal.this).casefold() == "status"
+                    for literal in node.find_all(exp.Literal)
+                )
+            )
+
+        def status_value(node: exp.Expression) -> bool:
+            return (
+                isinstance(node, exp.Literal)
+                and node.is_string
+                and str(node.this).casefold()
+                == (
+                    "Pending For Authorization" if status == "pending" else status
+                ).casefold()
+            )
+
+        if isinstance(predicate, exp.EQ):
+            return (
+                status_expression(predicate.this) and status_value(predicate.expression)
+            ) or (
+                status_expression(predicate.expression) and status_value(predicate.this)
+            )
+        if isinstance(predicate, exp.In):
+            return (
+                status_expression(predicate.this)
+                and bool(predicate.expressions)
+                and all(status_value(value) for value in predicate.expressions)
+            )
+        return False
+
+    return all(any(matches(predicate) for predicate in path) for path in paths)
+
+
 def _carried_verified_employees(
     sql: str,
     previous_active: tuple[Employee, ...],
@@ -380,6 +456,9 @@ def _sql_semantic_issue(
         return "detail_request_requires_rows"
     if not _has_required_date_scope(sql, required_date_scope):
         return "date_scope_mismatch"
+    requested_status = _requested_workflow_status(question)
+    if requested_status and not _has_required_workflow_status(sql, requested_status):
+        return "missing_workflow_status_filter"
     return None
 
 
@@ -1605,6 +1684,7 @@ def run_turn(
                 "running_total_requires_daily_grouping",
                 "self_membership_filter",
                 "date_scope_mismatch",
+                "missing_workflow_status_filter",
             }:
                 if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
                     raise ProviderFailure(
@@ -1679,6 +1759,12 @@ def run_turn(
                         "The SQL omitted or incorrectly scoped the required inclusive "
                         "attendance_date range. Apply both bounds to every OR branch: "
                         f"{required_date_scope[0]} through {required_date_scope[1]}."
+                    )
+                elif semantic_issue == "missing_workflow_status_filter":
+                    database_error = (
+                        "The current question explicitly requests one workflow "
+                        "status. Filter status to that named category on every "
+                        "contributing source path before counting or grouping."
                     )
                 sql_execution_failure = {
                     "retry_number": attempt,

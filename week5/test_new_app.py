@@ -297,6 +297,9 @@ class SessionStateTests(unittest.TestCase):
             page_content="Rows: 2", metadata={"source": "attendance"}
         )
         final_reply = "## Verified summary\n" + "- Three days of attendance.\n" * 12
+        displayed_reply = (
+            "## Verified summary\n\n" + "- Three days of attendance.\n" * 12
+        )
         with (
             patch.object(
                 new_app,
@@ -326,9 +329,11 @@ class SessionStateTests(unittest.TestCase):
         self.assertEqual(paced_sleep.call_count, len(snapshots) - 1)
         paced_sleep.assert_called_with(new_app._REVEAL_INTERVAL_SECONDS)
         self.assertTrue(
-            all(final_reply.startswith(item[0][-1]["content"]) for item in snapshots)
+            all(
+                displayed_reply.startswith(item[0][-1]["content"]) for item in snapshots
+            )
         )
-        self.assertEqual(snapshots[-1][0][-1]["content"], final_reply)
+        self.assertEqual(snapshots[-1][0][-1]["content"], displayed_reply)
         self.assertTrue(
             all("Draft answer" not in item[0][-1]["content"] for item in snapshots)
         )
@@ -380,6 +385,27 @@ class SessionStateTests(unittest.TestCase):
             )
         )
         self.assertEqual(snapshots[-1][0][-1]["content"], reply)
+
+    def test_streamed_markdown_separates_list_from_surrounding_prose(self):
+        reply = "Counts:\n- Draft: 2\n- Authorized: 3\nThese are all records."
+        with (
+            patch.object(
+                new_app,
+                "answer_question_with_state",
+                return_value=(reply, [], answer.ConversationState()),
+            ),
+            patch.object(new_app, "sleep"),
+        ):
+            snapshots = list(
+                new_app.chat_with_state_stream(
+                    [{"role": "user", "content": "Show counts"}],
+                    answer.ConversationState(),
+                )
+            )
+        self.assertEqual(
+            snapshots[-1][0][-1]["content"],
+            "Counts:\n\n- Draft: 2\n- Authorized: 3\n\nThese are all records.",
+        )
 
     def test_streamed_chat_replaces_progress_after_unexpected_failure(self):
         state = answer.ConversationState()

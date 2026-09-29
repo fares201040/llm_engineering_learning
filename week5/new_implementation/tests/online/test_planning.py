@@ -519,6 +519,23 @@ class ReferenceAndPlanningTests(unittest.TestCase):
             ("A2", "A1"),
         )
 
+    def test_name_copied_into_identity_id_still_reaches_name_search(self):
+        bound = bind_references(
+            response(
+                rewritten_request="Show attendance for Wael Saleh.",
+                employee_names=("Wael Saleh",),
+                identity_claims=(
+                    IdentityClaim(employee_id="Wael Saleh", employee_name="Wael Saleh"),
+                ),
+            ),
+            (Employee(employee_id="A11026", name="Wail Saleh Awadh"),),
+            original_question="Show attendance for Wael Saleh.",
+        )
+
+        self.assertTrue(bound.ambiguous)
+        self.assertEqual(bound.unresolved_mention, "Wael Saleh")
+        self.assertNotEqual(bound.reason, "unknown_employee_id")
+
     def test_invented_identity_name_is_ignored_when_exact_id_is_authoritative(self):
         bound = bind_references(
             response(

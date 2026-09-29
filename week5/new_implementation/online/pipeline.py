@@ -288,7 +288,10 @@ def _sql_semantic_issue(
                 return "invalid_running_total_expression"
             if not any(True for _ in statement.find_all(exp.Group)):
                 return "running_total_requires_daily_grouping"
-        for select_node in statement.find_all(exp.Select):
+        # Only the published result needs a matched_count. An inner grouped CTE
+        # may use LIMIT to select an eligible cohort before the outer query
+        # computes a scalar or a different result shape.
+        for select_node in (statement,) if isinstance(statement, exp.Select) else ():
             if not (select_node.args.get("group") and select_node.args.get("limit")):
                 continue
             matched = [
@@ -918,13 +921,14 @@ def run_turn(
             needs_reconsideration = isinstance(
                 decision, (AmbiguousReference, UnsupportedReference)
             )
+            inconsistent_ready = False
             if isinstance(decision, ReadyReference):
                 has_employee_references = bool(
                     decision.employee_ids
                     or decision.employee_names
                     or decision.identity_claims
                 )
-                needs_reconsideration = (
+                inconsistent_ready = (
                     decision.subject_relationship in {"criteria", "all_authorized"}
                     and has_employee_references
                 ) or (
@@ -933,10 +937,16 @@ def run_turn(
                     and not has_employee_references
                     and not (decision.request_relationship == "follow_up" and active)
                 )
-            if (
-                needs_reconsideration
-                and settings.llm_planner_model != settings.llm_reference_model
-            ):
+                needs_reconsideration = inconsistent_ready
+            if needs_reconsideration:
+                feedback = (
+                    "The prior decision has an inconsistent subject_relationship "
+                    "and employee references. Re-evaluate the current user intent; "
+                    "a person reference needs an employee side, while a criterion "
+                    "or all-records request should not claim a named employee."
+                    if inconsistent_ready
+                    else None
+                )
                 reference = deps.reference_writer(
                     question,
                     history=conversation_history,
@@ -948,6 +958,7 @@ def run_turn(
                     timeout=settings.llm_planner_timeout_seconds,
                     max_output_tokens=settings.llm_reference_max_output_tokens,
                     observer=observer,
+                    reconsideration_feedback=feedback,
                 )
                 log_layer_output("reference_reconsidered", reference)
             if isinstance(reference.decision, UnsupportedReference):

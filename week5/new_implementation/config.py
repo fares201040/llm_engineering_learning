@@ -125,8 +125,8 @@ class Settings:
         global_model = (
             global_model.strip() if global_model and global_model.strip() else None
         )
-        reference_default_model = global_model or "ollama_chat/qwen3.5:2b"
-        planner_default_model = global_model or "openai/gpt-5-nano"
+        reference_default_model = global_model or "openai/gpt-4.1-mini"
+        planner_default_model = global_model or "openai/gpt-4.1-mini"
         postgres_dsn = _text("POSTGRES_DSN", "")
         embedding_provider = _text("EMBEDDING_PROVIDER", "huggingface").lower()
         if embedding_provider not in {"huggingface", "openai"}:

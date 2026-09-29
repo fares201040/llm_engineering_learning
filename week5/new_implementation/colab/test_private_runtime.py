@@ -77,7 +77,7 @@ class PrivateRuntimeTests(unittest.TestCase):
             ):
                 settings = prepare_private_runtime._model_settings()
 
-        self.assertEqual(settings["LLM_PLANNER_MODEL"], "openai/gpt-5-nano")
+        self.assertEqual(settings["LLM_PLANNER_MODEL"], "openai/gpt-4.1-mini")
 
     def test_private_runtime_gives_api_planner_time_for_full_schema(self):
         from week5.new_implementation.colab import prepare_private_runtime

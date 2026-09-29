@@ -1,4 +1,4 @@
-"""Create a synthetic PostgreSQL and Qwen runtime inside a Colab VM."""
+"""Create a synthetic PostgreSQL attendance runtime inside a Colab VM."""
 
 from __future__ import annotations
 
@@ -6,28 +6,13 @@ import json
 import os
 from pathlib import Path
 import secrets
-import shutil
 import subprocess
 import time
-from urllib.error import URLError
-from urllib.request import Request, urlopen
 
 
 SOURCE_ROOT = Path("/content/attendance_phase2_source")
 RUNTIME_CONFIG = Path("/content/.attendance_phase3_runtime.json")
 OPENAI_KEY_FILE = Path("/content/.attendance_openai_api_key")
-OLLAMA_LOG = Path("/content/ollama-phase3.log")
-
-
-def model_stage_timeout_seconds() -> str:
-    """Allow slower CPU inference without relaxing GPU session timeouts."""
-    if shutil.which("nvidia-smi") is not None:
-        probe = subprocess.run(
-            ["nvidia-smi", "-L"], capture_output=True, text=True, check=False
-        )
-        if probe.returncode == 0 and probe.stdout.strip():
-            return "240"
-    return "900"
 
 
 def run(
@@ -112,64 +97,6 @@ def create_synthetic_database() -> str:
     return f"postgresql://{role}:{password}@127.0.0.1:5432/{database}"
 
 
-def install_ollama() -> None:
-    if shutil.which("ollama") is None:
-        installer = run(["curl", "-fsSL", "https://ollama.com/install.sh"]).stdout
-        try:
-            run(["bash"], input_text=installer)
-        except subprocess.CalledProcessError as exc:
-            detail = "\n".join(item for item in (exc.stdout, exc.stderr) if item)
-            detail = detail.strip()[-4000:] or "no installer output"
-            raise RuntimeError(f"Official Ollama installer failed: {detail}") from exc
-    server_env = os.environ.copy()
-    server_env["OLLAMA_HOST"] = "127.0.0.1:11434"
-    server_env["OLLAMA_NUM_PARALLEL"] = "1"
-    log_handle = OLLAMA_LOG.open("ab")
-    try:
-        with urlopen("http://127.0.0.1:11434/api/tags", timeout=2):
-            server = None
-    except (OSError, URLError):
-        try:
-            server = subprocess.Popen(
-                ["ollama", "serve"],
-                env=server_env,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-        except Exception:
-            log_handle.close()
-            raise
-
-    for _ in range(60):
-        if server is not None and server.poll() is not None:
-            log_handle.close()
-            raise RuntimeError(
-                "Ollama server exited during startup; inspect its Colab log."
-            )
-        try:
-            with urlopen("http://127.0.0.1:11434/api/tags", timeout=2):
-                break
-        except (OSError, URLError):
-            time.sleep(1)
-    else:
-        raise RuntimeError("Ollama server did not become ready within 60 seconds.")
-
-    run(["ollama", "pull", "qwen3.5:2b"])
-    smoke_payload = json.dumps(
-        {"model": "qwen3.5:2b", "prompt": "Reply with the word ready.", "stream": False}
-    ).encode("utf-8")
-    request = Request(
-        "http://127.0.0.1:11434/api/generate",
-        data=smoke_payload,
-        headers={"Content-Type": "application/json"},
-    )
-    with urlopen(request, timeout=180) as response:
-        if not json.loads(response.read()).get("response", "").strip():
-            raise RuntimeError("Qwen returned an empty Colab smoke-test response.")
-    log_handle.close()
-
-
 def main() -> None:
     if not SOURCE_ROOT.joinpath("week5/new_evaluation/acceptance.py").is_file():
         raise FileNotFoundError(
@@ -179,7 +106,7 @@ def main() -> None:
         raise RuntimeError("Colab setup needs its standard root notebook kernel.")
 
     run(["apt-get", "update", "-qq"])
-    run(["apt-get", "install", "-y", "postgresql", "postgresql-client", "zstd"])
+    run(["apt-get", "install", "-y", "postgresql", "postgresql-client"])
     run(["service", "postgresql", "start"])
     for _ in range(30):
         probe = subprocess.run(
@@ -191,7 +118,6 @@ def main() -> None:
     else:
         raise RuntimeError("Synthetic PostgreSQL did not start in Colab.")
 
-    install_ollama()
     if RUNTIME_CONFIG.is_file():
         settings = json.loads(RUNTIME_CONFIG.read_text(encoding="utf-8"))
         dsn = settings["POSTGRES_READONLY_DSN"]
@@ -201,21 +127,20 @@ def main() -> None:
             "ATTENDANCE_PHASE2_SOURCE_ROOT": str(SOURCE_ROOT),
             "POSTGRES_READONLY_DSN": dsn,
             "POSTGRES_ATTENDANCE_TABLE": "attendance_records",
-            "LLM_REFERENCE_MODEL": "ollama_chat/qwen3.5:2b",
-            "LLM_PLANNER_MODEL": "openai/gpt-5-nano",
+            "LLM_REFERENCE_MODEL": "openai/gpt-4.1-mini",
+            "LLM_PLANNER_MODEL": "openai/gpt-4.1-mini",
             "LLM_PLANNER_MAX_OUTPUT_TOKENS": "6000",
-            "OLLAMA_API_BASE": "http://127.0.0.1:11434",
-            "OLLAMA_HOST": "127.0.0.1:11434",
         }
-    settings["LLM_PLANNER_MODEL"] = "openai/gpt-5-nano"
+    settings["LLM_PLANNER_MODEL"] = "openai/gpt-4.1-mini"
     settings["LLM_PLANNER_MAX_OUTPUT_TOKENS"] = "6000"
-    settings["LLM_REFERENCE_MODEL"] = "ollama_chat/qwen3.5:2b"
+    settings["LLM_REFERENCE_MODEL"] = "openai/gpt-4.1-mini"
     if OPENAI_KEY_FILE.is_file():
         settings["OPENAI_API_KEY"] = OPENAI_KEY_FILE.read_text(encoding="utf-8").strip()
         OPENAI_KEY_FILE.unlink()
-    timeout = model_stage_timeout_seconds()
     for stage in ("REFERENCE", "PLANNER"):
-        settings[f"LLM_{stage}_TIMEOUT_SECONDS"] = timeout
+        settings[f"LLM_{stage}_TIMEOUT_SECONDS"] = "180"
+    settings.pop("OLLAMA_API_BASE", None)
+    settings.pop("OLLAMA_HOST", None)
     RUNTIME_CONFIG.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     RUNTIME_CONFIG.chmod(0o600)
     os.environ.update(settings)
@@ -231,9 +156,7 @@ def main() -> None:
             "Synthetic fixture row/employee count did not match its oracle."
         )
 
-    print(
-        "Colab runtime ready: Qwen smoke test passed; synthetic DB has 16 rows and 3 employees."
-    )
+    print("Colab runtime ready: synthetic DB has 16 rows and 3 employees.")
     print(
         "The generated read-only DSN is stored only in this Colab VM's private runtime config."
     )

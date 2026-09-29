@@ -1,8 +1,8 @@
 # Run the attendance chatbot in Colab
 
 The launcher rebuilds the source package every time, so edits to the current local
-application files are included automatically. It uses Qwen 3.5 2B for reference
-resolution and `gpt-5-nano` through the OpenAI API for SQL planning, final
+application files are included automatically. It uses `gpt-4.1-mini` through the
+OpenAI API for reference resolution, SQL planning, final
 answering, and answer review. The reviewer can request another bounded query
 when a materially wrong answer needs evidence available in the database.
 
@@ -35,12 +35,10 @@ The script automatically:
   `attendance-chatbot` session (Enter keeps A100 as the default);
 - uploads the code and data;
 - uploads the OpenAI API key to a temporary private file that the Colab setup consumes;
-- installs PostgreSQL, Ollama, and Python dependencies;
-- downloads `qwen3.5:2b` when needed;
+- installs PostgreSQL and Python dependencies;
 - starts the chatbot and prints a public Gradio URL.
 
-The first run on a new Colab session downloads Qwen; later starts in the same
-live session reuse it. The SQL planner uses the OpenAI API key from your
+The models use the OpenAI API key from your
 PowerShell environment or the repository root `.env`.
 If the named session already exists, the script asks whether to reuse its current
 hardware or stop it and create a new session with your selected runtime.
@@ -87,7 +85,7 @@ chatbot again.
 ### The selected GPU is unavailable
 
 Choose another GPU or CPU on the next run. Availability depends on your Colab
-subscription and current capacity. CPU inference can be very slow.
+subscription and current capacity.
 
 ### No Gradio URL appears
 

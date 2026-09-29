@@ -173,7 +173,10 @@ def _content(response: object, stage: str) -> str:
 
 
 def _local_model_options(model: str, stage: str) -> dict[str, object]:
-    if model in {"openai/gpt-5-nano", "gpt-5-nano"} and stage == "sql_planner":
+    if model in {"openai/gpt-5-nano", "gpt-5-nano"} and stage in {
+        "reference",
+        "sql_planner",
+    }:
         return {"reasoning_effort": "low"}
     if model.startswith(("ollama/", "ollama_chat/")):
         local_model = model.rsplit("/", 1)[-1].casefold()

@@ -90,17 +90,13 @@ versions are implementation details, not deployment settings. For the current Ph
 local run, configure the model roles as follows:
 
 ```env
-LLM_REFERENCE_MODEL=ollama_chat/qwen3.5:2b
-LLM_PLANNER_MODEL=openai/gpt-5-nano
+LLM_REFERENCE_MODEL=openai/gpt-4.1-mini
+LLM_PLANNER_MODEL=openai/gpt-4.1-mini
 LLM_PLANNER_MAX_OUTPUT_TOKENS=6000
 ```
 
-Install the local reference model with `ollama pull qwen3.5:2b`.
-Set `OPENAI_API_KEY` for the planner's `gpt-5-nano` SQL, final-answer, and review calls.
-
-For local Ollama calls, the provider sets `reasoning_effort="none"` and
-`temperature=0`; the reference call uses `num_ctx=32768`. The planner uses GPT
-for SQL, answering from executed rows, and reviewing the answer. The maximum
+Set `OPENAI_API_KEY` for the reference, SQL planning, final-answer, and review calls.
+The maximum
 provider-call budget is eight. Keep
 `POSTGRES_READONLY_DSN` configured independently from the ingestion writer DSN.
 
@@ -184,7 +180,7 @@ and shutdown instructions. It is the canonical local-to-Colab workflow.
 
 The deterministic Phase 2/3 notebook is
 [`colab/attendance_phase2_tests.ipynb`](colab/attendance_phase2_tests.ipynb). Its
-paired source archive contains an explicit 32-file allowlist, test helpers, and a
+paired source archive contains an explicit source allowlist, test helpers, and a
 generated count-only placeholder manifest. It excludes `.env` files, credentials,
 attendance rows, the private evaluation corpus, and result artifacts. The notebook
 uses mocked model/database boundaries; it does not call an LLM or connect to
@@ -192,15 +188,14 @@ PostgreSQL.
 
 For an approved live long-conversation acceptance, run
 `colab/prepare_synthetic_runtime.py` first. It provisions a temporary read-only local
-PostgreSQL database with synthetic rows and installs Qwen 3.5 4B in the Colab T4 VM.
+PostgreSQL database with synthetic rows in the Colab VM.
 Then call `colab/run_acceptance_turn.py` once per turn and inspect each result before
 continuing. No production DSN, database tunnel, real attendance rows, or external
 Google credential is needed. The generated test DSN remains in a mode-0600 runtime
 file inside the temporary Colab VM and is not placed in the source archive or a
 repository `.env` file.
 
-The 2026-09-25 synthetic Colab runs confirmed the helper's PostgreSQL fixture and
-Qwen smoke test after adding the Ollama installer's `zstd` prerequisite. Later
+The 2026-09-25 synthetic Colab runs confirmed the helper's PostgreSQL fixture. Later
 Gradio callback acceptance verified turns 1–4, then stopped at an incorrect grouped
 relative-month comparison on turn 5. The runtime expired, and Colab returned
 `Service Unavailable` when creating a replacement T4. See the Colab sync guide for

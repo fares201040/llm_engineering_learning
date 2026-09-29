@@ -29,7 +29,6 @@ SOURCE_PATHS = (
     "week5/new_implementation/colab/private_payload.py",
     "week5/new_implementation/colab/test_private_payload.py",
     "week5/new_implementation/colab/prepare_synthetic_runtime.py",
-    "week5/new_implementation/colab/test_prepare_synthetic_runtime.py",
     "week5/new_implementation/colab/prepare_private_runtime.py",
     "week5/new_implementation/colab/run_private_eval.py",
     "week5/new_implementation/colab/compare_planner_prompts.py",

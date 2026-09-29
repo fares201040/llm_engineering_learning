@@ -28,10 +28,9 @@ query, witness query, narrative query route, shadow/canary path, or old state ad
 
 ## Model roles and payloads
 
-The reference model uses `ollama_chat/qwen3.5:2b`. The query planner uses
-`openai/gpt-5-nano` for SQL planning, answering from executed rows, and reviewing
-its answer. Local Qwen calls use `reasoning_effort="none"`, `temperature=0`, and
-`num_ctx=32768`. Set `LLM_PLANNER_MAX_OUTPUT_TOKENS=6000`.
+The reference and query-planning roles use `openai/gpt-4.1-mini` by default.
+The planner also answers from executed rows and reviews its answer. Set
+`LLM_PLANNER_MAX_OUTPUT_TOKENS=6000`.
 
 There are two configured model roles:
 

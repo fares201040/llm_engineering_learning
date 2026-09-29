@@ -9,9 +9,6 @@ import secrets
 import shutil
 import subprocess
 import sys
-import time
-from urllib.error import URLError
-from urllib.request import urlopen
 from zipfile import ZipFile
 
 
@@ -20,7 +17,6 @@ SOURCE_ROOT = Path("/content/attendance_chatbot_source")
 NEXT_PRIVATE_PAYLOAD = Path("/content/attendance_private_payload.next.zip")
 PRIVATE_PAYLOAD = Path("/content/attendance_private_payload.zip")
 PRIVATE_RUNTIME = Path("/content/.attendance_private_runtime.json")
-OLLAMA_LOG = Path("/content/ollama-chatbot.log")
 
 
 def run(command: list[str], *, input_text: str | None = None) -> None:
@@ -79,43 +75,6 @@ def install_dependencies() -> None:
     run(["service", "postgresql", "start"])
 
 
-def ensure_ollama() -> None:
-    if shutil.which("ollama") is None:
-        installer = subprocess.run(
-            ["curl", "-fsSL", "https://ollama.com/install.sh"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout
-        run(["bash"], input_text=installer)
-
-    os.environ["OLLAMA_HOST"] = "127.0.0.1:11434"
-    os.environ["OLLAMA_API_BASE"] = "http://127.0.0.1:11434"
-    try:
-        with urlopen("http://127.0.0.1:11434/api/tags", timeout=2):
-            pass
-    except (OSError, URLError):
-        log = OLLAMA_LOG.open("ab")
-        subprocess.Popen(
-            ["ollama", "serve"],
-            env={**os.environ, "OLLAMA_NUM_PARALLEL": "1"},
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-
-    for _ in range(60):
-        try:
-            with urlopen("http://127.0.0.1:11434/api/tags", timeout=2):
-                break
-        except (OSError, URLError):
-            time.sleep(1)
-    else:
-        raise RuntimeError("Ollama did not become ready within 60 seconds")
-
-    run(["ollama", "pull", "qwen3.5:2b"])
-
-
 def prepare_private_data() -> dict[str, str]:
     if not NEXT_PRIVATE_PAYLOAD.is_file():
         raise FileNotFoundError("The private attendance payload was not uploaded")
@@ -139,7 +98,8 @@ def prepare_private_data() -> dict[str, str]:
 
     prepare_private_runtime()
     settings = json.loads(PRIVATE_RUNTIME.read_text(encoding="utf-8"))
-    settings["LLM_PLANNER_MODEL"] = "openai/gpt-5-nano"
+    settings["LLM_REFERENCE_MODEL"] = "openai/gpt-4.1-mini"
+    settings["LLM_PLANNER_MODEL"] = "openai/gpt-4.1-mini"
     PRIVATE_RUNTIME.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     PRIVATE_RUNTIME.chmod(0o600)
     return settings
@@ -152,7 +112,6 @@ def main() -> None:
 
     extract_source()
     install_dependencies()
-    ensure_ollama()
     settings = prepare_private_data()
     os.environ.update(settings)
     os.environ["GRADIO_SHARE"] = "true"

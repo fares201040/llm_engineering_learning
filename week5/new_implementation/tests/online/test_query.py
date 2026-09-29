@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import unittest
+from unittest.mock import patch
 
 from pydantic import BaseModel, ValidationError
 
 from week5.new_implementation.online import context
+from week5.new_implementation.config import Settings
 from week5.new_implementation.online.context import (
     DatabaseColumn,
     DatabaseContext,
@@ -59,6 +61,12 @@ class StructuredProbe(BaseModel):
 
 
 class DatabaseContextTests(unittest.TestCase):
+    def test_default_reference_uses_planner_model(self):
+        with patch.dict("os.environ", {"LLM_MODEL": "", "LLM_REFERENCE_MODEL": ""}):
+            current = Settings.from_environment()
+
+        self.assertEqual(current.llm_reference_model, current.llm_planner_model)
+
     def test_database_categories_are_discovered_as_exact_standard_values(self):
         class Result:
             def fetchall(self):
@@ -546,6 +554,37 @@ class DatabaseContextTests(unittest.TestCase):
         self.assertEqual(captured["reasoning_effort"], "none")
         self.assertEqual(captured["temperature"], 0)
         self.assertEqual(captured["num_ctx"], 32768)
+
+    def test_nano_reference_uses_bounded_reasoning_for_structured_output(self):
+        captured = {}
+
+        class Message:
+            content = '{"value":"ok"}'
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+
+        def complete(**kwargs):
+            captured.update(kwargs)
+            return Response()
+
+        result = call_structured(
+            stage="reference",
+            model="openai/gpt-5-nano",
+            system="system",
+            payload={"current_question": "test"},
+            response_model=StructuredProbe,
+            budget=CallBudget(limit=1),
+            timeout=1,
+            max_output_tokens=3000,
+            completion_fn=complete,
+        )
+
+        self.assertEqual(result.value, "ok")
+        self.assertEqual(captured["reasoning_effort"], "low")
 
     def test_layer_logger_emits_summary_and_exact_debug_output(self):
         with self.assertLogs(

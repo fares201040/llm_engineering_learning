@@ -208,21 +208,16 @@ def write_runtime_config(path: Path, settings: dict[str, str]) -> None:
 
 def _model_settings() -> dict[str, str]:
     defaults = {
-        "LLM_REFERENCE_MODEL": "ollama_chat/qwen3.5:2b",
+        "LLM_REFERENCE_MODEL": "openai/gpt-4.1-mini",
         "LLM_REFERENCE_TIMEOUT_SECONDS": "180",
-        "LLM_PLANNER_MODEL": "openai/gpt-5-nano",
+        "LLM_PLANNER_MODEL": "openai/gpt-4.1-mini",
         "LLM_PLANNER_TIMEOUT_SECONDS": "180",
         "LLM_PLANNER_MAX_OUTPUT_TOKENS": "6000",
-        "OLLAMA_API_BASE": "http://127.0.0.1:11434",
-        "OLLAMA_HOST": "127.0.0.1:11434",
     }
     if SYNTHETIC_RUNTIME_CONFIG.is_file():
         prior = json.loads(SYNTHETIC_RUNTIME_CONFIG.read_text(encoding="utf-8"))
         if isinstance(prior.get("OPENAI_API_KEY"), str):
             defaults["OPENAI_API_KEY"] = prior["OPENAI_API_KEY"]
-        for key in ("OLLAMA_API_BASE", "OLLAMA_HOST"):
-            if isinstance(prior.get(key), str):
-                defaults[key] = prior[key]
         for stage in ("REFERENCE", "PLANNER", "ANSWER"):
             key = f"LLM_{stage}_TIMEOUT_SECONDS"
             if isinstance(prior.get(key), str):
@@ -245,7 +240,7 @@ def main() -> None:
     model_settings = _model_settings()
     if not model_settings.get("OPENAI_API_KEY"):
         raise RuntimeError(
-            "The private runtime requires OPENAI_API_KEY for the GPT SQL planner"
+            "The private runtime requires OPENAI_API_KEY for the GPT reference and SQL planner"
         )
 
     run(["service", "postgresql", "start"])

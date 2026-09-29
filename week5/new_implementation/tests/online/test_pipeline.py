@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
+from unittest.mock import patch
 
 import psycopg
 
@@ -47,6 +49,7 @@ from week5.new_implementation.online.reference import (
 from week5.new_implementation.online.state import ConversationState, VerifiedTurn
 from week5.new_implementation.tests.online.test_query import database_context
 from week5.new_implementation.tests.online.test_comparison import attendance_schema
+from week5.new_implementation.config import settings
 
 
 def ready_reference(*_args, **_kwargs):
@@ -1105,6 +1108,64 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(planned_contexts[0].subject_relationship, "criteria")
         self.assertIn("Finance department", planned_contexts[0].updated_request)
 
+    def test_inconsistent_reference_is_reconsidered_when_models_are_the_same(self):
+        dependencies = self.dependencies()
+        reference_calls = []
+
+        def reference_writer(question, **kwargs):
+            reference_calls.append(kwargs)
+            if len(reference_calls) == 1:
+                return ReferenceResponse(
+                    decision=ReadyReference(
+                        rewritten_request=question,
+                        locale="en",
+                        request_relationship="follow_up",
+                        subject_relationship="intersection",
+                    )
+                )
+            return ReferenceResponse(
+                decision=ReadyReference(
+                    rewritten_request=question,
+                    locale="en",
+                    request_relationship="follow_up",
+                    subject_relationship="criteria",
+                    employee_criteria=("workflow status Authorized",),
+                )
+            )
+
+        dependencies.reference_writer = reference_writer
+        dependencies.planner = lambda **_kwargs: (
+            "SELECT COUNT(DISTINCT employee_id) AS employee_count "
+            "FROM attendance_records WHERE status = 'Authorized'"
+        )
+        dependencies.executor = lambda *_args, **_kwargs: SqlExecutionResult(
+            columns=(),
+            rows=({"employee_count": 370},),
+            coverage=ExecutionCoverage(
+                fetched_rows=1, result_limit=100, response_bytes=22
+            ),
+        )
+        dependencies.answerer = lambda **_kwargs: "370 employees."
+
+        with patch(
+            "week5.new_implementation.online.pipeline.settings",
+            replace(settings, llm_reference_model=settings.llm_planner_model),
+        ):
+            outcome = run_turn(
+                TurnRequest(
+                    question="How many of those employees have Authorized status?",
+                    access_context=LOCAL_DEMO_ACCESS,
+                ),
+                dependencies=dependencies,
+            )
+
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(len(reference_calls), 2)
+        self.assertEqual(reference_calls[0]["model"], reference_calls[1]["model"])
+        self.assertIn(
+            "subject_relationship", reference_calls[1]["reconsideration_feedback"]
+        )
+
     def test_unknown_grouped_metric_reaches_planner_capability_protocol(self):
         dependencies = self.dependencies()
         dependencies.context_loader = lambda **_kwargs: attendance_schema()
@@ -1544,6 +1605,17 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertIn("ORDER BY indicator_count DESC", repaired)
         self.assertIsNone(_sql_semantic_issue("Find indicators by employee.", repaired))
+
+    def test_grouped_cte_limit_does_not_need_final_result_count(self):
+        self.assertIsNone(
+            _sql_semantic_issue(
+                "Count the leading departments.",
+                "WITH leaders AS ("
+                "SELECT department FROM attendance_records "
+                "GROUP BY department ORDER BY SUM(total_worked_hrs) DESC LIMIT 3"
+                ") SELECT COUNT(*) AS leading_count FROM leaders",
+            )
+        )
 
     def test_running_total_alias_requires_an_ordered_window(self):
         self.assertEqual(
@@ -2490,7 +2562,7 @@ class PipelineTests(unittest.TestCase):
 
         self.assertIsInstance(outcome, Answered)
         self.assertEqual(len(models), 2)
-        self.assertNotEqual(models[0], models[1])
+        self.assertEqual(models[0], models[1])
 
     def test_planner_model_rechecks_conflicting_reference_fields(self):
         dependencies = self.dependencies()
@@ -2529,7 +2601,7 @@ class PipelineTests(unittest.TestCase):
 
         self.assertIsInstance(outcome, Answered)
         self.assertEqual(len(models), 2)
-        self.assertNotEqual(models[0], models[1])
+        self.assertEqual(models[0], models[1])
         self.assertEqual(outcome.state.active_employee_ids, ("A1",))
 
     def test_unclassified_reference_leaves_subject_for_sql_planner(self):

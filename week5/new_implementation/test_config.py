@@ -8,7 +8,7 @@ class ConfigTests(unittest.TestCase):
     def test_online_runtime_has_one_fixed_call_ceiling(self):
         self.assertEqual(settings.llm_turn_provider_call_limit, 8)
 
-    def test_default_models_use_qwen_reference_and_gpt_planner(self):
+    def test_default_models_use_shared_gpt_reference_and_planner(self):
         with patch.dict(
             "os.environ",
             {
@@ -19,8 +19,8 @@ class ConfigTests(unittest.TestCase):
         ):
             configured = Settings.from_environment()
 
-        self.assertEqual(configured.llm_reference_model, "ollama_chat/qwen3.5:2b")
-        self.assertEqual(configured.llm_planner_model, "openai/gpt-5-nano")
+        self.assertEqual(configured.llm_reference_model, "openai/gpt-4.1-mini")
+        self.assertEqual(configured.llm_planner_model, "openai/gpt-4.1-mini")
 
     def test_global_model_remains_an_explicit_all_role_override(self):
         with patch.dict(

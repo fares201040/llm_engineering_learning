@@ -55,6 +55,18 @@ class ReferenceAndPlanningTests(unittest.TestCase):
                     "Authorized records by country",
                     "HR employees by work location",
                 ),
+                scope_clauses=(
+                    {
+                        "request": "Count Authorized records by country.",
+                        "current_question_basis": "auth by country",
+                        "carried_from_previous": (),
+                    },
+                    {
+                        "request": "Count HR people by work location across all HR rows.",
+                        "current_question_basis": "hr work loc ppl count, all hr",
+                        "carried_from_previous": (),
+                    },
+                ),
             ),
             (),
             original_question="auth by country; hr work loc ppl count, all hr",
@@ -62,6 +74,8 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertFalse(bound.ambiguous)
         self.assertEqual(bound.subject_relationship, "union")
         self.assertEqual(bound.employee_ids, ())
+        self.assertEqual(len(bound.scope_clauses), 2)
+        self.assertEqual(bound.scope_clauses[1].carried_from_previous, ())
 
     def test_follow_up_ignores_unmentioned_invented_id_and_keeps_active_person(self):
         active = Employee(employee_id="A11026", name="Wail Saleh Awadh")
@@ -466,6 +480,13 @@ class ReferenceAndPlanningTests(unittest.TestCase):
             trusted_context={
                 "active_employees": [{"employee_id": "A1", "name": "Wail Ali"}]
             },
+            prior_reference_scope_clauses=(
+                {
+                    "request": "Show Wail Ali's attendance.",
+                    "current_question_basis": "show Wail",
+                    "carried_from_previous": (),
+                },
+            ),
             active_employees=(Employee(employee_id="A1", name="Wail Ali"),),
             as_of_date="2026-09-25",
             model="reference-model",
@@ -479,6 +500,11 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertEqual(payload["as_of_date"], "2026-09-25")
         self.assertIn("conversation_history", payload)
         self.assertIn("trusted_context", payload)
+        self.assertEqual(
+            payload["prior_reference_scope_clauses"][0]["request"],
+            "Show Wail Ali's attendance.",
+        )
+        self.assertNotIn("scope_clauses", payload["trusted_context"])
         self.assertNotIn("database_context", payload)
         self.assertNotIn("database_schema", payload)
 

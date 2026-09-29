@@ -51,6 +51,12 @@ class IdentityClaim(_Strict):
     employee_name: str = Field(min_length=1, max_length=256)
 
 
+class ScopeClause(_Strict):
+    request: str = Field(min_length=1, max_length=10000)
+    current_question_basis: str = Field(min_length=1, max_length=10000)
+    carried_from_previous: tuple[str, ...] = Field(default=(), max_length=20)
+
+
 class ReadyReference(_Strict):
     status: Literal["ready"] = "ready"
     rewritten_request: str = Field(min_length=1, max_length=50000)
@@ -63,6 +69,7 @@ class ReadyReference(_Strict):
     employee_names: tuple[str, ...] = Field(default=(), max_length=20)
     identity_claims: tuple[IdentityClaim, ...] = Field(default=(), max_length=20)
     employee_criteria: tuple[str, ...] = Field(default=(), max_length=20)
+    scope_clauses: tuple[ScopeClause, ...] = Field(default=(), max_length=20)
 
 
 class AmbiguousReference(_Strict):
@@ -72,6 +79,7 @@ class AmbiguousReference(_Strict):
     rewritten_request: str = Field(min_length=1, max_length=50000)
     request_relationship: Literal["new", "follow_up"] = "new"
     employee_mention: str | None = Field(default=None, min_length=1, max_length=256)
+    scope_clauses: tuple[ScopeClause, ...] = Field(default=(), max_length=20)
 
 
 class UnsupportedReference(_Strict):
@@ -98,6 +106,7 @@ class PendingResolution(_Strict):
     resolved_employees: tuple[Employee, ...] = Field(default=(), max_length=20)
     employee_criteria: tuple[str, ...] = Field(default=(), max_length=20)
     identity_claim: IdentityClaim | None = None
+    scope_clauses: tuple[ScopeClause, ...] = Field(default=(), max_length=20)
 
 
 class PendingEmployeeConfirmation(_Strict):
@@ -120,6 +129,7 @@ class BoundReferences(_Strict):
     ) = None
     employee_criteria: tuple[str, ...] = Field(default=(), max_length=20)
     employees: tuple[Employee, ...] = Field(default=(), max_length=20)
+    scope_clauses: tuple[ScopeClause, ...] = Field(default=(), max_length=20)
     confirmation: PendingEmployeeConfirmation | None = None
     ambiguous: bool = False
     reason: Literal[
@@ -163,10 +173,22 @@ across the dataset, and separately distinct people by work location across all
 HR rows. Do not turn those clauses into one country-by-location breakdown or
 apply the approval filter to all HR rows. Preserve informal language's intended
 meaning without treating each abbreviation or spelling error as an unknown field.
-For a follow-up, start with the most recent
+For each independently answerable clause, include one scope_clauses entry. Its
+request is that clause's complete interpreted request, current_question_basis
+identifies the current user's wording that asks for it, and
+carried_from_previous lists only constraints inherited from the last verified
+user request. Keep independent clause scopes separate. Do not copy a value seen
+only in an earlier result or SQL query into carried_from_previous. These entries
+are interpretations for the planner to check against the original question,
+not new authority over it.
+prior_reference_scope_clauses contains only earlier reference interpretations,
+not verified user intent. Cross-check each against the earlier original_question
+before using it to resolve a follow-up. For a follow-up, start with the most recent
 verified request in trusted_context. Carry forward its employee, date interval,
 comparison, and other user-requested filters unless the current question changes
-them. A value seen only in an earlier result or answer is context, not an inherited
+them. requested_date_scope records a period verified as requested; date_scope
+describes the executed SQL and is not by itself a user-requested filter. A value
+seen only in an earlier result or answer is context, not an inherited
 filter; consult the earlier original_question to distinguish the two. Apply the
 current requested output in place of the previous output unless the user explicitly
 asks to include, compare, or continue that earlier output. Reusing a subject or
@@ -273,6 +295,7 @@ def request_references(
     *,
     history: tuple[dict[str, str], ...],
     trusted_context: dict[str, object],
+    prior_reference_scope_clauses: tuple[dict[str, object], ...] = (),
     active_employees: tuple[Employee, ...],
     as_of_date: str | None = None,
     model: str,
@@ -288,6 +311,7 @@ def request_references(
     payload: dict[str, object] = {
         "conversation_history": list(history),
         "trusted_context": trusted_context,
+        "prior_reference_scope_clauses": list(prior_reference_scope_clauses),
         "active_authoritative_employees": [
             item.model_dump(mode="json") for item in active_employees
         ],
@@ -398,6 +422,7 @@ def _pending(
         ),
         employee_criteria=ready.employee_criteria,
         identity_claim=identity_claim,
+        scope_clauses=ready.scope_clauses,
     )
 
 
@@ -460,6 +485,7 @@ def bind_references(
                 locale=ambiguous.locale,
                 request_relationship=ambiguous.request_relationship,
                 subject_relationship="employees",
+                scope_clauses=ambiguous.scope_clauses,
             )
             if mention is not None
             else None
@@ -485,12 +511,14 @@ def bind_references(
                 request_relationship=ambiguous.request_relationship,
                 subject_relationship="employees",
                 employees=(selected,),
+                scope_clauses=ambiguous.scope_clauses,
             )
         if exact_options and pending is not None:
             return BoundReferences(
                 rewritten_request=ambiguous.rewritten_request,
                 locale=ambiguous.locale,
                 request_relationship=ambiguous.request_relationship,
+                scope_clauses=ambiguous.scope_clauses,
                 confirmation=PendingEmployeeConfirmation(
                     original_question=original_question,
                     mention=mention,
@@ -502,6 +530,7 @@ def bind_references(
             rewritten_request=ambiguous.rewritten_request,
             locale=ambiguous.locale,
             request_relationship=ambiguous.request_relationship,
+            scope_clauses=ambiguous.scope_clauses,
             ambiguous=True,
             reason=ambiguous.reason,
             unresolved_mention=mention,
@@ -532,6 +561,7 @@ def bind_references(
             request_relationship=ready.request_relationship,
             subject_relationship=ready.subject_relationship,
             employee_criteria=ready.employee_criteria,
+            scope_clauses=ready.scope_clauses,
         )
     ordered_question_words = _words(original_question)
     question_tokens = set(ordered_question_words)
@@ -543,6 +573,7 @@ def bind_references(
         "request_relationship": ready.request_relationship,
         "subject_relationship": normalized_subject_relationship,
         "employee_criteria": ready.employee_criteria,
+        "scope_clauses": ready.scope_clauses,
     }
     by_id = {_normalize(item.employee_id): item for item in directory}
     authorized_id_shapes = {_identifier_shape(item.employee_id) for item in directory}
@@ -636,7 +667,9 @@ def bind_references(
             and authorized_id_shapes
             and _identifier_shape(employee_id) not in authorized_id_shapes
         ):
-            return BoundReferences(**base, ambiguous=True, reason="malformed_identifier")
+            return BoundReferences(
+                **base, ambiguous=True, reason="malformed_identifier"
+            )
         employee = by_id.get(normalized_reference)
         if employee is None:
             exact_name_matches = by_name.get(normalized_reference, ())
@@ -735,7 +768,9 @@ def bind_references(
             and authorized_id_shapes
             and _identifier_shape(claim.employee_id) not in authorized_id_shapes
         ):
-            return BoundReferences(**base, ambiguous=True, reason="malformed_identifier")
+            return BoundReferences(
+                **base, ambiguous=True, reason="malformed_identifier"
+            )
         id_owner = by_id.get(_normalize(claim.employee_id))
         if id_owner is None and _normalize(claim.employee_id) not in question_tokens:
             exact_name_matches = by_name.get(normalized_claim_name, ())
@@ -877,6 +912,7 @@ def complete_confirmation(
         subject_relationship=pending.resolution.subject_relationship,
         employee_criteria=pending.resolution.employee_criteria,
         employees=employees,
+        scope_clauses=pending.resolution.scope_clauses,
     )
 
 

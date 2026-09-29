@@ -54,6 +54,9 @@ concisely even if the executed SQL returned unrelated attendance rows.
 Use scope_provenance to check whether the executed SQL added an earlier person's
 or location's filter to a broader current request. If so, do not present its
 limited rows as an answer over all requested subjects; explain the scope gap.
+Use scope_provenance.reference_scope_clauses to check each independently
+requested part against the executed SQL and rows. The clauses are a reference
+interpretation; current_question is authoritative when they disagree.
 If the current message selects an option from a clarification, answer the original
 pending question with that resolved identity; the selection does not ask for a
 report of every attendance record.
@@ -162,6 +165,9 @@ different, unavailable record type, replace the answer with a concise statement
 that the requested records are unavailable. Do not present the unrelated rows.
 The reference_interpretation in scope_provenance can help unpack shorthand, but
 verify its clauses and filters against current_question before trusting it.
+Check scope_provenance.reference_scope_clauses separately, including each clause's inherited
+constraints, against the prior original question and current question. Do not
+accept a filter merely because it appears in a clause interpretation.
 Then inspect proposed_answer, executed_sql, typed rows, result coverage, schema
 descriptions, and employee identities. Check that each stated fact belongs to the
 correct person, department, work location, period, and measure. Check that SQL
@@ -491,6 +497,11 @@ user wants now. Check that interpretation against current_question and scope_pro
 scope_provenance.reference_interpretation is the reference model's reading of the
 current message. Use it to unpack shorthand and independent clauses, then verify
 every inferred filter, subject, and requested output against current_question.
+scope_provenance.reference_scope_clauses separates independently requested parts
+and labels constraints carried from the previous request. Check each clause's
+current_question_basis against the user's message and every carried constraint
+against the previous original question. Treat these clauses as interpretations,
+not authority over the current question or database schema.
 Do not carry a prior value just because the interpretation mentions it.
 updated_request includes the current request with resolved references. For a new
 request, leave unrelated earlier filters and output shapes behind. For a follow-up,
@@ -536,8 +547,10 @@ status predicate, even if a reference rewrite describes the request broadly.
 Count only records with that status; a count over all statuses answers a
 different question.
 required_date_scope is the resolved date interval for this turn; apply it
-throughout the relevant query. Use as_of_date for relative
-dates. The database's date_coverage describes available data, not a requested filter.
+to the clauses that request or carry that period. An independent unbounded
+clause must remain unbounded even when another clause names a date. Use
+as_of_date for relative dates. The database's date_coverage describes available
+data, not a requested filter.
 For an unbounded request, use all accessible rows without date predicates. Do not
 copy the table's first and last observed dates into WHERE; they are metadata about
 available data, not dates chosen by the user. They must not become scope in a later

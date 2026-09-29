@@ -9,7 +9,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from . import RUNTIME_VERSION
-from .reference import Employee, PendingEmployeeConfirmation
+from .reference import Employee, PendingEmployeeConfirmation, ScopeClause
 
 
 class _Strict(BaseModel):
@@ -27,14 +27,17 @@ class VerifiedTurn(_Strict):
     employees: tuple[Employee, ...] = Field(default=(), max_length=20)
     executed_sql: str = Field(min_length=1, max_length=100000)
     date_scope: tuple[str, str] | None = None
+    requested_date_scope: tuple[str, str] | None = None
     result: dict[str, object] = Field(default_factory=dict)
+    scope_clauses: tuple[ScopeClause, ...] = Field(default=(), max_length=20)
 
     @model_validator(mode="after")
     def _valid_date_scope(self):
-        if self.date_scope is not None:
-            start, end = (date.fromisoformat(value) for value in self.date_scope)
-            if start > end:
-                raise ValueError("date scope must be ordered")
+        for scope in (self.date_scope, self.requested_date_scope):
+            if scope is not None:
+                start, end = (date.fromisoformat(value) for value in scope)
+                if start > end:
+                    raise ValueError("date scope must be ordered")
         return self
 
     @property
@@ -87,6 +90,7 @@ class ConversationState(_Strict):
                         item.model_dump(mode="json") for item in turn.employees
                     ],
                     "date_scope": turn.date_scope,
+                    "requested_date_scope": turn.requested_date_scope,
                 }
                 for turn in self.verified_turns[-1:]
             ],

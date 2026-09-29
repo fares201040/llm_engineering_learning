@@ -209,13 +209,33 @@ def _unwrap_parentheses(node: exp.Expression) -> exp.Expression:
 
 
 def _has_required_date_scope(
-    sql: str, required_date_scope: tuple[str, str] | None
+    sql: str,
+    required_date_scope: tuple[str, str] | None,
+    *,
+    independent_clauses: bool = False,
 ) -> bool:
     if required_date_scope is None:
         return True
     paths = contributing_where_paths(sql)
-    return bool(paths) and all(
-        _date_scope_for_path(path) == required_date_scope for path in paths
+    matches = (_date_scope_for_path(path) == required_date_scope for path in paths)
+    return (any(matches) if independent_clauses else all(matches)) if paths else False
+
+
+def _has_multiple_source_scopes(sql: str) -> bool:
+    try:
+        statements = parse(sql, read="postgres")
+    except ParseError:
+        return False
+    attendance_table = settings.postgres_attendance_table.rsplit(".", 1)[-1].casefold()
+    return any(
+        sum(
+            table.name.casefold() == attendance_table
+            for table in statement.find_all(exp.Table)
+        )
+        > 1
+        or sum(1 for _ in statement.find_all(exp.Filter)) > 1
+        for statement in statements
+        if statement is not None
     )
 
 
@@ -250,7 +270,9 @@ def _requested_workflow_status(question: str) -> str | None:
     return status
 
 
-def _has_required_workflow_status(sql: str, status: str) -> bool:
+def _has_required_workflow_status(
+    sql: str, status: str, *, independent_clauses: bool = False
+) -> bool:
     paths = contributing_where_paths(sql, include_scalar_subqueries=False)
 
     def status_expression(node: exp.Expression) -> bool:
@@ -290,7 +312,8 @@ def _has_required_workflow_status(sql: str, status: str) -> bool:
             )
         return False
 
-    if paths and all(any(matches(predicate) for predicate in path) for path in paths):
+    matching_paths = (any(matches(predicate) for predicate in path) for path in paths)
+    if paths and (any(matching_paths) if independent_clauses else all(matching_paths)):
         return True
     if any(status_expression(predicate) for path in paths for predicate in path):
         return False
@@ -404,6 +427,7 @@ def _sql_semantic_issue(
     allow_rewritten_contracts: bool = True,
     database_context: DatabaseContext | None = None,
     required_date_scope: tuple[str, str] | None = None,
+    independent_clauses: bool = False,
 ) -> str | None:
     if _planner_control_alias(sql) is not None:
         return None
@@ -479,18 +503,28 @@ def _sql_semantic_issue(
         re.search(r"\b(?:AVG|COUNT|MAX|MIN|SUM)\s*\(", select_list, re.IGNORECASE)
         and not re.search(r"\bOVER\s*\(", select_list, re.IGNORECASE)
     )
+    grouped_result = any(
+        isinstance(statement, exp.Select) and statement.args.get("group") is not None
+        for statement in statements
+    )
     if (
         detail_noun
         and detail_verb
         and not aggregate_intent
         and scalar_aggregate
+        and not grouped_result
         and not re.search(r"\brecord_id\b", select_list, re.IGNORECASE)
     ):
         return "detail_request_requires_rows"
-    if not _has_required_date_scope(sql, required_date_scope):
+    separate_sources = independent_clauses and _has_multiple_source_scopes(sql)
+    if not _has_required_date_scope(
+        sql, required_date_scope, independent_clauses=separate_sources
+    ):
         return "date_scope_mismatch"
     requested_status = _requested_workflow_status(question)
-    if requested_status and not _has_required_workflow_status(sql, requested_status):
+    if requested_status and not _has_required_workflow_status(
+        sql, requested_status, independent_clauses=separate_sources
+    ):
         return "missing_workflow_status_filter"
     return None
 
@@ -590,7 +624,9 @@ def _strip_private_projections(
     for select in reversed(list(statement.find_all(exp.Select))):
         relation_names = _relation_names_for_select(
             select,
-            frozenset({settings.postgres_attendance_table.rsplit(".", 1)[-1].casefold()}),
+            frozenset(
+                {settings.postgres_attendance_table.rsplit(".", 1)[-1].casefold()}
+            ),
         )
         kept: list[exp.Expression] = []
         for item in select.expressions:
@@ -601,7 +637,11 @@ def _strip_private_projections(
             ):
                 source = select.args.get("from_")
                 table = source.this if isinstance(source, exp.From) else None
-                if isinstance(table, exp.Table) and table.name.casefold() != settings.postgres_attendance_table.rsplit(".", 1)[-1].casefold():
+                if (
+                    isinstance(table, exp.Table)
+                    and table.name.casefold()
+                    != settings.postgres_attendance_table.rsplit(".", 1)[-1].casefold()
+                ):
                     kept.append(item)
                     continue
                 if (
@@ -611,7 +651,12 @@ def _strip_private_projections(
                 ):
                     return None
                 kept.extend(
-                    exp.column(name, table=projection.table if isinstance(projection, exp.Column) else None)
+                    exp.column(
+                        name,
+                        table=projection.table
+                        if isinstance(projection, exp.Column)
+                        else None,
+                    )
                     for name in public_columns
                     if name.casefold() not in private_names
                 )
@@ -624,8 +669,13 @@ def _strip_private_projections(
         if len(kept) != len(select.expressions):
             if not any(
                 not (
-                    isinstance(item.this if isinstance(item, exp.Alias) else item, exp.Window)
-                    and isinstance((item.this if isinstance(item, exp.Alias) else item).this, exp.Count)
+                    isinstance(
+                        item.this if isinstance(item, exp.Alias) else item, exp.Window
+                    )
+                    and isinstance(
+                        (item.this if isinstance(item, exp.Alias) else item).this,
+                        exp.Count,
+                    )
                 )
                 for item in kept
             ):
@@ -677,7 +727,8 @@ def _mentions_time_period(question: str) -> bool:
     if any(re.search(rf"\b{month}\b", folded) for month in month_names):
         return True
     if re.search(
-        r"\b(?:today|yesterday|tomorrow|this|last|previous|next)\s+"
+        r"\b(?:today|yesterday|tomorrow)\b|"
+        r"\b(?:this|last|previous|next)\s+"
         r"(?:day|week|month|year|quarter)\b",
         folded,
     ):
@@ -806,7 +857,9 @@ def _unsupported_identifier(locale: str) -> str:
 def _unsupported_value(locale: str, issue: str) -> str:
     if issue == "reversed_temporal_range":
         if locale == "ar":
-            return "تاريخ بداية النطاق يأتي بعد تاريخ نهايته. يرجى تصحيح ترتيب التاريخين."
+            return (
+                "تاريخ بداية النطاق يأتي بعد تاريخ نهايته. يرجى تصحيح ترتيب التاريخين."
+            )
         return "The date range starts after it ends. Please correct the two dates."
     if locale == "ar":
         return "يحتوي الطلب على تاريخ أو قيمة رقمية غير صالحة. يرجى تصحيحها."
@@ -975,6 +1028,18 @@ def _requested_date_scope(question: str) -> tuple[str, str] | None:
 
     scopes = _explicit_date_scopes(question)
     return next(iter(scopes)) if len(scopes) == 1 else None
+
+
+def _verified_requested_date_scope(
+    turn: VerifiedTurn | None,
+) -> tuple[str, str] | None:
+    if turn is None:
+        return None
+    if turn.requested_date_scope is not None:
+        return turn.requested_date_scope
+    # Older saved turns have only the executed SQL scope.
+    explicit = _requested_date_scope(turn.original_question)
+    return explicit if explicit == turn.date_scope else None
 
 
 def _required_date_scope(
@@ -1270,6 +1335,14 @@ def run_turn(
             for item in previous.active_employee_ids
             if item in authoritative
         )
+        prior_reference_scope_clauses = (
+            tuple(
+                clause.model_dump(mode="json")
+                for clause in previous.verified_turns[-1].scope_clauses
+            )
+            if previous.verified_turns
+            else ()
+        )
         pending = previous.pending_employee_confirmation
         pending_response = (
             _pending_response(request.question, pending)
@@ -1349,6 +1422,7 @@ def run_turn(
                 question,
                 history=conversation_history,
                 trusted_context=previous.trusted_context(),
+                prior_reference_scope_clauses=prior_reference_scope_clauses,
                 active_employees=active,
                 as_of_date=as_of_date,
                 model=settings.llm_reference_model,
@@ -1424,6 +1498,7 @@ def run_turn(
                     question,
                     history=conversation_history,
                     trusted_context=previous.trusted_context(),
+                    prior_reference_scope_clauses=prior_reference_scope_clauses,
                     active_employees=active,
                     as_of_date=as_of_date,
                     model=settings.llm_planner_model,
@@ -1595,14 +1670,14 @@ def run_turn(
                 }
             )
 
-        required_date_scope = _required_date_scope(
+        enforced_date_scope = _required_date_scope(
             question,
             request_relationship=bound.request_relationship,
             subject_relationship=bound.subject_relationship,
             union_has_criteria=bool(bound.employee_criteria),
             rewritten_request=resolved_rewrite,
             previous_scope=(
-                previous.verified_turns[-1].date_scope
+                _verified_requested_date_scope(previous.verified_turns[-1])
                 if previous.verified_turns
                 else None
             ),
@@ -1620,6 +1695,9 @@ def run_turn(
         scope_provenance = {
             "current_original_question": question,
             "reference_interpretation": resolved_rewrite,
+            "reference_scope_clauses": [
+                clause.model_dump(mode="json") for clause in bound.scope_clauses
+            ],
             "previous_original_question": (
                 previous_turn.original_question if previous_turn is not None else None
             ),
@@ -1691,9 +1769,9 @@ def run_turn(
             request_relationship=bound.request_relationship,
             subject_relationship=bound.subject_relationship,
             resolved_employee_ids=bound.employee_ids,
-            required_date_scope=required_date_scope,
+            required_date_scope=enforced_date_scope,
             request_has_date_period=(
-                _mentions_time_period(question) or required_date_scope is not None
+                _mentions_time_period(question) or enforced_date_scope is not None
             ),
             conversation_history=downstream_history,
             trusted_context=downstream_trusted_context,
@@ -1811,7 +1889,8 @@ def run_turn(
                 rewritten_request=bound.updated_request,
                 allow_rewritten_contracts=(bound.request_relationship == "follow_up"),
                 database_context=database_context,
-                required_date_scope=required_date_scope,
+                required_date_scope=enforced_date_scope,
+                independent_clauses=len(bound.scope_clauses) > 1,
             )
             if semantic_issue in {
                 "nested_result_shape",
@@ -1898,7 +1977,7 @@ def run_turn(
                     database_error = (
                         "The SQL omitted or incorrectly scoped the required inclusive "
                         "attendance_date range. Apply both bounds to every OR branch: "
-                        f"{required_date_scope[0]} through {required_date_scope[1]}."
+                        f"{enforced_date_scope[0]} through {enforced_date_scope[1]}."
                     )
                 elif semantic_issue == "missing_workflow_status_filter":
                     database_error = (
@@ -1993,7 +2072,8 @@ def run_turn(
                 rewritten_request=bound.updated_request,
                 allow_rewritten_contracts=(bound.request_relationship == "follow_up"),
                 database_context=database_context,
-                required_date_scope=required_date_scope,
+                required_date_scope=enforced_date_scope,
+                independent_clauses=len(bound.scope_clauses) > 1,
             )
             if semantic_issue is not None:
                 raise ProviderFailure("sql_semantics", semantic_issue, semantic_issue)
@@ -2013,10 +2093,21 @@ def run_turn(
                 if native_comparison_used or native_running_total_used
                 else _sql_date_scope(sql)
             )
+            separate_sources = len(
+                bound.scope_clauses
+            ) > 1 and _has_multiple_source_scopes(sql)
             if (
                 not control_result
-                and required_date_scope is not None
-                and date_scope != required_date_scope
+                and enforced_date_scope is not None
+                and not (
+                    _has_required_date_scope(
+                        sql,
+                        enforced_date_scope,
+                        independent_clauses=True,
+                    )
+                    if separate_sources
+                    else date_scope == enforced_date_scope
+                )
             ):
                 raise ProviderFailure(
                     "sql_semantics", "date_scope_mismatch", "date_scope_mismatch"
@@ -2084,7 +2175,11 @@ def run_turn(
             employees=published_employees,
             executed_sql=sql,
             date_scope=date_scope,
+            requested_date_scope=(
+                enforced_date_scope if len(bound.scope_clauses) <= 1 else None
+            ),
             result=result.model_dump(mode="json"),
+            scope_clauses=bound.scope_clauses,
         )
         new_state = previous.model_copy(
             update={

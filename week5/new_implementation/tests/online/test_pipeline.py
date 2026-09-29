@@ -232,6 +232,29 @@ class PipelineTests(unittest.TestCase):
             ("2026-09-02", "2026-09-02"),
         )
 
+    def test_ordinal_day_follow_up_replaces_previous_range(self):
+        self.assertEqual(
+            pipeline._required_date_scope(
+                "him on 2nd, shift + status?",
+                request_relationship="follow_up",
+                subject_relationship="employees",
+                previous_scope=("2026-09-01", "2026-09-07"),
+                rewritten_request="For that employee on September 2, 2026, show shift and status.",
+            ),
+            ("2026-09-02", "2026-09-02"),
+        )
+        self.assertEqual(
+            pipeline._required_date_scope(
+                "what about 5th?",
+                request_relationship="follow_up",
+                subject_relationship="employees",
+                previous_scope=("2026-09-02", "2026-09-02"),
+                rewritten_request="For that employee on September 5, 2026, show shift and status.",
+            ),
+            ("2026-09-05", "2026-09-05"),
+        )
+        self.assertFalse(_mentions_time_period("How many worked a 2nd Shift?"))
+
     def test_verified_mixed_sql_preserves_previous_employee_antecedent(self):
         employee = Employee(employee_id="A11026", name="Wail Saleh Awadh")
         sql = (

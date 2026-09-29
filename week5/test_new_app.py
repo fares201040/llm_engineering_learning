@@ -10,6 +10,18 @@ from week5.new_implementation import answer
 
 
 class LaunchModeTests(unittest.TestCase):
+    def test_clear_event_resets_visible_chatbot_history(self):
+        with patch.object(new_app.gr.Blocks, "launch", autospec=True) as launch:
+            new_app.main()
+        dependencies = launch.call_args.args[0].config["dependencies"]
+        clear = next(item for item in dependencies if item["targets"][0][1] == "clear")
+        display = next(
+            item for item in dependencies if item["targets"][0][1] == "change"
+        )
+
+        self.assertEqual(clear["outputs"][0], display["outputs"][0])
+        self.assertEqual(new_app.reset_session(new_app._TurnGate(), 1)[0], [])
+
     def test_submit_and_clear_capture_client_sequence_before_backend_work(self):
         with patch.object(new_app.gr.Blocks, "launch", autospec=True) as launch:
             new_app.main()
@@ -52,7 +64,7 @@ class LaunchModeTests(unittest.TestCase):
         self.assertNotIn(display["outputs"][0], submitted["outputs"])
         self.assertNotIn(display["outputs"][2], submitted["outputs"])
         self.assertEqual(len(display["outputs"]), 3)
-        self.assertEqual(len(clear_handlers[0]["outputs"]), 1)
+        self.assertEqual(len(clear_handlers[0]["outputs"]), 2)
         self.assertTrue(any(fn.concurrency_limit == 2 for fn in ui.fns.values()))
 
     def test_default_launch_mode_opens_the_local_browser(self):
@@ -152,11 +164,12 @@ class SessionStateTests(unittest.TestCase):
             "answer_question_with_state",
             return_value=("New answer", [], state),
         ) as complete:
-            cleared_context = new_app.reset_session(gate, 2)
+            cleared_history, cleared_context = new_app.reset_session(gate, 2)
             old = list(new_app.submit_chat("old question", gate, 1))
             new = list(new_app.submit_chat("new question", gate, 3))
 
         self.assertEqual(old, [])
+        self.assertEqual(cleared_history, [])
         self.assertIn("Relevant Context", cleared_context)
         complete.assert_called_once()
         self.assertEqual(new[-1]["history"][-1]["content"], "New answer")
@@ -173,7 +186,7 @@ class SessionStateTests(unittest.TestCase):
             stale_clear = new_app.reset_session(gate, 2)
 
         self.assertEqual(gate.current(), 3)
-        self.assertEqual(stale_clear, new_app.gr.skip())
+        self.assertEqual(stale_clear, (new_app.gr.skip(), new_app.gr.skip()))
         self.assertEqual(new[-1]["history"][-1]["content"], "New answer")
 
     def test_submit_after_clear_resets_canonical_history_before_clear_reaches_backend(
@@ -196,7 +209,7 @@ class SessionStateTests(unittest.TestCase):
             updates = list(new_app.submit_chat("New question", gate, 3, 2))
             delayed_clear = new_app.reset_session(gate, 2)
 
-        self.assertEqual(delayed_clear, new_app.gr.skip())
+        self.assertEqual(delayed_clear, (new_app.gr.skip(), new_app.gr.skip()))
         self.assertEqual(updates[0]["history"][0]["content"], "New question")
         self.assertEqual(len(updates[-1]["history"]), 2)
         self.assertEqual(complete.call_args.args[1], [])
@@ -324,6 +337,49 @@ class SessionStateTests(unittest.TestCase):
         )
         self.assertIn("Rows: 2", snapshots[-1][1])
         self.assertIs(snapshots[-1][2], updated_state)
+
+    def test_progressive_markdown_keeps_tables_and_code_fences_well_formed(self):
+        reply = (
+            "## 1. Summary\n\nOne complete sentence. Another sentence.\n\n"
+            "| Day | Count |\n| --- | --- |\n| Sep 1 | 4 |\n| Sep 2 | 5 |\n\n"
+            "1. First item.\n2. Second item.\n\n"
+            "```sql\nSELECT 1;\n```not-a-close\nSELECT 2;\n```\n"
+        )
+        with (
+            patch.object(
+                new_app,
+                "answer_question_with_state",
+                return_value=(reply, [], answer.ConversationState()),
+            ),
+            patch.object(new_app, "sleep"),
+        ):
+            snapshots = list(
+                new_app.chat_with_state_stream(
+                    [{"role": "user", "content": "Show the summary"}],
+                    answer.ConversationState(),
+                )
+            )
+        partials = [item[0][-1]["content"] for item in snapshots[1:-1]]
+        self.assertGreater(len(partials), 1)
+        self.assertTrue(all(part.endswith(("\n", ".", "!", "?")) for part in partials))
+        self.assertTrue(all(part.count("```") % 2 == 0 for part in partials))
+        self.assertTrue(
+            all(
+                "| --- | --- |" in part
+                for part in partials
+                if "| Day | Count |" in part
+            )
+        )
+        self.assertTrue(all(not part.endswith(("1.", "2.")) for part in partials))
+        self.assertTrue(all(not part.endswith("## 1.") for part in partials))
+        self.assertTrue(
+            all(
+                "SELECT 2;\n```\n" in part
+                for part in partials
+                if "```not-a-close" in part
+            )
+        )
+        self.assertEqual(snapshots[-1][0][-1]["content"], reply)
 
     def test_streamed_chat_replaces_progress_after_unexpected_failure(self):
         state = answer.ConversationState()

@@ -4,6 +4,88 @@ Updated: 2026-09-29
 
 Code baseline: `e5e9dadc3b0ed0fd3cfc6b9370ce7df8840461db`
 
+## September 29 long UI conversation after `d80f5c33`
+
+These prompts were entered in the local Gradio chat at `127.0.0.1:7865`, in
+order within each sequence. The app was restarted between sequences to load
+code changes. The checked SQL evidence was the query-result JSON shown in the
+UI plus separate read-only PostgreSQL aggregates for the reported counts.
+Employee-specific raw rows and names are intentionally omitted here. `pass`
+means the visible answer matched those rows and the requested scope; a failure
+is recorded explicitly.
+
+| ID | Exact prompt | Visible outcome and check |
+| --- | --- | --- |
+| L01 | `sep 1 2026 day types? counts pls` | **Pass:** Working Day 460, OFF Day (ZAS) 86, OFF Day 19, all statuses. Independent `attendance_date`/`status`/`day_type` aggregate summed to these values. |
+| L02 | `only auth ones that day? same split` | **Pass:** September 1 Authorized: Working Day 58, OFF Day (ZAS) 32, OFF Day 11. Independent aggregate matched. |
+| L03 | `nah sep 3 instead; keep auth split` | **Pass:** September 3 Authorized: OFF Day (ZAS) 50, Working Day 38, OFF Day 1. Date changed; Authorized remained. |
+| L04 | `wait all statuses sep 3, same day types` | **Pass:** September 3 all statuses: Working Day 396, OFF Day (ZAS) 157, OFF Day 12. Authorized filter dropped. |
+| L05 | `status counts then, sep 3 all day types` | **Pass:** Nine status/day-type cells; Authorized 50/38/1, Draft 39/198/1, Pending For Authorization 68/160/10 (OFF Day (ZAS)/Working Day/OFF Day). UI rendered Markdown list items. |
+| L06 | `on 3rd off days only, both kinds: ppl count by dept, all statuses` | **Pass:** Distinct employees for both off-day types on September 3: Operations 68, Engineering 59, then seven departments totaling 42. Independent `COUNT(DISTINCT employee_id)` by department matched all nine groups. |
+| L07 | `no date now: countries for pending only, recs each` | **Pass:** Pending For Authorization across all dates: Yemen 1,512, Burundi 5, Uganda 3. Old date and off-day filters dropped; independent SQL matched. |
+| L08 | `all statuses now, sep 1-7, countries n recs each` | **Pass:** September 1–7 all statuses: Yemen 3,950, Burundi 7, Uganda 7. Pending filter dropped; independent SQL matched. |
+| L09 | `A11017 only, sep 1-7: worked days, off days, leave days separately pls` | **Pass:** Employee and week scope; three separate measures matched the UI result row. Per-person values omitted. |
+| L10 | `which days did he work? hrs each` | **Pass:** Reused the verified employee and week; four worked-date rows matched the visible answer. Per-person dates and hours omitted. |
+| L11 | `him on 2nd, shift + status?` | **Fail on baseline:** Four planner attempts selected September 2, but the validator incorrectly required the previous September 1–7 scope; UI displayed the safe failure message. A direct three-turn replay reproduced it. |
+
+The L11 root cause was `_mentions_time_period` missing ordinal day references.
+The reference rewrite resolved September 2, but `_required_date_scope` carried
+the prior week and rejected the correct single-day SQL. The regression test
+first failed with the previous range, then passed after the temporal-reference
+fix. A direct three-turn replay then returned a verified single-day answer.
+
+| ID | Exact prompt | Visible outcome and check |
+| --- | --- | --- |
+| L12 | `A11018 sep 1-7 worked n off days?` | **Pass:** No matching employee ID; UI asked for a corrected code. |
+| L13 | `sorry A10042. sep 1-7 same` | **Pass:** Corrected employee, same week and worked/off-day measures; UI result rows matched the answer. Per-person details omitted. |
+| L14 | `him on 2nd shift/status?` | **Ambiguous:** Interpreted `2nd shift` as a shift label and answered across the week. The next turn clarified the intended date; this is not counted as a date-scope failure. |
+| L15 | `no, date 2nd of Sep, what shift/status just that day` | **Pass:** One September 2 row for the corrected employee, with requested fields. |
+| L16 | `what about 5th?` | **Fail before second fix:** The planner selected September 5, but the validator retained September 2 and rejected four attempts. UI displayed the safe failure message. |
+
+The same temporal-reference fix was broadened to recognize a bare ordinal day
+without treating a shift label such as `2nd Shift` as a date. The focused test
+first failed for L16 and then passed after the change.
+
+| ID | Exact prompt | Visible outcome and check |
+| --- | --- | --- |
+| L17 | `A10042 on Sep 2 2026, shift/status pls` | **Pass after restart:** One requested employee/date row; shift and workflow status matched. |
+| L18 | `what about 5th?` | **Pass after restart:** Moved to September 5 while retaining the employee and shift/status fields; one requested row matched. |
+| L19 | `and 4th? plus day type, worked hrs` | **Pass:** Moved to September 4, retained prior fields, added day type and worked hours; one row matched. |
+| L20 | `new person A10029, same on 4th` | **Pass:** Replaced the employee, retained date and measures; one row matched. |
+| L21 | `no person now: 4th status counts all employees` | **Pass:** Dropped employee scope. Authorized 230, Draft 160, Pending For Authorization 175 on September 4; independent SQL matched. |
+| L22 | `4th auth recs by dept; separately A10029 sep 1-7 shifts n day counts` | **Mixed:** The department branch used September 4 Authorized and matched all 16 department counts, including Engineering 59 and Operations 57. The employee branch kept its own week and reported three distinct shift labels and two day types. `shifts n day counts` was ambiguous; L23 specified per-shift counts. |
+| L23 | `nah per shift how many days for A10029 sep1-7, no auth filter` | **Pass:** 1st Shift 5 days, 2nd Shift 1, OFF 1; independent `COUNT(DISTINCT attendance_date)` by shift matched. Authorized did not leak from L22. |
+| L24 | `all employees sep 1-7: daily status counts, markdown table pls` | **Pass:** Seven-date, three-status Markdown table rendered as a real HTML table. All 21 cells matched UI result rows and independent SQL. The reviewed answer appeared progressively at observed text lengths 190, 303, and 347 characters. |
+| L25 | `sep 1-7 all depts daily worked hrs totals, table with status too pls` | **Interrupted intentionally for Clear/Submit:** No final answer accepted. |
+| L26 | `how many Draft on Sep 6 2026?` | **Answer pass, Clear behavior failed before repair:** 280 Draft records matched independent SQL, and L25 did not reappear. Older conversation messages stayed visibly in the chat after Clear, including after a second idle Clear click. |
+
+The L17–L26 sequence used the updated pipeline, before the concurrently edited
+UI progress-text change was loaded into the running server. The server needs a
+restart for any later UI edit.
+
+## UI repair and Markdown display checks
+
+The Clear event had reset the trusted gate and context but had not output a new
+value to the visible Chatbot component. Returning empty chatbot history from the
+event fixed both an idle Clear and Clear followed by immediate Submit in the
+actual UI. The pending old turn never reappeared. The newer UI build also showed
+`Thinking ...` **inside** the chat while verification ran, then replaced it with
+the reviewed answer.
+
+| ID | Exact prompt | Visible outcome and check |
+| --- | --- | --- |
+| L27 | `Draft recs on Sep 6 2026?` | **Count pass, answer scope issue:** 280 Draft records matched independent SQL, but the answer added unrequested claims about exception categories based on 100 sampled detail rows out of 280 matches. This prompted tighter count-answer guidance. |
+| L28 | `how many Authorized on Sep 5 2026?` | **Interrupted intentionally for Clear/Submit:** `Thinking ...` appeared, then Clear removed this pending turn. |
+| L29 | `Draft on Sep 6 2026, count only` | **Fail before prompt repair:** immediately after L28 Clear, the UI answered 568, the all-status total, rather than 280 Draft records. The result JSON contained a scalar all-record count. A separate direct run of the same prompt produced the correct status-filtered SQL, showing the model behavior was variable. |
+| L30 | `sep 1-7 day types by date, markdown table pls` | **Pass after display repair:** Seven-date, three-day-type table rendered as a real HTML table. All 21 counts matched the UI result rows and independent PostgreSQL aggregate. The UI showed `Thinking ...`, then complete Markdown chunks at observed text lengths 145, 231, and 272; the table was present from the first reviewed chunk. |
+| L31 | `Draft on Sep 6 2026, count only` | **Pass after prompt repair:** 280 Draft records, one scalar result. The September 1–7 date range and day-type grouping from L30 did not leak. Three additional direct model/database count checks for Draft, Authorized, and Pending For Authorization all used the requested status predicates and matched independent aggregates. |
+| L32 | `Sep 2 2026 status totals pls in bullets` | **Pass in final restarted UI:** Authorized 74, Draft 234, Pending For Authorization 257; the three UI result rows and independent SQL matched. `Thinking ...` appeared first, followed by complete reviewed chunks at observed text lengths 67 and 149. The final Markdown rendered as three actual list items. |
+| L33 | `sep 7 status rec counts as bullets` | **Pass after the last display restart:** Authorized 65, Draft 381, Pending For Authorization 122; UI result rows matched the independent daily-status aggregate, and Markdown rendered three actual list items. |
+
+After L31, an idle Clear visibly emptied the chat. The count-guidance repair
+was checked with live model calls and this UI turn; it does not establish that
+every stochastic model run will preserve a category filter.
+
 This is a record of **questions actually sent to the attendance chatbot and
 answers checked**, so later manual sessions can choose new cases instead of
 repeating these. Counts below describe the local attendance dataset observed on

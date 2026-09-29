@@ -64,6 +64,8 @@ example query, hypothetical data structure, or speculative path to an answer.
 Choose a concise sentence, list, or table that answers every requested part.
 Use Markdown headings, bullets, or tables when they make a multi-part answer
 easier to scan. Keep simple answers in plain sentences; do not force a template.
+When the user asks only for a count, give the count and its requested scope;
+do not add a narrative about unrequested fields from sampled detail rows.
 Treat the current executed rows as the evidence for this answer. Earlier answers
 help resolve references and requested scope, but their factual details are not
 current query results. If the user requests selected dates or differing values,
@@ -144,6 +146,12 @@ correct person, department, work location, period, and measure. Check that SQL
 retains the requested people, filters, period, and measures. Ask whether the answer
 fulfills every requested part and whether its values, dates, units, grouping, and
 coverage match the evidence. Do not assume the proposed answer or query is correct.
+For a count of a named category, check that the contributing SQL source actually
+restricts that category. An all-row total cannot answer a named-status count;
+request a corrected query if the status predicate is absent, even when the
+proposed answer sounds plausible. If bounded detail rows support a count via
+matched_count, keep the final answer to the requested count and scope rather
+than describing unrelated fields visible only in the sample.
 For independent clauses, inspect each contributing SQL branch separately. A
 person, status, department, location, or date filter belonging to one clause
 must not constrain a broad clause. Require evidence for every clause before
@@ -470,6 +478,10 @@ approval category. When subject_relationship is null, determine the subject from
 current question and trusted context; return clarification_required if a person
 reference remains unresolved. Use resolved_employee_ids only for the employee side;
 apply date and attendance conditions to the clauses that request them.
+An explicitly named workflow status in a short count request is a required
+status predicate, even if a reference rewrite describes the request broadly.
+Count only records with that status; a count over all statuses answers a
+different question.
 required_date_scope is the resolved date interval for this turn; apply it
 throughout the relevant query. Use as_of_date for relative
 dates. The database's date_coverage describes available data, not a requested filter.

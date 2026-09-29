@@ -1,6 +1,7 @@
 import html
 import logging
 import os
+import re
 from math import ceil
 from threading import Lock
 from time import sleep
@@ -183,6 +184,75 @@ def chat_with_state(history, state):
     return history, format_context(context), updated_state
 
 
+def _markdown_reveal_points(reply: str) -> list[int]:
+    """Choose complete Markdown units for the reviewed answer's display pace."""
+
+    if not reply:
+        return []
+    lines = reply.splitlines(keepends=True)
+    points: list[int] = []
+    offset = 0
+    fence: str | None = None
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.lstrip()
+        marker = re.match(r"(`{3,}|~{3,})(.*)", stripped.rstrip("\r\n"))
+        if marker is not None:
+            if fence is None:
+                fence = marker.group(1)
+            elif (
+                marker.group(1)[0] == fence[0]
+                and len(marker.group(1)) >= len(fence)
+                and not marker.group(2).strip()
+            ):
+                fence = None
+            offset += len(line)
+            if fence is None:
+                points.append(offset)
+            index += 1
+            continue
+        if fence is not None:
+            offset += len(line)
+            index += 1
+            continue
+        if (
+            index + 1 < len(lines)
+            and "|" in line
+            and re.fullmatch(
+                r"\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*",
+                lines[index + 1],
+            )
+        ):
+            offset += len(line) + len(lines[index + 1])
+            points.append(offset)
+            index += 2
+            continue
+        if not any(
+            token in line for token in ("`", "*", "_", "[", "]", "|", "<")
+        ) and not re.match(r"\s*(?:[-+]|\d+[.)]|#{1,6})\s", line):
+            sentences = list(re.finditer(r"[.!?](?=\s|$)", line))
+            if sentences:
+                points.extend(offset + match.end() for match in sentences)
+            elif len(line) > 64:
+                next_target = 64
+                for match in re.finditer(r"\s+", line):
+                    if match.start() >= next_target:
+                        points.append(offset + match.start())
+                        next_target = match.start() + 64
+        offset += len(line)
+        points.append(offset)
+        index += 1
+    if not points or points[-1] != len(reply):
+        points.append(len(reply))
+    points = sorted(set(points))
+    stride = max(1, ceil(len(points) / _MAX_REVEAL_STEPS))
+    selected = points[stride - 1 :: stride]
+    if selected[-1] != len(reply):
+        selected.append(len(reply))
+    return selected
+
+
 def chat_with_state_stream(
     history,
     state,
@@ -215,9 +285,8 @@ def chat_with_state_stream(
         )
         # The pipeline has completed its review. Only this accepted reply is
         # exposed to the browser, in cumulative chunks for progressive display.
-        chunk_size = max(64, ceil(len(reply) / _MAX_REVEAL_STEPS))
-        for end in range(chunk_size, len(reply) + chunk_size, chunk_size):
-            if end > chunk_size:
+        for index, end in enumerate(_markdown_reveal_points(reply)):
+            if index:
                 sleep(_REVEAL_INTERVAL_SECONDS)
             if gate.current() != generation:
                 return
@@ -282,8 +351,8 @@ def submit_chat(message, gate: _TurnGate, sequence: int, clear_sequence: int = 0
 
 def reset_session(gate: _TurnGate, sequence: int):
     if not gate.reset(int(sequence)):
-        return gr.skip()
-    return format_context([])
+        return gr.skip(), gr.skip()
+    return [], format_context([])
 
 
 def reset_conversation(_state=None):
@@ -351,7 +420,7 @@ def main():
         chatbot.clear(
             reset_session,
             inputs=[turn_gate, client_sequence],
-            outputs=[context_markdown],
+            outputs=[chatbot, context_markdown],
             js=_CLEAR_WITH_SEQUENCE_JS,
             queue=False,
             show_progress="hidden",

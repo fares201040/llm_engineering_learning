@@ -489,6 +489,12 @@ def _planner_control_alias(sql: str) -> str | None:
 
 def _mentions_time_period(question: str) -> bool:
     folded = question.casefold()
+    if re.search(
+        r"\b(?:[1-9]|[12]\d|3[01])(?:st|nd|rd|th)\b"
+        r"(?!\s+(?:shift|employee|person|rank|place|item|record)\b)",
+        folded,
+    ):
+        return True
     if re.search(r"\b(?:19|20)\d{2}\b", folded):
         return True
     month_names = (

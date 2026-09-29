@@ -86,6 +86,7 @@ def test_planner_reviews_and_corrects_answer_using_full_context(call):
     )
     for item in call.call_args_list:
         payload = item.kwargs["payload"]
+        assert payload["latest_user_message"] == shared.current_question
         assert payload["conversation_history"] == list(shared.conversation_history)
         assert payload["database_result"]["rows"] == list(rows)
         assert payload["authoritative_employees"][0]["employee_id"] == "A11000"

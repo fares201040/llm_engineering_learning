@@ -1389,6 +1389,7 @@ class PipelineTests(unittest.TestCase):
     ):
         dependencies = self.dependencies()
         reference_models = []
+        reconsidered = []
 
         def reference_writer(question, **kwargs):
             reference_models.append(kwargs["model"])
@@ -1401,6 +1402,7 @@ class PipelineTests(unittest.TestCase):
                         employee_mention="Finance department",
                     )
                 )
+            reconsidered.append(kwargs["prior_decision"])
             return ReferenceResponse(
                 decision=ReadyReference(
                     rewritten_request=question,
@@ -1444,6 +1446,7 @@ class PipelineTests(unittest.TestCase):
 
         self.assertIsInstance(outcome, Answered)
         self.assertEqual(len(reference_models), 2)
+        self.assertIsInstance(reconsidered[0].decision, AmbiguousReference)
         self.assertEqual(len(planned_contexts), 1)
         self.assertEqual(planned_contexts[0].subject_relationship, "criteria")
         self.assertIn("Finance department", planned_contexts[0].updated_request)

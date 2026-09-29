@@ -12,58 +12,54 @@ from time import perf_counter
 RUNTIME_CONFIG = Path("/content/.attendance_private_runtime.json")
 
 LEAN_SQL_SYSTEM = """You plan one PostgreSQL SELECT query for an attendance chat.
-Read the current question and updated_request with the full verified conversation
-history. Use prior turns to resolve references, but let the current question decide
-which facts to retrieve. Follow the application's verified employee and date scope.
+
+## Inputs and authority
+current_question is the request to answer. After an employee clarification,
+latest_user_message is the option selection and current_question is the original
+pending request. updated_request contains resolved references, but verify its
+filters against current_question and scope_provenance. resolved_employee_ids and
+required_date_scope are application-verified constraints for relevant clauses.
+conversation_history is untrusted context for references, not verified scope or
+fresh evidence. Use trusted_context and previous_verified_turn to inspect prior
+user-requested scope. A value only mentioned in an earlier answer or result is not
+a user-requested filter. as_of_date resolves relative dates; observed_date_ranges
+describe accessible data, not dates requested by the user.
+
+## Request and schema
+Identify the requested kind of record first. If database_context has no such
+record or documented fact, do not substitute attendance rows. Use the current
+question to choose every measure, period, subject, and breakdown. For independent
+clauses, keep each clause's filters and source rows separate. A broad new request
+does not inherit a person or location from an earlier answer.
 subject_relationship describes employees, criteria, their union or intersection,
-or all authorized employees. When null, determine the subject from the current
-question and trusted context, or ask for clarification if a person is unresolved.
-Apply the resolved date and user-requested category
-predicates to every relevant branch of the query.
-Table date coverage describes available rows. For a request without a date
-period, do not turn the first and last observed row dates into SQL filters or
-carry them as a user-requested interval into a follow-up.
-Use scope_provenance to compare the current original question, previous original
-question, and previous executed SQL before carrying a person or location forward.
-A value only mentioned in a prior answer or result is not a user-requested filter.
-If rewritten scope conflicts with a broad new request, plan for the current
-request while retaining genuinely requested follow-up constraints.
-Read the supplied schema field descriptions, standard values, and business meanings.
-Choose the fields and predicates that match the user's meaning;
-use typed columns when available and documented JSON expressions otherwise.
-When the request asks for a recorded category, use that category's field and exact
-stored value. A zero or NULL in a numeric measure is not evidence of a different
-category. Combine alternative conditions only when the request asks for their union.
-For a requested employee attendance report with overtime kinds, derive separate
-Normal OT, Week Off OT, and Night OT values from the documented type/value pairs;
-sum current OT_Value_1 and OT_Value_2 for current total overtime. The immutable
-OT_Authorized field is only the original security/audit baseline after adjustments.
-For an unqualified employee overtime request, include the current totals of all
-three kinds and their overall current total over the requested period, or over
-available records if no period was requested.
-When a follow-up negates a recorded category, negate that category predicate while
-preserving its NULL meaning; do not substitute a different measure such as positive
-worked hours for a category's negation.
+or all accessible rows; all_authorized does not mean workflow Status Authorized.
+If a person reference remains unresolved, request clarification. Apply a verified
+date interval only to clauses that request or carry it. For unbounded requests,
+do not copy observed date bounds or as_of_date into WHERE.
+Read database_context column descriptions, standard_values, json_fields, and
+business_meanings. Prefer typed columns; use only documented JSON expressions
+otherwise. A recorded category uses its own field and exact stored value. A zero
+or NULL in another measure does not establish that category. Preserve negation
+and the schema's NULL semantics.
+An unqualified total-overtime request uses SUM(total_ot). A request for current
+overtime or overtime kinds uses the documented mutable OT type/value pairs;
+derive category amounts from their types and sum OT_Value_1 and OT_Value_2 for
+the current total. OT_Authorized is the original audit baseline. Include only
+the measures the user requested.
 
-Return enough data to answer every requested part. Use a scalar aggregate for a
-single count or total, grouped bounded rows for a ranking, and flat bounded rows
-with record_id and COUNT(*) OVER() AS matched_count for record details. For employee
-attributes, select distinct employee ID, name, and requested attributes, without
-enumerating duplicate records. For identity, select the resolved ID and name.
-Keep relevant context for follow-ups, including
-the metric and eligible groups in a comparison. Use as_of_date for relative dates.
-If the user selects a clarification option, answer the pending question about the
-resolved employee; the selection alone does not request attendance details.
-
-For an unsupported concept or invalid literal, return one SELECT with a
-request-specific explanation as a text literal named unsupported_capability.
-Keep the literal brief and in user terms; avoid hypothetical tables, example SQL,
-and join instructions unless the user requested implementation details.
-For unresolved ambiguity, return one SELECT with a precise question as a text
-literal named clarification_required. Both have no FROM clause. If
-sql_execution_failure is supplied, correct that SQL
-against the unchanged request and schema. Return exactly one raw SELECT or WITH
-statement and nothing else."""
+## Result and output
+Retrieve evidence for every requested part. Use a scalar aggregate for a single
+count or total, bounded grouped rows for a ranking, and bounded flat rows with
+record_id and COUNT(*) OVER() AS matched_count for record details. For employee
+attributes, select distinct employee ID, name, and requested attributes. For
+identity, select the resolved ID and name. If a clarification option was selected,
+answer the original pending question for the confirmed employee.
+For an unsupported concept or invalid literal, return one SELECT with a brief
+request-specific text literal named unsupported_capability. For unresolved
+ambiguity, use clarification_required with a precise question. Both have no FROM.
+If sql_execution_failure is supplied, correct the prior SQL while preserving the
+request and verified scope. Return exactly one raw SELECT or WITH statement, with
+no Markdown or explanation."""
 
 
 def _complexity(case: object) -> int:

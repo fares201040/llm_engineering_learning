@@ -508,6 +508,30 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertNotIn("database_context", payload)
         self.assertNotIn("database_schema", payload)
 
+    @patch("week5.new_implementation.online.reference.call_structured")
+    def test_reference_reconsideration_receives_prior_decision(self, call):
+        prior = response(rewritten_request="Show A1 attendance.", employee_ids=("A1",))
+        call.return_value = prior
+
+        reference.request_references(
+            "Show A1 attendance.",
+            history=(),
+            trusted_context={},
+            active_employees=(),
+            model="reference-model",
+            budget=CallBudget(),
+            timeout=1,
+            max_output_tokens=100,
+            reconsideration_feedback="The subject was misclassified.",
+            prior_decision=prior,
+        )
+
+        payload = call.call_args.kwargs["payload"]
+        self.assertEqual(payload["prior_decision"], prior.model_dump(mode="json"))
+        self.assertEqual(
+            payload["reconsideration_feedback"], "The subject was misclassified."
+        )
+
     def test_reference_response_schema_omits_unsupported_classification(self):
         schema = json.dumps(ReferenceResponse.model_json_schema())
         self.assertNotIn("outside_attendance_domain", schema)

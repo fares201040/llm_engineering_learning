@@ -1507,6 +1507,7 @@ def run_turn(
                     max_output_tokens=settings.llm_reference_max_output_tokens,
                     observer=observer,
                     reconsideration_feedback=feedback,
+                    prior_decision=reference,
                 )
                 log_layer_output("reference_reconsidered", reference)
             if isinstance(reference.decision, UnsupportedReference):

@@ -294,6 +294,27 @@ def planner_examples(context: DatabaseContext) -> str:
                 f"SELECT {', '.join(audit_columns)} FROM {source}"
                 f"{order_by} LIMIT 100;"
             )
+    if {"status", "country", "department", "work_location", "employee_id"}.issubset(
+        columns
+    ):
+        examples.append(
+            "Two independent breakdowns with different filters: each source "
+            "reads the base table with only its own clause's filter. The first "
+            "counts Authorized records by country; the second counts distinct "
+            "Human Resource people by work location across every status. "
+            "The dimensions must not be grouped or joined together:\n"
+            "WITH country_counts AS ("
+            f"SELECT \"country\" AS group_value, COUNT(*) AS record_count FROM {source} "
+            "WHERE \"status\" = 'Authorized' GROUP BY \"country\"), "
+            "hr_locations AS ("
+            f"SELECT \"work_location\" AS group_value, COUNT(DISTINCT \"employee_id\") "
+            f"AS people_count FROM {source} WHERE \"department\" = 'Human Resource' "
+            "GROUP BY \"work_location\") "
+            "SELECT 'country' AS breakdown, group_value, record_count, "
+            "NULL::bigint AS people_count FROM country_counts "
+            "UNION ALL SELECT 'hr_location' AS breakdown, group_value, "
+            "NULL::bigint AS record_count, people_count FROM hr_locations;"
+        )
     if context.relationships:
         relation = context.relationships[0]
         if relation.from_columns and relation.to_columns:

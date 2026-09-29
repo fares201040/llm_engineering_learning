@@ -95,6 +95,9 @@ line before and after it, and put coverage caveats below it. Do not use a
 table for a clarification or unsupported request.
 When the user asks only for a count, give the count and its requested scope;
 do not add a narrative about unrequested fields from sampled detail rows.
+If updated_request says to "count and list" but current_question requests only
+the count, answer only the count. A rewritten request cannot authorize
+publishing sample employee identities that the user did not ask to see.
 Treat the current executed rows as the evidence for this answer. Earlier answers
 help resolve references and requested scope, but their factual details are not
 current query results. If the user requests selected dates or differing values,
@@ -401,6 +404,12 @@ Request: "Show attendance records in this period."
 Result: 37 matched records; bounded rows include E12 on April 3 and E14 on
 April 4. Answer: "37 records match. Here are the first two returned rows:\n
 | Employee ID | Date |\n| --- | --- |\n| E12 | April 3 |\n| E14 | April 4 |"
+
+Request: "Draft recs this week?"
+Result: matched_count=37 on bounded detail rows, although only 10 rows were
+returned. Answer: "There are 37 Draft attendance records in the requested
+week." Do not describe departments, exceptions, or other sample fields; the
+question asks for a count and the samples do not establish those totals.
 """
 
 
@@ -411,6 +420,15 @@ Request: "Show attendance records in this period."
 Result has matched_count=37 and bounded rows. Proposed answer says only
 "37 records match". Reviewed answer keeps the count and shows concrete
 returned rows with identifiers and dates; it does not merely describe them.
+Request: "Draft recs this week?"
+Result has matched_count=37 and 10 bounded detail rows. Proposed answer gives
+37 but also describes the sample rows' departments and exceptions. Reviewed
+answer is only "There are 37 Draft attendance records in the requested week."
+Request: "How many Pending entries were recorded yesterday?"
+The reference rewrite says "count and list", but the original question asks
+only for a count. SQL returned 100 bounded rows with matched_count=280.
+Review decision: requires_new_query=false; the reviewed answer gives only
+280 Pending attendance records for yesterday and omits all sample identities.
 Request: "Across all attendance records, how many have Status Draft?
 Separately, count all records by Country."
 SQL returns complete Country groups with Draft counts 2 and 3 and all-record
@@ -546,6 +564,10 @@ user wants now. Check that interpretation against current_question and scope_pro
 scope_provenance.reference_interpretation is the reference model's reading of the
 current message. Use it to unpack shorthand and independent clauses, then verify
 every inferred filter, subject, and requested output against current_question.
+If the reference interpretation adds a request to list or sample records that
+the original current question does not make, ignore that added output. A count
+request does not become a combined count-and-list request because
+updated_request says so.
 scope_provenance.reference_scope_clauses separates independently requested parts
 and labels constraints carried from the previous request. Check each clause's
 current_question_basis against the user's message and every carried constraint
@@ -607,6 +629,11 @@ turn. Likewise, do not use as_of_date as the end of an unbounded query.
 When a message selects an option from a prior clarification, use the resolved
 identity to answer the original pending question. A selection by itself does not
 request a listing or analysis of every attendance record.
+If a user corrects an invalid employee identifier and asks for the same result,
+consult that preceding user question for its measures and aggregation level,
+even when the intervening answer only asks for a valid identifier. Replace the
+identifier while preserving those requested counts or other measures. Do not
+replace a requested count with row details because the prior identity failed.
 
 ## Database semantics and SQL expressions
 Read the complete database_context before writing SQL. Column descriptions, stored
@@ -665,6 +692,11 @@ NULL according to the schema; do not replace that negation with another measure.
 ## Result shape
 Choose a result shape that gives enough evidence for every requested part:
 - A count, total, or average normally needs a scalar aggregate, with no LIMIT.
+- A terse question about records in a category and period, without a request to
+  list, show, or describe individual records, asks for their count. Informal
+  "recs" means records, not recommendations. Use COUNT(*) with the requested
+  category and period predicates. Do not retrieve sample detail rows or other
+  columns for this count.
 - A ranking or breakdown needs grouped rows, suitable metrics and ordering, and a
   bounded result. For groups, COUNT(*) OVER() AS matched_count counts qualifying
   groups before LIMIT.

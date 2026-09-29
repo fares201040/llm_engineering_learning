@@ -5,6 +5,8 @@ import inspect
 import unittest
 from unittest.mock import patch
 
+from sqlglot import exp, parse_one
+
 from week5.new_implementation.online import context, planner, reference
 from week5.new_implementation.online.context import (
     DatabaseColumn,
@@ -14,6 +16,7 @@ from week5.new_implementation.online.context import (
     SharedModelContext,
 )
 from week5.new_implementation.online.provider import CallBudget, ProviderFailure
+from week5.new_implementation.online.execution import validate_read_query
 from week5.new_implementation.online.planner_examples import planner_examples
 from week5.new_implementation.online.reference import (
     AmbiguousReference,
@@ -42,6 +45,33 @@ def response(**updates):
 
 
 class ReferenceAndPlanningTests(unittest.TestCase):
+    def test_independent_breakdown_example_uses_separate_source_scopes(self):
+        minimal = database_context()
+        extra_columns = tuple(
+            DatabaseColumn(name=name, data_type="text", nullable=True, description=name)
+            for name in ("status", "country", "department", "work_location")
+        )
+        table = minimal.tables[0].model_copy(
+            update={"columns": minimal.tables[0].columns + extra_columns}
+        )
+        examples = planner_examples(minimal.model_copy(update={"tables": (table,)}))
+        sql = (
+            "WITH country_counts AS ("
+            + examples.split("WITH country_counts AS (", 1)[1].split(";", 1)[0]
+            + ";"
+        )
+        validate_read_query(sql, allowed_tables=("public.attendance_records",))
+        statement = parse_one(sql, read="postgres")
+        branches = list(statement.find_all(exp.CTE))
+        self.assertEqual(len(branches), 2)
+        country_sql = branches[0].sql().lower()
+        hr_sql = branches[1].sql().lower()
+        self.assertIn("authorized", country_sql)
+        self.assertNotIn("human resource", country_sql)
+        self.assertIn("human resource", hr_sql)
+        self.assertNotIn("authorized", hr_sql)
+        self.assertIn("count(distinct", hr_sql)
+
     def test_union_of_independent_criteria_needs_no_named_employee(self):
         bound = bind_references(
             response(

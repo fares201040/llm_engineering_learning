@@ -213,6 +213,25 @@ negated. A follow-up such as "Show absence dates instead" retains the verified
 employee and date interval while changing the requested output and predicate;
 "Show dates that are not absent" retains that interval and means the opposite of
 explicit absence. Write inherited constraints explicitly in rewritten_request.
+When a user corrects an invalid employee identifier and says to do the same
+request, recover the measures and aggregation level from the immediately prior
+user question even if the assistant only asked for a corrected identifier. A
+prior request for counts of worked and off days remains two counts for the new
+employee; do not expand it into a daily attendance report or add leave, status,
+or other measures. A correction replaces the identifier, not the requested
+output. For terse category-and-period questions without a request to list,
+show, or describe individual records, interpret "records" or "recs" as a
+record-count request. Keep that count intent in rewritten_request and each
+scope clause; do not turn it into a detail listing. For example, "Pending
+entries yesterday?" asks for the number of matching attendance records;
+"List Pending entries yesterday" asks for individual rows. The plural noun
+alone does not request every available column or a sample of people.
+Before returning, compare the rewritten request and every scope clause with
+the original current question. Remove any invented output action such as
+"list", "show examples", or "describe records" when the user only asked how
+many records match. Never combine a count and a list merely to hedge between
+interpretations; if the requested output is genuinely unclear, preserve that
+uncertainty for the planner to clarify instead of adding both outputs.
 If the current question starts a new topic or changes the time period or subject,
 do not inherit the replaced scope.
 An explicit correction that broadens the subject to all records replaces the prior

@@ -1319,6 +1319,35 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(planned_contexts[0].subject_relationship, "criteria")
         self.assertIn("Finance department", planned_contexts[0].updated_request)
 
+    def test_reference_decision_limit_prevents_reconsideration(self):
+        dependencies = self.dependencies()
+        calls = []
+
+        def reference_writer(question, **_kwargs):
+            calls.append(question)
+            return ReferenceResponse(
+                decision=AmbiguousReference(
+                    rewritten_request=question,
+                    locale="en",
+                    reason="ambiguous_reference",
+                    employee_mention="Finance department",
+                )
+            )
+
+        dependencies.reference_writer = reference_writer
+        dependencies.employee_fuzzy_search = lambda *_args, **_kwargs: ()
+        outcome = run_turn(
+            TurnRequest(
+                question="How many total worked hours are in the Finance department?",
+                access_context=LOCAL_DEMO_ACCESS,
+                max_reference_calls=1,
+            ),
+            dependencies=dependencies,
+        )
+
+        self.assertIsInstance(outcome, Clarification)
+        self.assertEqual(len(calls), 1)
+
     def test_inconsistent_reference_is_reconsidered_when_models_are_the_same(self):
         dependencies = self.dependencies()
         reference_calls = []

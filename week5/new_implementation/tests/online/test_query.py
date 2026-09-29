@@ -333,9 +333,7 @@ class DatabaseContextTests(unittest.TestCase):
         self.assertIn("immutable", meanings["overtime_type_breakdown"].casefold())
         self.assertIn("mutable", meanings["overtime_type_breakdown"])
         self.assertIn("current overtime total", meanings["overtime_type_breakdown"])
-        self.assertIn(
-            "unqualified employee overtime request", meanings["overtime_type_breakdown"]
-        )
+        self.assertIn("typed total_ot measure", meanings["overtime_type_breakdown"])
         self.assertIn("audit", meanings["overtime_type_breakdown"])
         self.assertIn(
             "current overtime total", context._COLUMN_DESCRIPTIONS["ot_authorized"]

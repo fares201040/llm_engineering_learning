@@ -14,7 +14,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 COLAB_DIRECTORY = Path(__file__).resolve().parent
 ARCHIVE_PATH = COLAB_DIRECTORY / "attendance_phase2_source.zip"
 NOTEBOOK_PATH = COLAB_DIRECTORY / "attendance_phase2_tests.ipynb"
-SYNTHETIC_CASE_COUNT = 311
+SYNTHETIC_CASE_COUNT = 231
 
 SOURCE_PATHS = (
     "week5/new_app.py",
@@ -65,6 +65,7 @@ SOURCE_PATHS = (
     "week5/new_implementation/tests/online/test_planning.py",
     "week5/new_implementation/tests/online/test_planner_answer.py",
     "week5/new_implementation/tests/online/test_query.py",
+    "week5/new_implementation/tests/online/test_review_regressions.py",
     "week5/new_implementation/tests/online/test_running_total.py",
     "week5/new_evaluation/__init__.py",
     "week5/new_evaluation/acceptance.py",

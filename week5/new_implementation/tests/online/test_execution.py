@@ -152,7 +152,7 @@ class DirectExecutionTests(unittest.TestCase):
 
     def test_query_boundary_accepts_ctes_and_rejects_other_statements(self):
         validate_read_query(
-            "WITH a AS (SELECT * FROM attendance_records) SELECT * FROM a",
+            "WITH a AS (SELECT employee_id FROM attendance_records) SELECT * FROM a",
             allowed_tables=("public.attendance_records",),
         )
         for sql in (
@@ -169,7 +169,8 @@ class DirectExecutionTests(unittest.TestCase):
     def test_employee_scope_applies_inside_aggregate_cte_and_join(self):
         sql = (
             "WITH totals AS (SELECT employee_id, COUNT(*) n FROM attendance_records "
-            "GROUP BY employee_id) SELECT * FROM totals JOIN attendance_records ar "
+            "GROUP BY employee_id) SELECT totals.employee_id, totals.n, "
+            "ar.attendance_date FROM totals JOIN attendance_records ar "
             "ON totals.employee_id = ar.employee_id"
         )
         connection = Connection(Cursor(description=(Description("n", 23),)))

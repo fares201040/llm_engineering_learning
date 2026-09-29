@@ -39,6 +39,7 @@ class TestQuestion(BaseModel):
     expected_clarification_outcome: Literal["none", "ambiguous"] | None = None
     expected_record_ids: list[str] = Field(default_factory=list)
     expected_group_values: list[dict] = Field(default_factory=list)
+    expected_group_order: list[str] = Field(default_factory=list)
     expected_normalized_result: dict | None = None
     expected_violation_codes: list[str] = Field(default_factory=list)
     expected_answer_contract: dict | None = None

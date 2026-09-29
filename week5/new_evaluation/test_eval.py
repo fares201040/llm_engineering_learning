@@ -260,6 +260,82 @@ class EvaluatorTests(unittest.TestCase):
 
         self.assertFalse(result.unsupported_capabilities_ok)
 
+    def test_expected_unsupported_rejects_unrelated_clarification(self):
+        case = TestQuestion(
+            question="Count records on September 31, 2026.",
+            keywords=[],
+            reference_answer="The date is invalid.",
+            category="synthetic_invalid_date",
+            expected_unsupported_capabilities=["malformed_value"],
+        )
+        outcome = Clarification(
+            reply="Which employee?",
+            state=ConversationState(),
+            reason="missing_employee",
+        )
+
+        result = evaluate_outcome(case, outcome)
+
+        self.assertFalse(result.outcome_ok)
+        self.assertFalse(result.unsupported_capabilities_ok)
+        valid = evaluate_outcome(
+            case,
+            Unsupported(
+                reply="Invalid date.",
+                state=ConversationState(),
+                capability="malformed_value",
+            ),
+        )
+        self.assertTrue(valid.outcome_ok)
+        self.assertTrue(valid.unsupported_capabilities_ok)
+
+    def test_ranked_group_order_is_checked_against_result_rows(self):
+        case = TestQuestion(
+            question="Rank departments by worked hours.",
+            keywords=[],
+            reference_answer="Engineering, then Finance, then Operations.",
+            category="synthetic_grouped_aggregate",
+            expected_group_order=["Engineering", "Finance", "Operations"],
+        )
+        turn = VerifiedTurn(
+            turn_id="ranked",
+            original_question=case.question,
+            rewritten_request=case.question,
+            answer="Engineering, Finance, Operations",
+            locale="en",
+            executed_sql="SELECT department, SUM(total_worked_hrs) FROM attendance_records GROUP BY department",
+            result={
+                "rows": [
+                    {"department": "Finance", "total": 36},
+                    {"department": "Engineering", "total": 56},
+                    {"department": "Operations", "total": 16},
+                ]
+            },
+        )
+        outcome = Answered(
+            reply=turn.answer, state=ConversationState(verified_turns=(turn,))
+        )
+
+        result = evaluate_outcome(case, outcome)
+
+        self.assertFalse(result.group_order_ok)
+        ordered_turn = turn.model_copy(
+            update={
+                "result": {
+                    "rows": [
+                        {"department": "Engineering", "total": 56},
+                        {"department": "Finance", "total": 36},
+                        {"department": "Operations", "total": 16},
+                    ]
+                }
+            }
+        )
+        ordered_outcome = Answered(
+            reply=ordered_turn.answer,
+            state=ConversationState(verified_turns=(ordered_turn,)),
+        )
+        self.assertTrue(evaluate_outcome(case, ordered_outcome).group_order_ok)
+
     def test_cli_can_use_explicit_synthetic_case_file(self):
         with TemporaryDirectory() as directory:
             case_file = Path(directory) / "synthetic.jsonl"
@@ -454,8 +530,8 @@ class EvaluatorTests(unittest.TestCase):
         unlink.assert_called_once_with(missing_ok=True)
         self.assertEqual(temporary.suffix, ".tmp")
 
-    def test_complete_behavior_corpus_has_311_cases(self):
-        self.assertEqual(len(load_evaluation_tests()), 311)
+    def test_curated_behavior_corpus_has_231_cases(self):
+        self.assertEqual(len(load_evaluation_tests()), 231)
 
     def test_physical_sql_and_typed_rows_are_scored(self):
         coverage = ExecutionCoverage(

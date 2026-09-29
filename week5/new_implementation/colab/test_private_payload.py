@@ -11,6 +11,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 from week5.new_implementation.colab.private_payload import (
     DATASET_FINGERPRINT,
+    EXPECTED_FACTS,
     build_payload_archive,
     validate_case_bytes,
     validate_payload_archive,
@@ -33,7 +34,7 @@ def _case_bytes(*, placeholder: bool = False) -> bytes:
             )
             + "\n"
         ).encode("utf-8")
-        for index in range(311)
+        for index in range(231)
     )
 
 
@@ -63,7 +64,7 @@ def _manifest(attendance: bytes, cases: bytes, **overrides) -> dict:
         "employee_count": 568,
         "date_min": "2026-09-01",
         "date_max": "2026-09-07",
-        "case_count": 311,
+        "case_count": 231,
         "files": {
             "attendance_records.jsonl": sha256(attendance).hexdigest(),
             "tests.jsonl": sha256(cases).hexdigest(),
@@ -85,12 +86,12 @@ class PrivatePayloadTests(unittest.TestCase):
         cls.attendance = _attendance_bytes()
         cls.cases = _case_bytes()
 
-    def test_placeholder_corpus_is_rejected_even_with_311_lines(self):
+    def test_placeholder_corpus_is_rejected_even_with_curated_case_count(self):
         with self.assertRaisesRegex(ValueError, "placeholder"):
             validate_case_bytes(_case_bytes(placeholder=True))
 
     def test_valid_case_corpus_reports_exact_count(self):
-        self.assertEqual(validate_case_bytes(self.cases), 311)
+        self.assertEqual(validate_case_bytes(self.cases), 231)
 
     def test_builder_writes_only_allowlisted_members_and_no_credentials(self):
         with TemporaryDirectory() as directory:
@@ -125,7 +126,7 @@ class PrivatePayloadTests(unittest.TestCase):
             manifest = validate_payload_archive(output, expected_sha256=digest)
 
             self.assertEqual(manifest["record_count"], 3964)
-            self.assertEqual(manifest["case_count"], 311)
+            self.assertEqual(manifest["case_count"], 231)
 
     def test_archive_rejects_unsafe_unexpected_duplicate_and_secret_members(self):
         invalid_names = ("../tests.jsonl", "extra.json", ".env.postgres")
@@ -210,6 +211,7 @@ class PrivatePayloadTests(unittest.TestCase):
         self.assertEqual(
             json.loads(cases.splitlines()[0])["category"], "synthetic_manifest"
         )
+        self.assertEqual(len(cases.splitlines()), EXPECTED_FACTS["case_count"])
         self.assertFalse(any("results" in name.casefold() for name in names))
 
 

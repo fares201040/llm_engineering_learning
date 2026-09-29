@@ -176,7 +176,7 @@ colab --auth=adc exec \
   --timeout 1200
 ```
 
-`colab exec` sends notebook code cells to the Colab kernel and writes an output notebook alongside the local input, named `attendance_phase2_tests_output.ipynb`. The notebook verifies the source ZIP SHA-256, extracts only its sanitized snapshot, installs a minimal test environment, and runs mocked Phase 2 runtime/evaluator, Phase 3 acceptance-checkpoint and Gradio UI tests plus Ruff and compilation checks. Its paired archive contains an explicit 42-file allowlist and generated placeholder manifest; it excludes `.env` files, credentials, attendance rows, previous results, and the private 311-case evaluation corpus. The deterministic notebook does not call an LLM or connect to PostgreSQL. For live tests, follow `LOCAL_COLAB_SYNC_GUIDE.md`; they use only a generated synthetic PostgreSQL database and a Colab T4 model.
+`colab exec` sends notebook code cells to the Colab kernel and writes an output notebook alongside the local input, named `attendance_phase2_tests_output.ipynb`. The notebook verifies the source ZIP SHA-256, extracts only its sanitized snapshot, installs a minimal test environment, and runs mocked Phase 2 runtime/evaluator, Phase 3 acceptance-checkpoint and Gradio UI tests plus Ruff and compilation checks. Its paired archive contains an explicit 56-file allowlist and generated placeholder manifest; it excludes `.env` files, credentials, attendance rows, previous results, and the private 231-case evaluation corpus. The deterministic notebook does not call an LLM or connect to PostgreSQL. For live tests, follow `LOCAL_COLAB_SYNC_GUIDE.md`; they use only a generated synthetic PostgreSQL database and a Colab T4 model.
 
 ## 7. Common session commands
 

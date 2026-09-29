@@ -266,7 +266,7 @@ def planner_examples(context: DatabaseContext) -> str:
         ]
         total_columns.append(f"SUM({current_total}) AS current_ot")
         examples.append(
-            "Overtime type totals. Unqualified employee overtime request: return "
+            "Current overtime type totals. When current/category overtime is requested, return "
             "all three current kinds and their overall current total over the "
             "requested employee, date, and group "
             "scope. Use current mutable values for the total, not the immutable "

@@ -36,6 +36,7 @@ class BehaviorEval(BaseModel):
     answer_facts_ok: bool = True
     record_ids_ok: bool = True
     group_values_ok: bool = True
+    group_order_ok: bool = True
     unsupported_capabilities_ok: bool = True
     multi_turn_ok: bool = True
 
@@ -60,6 +61,8 @@ _PHYSICAL_FIELD = {
     "OT_Not_Authorized": "ot_not_authorized",
     "Leave_Hrs": "leave_hrs",
 }
+
+_CLARIFIABLE_CAPABILITIES = {"unsupported_constraint", "reversed_temporal_range"}
 
 
 def _last_turn(state: ConversationState) -> VerifiedTurn | None:
@@ -488,6 +491,9 @@ def evaluate_outcome(test: TestQuestion, outcome) -> BehaviorEval:
     turn = _last_turn(outcome.state)
     rows = _result_rows(turn)
     expected_unsupported = test.expected_unsupported_capabilities
+    clarifiable_unsupported = bool(
+        set(expected_unsupported) & _CLARIFIABLE_CAPABILITIES
+    )
     expected_clarification = bool(
         test.expected_clarification_ids
         or test.expected_clarification_outcome == "ambiguous"
@@ -502,6 +508,13 @@ def evaluate_outcome(test: TestQuestion, outcome) -> BehaviorEval:
     pending_ids = [option.employee_id for option in pending.options] if pending else []
     calculation = _calculation(turn, test.expected_calculation)
     shaped_group_values = _group_values_by_shape(rows, test.expected_group_values)
+    group_order_ok = not test.expected_group_order or (
+        len(rows) == len(test.expected_group_order)
+        and all(
+            expected_group in row.values()
+            for row, expected_group in zip(rows, test.expected_group_order)
+        )
+    )
     matched_count = next(
         (
             value
@@ -541,7 +554,11 @@ def evaluate_outcome(test: TestQuestion, outcome) -> BehaviorEval:
         outcome_ok=(
             (
                 isinstance(outcome, Unsupported)
-                or (isinstance(outcome, Clarification) and pending is None)
+                or (
+                    clarifiable_unsupported
+                    and isinstance(outcome, Clarification)
+                    and pending is None
+                )
             )
             if expected_unsupported
             else isinstance(outcome, (Clarification, Unsupported))
@@ -611,6 +628,7 @@ def evaluate_outcome(test: TestQuestion, outcome) -> BehaviorEval:
                 ),
             )
         ),
+        group_order_ok=group_order_ok,
         unsupported_capabilities_ok=(
             (
                 not expected_unsupported
@@ -626,7 +644,7 @@ def evaluate_outcome(test: TestQuestion, outcome) -> BehaviorEval:
                 and isinstance(outcome, (Clarification, Unsupported))
             )
             or (
-                expected_unsupported
+                clarifiable_unsupported
                 and isinstance(outcome, Clarification)
                 and pending is None
             )

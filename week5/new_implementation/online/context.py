@@ -66,6 +66,16 @@ class DatabaseBusinessMeaning(_Strict):
 
 BUSINESS_MEANINGS = (
     DatabaseBusinessMeaning(
+        name="available_dataset_boundary",
+        description=(
+            "This interface exposes attendance records and documented attendance "
+            "fields only. An employee identifier does not make a different kind "
+            "of employee record available. If the requested record type or business "
+            "fact has no table or documented field, report it as unavailable; "
+            "attendance rows are not a substitute for those records."
+        ),
+    ),
+    DatabaseBusinessMeaning(
         name="worked_day_count",
         description=(
             "How many days means one scalar aggregate counting distinct "
@@ -134,10 +144,14 @@ BUSINESS_MEANINGS = (
             "for a total. Normal OT totals sum OT_Value_1 only where OT_Type_1 "
             "= 'Normal OT'; Week Off OT totals sum OT_Value_1 only where "
             "OT_Type_1 = 'Week Off OT'; Night OT totals sum OT_Value_2 only "
-            "where OT_Type_2 = 'Night OT'. For an unqualified employee overtime request, "
-            "give the current Normal OT, Week Off OT, and Night OT totals plus "
-            "their current overall overtime total for the requested period; "
-            "do not substitute pre/post-shift or audit fields. An employee attendance report "
+            "where OT_Type_2 = 'Night OT'. "
+            "In user-facing answers, name these amounts by their stored category "
+            "(Normal OT, Week Off OT, or Night OT), not by OT_Value_1 or OT_Value_2; "
+            "OT_Value_1 must take its label from OT_Type_1 for each row. These "
+            "mutable values answer a request for current or category-specific "
+            "overtime. A request for total "
+            "overtime without a current/category qualifier uses the source-named "
+            "typed total_ot measure, summed over the requested scope. An employee attendance report "
             "requesting these kinds must include their separate current values "
             "and the current overtime total when requested. OT_Authorized, also "
             "exposed as typed ot_authorized, is an immutable pre-adjustment "
@@ -347,13 +361,13 @@ _COLUMN_DESCRIPTIONS = {
     "status": "Workflow approval status of this attendance row (for example Authorized, Draft, or Pending For Authorization). It is not proof that work occurred and is separate from the application's access authorization. Filter by status only when the user explicitly asks for a workflow approval category; a general request for attendance records or employees includes rows of every status.",
     "exception": "Attendance exception. For dates or records explicitly marked absent, filter exception = 'Absent' using the exact observed value. Zero worked hours, leave, and scheduled work days are separate facts and must not be added as alternative absence conditions. Not absent is the negation of that recorded exception, including NULL: exception IS DISTINCT FROM 'Absent'. It does not mean positive worked hours or prove work occurred. 'OK' is neutral. Add worked-hours or schedule conditions only when requested.",
     "total_worked_hrs": "Effective worked hours recorded from attendance for the attendance date. A positive number proves the employee attended work. Empty, null, or zero means no work-attendance evidence; inspect leave_type, leave_hrs, and exception to determine whether the employee was on leave, absent, or otherwise not working. Count distinct attendance_date values with total_worked_hrs > 0 for worked or attended days.",
-    "lateness_hrs": "Hours of lateness.",
-    "early_out_hrs": "Hours of early departure.",
+    "lateness_hrs": "Hours of lateness. Missing values are NULL, not zero; an ordinary average uses AVG(lateness_hrs) over recorded values.",
+    "early_out_hrs": "Hours of early departure. Missing values are NULL, not zero; an ordinary average uses AVG(early_out_hrs) over recorded values.",
     "overbreak_hrs": "Hours beyond the permitted break.",
     "regular_units": "Regular attendance units credited on the row; do not assume the unit is hours unless the request or source semantics establish it.",
     "pre_ot_hrs": "Overtime hours before the shift.",
     "post_ot_hrs": "Overtime hours after the shift.",
-    "total_ot": "Source pre/post-shift overtime measure. It is separate from the category-based current overtime total, which sums the mutable OT_Value_1 and OT_Value_2 values in record_json. Use this column only when the request specifically concerns that pre/post-shift measure.",
+    "total_ot": "Source-named total overtime measure for the row, based on pre/post-shift overtime. Sum this typed column for an unqualified total-overtime request. It is separate from the category-based current overtime total, which sums the mutable OT_Value_1 and OT_Value_2 values in record_json; use those mutable values when current or category-specific overtime is requested.",
     "ot_authorized": "Typed copy of immutable source OT_Authorized: the original pre-adjustment total of OT_Value_1 + OT_Value_2 retained for security and audit tracing. It is not the current overtime total after the mutable values change; calculate that from current OT_Value_1 and OT_Value_2.",
     "ot_not_authorized": "Unauthorized overtime hours.",
     "leave_type": "Recorded leave category when the employee is on leave; an empty value means no leave category is recorded, not that the employee attended.",
@@ -364,7 +378,7 @@ _COLUMN_DESCRIPTIONS = {
     "source_excel_row": "One-based row number in the source spreadsheet used for traceability.",
     "source_jsonl_line": "Line number in the generated normalized attendance JSONL used for traceability.",
     "search_text": "Normalized search text generated during ingestion.",
-    "record_json": "Full normalized source attendance record as JSONB. Its json_fields catalog describes device swipes, clerk-adjustable effective swipes, schedules, workflow, overtime, and other source fields with exact SQL text expressions. Prefer equivalent typed relational columns when available. A manually adjusted swipe differs in any corresponding effective From_Date, From_Time, To_Date, or To_Time and immutable Actual_* device value. Compare all four pairs with nullable-safe IS DISTINCT FROM and combine differences with OR; an unchanged swipe has no such difference.",
+    "record_json": "Private normalized source attendance record as JSONB. Query only documented attendance fields through the json_fields expressions; never project the whole JSON payload. Prefer equivalent typed relational columns when available. A manually adjusted swipe differs in any corresponding effective From_Date, From_Time, To_Date, or To_Time and immutable Actual_* device value. Compare all four pairs with nullable-safe IS DISTINCT FROM and combine differences with OR; an unchanged swipe has no such difference.",
     "raw_row_key": "Stable key linking to the private raw ingestion row.",
     "synced_at": "Timestamp when the row was synchronized to PostgreSQL.",
 }
@@ -444,8 +458,8 @@ _RECORD_JSON_FIELD_DESCRIPTIONS = {
     "OT_Type_3": "Third source overtime category or rate label; interpret together with OT_Value_3.",
     "OT_Type_4": "Fourth source overtime category or rate label; interpret together with OT_Value_4.",
     "OT_Type_5": "Fifth source overtime category or rate label; interpret together with OT_Value_5.",
-    "OT_Value_1": "Mutable numeric overtime value paired with OT_Type_1: Normal OT when OT_Type_1 = 'Normal OT', or Week Off OT when OT_Type_1 = 'Week Off OT'. Cast nonempty JSON text to numeric for totals.",
-    "OT_Value_2": "Mutable numeric Night OT value paired with OT_Type_2 when OT_Type_2 = 'Night OT'. Cast nonempty JSON text to numeric for totals.",
+    "OT_Value_1": "Mutable numeric overtime value paired with OT_Type_1: Normal OT when OT_Type_1 = 'Normal OT', or Week Off OT when OT_Type_1 = 'Week Off OT'. Cast nonempty JSON text to numeric for totals. In user-facing answers, label the amount by its actual category, Normal OT or Week Off OT, rather than the source field name OT_Value_1.",
+    "OT_Value_2": "Mutable numeric Night OT value paired with OT_Type_2 when OT_Type_2 = 'Night OT'. Cast nonempty JSON text to numeric for totals. In user-facing answers, label the amount Night OT rather than the source field name OT_Value_2.",
     "OT_Value_3": "Numeric overtime amount associated with OT_Type_3; do not assume it is payable hours without considering the overtime category and authorization fields.",
     "OT_Value_4": "Numeric overtime amount associated with OT_Type_4; do not assume it is payable hours without considering the overtime category and authorization fields.",
     "OT_Value_5": "Numeric overtime amount associated with OT_Type_5; do not assume it is payable hours without considering the overtime category and authorization fields.",
@@ -467,7 +481,7 @@ _RECORD_JSON_FIELD_DESCRIPTIONS = {
     "Status": "Workflow approval status of this attendance row. It is not proof that work occurred and is separate from the application's access authorization. Filter by this field only when the user explicitly asks for a workflow approval category; a general attendance request includes every status.",
     "To_Date": "Effective end-date copy of Actual_To_Date for the same swipe. An admin clerk may modify it manually; worked-time calculations use this adjusted field. Compare with Actual_To_Date using IS DISTINCT FROM to detect a nullable change; inspect all corresponding From/To date and time pairs for any adjusted swipe.",
     "To_Time": "Effective end-time copy of Actual_To_Time for the same swipe. An admin clerk may modify it manually; worked-time calculations use this adjusted field. Compare with Actual_To_Time using IS DISTINCT FROM to detect a nullable change; inspect all corresponding From/To date and time pairs for any adjusted swipe.",
-    "Total_OT": "Source pre/post-shift overtime measure for the row. It is separate from the category-based current overtime total, which is the sum of the mutable OT_Value_1 and OT_Value_2 values.",
+    "Total_OT": "Source-named total overtime measure for the row, exposed as typed total_ot. Sum it for an unqualified total-overtime request. It is separate from category-based current overtime, the sum of mutable OT_Value_1 and OT_Value_2 values.",
     "Total_Worked_Hrs": "Effective worked hours recorded from attendance for the attendance date. A positive number proves the employee attended work. Empty, null, or zero means the row has no work-attendance evidence; inspect Leave_Type, Leave_Hrs, and Exception to determine whether the employee was on leave, absent, or otherwise not working.",
     "Work_Location": "Work-location group within the employee's department. One department can contain multiple work-location groups. Use the typed department column for department-wide questions and the typed work_location column for work-location questions.",
     "last_Updated_date": "Source-system timestamp for the last workflow or attendance update to this record; it is not the attendance date.",

@@ -274,7 +274,9 @@ def main() -> None:
         raise
     print(
         "Private Colab runtime ready: payload hash and manifest validated; "
-        "3964 rows, 568 employees, 311 cases."
+        f"{EXPECTED_FACTS['record_count']} rows, "
+        f"{EXPECTED_FACTS['employee_count']} employees, "
+        f"{EXPECTED_FACTS['case_count']} cases."
     )
     print("The generated read-only DSN remains only in the mode-0600 runtime config.")
 

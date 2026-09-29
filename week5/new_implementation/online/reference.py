@@ -281,7 +281,10 @@ def request_references(
     max_output_tokens: int,
     observer: TurnObserver | None = None,
     reconsideration_feedback: str | None = None,
+    max_attempts: int = 2,
 ) -> ReferenceResponse:
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
     payload: dict[str, object] = {
         "conversation_history": list(history),
         "trusted_context": trusted_context,
@@ -293,7 +296,7 @@ def request_references(
     }
     if reconsideration_feedback is not None:
         payload["reconsideration_feedback"] = reconsideration_feedback
-    for attempt in (1, 2):
+    for attempt in range(1, max_attempts + 1):
         try:
             return call_structured(
                 stage="reference",
@@ -308,7 +311,7 @@ def request_references(
                 attempt=attempt,
             )
         except ProviderFailure as exc:
-            if exc.code != "invalid_schema" or attempt == 2:
+            if exc.code != "invalid_schema" or attempt == max_attempts:
                 raise
             payload["repair"] = {"code": exc.code, "message": str(exc)}
     raise AssertionError("unreachable")
@@ -628,6 +631,12 @@ def bind_references(
         if not reference_is_grounded and not trusted_active_id:
             ignored_invented_ids.append(employee_id)
             continue
+        if (
+            any(char.isdigit() for char in employee_id)
+            and authorized_id_shapes
+            and _identifier_shape(employee_id) not in authorized_id_shapes
+        ):
+            return BoundReferences(**base, ambiguous=True, reason="malformed_identifier")
         employee = by_id.get(normalized_reference)
         if employee is None:
             exact_name_matches = by_name.get(normalized_reference, ())
@@ -720,6 +729,13 @@ def bind_references(
             and not trusted_active_claim
         ):
             continue
+        if (
+            claim_id_mentioned
+            and any(char.isdigit() for char in claim.employee_id)
+            and authorized_id_shapes
+            and _identifier_shape(claim.employee_id) not in authorized_id_shapes
+        ):
+            return BoundReferences(**base, ambiguous=True, reason="malformed_identifier")
         id_owner = by_id.get(_normalize(claim.employee_id))
         if id_owner is None and _normalize(claim.employee_id) not in question_tokens:
             exact_name_matches = by_name.get(normalized_claim_name, ())

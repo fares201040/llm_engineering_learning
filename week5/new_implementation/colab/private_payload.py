@@ -19,7 +19,7 @@ EXPECTED_FACTS = {
     "employee_count": 568,
     "date_min": "2026-09-01",
     "date_max": "2026-09-07",
-    "case_count": 311,
+    "case_count": 231,
 }
 PAYLOAD_MEMBERS = frozenset(
     {"attendance_records.jsonl", "tests.jsonl", "manifest.json"}

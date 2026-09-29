@@ -107,6 +107,59 @@ def _json_value(value: object) -> object:
     return str(value)
 
 
+def _relation_names_for_select(
+    select: exp.Select, table_names: frozenset[str]
+) -> frozenset[str]:
+    sources: list[exp.Expression] = []
+    from_clause = select.args.get("from_")
+    if isinstance(from_clause, exp.From) and from_clause.this is not None:
+        sources.append(from_clause.this)
+    sources.extend(join.this for join in select.args.get("joins") or () if join.this)
+    return frozenset(
+        source.alias_or_name.casefold()
+        for source in sources
+        if isinstance(source, exp.Table) and source.name.casefold() in table_names
+    )
+
+
+def _projects_private_source(
+    item: exp.Expression, *, relation_names: frozenset[str] = frozenset()
+) -> bool:
+    """Detect direct source payload output while allowing documented JSON fields."""
+
+    projection = item.this if isinstance(item, exp.Alias) else item
+    if isinstance(projection, exp.Star) and relation_names:
+        return True
+    if (
+        isinstance(projection, exp.Column)
+        and isinstance(projection.this, exp.Star)
+        and projection.table.casefold() in relation_names
+    ):
+        return True
+    if not isinstance(projection, (exp.Star, exp.Column)) and any(
+        isinstance(node, exp.Star)
+        and node.find_ancestor(exp.Count) is None
+        for node in projection.find_all(exp.Star)
+    ):
+        return True
+    for column in projection.find_all(exp.Column):
+        name = column.name.casefold()
+        if not column.table and name in relation_names:
+            return True
+        if name == "raw_row_key":
+            return True
+        if name != "record_json":
+            continue
+        parent = column.parent
+        while parent is not None and parent is not projection.parent:
+            if isinstance(parent, (exp.JSONExtract, exp.JSONExtractScalar)):
+                break
+            parent = parent.parent
+        else:
+            return True
+    return False
+
+
 def validate_read_query(
     sql: str, *, allowed_tables: tuple[str, ...] | None = None
 ) -> None:
@@ -133,6 +186,14 @@ def validate_read_query(
         return
     allowed = {table.casefold() for table in allowed_tables}
     allowed_unqualified = {table.rsplit(".", 1)[-1] for table in allowed}
+    # Full source payloads and ingestion keys are not part of the attendance
+    # question interface. JSON field extraction remains available for valid
+    # attendance measures that are not represented by typed columns.
+    for select in statement.find_all(exp.Select):
+        relation_names = _relation_names_for_select(select, frozenset(allowed_unqualified))
+        for item in select.expressions:
+            if _projects_private_source(item, relation_names=relation_names):
+                raise ValueError("SQL projects a private source payload")
     cte_names = {
         cte.alias.casefold() for cte in statement.find_all(exp.CTE) if cte.alias
     }

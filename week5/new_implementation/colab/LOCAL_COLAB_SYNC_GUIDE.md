@@ -86,7 +86,7 @@ python3 week5/new_implementation/colab/package_source.py
 sha256sum week5/new_implementation/colab/attendance_phase2_source.zip
 ```
 
-The packager has an explicit source-file allowlist. It creates the 311-line count-only
+The packager has an explicit source-file allowlist. It creates the 231-line count-only
 manifest with generated placeholder records rather than copying the private
 `week5/new_evaluation/tests.jsonl`. It excludes environment files, credentials,
 attendance rows, result folders, and other repository files by construction. Keep the
@@ -176,7 +176,7 @@ The notebook validates the ZIP hash, installs only the direct test dependencies,
 runs online runtime, configuration, evaluator, acceptance-checkpoint, and Gradio UI
 tests. It also runs the selected Ruff lint and formatting rules plus Python
 compilation. These checks make no live model calls and do not connect to PostgreSQL.
-They load the generated count-only fixture, never the private 311-case evaluation.
+They load the generated count-only fixture, never the private 231-case evaluation.
 
 `colab exec` saves the executed notebook beside the local input as
 `attendance_phase2_tests_output.ipynb`. Review its output cells before treating the
@@ -293,19 +293,19 @@ colab --auth=adc exec \
 
 The runner invokes `week5.new_evaluation.eval --all --test-file` with the synthetic
 case file and writes `/content/attendance-synthetic-eval.json`. Inspect each failed
-flag in that report before changing application logic. The private 311-case corpus
+flag in that report before changing application logic. The private 231-case corpus
 is excluded from the archive; it is not evaluated in Colab.
 
 Never run multiple live turns as a batch. Stop after any failed turn. The other
 named Wail, Faris, and generic-subject scenarios need explicit factual oracles.
-The private 311-case corpus uses the separately approved bounded workflow below.
+The private 231-case corpus uses the separately approved bounded workflow below.
 
-## 9. Run the authorized private 311-case evaluation
+## 9. Run the authorized private 231-case evaluation
 
 Keep this payload separate from `attendance_phase2_source.zip`. The local exporter
 selects only `public.attendance_records`, reads the ignored private case JSONL, checks
 the fixed dataset oracle (3,964 rows, 568 employees, 2026-09-01 through 2026-09-07,
-311 cases, and the approved dataset fingerprint), and writes only three members under
+231 cases, and the approved dataset fingerprint), and writes only three members under
 the ignored results directory. It never serializes a DSN or environment file.
 
 ```powershell

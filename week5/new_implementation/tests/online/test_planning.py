@@ -395,7 +395,7 @@ class ReferenceAndPlanningTests(unittest.TestCase):
 
         examples = planner_examples(schema)
 
-        self.assertIn("Unqualified employee overtime request", examples)
+        self.assertIn("When current/category overtime is requested", examples)
         self.assertIn("AS normal_ot", examples)
         self.assertIn("AS week_off_ot", examples)
         self.assertIn("AS night_ot", examples)
@@ -417,7 +417,7 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertNotIn('SUM("ot_authorized") AS authorized_ot', examples)
         current_report = examples.split(
             "Attendance report with the requested overtime kinds:", 1
-        )[1].split("Overtime type totals", 1)[0]
+        )[1].split("Current overtime type totals", 1)[0]
         self.assertNotIn('"ot_authorized"', current_report)
 
     def test_reference_schema_uses_openai_supported_union_shape(self):

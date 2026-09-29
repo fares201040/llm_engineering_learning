@@ -35,6 +35,8 @@ from .execution import (
     load_employee_directory,
     search_employee_directory_postgres,
     validate_read_query,
+    _projects_private_source,
+    _relation_names_for_select,
 )
 from .history import model_history
 from .limits import MAX_EMPLOYEE_CANDIDATES
@@ -117,6 +119,7 @@ class TurnRequest(_Strict):
     history: tuple[dict[str, str], ...] = ()
     state: ConversationState = Field(default_factory=ConversationState)
     access_context: AccessContext | None = None
+    max_reference_calls: Literal[1, 2] = 2
 
 
 class Answered(_Strict):
@@ -249,22 +252,20 @@ def _requested_workflow_status(question: str) -> str | None:
 
 def _has_required_workflow_status(sql: str, status: str) -> bool:
     paths = contributing_where_paths(sql, include_scalar_subqueries=False)
-    if not paths:
-        return False
+
+    def status_expression(node: exp.Expression) -> bool:
+        columns = {column.name.casefold() for column in node.find_all(exp.Column)}
+        return "status" in columns or (
+            "record_json" in columns
+            and any(
+                isinstance(literal, exp.Literal)
+                and literal.is_string
+                and str(literal.this).casefold() == "status"
+                for literal in node.find_all(exp.Literal)
+            )
+        )
 
     def matches(predicate: exp.Expression) -> bool:
-        def status_expression(node: exp.Expression) -> bool:
-            columns = {column.name.casefold() for column in node.find_all(exp.Column)}
-            return "status" in columns or (
-                "record_json" in columns
-                and any(
-                    isinstance(literal, exp.Literal)
-                    and literal.is_string
-                    and str(literal.this).casefold() == "status"
-                    for literal in node.find_all(exp.Literal)
-                )
-            )
-
         def status_value(node: exp.Expression) -> bool:
             return (
                 isinstance(node, exp.Literal)
@@ -289,7 +290,39 @@ def _has_required_workflow_status(sql: str, status: str) -> bool:
             )
         return False
 
-    return all(any(matches(predicate) for predicate in path) for path in paths)
+    if paths and all(any(matches(predicate) for predicate in path) for path in paths):
+        return True
+    if any(status_expression(predicate) for path in paths for predicate in path):
+        return False
+    try:
+        statements = parse(sql, read="postgres")
+    except ParseError:
+        return False
+    for statement in statements:
+        if not isinstance(statement, exp.Select):
+            continue
+        filtered_projections = []
+        unfiltered_count_projections = []
+        for item in statement.expressions:
+            has_status_filter = any(
+                isinstance(filtered.this, exp.Count)
+                and isinstance(filtered.expression, exp.Where)
+                and matches(filtered.expression.this)
+                for filtered in item.find_all(exp.Filter)
+            )
+            if has_status_filter:
+                filtered_projections.append(item)
+            if any(
+                count.find_ancestor(exp.Filter) is None
+                and count.find_ancestor(exp.Window) is None
+                for count in item.find_all(exp.Count)
+            ):
+                unfiltered_count_projections.append(item)
+        if filtered_projections and all(
+            item in filtered_projections for item in unfiltered_count_projections
+        ):
+            return True
+    return False
 
 
 def _carried_verified_employees(
@@ -540,6 +573,67 @@ def _repair_group_matched_count(sql: str) -> str:
     return statement.sql(dialect="postgres")
 
 
+def _strip_private_projections(
+    sql: str, *, public_columns: tuple[str, ...] = ()
+) -> str | None:
+    """Keep public attendance evidence while withholding full ingestion payloads."""
+
+    try:
+        statements = parse(sql, read="postgres")
+    except ParseError:
+        return sql
+    if len(statements) != 1 or statements[0] is None:
+        return sql
+    statement = statements[0]
+    changed = False
+    private_names = {"record_json", "raw_row_key"}
+    for select in reversed(list(statement.find_all(exp.Select))):
+        relation_names = _relation_names_for_select(
+            select,
+            frozenset({settings.postgres_attendance_table.rsplit(".", 1)[-1].casefold()}),
+        )
+        kept: list[exp.Expression] = []
+        for item in select.expressions:
+            projection = item.this if isinstance(item, exp.Alias) else item
+            if isinstance(projection, exp.Star) or (
+                isinstance(projection, exp.Column)
+                and isinstance(projection.this, exp.Star)
+            ):
+                source = select.args.get("from_")
+                table = source.this if isinstance(source, exp.From) else None
+                if isinstance(table, exp.Table) and table.name.casefold() != settings.postgres_attendance_table.rsplit(".", 1)[-1].casefold():
+                    kept.append(item)
+                    continue
+                if (
+                    not public_columns
+                    or not isinstance(table, exp.Table)
+                    or select.args.get("joins")
+                ):
+                    return None
+                kept.extend(
+                    exp.column(name, table=projection.table if isinstance(projection, exp.Column) else None)
+                    for name in public_columns
+                    if name.casefold() not in private_names
+                )
+                changed = True
+                continue
+            if _projects_private_source(item, relation_names=relation_names):
+                changed = True
+                continue
+            kept.append(item)
+        if len(kept) != len(select.expressions):
+            if not any(
+                not (
+                    isinstance(item.this if isinstance(item, exp.Alias) else item, exp.Window)
+                    and isinstance((item.this if isinstance(item, exp.Alias) else item).this, exp.Count)
+                )
+                for item in kept
+            ):
+                return None
+            select.set("expressions", kept)
+    return statement.sql(dialect="postgres") if changed else sql
+
+
 def _planner_control_alias(sql: str) -> str | None:
     """Recognize the planner's safe, single-value control protocol."""
 
@@ -649,7 +743,11 @@ def _date_scope_for_path(
             lower = max(lower, start) if lower is not None else start
         if end is not None:
             upper = min(upper, end) if upper is not None else end
-    if lower is None or upper is None or lower > upper:
+    if lower is None and upper is None:
+        return None
+    lower = lower or date.min
+    upper = upper or date.max
+    if lower > upper:
         return None
     return lower.isoformat(), upper.isoformat()
 
@@ -705,7 +803,11 @@ def _unsupported_identifier(locale: str) -> str:
     )
 
 
-def _unsupported_value(locale: str) -> str:
+def _unsupported_value(locale: str, issue: str) -> str:
+    if issue == "reversed_temporal_range":
+        if locale == "ar":
+            return "تاريخ بداية النطاق يأتي بعد تاريخ نهايته. يرجى تصحيح ترتيب التاريخين."
+        return "The date range starts after it ends. Please correct the two dates."
     if locale == "ar":
         return "يحتوي الطلب على تاريخ أو قيمة رقمية غير صالحة. يرجى تصحيحها."
     return "The request contains an invalid date or numeric value. Please correct it."
@@ -793,6 +895,26 @@ def _explicit_date_scopes(question: str) -> set[tuple[str, str]]:
                 date(int(match["y"]), month, int(match["last"])),
             )
         except ValueError:
+            return set()
+    for match in re.finditer(
+        r"\b(?P<operator>before|after|on\s+or\s+before|on\s+or\s+after)\s+"
+        r"(?P<day>\d{4}-\d{1,2}-\d{1,2})\b",
+        question,
+        re.IGNORECASE,
+    ):
+        if any(a <= match.start() and match.end() <= b for (a, b), _ in found):
+            continue
+        try:
+            day = date.fromisoformat(match["day"])
+            operator = match["operator"].casefold()
+            start = date.min if "before" in operator else day
+            end = day if "before" in operator else date.max
+            if operator == "before":
+                end -= timedelta(days=1)
+            elif operator == "after":
+                start += timedelta(days=1)
+            add(match, start, end)
+        except (ValueError, OverflowError):
             return set()
     for match in re.finditer(r"\b\d{4}-\d{1,2}-\d{1,2}\b", question):
         if any(a <= match.start() and match.end() <= b for (a, b), _ in found):
@@ -1219,7 +1341,7 @@ def run_turn(
                     },
                 )
                 return Unsupported(
-                    reply=_unsupported_value(locale),
+                    reply=_unsupported_value(locale, request_issue),
                     state=previous,
                     capability=request_issue,
                 )
@@ -1280,7 +1402,7 @@ def run_turn(
                     )
                 )
                 needs_reconsideration = inconsistent_ready or ungrounded_active_new
-            if needs_reconsideration:
+            if needs_reconsideration and request.max_reference_calls > 1:
                 feedback = (
                     "The prior decision has an inconsistent subject_relationship "
                     "and employee references. Re-evaluate the current user intent; "
@@ -1599,6 +1721,24 @@ def run_turn(
                 else deps.planner(**planner_args)
             )
             sql = _repair_group_order(_repair_group_matched_count(sql))
+            sql = _strip_private_projections(
+                sql,
+                public_columns=tuple(
+                    column.name
+                    for table in database_context.tables
+                    for column in table.columns
+                ),
+            )
+            if sql is None:
+                return Unsupported(
+                    reply=(
+                        "Private source payloads are not available through this attendance interface."
+                        if locale == "en"
+                        else "حمولات المصدر الخاصة غير متاحة من خلال واجهة الحضور هذه."
+                    ),
+                    state=previous,
+                    capability="private_source_payload",
+                )
             log_layer_output("sql_planner", sql, attempt=attempt)
             if (
                 _planner_control_alias(sql) == "unsupported_capability"

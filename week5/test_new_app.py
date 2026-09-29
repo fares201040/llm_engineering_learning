@@ -10,6 +10,42 @@ from week5.new_implementation import answer
 
 
 class LaunchModeTests(unittest.TestCase):
+    def test_conversation_is_full_width_with_collapsed_context_below_input(self):
+        with patch.object(new_app.gr.Blocks, "launch", autospec=True) as launch:
+            new_app.main()
+        config = launch.call_args.args[0].config
+        components = {item["id"]: item for item in config["components"]}
+        parents = {}
+
+        def walk(node, parent=None):
+            parents[node["id"]] = parent
+            for child in node.get("children", []):
+                walk(child, node["id"])
+
+        walk(config["layout"])
+        chatbot = next(
+            id for id, item in components.items() if item["type"] == "chatbot"
+        )
+        textbox = next(
+            id for id, item in components.items() if item["type"] == "textbox"
+        )
+        context = next(
+            id
+            for id, item in components.items()
+            if item["type"] == "markdown"
+            and item["props"].get("label") == "📚 Retrieved Context"
+        )
+        accordion = parents[context]
+        root = config["layout"]["id"]
+
+        self.assertEqual(parents[chatbot], root)
+        self.assertEqual(parents[parents[textbox]], root)
+        self.assertEqual(parents[accordion], root)
+        self.assertEqual(components[accordion]["type"], "accordion")
+        self.assertFalse(components[accordion]["props"]["open"])
+        self.assertEqual(components[chatbot]["props"]["height"], 420)
+        self.assertEqual(components[textbox]["props"]["lines"], 1)
+
     def test_clear_event_resets_visible_chatbot_history(self):
         with patch.object(new_app.gr.Blocks, "launch", autospec=True) as launch:
             new_app.main()

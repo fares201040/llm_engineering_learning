@@ -397,7 +397,28 @@ def main():
 
     theme = gr.themes.Soft(font=["Inter", "system-ui", "sans-serif"])
 
-    with gr.Blocks(title="APDC Attendance Assistant", theme=theme) as ui:
+    with gr.Blocks(
+        title="APDC Attendance Assistant",
+        theme=theme,
+        css="""
+        #attendance-chat {
+            height: min(420px, calc(100dvh - 315px)) !important;
+            min-height: 220px;
+        }
+        #attendance-question textarea {
+            min-height: 60px !important;
+            max-height: 60px !important;
+        }
+        #attendance-chat .bot-row:has(table) {
+            width: calc(100% - 24px);
+            max-width: calc(100% - 24px);
+        }
+        #attendance-chat .bot-row:has(table) .flex-wrap,
+        #attendance-chat .bot-row:has(table) .message {
+            width: 100%;
+        }
+        """,
+    ) as ui:
         turn_gate = gr.State(value=_TurnGate())
         client_sequence = gr.Number(value=0, precision=0, visible=False)
         client_clear_sequence = gr.Number(value=0, precision=0, visible=False)
@@ -407,28 +428,28 @@ def main():
             "Ask about employee attendance, worked days, schedules, leave, or overtime."
         )
 
-        with gr.Row():
-            with gr.Column(scale=1):
-                chatbot = gr.Chatbot(
-                    label="💬 Conversation",
-                    height=600,
-                    type="messages",
-                    show_copy_button=True,
-                    render_markdown=True,
-                    sanitize_html=True,
-                )
-                message = gr.Textbox(
-                    label="Your Question",
-                    placeholder="Ask an APDC attendance question...",
-                    show_label=False,
-                )
-            with gr.Column(scale=1):
-                context_markdown = gr.Markdown(
-                    label="📚 Retrieved Context",
-                    value="*Retrieved context will appear here*",
-                    container=True,
-                    height=600,
-                )
+        chatbot = gr.Chatbot(
+            label="💬 Conversation",
+            height=420,
+            elem_id="attendance-chat",
+            type="messages",
+            show_copy_button=True,
+            render_markdown=True,
+            sanitize_html=True,
+        )
+        message = gr.Textbox(
+            label="Your Question",
+            placeholder="Ask an APDC attendance question...",
+            show_label=False,
+            elem_id="attendance-question",
+        )
+        with gr.Accordion("📚 Retrieved Context", open=False):
+            context_markdown = gr.Markdown(
+                label="📚 Retrieved Context",
+                value="*Retrieved context will appear here*",
+                container=True,
+                height=400,
+            )
 
         message.submit(
             submit_chat,

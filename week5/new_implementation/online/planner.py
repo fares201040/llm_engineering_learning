@@ -64,6 +64,12 @@ example query, hypothetical data structure, or speculative path to an answer.
 Choose a concise sentence, list, or table that answers every requested part.
 Use Markdown headings, bullets, or tables when they make a multi-part answer
 easier to scan. Keep simple answers in plain sentences; do not force a template.
+For an answerable comparison report, use a valid Markdown table. Put each
+compared person, group, or period on its own row; use the requested measures
+as columns with clear units. Include a difference column only when requested
+or useful and supported by the result. Keep the table compact, leave a blank
+line before and after it, and put coverage caveats below it. Do not use a
+table for a clarification or unsupported request.
 When the user asks only for a count, give the count and its requested scope;
 do not add a narrative about unrequested fields from sampled detail rows.
 Treat the current executed rows as the evidence for this answer. Earlier answers
@@ -236,6 +242,12 @@ a concrete request-specific reason or question rather than a placeholder.
 Keep implementation details out of a user-facing capability answer unless requested.
 Remove example SQL, invented structures, and implementation offers from a capability
 answer when the user asked only for the unavailable result.
+For an answerable comparison report, publish a valid Markdown table with one
+row per compared person, group, or period and columns for requested measures
+with units. If the proposed answer is prose and the executed rows support a
+comparison, rewrite it as a Markdown table directly without requesting new
+SQL. Put coverage notes below the table. Do not invent missing values or
+force a table into a clarification or unsupported answer.
 Requery only if the proposed answer is materially incorrect, omits a requested
 answerable part, includes unrelated information as an answer, or answers a
 different question, and the error comes from SQL that can be corrected against
@@ -292,8 +304,7 @@ Request: "Compare August and September hours."
 Result: August=16, September=40, previous_period_record_count=2,
 current_period_record_count=6; as_of_date=September 27; observed table rows
 span August 3 to September 6.
-Answer: "The available records show 16 hours in August and 40 in September.
-They do not cover either full month."
+Answer: "| Period | Worked hours |\n| --- | ---: |\n| August | 16 |\n| September | 40 |\n\nThe available records do not cover either full month."
 
 Earlier request: "What department does Alex work in?" Current message: "1"
 selects Alex (E42) from a name clarification. Result: department=Support.
@@ -337,16 +348,13 @@ Request: "Compare August and September."
 Result: August hours=16, September hours=40; observed table rows span August 3
 to September 6; as_of_date is September 27.
 Proposed answer: "September data are current through September 27."
-Reviewed answer: "Available records show 16 hours in August and 40 in
-September. Observed rows span August 3 to September 6, so these totals do not
-represent two complete months."
+Reviewed answer: "| Period | Worked hours |\n| --- | ---: |\n| August | 16 |\n| September | 40 |\n\nObserved rows span August 3 to September 6, so these totals do not represent two complete months."
 
 Request: "Compare hours by department between August and September."
 Result for one department: August hours=16, September hours=40,
 previous_period_record_count=2, current_period_record_count=6.
 Proposed answer: "The department had 2 observed days in August and 6 in September."
-Reviewed answer: "The available records show 16 hours in August and 40 in
-September for the department." The record counts do not establish distinct days.
+Reviewed answer: "| Period | Worked hours |\n| --- | ---: |\n| August | 16 |\n| September | 40 |" The record counts do not establish distinct days.
 
 Request: "Group worked hours by department."
 SQL has no date filter; observed rows span August 3 to September 6.
@@ -392,8 +400,7 @@ count from the restricted rows.
 Request: "Compare overtime totals by department and analyze them."
 Result: Department A has 100 overtime hours across 50 rows; Department B has
 80 hours across 10 rows. Proposed analysis: "A has a higher overtime rate."
-Reviewed analysis: "A has the higher observed overtime total." The rows do
-not establish the rate per person or per worked hour.
+Reviewed answer: "| Department | Overtime hours |\n| --- | ---: |\n| A | 100 |\n| B | 80 |\n\nA has the higher observed overtime total. These rows do not establish the rate per person or per worked hour."
 
 Request: "Give their total hours and late days."
 Executed SQL retrieves only total_hours, and the proposed answer omits late days.

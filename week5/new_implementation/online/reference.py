@@ -409,6 +409,26 @@ def _options_for_name(
     )
 
 
+def _normalize_id(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).strip().casefold()
+
+
+def _exact_identity_options(
+    mention: str, directory: tuple[Employee, ...]
+) -> tuple[EmployeeOption, ...]:
+    normalized = _normalize(mention)
+    normalized_id = _normalize_id(mention)
+    matches = {
+        item.employee_id: EmployeeOption(
+            employee_id=item.employee_id, employee_name=item.name
+        )
+        for item in directory
+        if normalized_id == _normalize_id(item.employee_id)
+        or normalized == _normalize(item.name)
+    }
+    return tuple(matches.values())[:MAX_EMPLOYEE_CANDIDATES]
+
+
 def bind_references(
     decision: ReferenceResponse,
     directory: tuple[Employee, ...],
@@ -442,14 +462,27 @@ def bind_references(
             else None
         )
         exact_options = (
-            tuple(
-                EmployeeOption(employee_id=item.employee_id, employee_name=item.name)
-                for item in directory
-                if _normalize(item.name) == _normalize(mention)
-            )[:MAX_EMPLOYEE_CANDIDATES]
-            if mention is not None
-            else ()
+            _exact_identity_options(mention, directory) if mention is not None else ()
         )
+        if len(exact_options) == 1 and any(
+            _normalize_id(item.employee_id) == _normalize_id(mention)
+            for item in directory
+        ):
+            selected = next(
+                item
+                for item in directory
+                if item.employee_id == exact_options[0].employee_id
+            )
+            return BoundReferences(
+                rewritten_request=ambiguous.rewritten_request,
+                updated_request=attach_resolved_employees(
+                    ambiguous.rewritten_request, (selected,)
+                ),
+                locale=ambiguous.locale,
+                request_relationship=ambiguous.request_relationship,
+                subject_relationship="employees",
+                employees=(selected,),
+            )
         if exact_options and pending is not None:
             return BoundReferences(
                 rewritten_request=ambiguous.rewritten_request,
@@ -637,6 +670,20 @@ def bind_references(
             for other in ready.employee_names
         )
         if shadowed_by_longer_name:
+            continue
+        exact_options = _exact_identity_options(name, directory)
+        if len(exact_options) > 1:
+            return BoundReferences(
+                **base,
+                confirmation=PendingEmployeeConfirmation(
+                    original_question=original_question,
+                    mention=name,
+                    options=exact_options,
+                    resolution=_pending(ready, resolved),
+                ),
+            )
+        if len(exact_options) == 1:
+            resolved.append(by_id[_normalize(exact_options[0].employee_id)])
             continue
         if re.fullmatch(r"(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_-]+", name):
             return BoundReferences(

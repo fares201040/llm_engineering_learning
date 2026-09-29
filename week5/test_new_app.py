@@ -91,9 +91,10 @@ class LaunchModeTests(unittest.TestCase):
             "payload.sequence !== globalThis.__apdcTurnSequence", display["js"]
         )
         self.assertIn(
-            "payload.clear_input && message === payload.submitted_message",
+            "message === payload.submitted_message",
             display["js"],
         )
+        self.assertNotIn("payload.clear_input &&", display["js"])
         self.assertNotIn("payload.status", display["js"])
         self.assertFalse(display["queue"])
         self.assertEqual(display["inputs"][0], submitted["outputs"][0])
@@ -361,6 +362,8 @@ class SessionStateTests(unittest.TestCase):
             all(item[0][-1]["content"] != "Thinking ..." for item in snapshots)
         )
         self.assertGreater(len(snapshots), 1)
+        self.assertGreaterEqual(new_app._REVEAL_INTERVAL_SECONDS, 0.12)
+        self.assertLessEqual(new_app._REVEAL_INTERVAL_SECONDS, 0.25)
         self.assertLessEqual(len(snapshots), new_app._MAX_REVEAL_STEPS)
         self.assertEqual(paced_sleep.call_count, len(snapshots) - 1)
         paced_sleep.assert_called_with(new_app._REVEAL_INTERVAL_SECONDS)

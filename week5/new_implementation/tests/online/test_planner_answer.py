@@ -177,3 +177,50 @@ def test_review_requery_requires_actionable_feedback(call):
             max_output_tokens=3000,
         )
     assert error.value.code == "missing_replan_reason"
+
+
+@patch("week5.new_implementation.online.planner.call_structured")
+def test_comparison_report_requests_a_supported_markdown_table(call):
+    call.side_effect = [
+        PlannerAnswer(answer="August has 16 hours; September has 40 hours."),
+        ReviewedAnswer(
+            answer=(
+                "| Period | Worked hours |\n"
+                "| --- | ---: |\n"
+                "| August | 16 |\n"
+                "| September | 40 |\n\n"
+                "Available records do not cover either full month."
+            )
+        ),
+    ]
+    shared = SharedModelContext(
+        current_question="Give me a comparison report of August and September hours.",
+        updated_request="Compare August and September worked hours.",
+        database_context=database_context(),
+    )
+    result = SqlExecutionResult(
+        columns=(ResultColumn(name="period"), ResultColumn(name="worked_hours")),
+        rows=(
+            {"period": "August", "worked_hours": 16},
+            {"period": "September", "worked_hours": 40},
+        ),
+        coverage=ExecutionCoverage(fetched_rows=2, result_limit=100, response_bytes=90),
+    )
+
+    answer = answer_result(
+        shared_context=shared,
+        sql="SELECT period, SUM(worked_hours) AS worked_hours FROM attendance_records GROUP BY period",
+        result=result,
+        employees=(),
+        locale="en",
+        model="openai/gpt-5-nano",
+        budget=CallBudget(),
+        timeout=30,
+        max_output_tokens=3000,
+    )
+
+    assert answer.startswith("| Period | Worked hours |\n| --- | ---: |")
+    assert "do not cover either full month" in answer
+    assert all(
+        "Markdown table" in item.kwargs["system"] for item in call.call_args_list
+    )

@@ -648,6 +648,72 @@ class ReferenceAndPlanningTests(unittest.TestCase):
         self.assertFalse(bound.ambiguous)
         self.assertEqual(bound.employee_ids, ("A1",))
 
+    def test_authorized_code_mislabeled_as_name_resolves_by_exact_id(self):
+        bound = bind_references(
+            response(
+                rewritten_request="Who is A10937?",
+                employee_names=("A10937",),
+            ),
+            (Employee(employee_id="A10937", name="Sample Employee"),),
+            original_question="Who is A10937?",
+        )
+
+        self.assertFalse(bound.ambiguous)
+        self.assertIsNone(bound.confirmation)
+        self.assertEqual(bound.employee_ids, ("A10937",))
+        self.assertIn("Sample Employee (A10937)", bound.updated_request)
+
+    def test_ambiguous_code_mention_resolves_exact_authorized_id(self):
+        bound = bind_references(
+            ReferenceResponse(
+                decision=AmbiguousReference(
+                    locale="en",
+                    reason="ambiguous_reference",
+                    rewritten_request="Who is A10937?",
+                    employee_mention="A10937",
+                )
+            ),
+            (Employee(employee_id="A10937", name="Sample Employee"),),
+            original_question="Who is A10937?",
+        )
+
+        self.assertFalse(bound.ambiguous)
+        self.assertIsNone(bound.unresolved_mention)
+        self.assertEqual(bound.employee_ids, ("A10937",))
+
+    def test_name_and_code_collision_does_not_silently_choose_an_employee(self):
+        bound = bind_references(
+            response(
+                rewritten_request="Who is A10937?",
+                employee_names=("A10937",),
+            ),
+            (
+                Employee(employee_id="A10937", name="Code Owner"),
+                Employee(employee_id="B20001", name="A10937"),
+            ),
+            original_question="Who is A10937?",
+        )
+
+        self.assertEqual(bound.employee_ids, ())
+        self.assertIsNotNone(bound.confirmation)
+        self.assertEqual(
+            {option.employee_id for option in bound.confirmation.options},
+            {"A10937", "B20001"},
+        )
+
+    def test_code_matching_preserves_internal_punctuation(self):
+        bound = bind_references(
+            response(
+                rewritten_request="Who is A10937?",
+                employee_names=("A10937",),
+            ),
+            (Employee(employee_id="A-10937", name="Sample Employee"),),
+            original_question="Who is A10937?",
+        )
+
+        self.assertTrue(bound.ambiguous)
+        self.assertEqual(bound.employee_ids, ())
+
     def test_employee_label_plus_exact_id_is_not_an_identity_mismatch(self):
         bound = bind_references(
             response(

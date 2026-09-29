@@ -25,7 +25,7 @@ else:
 
 
 logger = logging.getLogger(__name__)
-_REVEAL_INTERVAL_SECONDS = 0.06
+_REVEAL_INTERVAL_SECONDS = 0.16
 _MAX_REVEAL_STEPS = 40
 _CLIENT_SEQUENCE_BODY_JS = """
     const next = Math.max((globalThis.__apdcTurnSequence || 0) + 1, Date.now());
@@ -52,7 +52,7 @@ _DISPLAY_CURRENT_SEQUENCE_JS = """(payload, history, context, message) => {
     if (!payload || payload.sequence !== globalThis.__apdcTurnSequence) {
         return [history, context, message];
     }
-    const clearInput = payload.clear_input && message === payload.submitted_message;
+    const clearInput = message === payload.submitted_message;
     return [payload.history, payload.context, clearInput ? "" : message];
 }"""
 

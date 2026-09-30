@@ -190,6 +190,19 @@ the app. Status describes the observed browser run, not a deterministic guarante
 | R06 | After R05: `That explanation assumes duplicate records. For Sep 6, check whether any employee has more than one attendance record within a status, then revise the explanation of why the two measures differ. Keep it brief.` | SQL found no duplicate groups. The draft said so, but review inserted a contradictory multiple-record explanation. The correct cause on this snapshot is the positive-hours eligibility condition: within each status, all records and all people coincide, while only 5/119/165 records have positive hours. | Fail before attempted prompt guidance; exact follow-up not rerun afterward. |
 | R07 | Fresh chat, exact N03 context: `Across all available dates, count distinct people by country. Separately, sum worked hours by work location for Engineering only. Present both as Markdown tables, then say which Engineering location has the most hours.` Then exact N04 follow-up: `For Engineering only, keep all dates and show the top 3 work locations by worked hours. Add each location’s share of all Engineering worked hours, and one brief takeaway. Do not repeat the country counts.` | First exact follow-up safe-failed after four attempts at `ROUND(double precision, integer)`. General PostgreSQL numeric-cast guidance was added and the app restarted. The next browser replay succeeded after one SQL retry, casting the entire percentage expression to numeric before rounding. Same-turn rows and independent totals gave Shift-Eng 868.61/24.07%, RTG-Eng 763.51/21.16%, QC-Eng 555.19/15.39% out of 3,608.21 Engineering hours. The answer omitted country counts and avoided a staffing or activity claim, though “workload” was a loose label for total hours. | Fail before SQL guidance; pass on observed rerun. |
 
+On 2026-09-30, a fresh browser chat at `http://127.0.0.1:7860/` replayed
+R05's fully spelled-out request with the configured `openai/gpt-5-nano` model.
+The executed SQL used separate positive-hour distinct-employee and all-record
+CTEs, grouped by status for September 6, then combined their six rows. The
+tables again showed 5/78, 119/280, and 165/210. Neither CTE measured
+positive-hour record counts or repeated employees. The final answer again
+suggested that multiple records per employee explain the difference. A shared
+schema/prompt example requiring those intermediate measurements was present
+during this replay and did not change the behavior; that unverified prompt
+change was removed. The production snapshot's independently checked
+positive-hour record counts are 5, 119, and 165, so this remains a failed
+explanation, not a verified fix. The runtime model change is commit `b85ec161`.
+
 A representative nonempty swipe-time browser turn after the time guidance displayed
 effective and device clock times as `08:18` and `15:41`, matching stored values
 with `:00` seconds. The employee identifier and trace are intentionally omitted

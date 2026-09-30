@@ -328,7 +328,11 @@ def normalize_attendance_record(record):
 def validate_attendance_record(record):
     normalized = normalize_attendance_record(record)
     validated = AttendanceRecord.model_validate(normalized)
-    return validated.model_dump(exclude_none=True)
+    result = validated.model_dump(exclude_none=True)
+    # These names are reserved for sink identity, never imported from a source.
+    result.pop("_record_id", None)
+    result.pop("_verified_record_id", None)
+    return result
 
 
 def _normalize_header(value, index):
@@ -449,6 +453,14 @@ def _unsafe_attendance_source_changes(
         elif current.get("domain") != "attendance" or current.get("status") != "valid":
             reasons.append(
                 f"previous attendance partition is no longer valid: {key[0]}#{key[1]}"
+            )
+        elif (
+            (previous.get("row_count") or 0) > 0
+            and not (current.get("row_count") or 0)
+            and not allow_removal
+        ):
+            reasons.append(
+                f"previous attendance partition is now empty: {key[0]}#{key[1]}"
             )
     return reasons
 
@@ -726,8 +738,33 @@ def convert_excel_to_jsonl(ledger=None):
     return JSONL_OUTPUT_PATH
 
 
-def convert_sources_to_jsonl(ledger=None, *, persist=True):
-    previous_partitions = _read_source_manifest().get("partitions") or []
+def _accepted_partitions_readonly():
+    path = settings.ingestion_state_path
+    if not path.is_file():
+        return None
+    try:
+        with closing(
+            sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
+        ) as connection:
+            row = connection.execute(
+                "SELECT value FROM state WHERE key = 'accepted_partitions'"
+            ).fetchone()
+        value = json.loads(row[0]) if row else None
+        return value if isinstance(value, list) else None
+    except (sqlite3.DatabaseError, OSError, ValueError, TypeError):
+        return None
+
+
+def convert_sources_to_jsonl(ledger=None, *, persist=True, accepted_only=False):
+    # Candidate projections are not publication history. The ledger baseline is
+    # advanced only after all sinks have accepted a generation.
+    previous_partitions = (
+        ledger.accepted_partitions() if ledger is not None
+        else _accepted_partitions_readonly() if accepted_only else None
+    )
+    if previous_partitions is None and not accepted_only and ledger is None:
+        previous_partitions = _read_source_manifest().get("partitions") or []
+    previous_partitions = previous_partitions or []
     if persist:
         JSONL_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
         INVALID_JSONL_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -743,16 +780,16 @@ def convert_sources_to_jsonl(ledger=None, *, persist=True):
             [],
             allow_removal=False,
         )
-        if removal_reasons:
-            return SourceConversionResult(
-                documents=(),
-                raw_rows=(),
-                partition_summaries=(),
-                unsafe_reasons=tuple(removal_reasons),
-                invalid_count=0,
-            )
-        raise FileNotFoundError(
-            f"No .xlsx or .csv files found under {KNOWLEDGE_BASE_PATH}"
+        return SourceConversionResult(
+            documents=(),
+            raw_rows=(),
+            partition_summaries=(),
+            unsafe_reasons=tuple(
+                removal_reasons or [
+                    f"No .xlsx or .csv files found under {KNOWLEDGE_BASE_PATH}"
+                ]
+            ),
+            invalid_count=0,
         )
 
     valid_records = []
@@ -786,7 +823,10 @@ def convert_sources_to_jsonl(ledger=None, *, persist=True):
                 continue
 
             for source_row, raw_row in zip(partition.rows, partition_raw_rows):
-                raw_record = dict(source_row.normalized_record)
+                raw_record = {
+                    key: value for key, value in source_row.normalized_record.items()
+                    if key not in {"_record_id", "_verified_record_id"}
+                }
                 try:
                     record = validate_attendance_record(raw_record)
                 except (ValidationError, ValueError, TypeError) as exc:
@@ -823,6 +863,23 @@ def convert_sources_to_jsonl(ledger=None, *, persist=True):
             allow_removal=ALLOW_ATTENDANCE_SOURCE_REMOVAL,
         )
     )
+
+    candidate_documents = tuple(
+        {
+            "source": record["_source_file"],
+            "sheet": record.get("_sheet"),
+            "excel_row": record.get("_excel_row"),
+            "record": record,
+        }
+        for record in valid_records
+    )
+    if candidate_documents:
+        unsafe_reasons.extend(find_duplicate_conflicts(candidate_documents))
+
+    if invalid_payloads:
+        unsafe_reasons.append(
+            f"{len(invalid_payloads)} invalid attendance record(s) in candidate snapshot"
+        )
 
     if persist and not unsafe_reasons:
         temporary_paths = []
@@ -1056,11 +1113,21 @@ def load_source_snapshot(ledger=None):
     ):
         return convert_sources_to_jsonl(ledger=ledger)
 
+    partitions = tuple(manifest.get("partitions") or ())
+    accepted = (
+        ledger.accepted_partitions()
+        if ledger is not None else _accepted_partitions_readonly()
+    )
     return SourceConversionResult(
         documents=tuple(_documents_from_jsonl()),
         raw_rows=(),
-        partition_summaries=tuple(manifest.get("partitions") or ()),
-        unsafe_reasons=(),
+        partition_summaries=partitions,
+        unsafe_reasons=tuple(
+            _unsafe_attendance_source_changes(
+                accepted or (), partitions,
+                allow_removal=ALLOW_ATTENDANCE_SOURCE_REMOVAL,
+            )
+        ),
         invalid_count=_count_invalid_records(),
     )
 
@@ -1247,8 +1314,8 @@ def _make_record_id(record):
     The key intentionally uses source-independent business values so the same
     attendance record receives the same ID after re-ingestion.
     """
-    if record.get("_record_id"):
-        return record["_record_id"]
+    if record.get("_verified_record_id"):
+        return record["_verified_record_id"]
     identity = {"Employee_ID": record.get("Employee_ID"), "Date": record.get("Date")}
 
     digest = hashlib.sha1(_canonical_json(identity).encode("utf-8")).hexdigest()[:12]
@@ -1281,8 +1348,14 @@ def _business_key(record):
 def apply_existing_record_ids(documents, existing_rows):
     """Retain installed sink IDs so a logical-key migration does not rewrite vectors."""
     ids_by_key = {}
+    keys_by_id = {}
     for row in existing_rows:
         key = (str(row["employee_id"]), str(row["attendance_date"]))
+        other_key = keys_by_id.setdefault(row["record_id"], key)
+        if other_key != key:
+            raise ValueError(
+                f"Existing sink ID {row['record_id']} belongs to multiple attendance keys"
+            )
         prior = ids_by_key.setdefault(key, row["record_id"])
         if prior != row["record_id"]:
             raise ValueError(
@@ -1290,9 +1363,16 @@ def apply_existing_record_ids(documents, existing_rows):
                 f"{prior}, {row['record_id']}"
             )
     for document in documents:
-        existing_id = ids_by_key.get(_business_key(document["record"]))
+        key = _business_key(document["record"])
+        existing_id = ids_by_key.get(key)
         if existing_id:
-            document["record"]["_record_id"] = existing_id
+            document["record"]["_verified_record_id"] = existing_id
+        final_id = _make_record_id(document["record"])
+        other_key = keys_by_id.setdefault(final_id, key)
+        if other_key != key:
+            raise ValueError(
+                f"Attendance sink ID {final_id} would collide across logical keys"
+            )
 
 
 def _existing_postgres_rows():
@@ -2662,7 +2742,7 @@ def _journal_documents(documents, ledger=None):
 
 def preview_import():
     """Inspect candidate sources and authoritative structured rows without writes."""
-    snapshot = convert_sources_to_jsonl(persist=False)
+    snapshot = convert_sources_to_jsonl(persist=False, accepted_only=True)
     documents = list(snapshot.documents)
     existing = _existing_postgres_rows() if ENABLE_POSTGRES else []
     coverage_dates = sorted({doc["record"]["Date"] for doc in documents})
@@ -2720,10 +2800,13 @@ def preview_import():
     report["chroma_records"] = len({
         (row["employee_id"], row["attendance_date"]) for row in chroma_rows
     })
-    if not documents:
-        report["unsafe_reasons"].append(
-            "zero valid attendance records; ingestion refuses destructive sink synchronization"
+    report["unsafe_reasons"].extend(
+        _candidate_acceptance_reasons(
+            snapshot, existing + chroma_rows,
+            accepted_partitions=_accepted_partitions_readonly(),
         )
+    )
+    if not documents:
         return report
     report["duplicate_conflicts"] = find_duplicate_conflicts(documents)
     if report["duplicate_conflicts"]:
@@ -2734,7 +2817,7 @@ def preview_import():
     except ValueError as exc:
         report["unsafe_reasons"].append(str(exc))
         return report
-    if snapshot.unsafe_reasons or snapshot.invalid_count:
+    if report["unsafe_reasons"]:
         return report
     current = {_business_key(doc["record"]): doc for doc in canonical}
     chroma_stored = {
@@ -2767,6 +2850,41 @@ def _preview_change_counts(current, stored):
     }
 
 
+def _candidate_acceptance_reasons(snapshot, existing_rows, *, accepted_partitions=None):
+    reasons = list(snapshot.unsafe_reasons)
+    if not snapshot.documents:
+        reasons.append(
+            "zero valid attendance records; ingestion refuses destructive sink synchronization"
+        )
+    if snapshot.invalid_count:
+        reasons.append(
+            f"{snapshot.invalid_count} invalid attendance record(s); refusing partial snapshot"
+        )
+    if not ENABLE_POSTGRES and any(
+        item.get("domain") == "unknown" for item in snapshot.partition_summaries
+    ):
+        reasons.append(
+            "Unknown source partitions were quarantined, but PostgreSQL is disabled; "
+            "raw rows cannot be preserved"
+        )
+    if not ALLOW_ATTENDANCE_SOURCE_REMOVAL:
+        candidate_keys = {_business_key(doc["record"]) for doc in snapshot.documents}
+        missing = {
+            (str(row["employee_id"]), str(row["attendance_date"]))
+            for row in existing_rows
+        } - candidate_keys
+        if missing:
+            history = (
+                "Accepted source history is unavailable and "
+                if accepted_partitions is None else ""
+            )
+            reasons.append(
+                history + "candidate omits "
+                f"{len(missing)} existing attendance key(s); refusing deletion"
+            )
+    return reasons
+
+
 def _run_ingestion(ledger):
     started = perf_counter()
     stats = IngestionStats()
@@ -2784,39 +2902,21 @@ def _run_ingestion(ledger):
         1 for row in snapshot.raw_rows if row.status == "quarantined"
     )
 
-    if stats.unknown_partitions and not ENABLE_POSTGRES:
-        raise RuntimeError(
-            "Unknown source partitions were quarantined, but PostgreSQL is disabled; "
-            "refusing Chroma mutation because the raw rows cannot be preserved."
-        )
-    if snapshot.unsafe_reasons:
+    existing_rows = _existing_postgres_rows() + _existing_chroma_rows()
+    acceptance_reasons = _candidate_acceptance_reasons(
+        snapshot, existing_rows, accepted_partitions=ledger.accepted_partitions()
+    )
+
+    if acceptance_reasons:
         if snapshot.raw_rows and ENABLE_POSTGRES:
             stats.raw_rows_seen = len(snapshot.raw_rows)
             stats.raw_rows_inserted = store_raw_rows_to_postgres(snapshot.raw_rows)
         raise RuntimeError(
             "Unsafe attendance source snapshot; typed attendance and Chroma were not "
-            "changed: " + "; ".join(snapshot.unsafe_reasons)
+            "changed: " + "; ".join(acceptance_reasons)
         )
-    if not documents:
-        if snapshot.raw_rows and ENABLE_POSTGRES:
-            stats.raw_rows_seen = len(snapshot.raw_rows)
-            stats.raw_rows_inserted = store_raw_rows_to_postgres(snapshot.raw_rows)
-        raise RuntimeError(
-            "Ingestion produced zero valid attendance records; refusing destructive "
-            "sink synchronization."
-        )
-    if stats.invalid_records:
-        if snapshot.raw_rows and ENABLE_POSTGRES:
-            stats.raw_rows_seen = len(snapshot.raw_rows)
-            stats.raw_rows_inserted = store_raw_rows_to_postgres(snapshot.raw_rows)
-        raise RuntimeError(
-            f"Ingestion found {stats.invalid_records} invalid attendance record(s); "
-            "refusing sink synchronization because a partial snapshot could delete "
-            "previously valid records."
-        )
-
     documents = canonicalize_documents(documents, stats)
-    apply_existing_record_ids(documents, _existing_postgres_rows() + _existing_chroma_rows())
+    apply_existing_record_ids(documents, existing_rows)
     stats.jsonl_records = len(documents)
 
     stage_started = perf_counter()
@@ -2862,6 +2962,7 @@ def _run_ingestion(ledger):
     if generation is not None:
         with ledger.writer() as writer:
             writer.activate_generation(generation)
+            writer.set_accepted_partitions(snapshot.partition_summaries)
 
     stats.elapsed_seconds = perf_counter() - started
     _print_stats(stats)

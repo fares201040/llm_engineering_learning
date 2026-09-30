@@ -601,6 +601,8 @@ class SourceChangeDetectionTests(unittest.TestCase):
             with (
                 patch.object(ingest, "IngestionLedger", return_value=ledger),
                 patch.object(ingest, "load_source_snapshot", return_value=snapshot),
+                patch.object(ingest, "_existing_postgres_rows", return_value=[]),
+                patch.object(ingest, "_existing_chroma_rows", return_value=[]),
                 patch.object(ingest, "create_record_chunks", return_value=[]),
                 patch.object(ingest, "create_employee_period_chunks", return_value=[]),
                 patch.object(ingest, "sync_embeddings_to_chroma"),

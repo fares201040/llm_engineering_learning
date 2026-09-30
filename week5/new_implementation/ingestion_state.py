@@ -170,6 +170,20 @@ class IngestionLedger:
             ).fetchone()
         return row["value"] if row else None
 
+    def accepted_partitions(self):
+        """Partition history from the last fully published generation only."""
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT value FROM state WHERE key = 'accepted_partitions'"
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            partitions = json.loads(row["value"])
+        except (TypeError, ValueError):
+            return None
+        return partitions if isinstance(partitions, list) else None
+
     def active_records(self):
         generation = self.active_generation()
         if generation is None:
@@ -319,4 +333,10 @@ class _LedgerWriter:
         self.connection.execute(
             "INSERT OR REPLACE INTO state(key, value) VALUES ('active_generation', ?)",
             (generation,),
+        )
+
+    def set_accepted_partitions(self, partitions):
+        self.connection.execute(
+            "INSERT OR REPLACE INTO state(key, value) VALUES ('accepted_partitions', ?)",
+            (json.dumps(partitions, ensure_ascii=False),),
         )

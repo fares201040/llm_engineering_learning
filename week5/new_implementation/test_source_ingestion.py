@@ -26,6 +26,173 @@ def workspace_temp_directory():
 
 
 class SourceIngestionModuleTests(unittest.TestCase):
+    def test_source_record_ids_cannot_replace_distinct_logical_ids(self):
+        first = {"Employee_ID": "E-1", "Date": "2026-09-03", "_record_id": "shared"}
+        second = {"Employee_ID": "E-2", "Date": "2026-09-03", "_record_id": "shared"}
+        self.assertNotEqual(ingest._make_record_id(first), "shared")
+        self.assertNotEqual(ingest._make_record_id(first), ingest._make_record_id(second))
+        validated = ingest.validate_attendance_record({
+            **first, "Name": "Example", "_verified_record_id": "attacker-controlled",
+        })
+        self.assertNotIn("_verified_record_id", validated)
+        documents = [{"record": first}]
+        ingest.apply_existing_record_ids(documents, [{
+            "employee_id": "E-1", "attendance_date": "2026-09-03",
+            "record_id": "attendance:legacy",
+        }])
+        self.assertEqual(ingest._make_record_id(first), "attendance:legacy")
+
+    def test_csv_supplied_id_cannot_collide_in_sink_rows(self):
+        with workspace_temp_directory() as root:
+            folder = root / "attendance"
+            folder.mkdir()
+            (folder / "two.csv").write_text(
+                "Employee ID,Name,Date,_record_id\n"
+                "E-1,First,2026-09-03,shared-id\n"
+                "E-2,Second,2026-09-03,shared-id\n",
+                encoding="utf-8",
+            )
+            with patch.object(ingest, "KNOWLEDGE_BASE_PATH", root):
+                snapshot = ingest.convert_sources_to_jsonl(persist=False)
+            documents = ingest.canonicalize_documents(list(snapshot.documents))
+            ids = [ingest._postgres_attendance_values(doc)["record_id"] for doc in documents]
+        self.assertEqual(len(set(ids)), 2)
+        self.assertNotIn("shared-id", ids)
+
+    def test_missing_accepted_baseline_blocks_sink_key_deletion(self):
+        snapshot = ingest.SourceConversionResult(
+            documents=({"record": {"Employee_ID": "E-1", "Date": "2026-09-03"}},),
+            raw_rows=(), partition_summaries=(), unsafe_reasons=(), invalid_count=0,
+        )
+        existing = [{"employee_id": "E-2", "attendance_date": "2026-09-03"}]
+        with (patch.object(ingest, "ENABLE_POSTGRES", True),
+              patch.object(ingest, "ALLOW_ATTENDANCE_SOURCE_REMOVAL", False)):
+            reasons = ingest._candidate_acceptance_reasons(snapshot, existing)
+            with_history = ingest._candidate_acceptance_reasons(
+                snapshot, existing, accepted_partitions=[{
+                    "source_path": "attendance/a.csv", "name": "CSV",
+                    "domain": "attendance", "status": "valid", "row_count": 2,
+                }]
+            )
+        self.assertIn("refusing deletion", " ".join(reasons))
+        self.assertIn("refusing deletion", " ".join(with_history))
+        with patch.object(ingest, "ALLOW_ATTENDANCE_SOURCE_REMOVAL", True):
+            self.assertFalse(ingest._candidate_acceptance_reasons(snapshot, existing))
+
+    def test_previous_populated_partition_cannot_become_header_only(self):
+        prior = [{"source_path": "a.csv", "name": "CSV", "domain": "attendance",
+                  "status": "valid", "row_count": 1}]
+        current = [{**prior[0], "row_count": 0}]
+        self.assertIn("now empty", " ".join(
+            ingest._unsafe_attendance_source_changes(prior, current)
+        ))
+        self.assertEqual(
+            ingest._unsafe_attendance_source_changes(prior, current, allow_removal=True),
+            [],
+        )
+
+    def test_duplicate_candidate_does_not_advance_manifest(self):
+        with workspace_temp_directory() as root:
+            folder = root / "attendance"
+            folder.mkdir()
+            first = folder / "first.csv"
+            second = folder / "second.csv"
+            first.write_text("Employee ID,Name,Date\nE-1,First,2026-09-03\n", encoding="utf-8")
+            second.write_text("Employee ID,Name,Date\nE-1,Second,2026-09-03\n", encoding="utf-8")
+            output = root / "attendance.jsonl"
+            invalid = root / "attendance.invalid.jsonl"
+            manifest = root / "attendance.sources.json"
+            output.write_text("ACCEPTED\n", encoding="utf-8")
+            manifest.write_text('{"partitions": []}', encoding="utf-8")
+            with (
+                patch.object(ingest, "KNOWLEDGE_BASE_PATH", root),
+                patch.object(ingest, "JSONL_OUTPUT_PATH", output),
+                patch.object(ingest, "INVALID_JSONL_PATH", invalid),
+                patch.object(ingest, "SOURCE_MANIFEST_PATH", manifest),
+            ):
+                rejected = ingest.convert_sources_to_jsonl()
+                self.assertEqual(output.read_text(encoding="utf-8"), "ACCEPTED\n")
+                self.assertEqual(manifest.read_text(encoding="utf-8"), '{"partitions": []}')
+                second.unlink()
+                accepted = ingest.convert_sources_to_jsonl()
+            self.assertTrue(rejected.unsafe_reasons)
+            self.assertFalse(accepted.unsafe_reasons)
+            self.assertEqual(len(accepted.documents), 1)
+
+    def test_preview_shares_postgres_disabled_quarantine_gate(self):
+        with workspace_temp_directory() as root:
+            attendance = root / "attendance"
+            attendance.mkdir()
+            (attendance / "valid.csv").write_text(
+                "Employee ID,Name,Date\nE-1,Example,2026-09-03\n", encoding="utf-8"
+            )
+            unknown = root / "unknown"
+            unknown.mkdir()
+            (unknown / "notes.csv").write_text(
+                "Code,Notes\nX,unclassified\n", encoding="utf-8"
+            )
+            with (
+                patch.object(ingest, "KNOWLEDGE_BASE_PATH", root),
+                patch.object(ingest, "ENABLE_POSTGRES", False),
+                patch.object(ingest, "_preview_chroma_rows", return_value=([], "absent", {})),
+            ):
+                report = ingest.preview_import()
+        self.assertIn("PostgreSQL is disabled", " ".join(report["unsafe_reasons"]))
+
+    def test_preview_missing_history_refuses_partial_source_set(self):
+        with workspace_temp_directory() as root:
+            folder = root / "attendance"
+            folder.mkdir()
+            (folder / "remaining.csv").write_text(
+                "Employee ID,Name,Date\nE-1,Example,2026-09-03\n", encoding="utf-8"
+            )
+            prior = [{"record_id": "attendance:prior", "employee_id": "E-2",
+                      "attendance_date": "2026-09-03", "content_hash": "hash"}]
+            with (
+                patch.object(ingest, "KNOWLEDGE_BASE_PATH", root),
+                patch.object(ingest, "settings", replace(
+                    ingest.settings, ingestion_state_path=root / "missing.sqlite3"
+                )),
+                patch.object(ingest, "ENABLE_POSTGRES", False),
+                patch.object(ingest, "_preview_chroma_rows",
+                             return_value=(prior, "snapshot_inspected", {})),
+                patch.object(ingest, "ALLOW_ATTENDANCE_SOURCE_REMOVAL", False),
+            ):
+                report = ingest.preview_import()
+        self.assertIsNone(report["chroma_counts"])
+        self.assertIn("refusing deletion", " ".join(report["unsafe_reasons"]))
+
+    def test_corrupt_candidate_manifest_uses_accepted_ledger_baseline(self):
+        with workspace_temp_directory() as root:
+            from week5.new_implementation.ingestion_state import IngestionLedger
+            folder = root / "attendance"
+            folder.mkdir()
+            (folder / "remaining.csv").write_text(
+                "Employee ID,Name,Date\nE-1,Example,2026-09-03\n", encoding="utf-8"
+            )
+            ledger = IngestionLedger(root / "ledger.sqlite3")
+            with ledger.writer() as writer:
+                writer.set_accepted_partitions([{
+                    "source_path": "attendance/removed.csv", "name": "CSV",
+                    "domain": "attendance", "status": "valid", "row_count": 1,
+                }])
+            manifest = root / "attendance.sources.json"
+            manifest.write_text("{corrupt", encoding="utf-8")
+            with (
+                patch.object(ingest, "KNOWLEDGE_BASE_PATH", root),
+                patch.object(ingest, "settings", replace(
+                    ingest.settings, ingestion_state_path=ledger.path
+                )),
+                patch.object(ingest, "SOURCE_MANIFEST_PATH", manifest),
+                patch.object(ingest, "JSONL_OUTPUT_PATH", root / "attendance.jsonl"),
+                patch.object(ingest, "INVALID_JSONL_PATH", root / "invalid.jsonl"),
+            ):
+                self.assertEqual(
+                    ingest._accepted_partitions_readonly(), ledger.accepted_partitions()
+                )
+                snapshot = ingest.load_source_snapshot(ledger)
+        self.assertIn("disappeared", " ".join(snapshot.unsafe_reasons))
+
     def test_preview_detects_divergent_chroma_id_without_opening_live_client(self):
         with workspace_temp_directory() as root:
             folder = root / "attendance"
@@ -104,6 +271,9 @@ class SourceIngestionModuleTests(unittest.TestCase):
                 patch.object(ingest, "INVALID_JSONL_PATH", invalid),
                 patch.object(ingest, "SOURCE_MANIFEST_PATH", manifest),
                 patch.object(ingest, "ENABLE_POSTGRES", True),
+                patch.object(ingest, "settings", replace(
+                    ingest.settings, chroma_db_path=root / "absent-chroma"
+                )),
                 patch.object(ingest, "_existing_postgres_rows", return_value=[existing_row]),
             ):
                 preview = ingest.preview_import()

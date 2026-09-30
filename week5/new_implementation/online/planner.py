@@ -42,6 +42,36 @@ class ReplanRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=4000)
 
 
+class SqlPlanStep(BaseModel):
+    """One independently scoped part of a multi-part question."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    scope_clause_index: int = Field(ge=0, le=4)
+    subrequest: str = Field(min_length=1, max_length=10000)
+    sql: str = Field(min_length=1, max_length=100000)
+
+
+class MultiSqlPlan(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    steps: tuple[SqlPlanStep, ...] = Field(min_length=2, max_length=4)
+
+
+class ExecutedPlanStep(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    scope_clause_index: int = Field(ge=0, le=3)
+    subrequest: str
+    sql: str
+    requested_date_scope: tuple[str, str] | None = None
+    requested_date_scopes: tuple[tuple[str, str], ...] = ()
+    date_scope: tuple[str, str] | None = None
+    result: SqlExecutionResult
+
+
+class ReviewedMultiAnswer(ReviewedAnswer):
+    covered_step_indices: tuple[int, ...] = ()
+    scope_valid_step_indices: tuple[int, ...] = ()
+
+
 _COUNT_FIELDS = (
     "all_record_count",
     "all_people_count",
@@ -120,6 +150,8 @@ def _reconciliation_group(
     try:
         query = parse_one(sql, read="postgres")
     except (ParseError, ValueError):
+        return ReplanRequest(reason=_COUNT_REPLAN)
+    if any(isinstance(node, (exp.Limit, exp.Offset)) for node in query.walk()):
         return ReplanRequest(reason=_COUNT_REPLAN)
     if not isinstance(query, exp.Select) or any(
         query.args.get(part)
@@ -213,6 +245,11 @@ def build_count_reconciliation_sql(
         query = parse_one(proposed_sql, read="postgres")
     except (ParseError, ValueError):
         return None
+    # A result window changes which groups are measured. Ordering does not;
+    # the merged four-count result can sort by its shared group instead.
+    if any(node.args.get("limit") or node.args.get("offset")
+           for node in query.walk() if isinstance(node, (exp.Select, exp.Union))):
+        return None
     branches = []
     for select in query.find_all(exp.Select):
         source = select.args.get("from_")
@@ -265,7 +302,9 @@ def build_count_reconciliation_sql(
             bool(select.args.get("distinct"))
             and any(_person_column(item) for item in select.expressions)
         )
-        branches.append((schema, table, group, where, scope, positive, all_records, positive_people))
+        having = select.args.get("having")
+        having_sql = having.this.sql(dialect="postgres") if having else None
+        branches.append((schema, table, group, where, scope, positive, all_records, positive_people, having_sql))
     if len(branches) != 2:
         return None
     all_branch = next((item for item in branches if item[6] and not item[5]), None)
@@ -275,9 +314,10 @@ def build_count_reconciliation_sql(
         or all_branch[0] != attended_branch[0]
         or all_branch[2].casefold() != attended_branch[2].casefold()
         or all_branch[4] != attended_branch[4]
+        or all_branch[8] != attended_branch[8]
     ):
         return None
-    schema, table, group, where, _, _, _, _ = all_branch
+    schema, table, group, where, _, _, _, _, having_sql = all_branch
     def quoted(value: str) -> str:
         return '"' + value.replace('"', '""') + '"'
     alias = table.alias
@@ -295,7 +335,28 @@ def build_count_reconciliation_sql(
         f"COUNT(*) FILTER (WHERE {hours} > 0) AS qualifying_record_count, "
         f"COUNT(DISTINCT {employee}) FILTER (WHERE {hours} > 0) "
         f"AS qualifying_people_count FROM {source}{where_sql} GROUP BY {field}"
+        + (f" HAVING {having_sql}" if having_sql else "")
+        + f" ORDER BY {field}"
     )
+
+
+def is_count_reconciliation_plan(
+    shared_context: SharedModelContext, proposed_sql: str
+) -> bool:
+    """Recognize the two measured populations without reading question wording."""
+    if not isinstance(_reconciliation_group(shared_context, proposed_sql), ReplanRequest):
+        return True
+    try:
+        query = parse_one(proposed_sql, read="postgres").copy()
+    except (ParseError, ValueError):
+        return False
+    # Detection ignores presentation clauses; the actual rewrite still rejects
+    # any clause it cannot preserve and asks the planner for a new query.
+    for node in query.walk():
+        if isinstance(node, (exp.Select, exp.Union)):
+            for name in ("order", "limit", "offset"):
+                node.set(name, None)
+    return build_count_reconciliation_sql(shared_context, query.sql(dialect="postgres")) is not None
 
 
 def _count_reconciliation_answer(
@@ -325,7 +386,11 @@ def _count_reconciliation_answer(
             and all_records - all_people >= qualifying_records - qualifying_people
         ):
             return ReplanRequest(reason=_COUNT_REPLAN)
-        label = str(row[group]) if group and row[group] is not None else "Overall"
+        label = (
+            str(row[group]) if group and row[group] is not None
+            else (f"Missing {group.replace('_', ' ')}" if group and locale != "ar"
+                  else f"قيمة {group.replace('_', ' ')} فارغة" if group else "Overall")
+        )
         if label in seen:
             return ReplanRequest(reason=_COUNT_REPLAN)
         seen.add(label)
@@ -352,26 +417,17 @@ def _count_reconciliation_answer(
         if repeated_any
         else f"No employee has more than one attendance record within a {group_label.lower()} {scope}. "
     )
-    correction = any(
-        word in shared_context.current_question.casefold()
-        for word in (
-            "revise", "correct", "duplicate", "more than one",
-            "راجع", "صحح", "مكرر", "أكثر من سجل",
-        )
-    )
     if locale == "ar":
         repeated = (
-            "توجد سجلات حضور متعددة لبعض الموظفين ضمن الحالة نفسها. "
+            f"توجد سجلات حضور متعددة لبعض الموظفين ضمن {group_label}. "
             if repeated_any else
-            "لا يوجد موظف له أكثر من سجل حضور واحد ضمن الحالة نفسها. "
+            f"لا يوجد موظف له أكثر من سجل حضور واحد ضمن {group_label}. "
         )
         gaps = "؛ ".join(
             f"{label}: {all_records - qualifying_records} سجلًا بلا ساعات عمل موجبة، "
             f"و{qualifying_records - qualifying_people} سجلًا إضافيًا بساعات موجبة للشخص نفسه"
             for label, all_records, _, qualifying_records, qualifying_people in facts
         )
-        if shared_context.request_relationship == "follow_up" or correction:
-            return repeated + "فروق العد: " + gaps + "."
         people_rows = "\n".join(
             f"| {label} | {qualifying_people} |"
             for label, _, _, _, qualifying_people in facts
@@ -381,14 +437,12 @@ def _count_reconciliation_answer(
             for label, all_records, _, _, _ in facts
         )
         return (
-            "الأشخاص الذين حضروا بساعات عمل موجبة:\n\n"
+            repeated + "الأشخاص الذين حضروا بساعات عمل موجبة:\n\n"
             f"| {group_label} | عدد الأشخاص |\n| --- | ---: |\n{people_rows}\n\n"
             "جميع سجلات الحضور:\n\n"
             f"| {group_label} | عدد السجلات |\n| --- | ---: |\n{record_rows}\n\n"
             f"الفرق: {gaps}. ولا تكشف هذه الأعداد سبب غياب ساعات العمل الموجبة."
         )
-    if shared_context.request_relationship == "follow_up" or correction:
-        return multiplicity + "The count gaps are: " + explanation
     people_rows = "\n".join(
         f"| {label} | {qualifying_people} |" for label, _, _, _, qualifying_people in facts
     )
@@ -396,7 +450,7 @@ def _count_reconciliation_answer(
         f"| {label} | {all_records} |" for label, all_records, _, _, _ in facts
     )
     return (
-        f"Attending people {scope}:\n\n| {group_label} | People with positive worked hours |\n"
+        multiplicity + f"Attending people {scope}:\n\n| {group_label} | People with positive worked hours |\n"
         f"| --- | ---: |\n{people_rows}\n\n"
         f"Attendance records {scope}:\n\n| {group_label} | All records |\n"
         f"| --- | ---: |\n{record_rows}\n\n"
@@ -561,6 +615,18 @@ trusted_context, and previous_verified_turn as labelled authoritative context.
 The executed SQL and database_result are the evidence for new measurements.
 Treat updated_request, scope_provenance, and proposed_answer as interpretations
 to verify against current_question, schema descriptions, and executed rows.
+When count_reconciliation is true, the proposed answer's arithmetic is a
+checked starting point, not a publication bypass. Correct its interpretation,
+requested output shape, and coverage caveats from the executed SQL and rows.
+Return the complete final answer in answer. Keep each requested count table and
+the actual grouping key; a follow-up can still request tables. A NULL group is
+an unknown value of that key, never the overall population. If the executed
+query cannot support a requested measure or group, request a new query.
+Use the four measured counts to explain each gap. When all_record_count equals
+all_people_count for a group, explicitly state that the data show no repeated
+person within that group and scope. Do not suggest duplicate records as a
+possible explanation for that group's gap. A zero or non-positive hours value
+does not establish leave, an absence, or any other underlying cause.
 
 ## Evidence and request scope
 Check whether the requested kind of record exists in the supplied schema before
@@ -944,6 +1010,9 @@ user wants now. Check that interpretation against current_question and scope_pro
 scope_provenance.reference_interpretation is the reference model's reading of the
 current message. Use it to unpack shorthand and independent clauses, then verify
 every inferred filter, subject, and requested output against current_question.
+When previous_verified_turn contains executed_steps, that earlier turn had
+independent queries. Read each step's subrequest, SQL, and result separately;
+there is no single prior SQL scope to inherit for the whole turn.
 If the reference interpretation adds a request to list or sample records that
 the original current question does not make, ignore that added output. A count
 request does not become a combined count-and-list request because
@@ -1109,6 +1178,12 @@ Choose a result shape that gives enough evidence for every requested part:
   filters into another. A running total over dates requires daily
   aggregation followed by an ordered running SUM. In PostgreSQL, repeat aggregate
   expressions in HAVING instead of referring to SELECT aliases.
+For two measures requested by the same group, keep the group and scope
+consistent for both measures unless the user explicitly assigns different
+groups or filters. Do not return one status for the first measure and all
+statuses for the second when both are requested by status. Include every
+requested group in each measure's result, including groups with zero
+qualifying people.
 When count_reconciliation is true, the requested explanation needs intermediate
 measurements even if the user wants only two displayed tables. Return a single
 grouped SELECT over the full requested scope with the four count aliases in the
@@ -1176,10 +1251,40 @@ def request_sql(
     sql_execution_failure: dict[str, object] | None = None,
     attempt: int = 1,
     observer: TurnObserver | None = None,
-) -> str:
+) -> str | MultiSqlPlan:
     payload = _planning_payload(shared_context)
     if sql_execution_failure is not None:
         payload["sql_execution_failure"] = sql_execution_failure
+    clauses = shared_context.scope_provenance.get("reference_scope_clauses", ())
+    if len(clauses) > 1 and not shared_context.count_reconciliation:
+        if len(clauses) > 4:
+            raise ProviderFailure("sql_planner", "too_many_scope_clauses", "At most four independent request clauses are supported")
+        payload["plan_scope_clauses"] = list(clauses)
+        return call_structured(
+            stage="sql_planner",
+            model=model,
+            system=(
+                _SYSTEM.split("## Output contract")[0]
+                + "## Output contract\nReturn a structured plan with two to four steps "
+                "covering every plan_scope_clauses entry in nondecreasing index order. "
+                "A clause may need multiple steps, such as separate dates in a comparison. "
+                "Each step has "
+                "scope_clause_index, subrequest, and one executable read-only PostgreSQL "
+                "SELECT or WITH SQL statement. The subrequest must preserve that clause's "
+                "population, filters, measure, grouping, and inherited scope justified by "
+                "the user's request. If one clause is divided into steps, identify the "
+                "specific part or date each step measures and cover the whole clause. "
+                "Query each clause independently; do not carry a filter from another clause.\n"
+                + planner_examples(shared_context.database_context)
+            ),
+            payload=payload,
+            response_model=MultiSqlPlan,
+            budget=budget,
+            timeout=timeout,
+            max_output_tokens=max_output_tokens,
+            attempt=attempt,
+            observer=observer,
+        )
     sql = call_text(
         stage="sql_planner",
         model=model,
@@ -1198,6 +1303,81 @@ def request_sql(
             "planner returned Markdown instead of SQL only",
         )
     return sql
+
+
+def retry_plan_step(
+    *, shared_context: SharedModelContext, step: SqlPlanStep,
+    failure: dict[str, object], model: str, budget: CallBudget,
+    timeout: float, max_output_tokens: int, attempt: int,
+    observer: TurnObserver | None = None,
+) -> str:
+    payload = _planning_payload(shared_context)
+    payload.update(plan_step=step.model_dump(), sql_execution_failure=failure)
+    return call_text(
+        stage="sql_planner", model=model,
+        system=_SYSTEM + "\nCorrect only plan_step.sql for plan_step.subrequest; preserve its independent scope.\n"
+        + planner_examples(shared_context.database_context),
+        payload=payload, budget=budget, timeout=timeout,
+        max_output_tokens=max_output_tokens, attempt=attempt, observer=observer,
+    )
+
+
+def answer_multi_result(
+    *, shared_context: SharedModelContext, steps: tuple[ExecutedPlanStep, ...],
+    employees: tuple[Employee, ...], locale: str, model: str,
+    budget: CallBudget, timeout: float, max_output_tokens: int,
+    observer: TurnObserver | None = None,
+) -> str | ReplanRequest:
+    payload = _planning_payload(shared_context)
+    payload.update(
+        executed_steps=[{"step_index": index, **step.model_dump(mode="json")}
+                        for index, step in enumerate(steps)],
+        authoritative_employees=[item.model_dump(mode="json") for item in employees],
+        answer_locale=locale,
+    )
+    multi_instruction = (
+        "\nFor this multi-query turn, executed_steps contains separate SQL and typed "
+        "results for independent clauses. Compare each step to its scope clause and "
+        "the original question. Use all steps for one answer. Do not transfer filters "
+        "or counts between steps. Request a new query if any clause lacks evidence.\n"
+    )
+    draft = call_structured(
+        stage="sql_final_answer", model=model,
+        system=_ANSWER_SYSTEM + multi_instruction + _RESULT_EXAMPLES,
+        payload=payload, response_model=PlannerAnswer, budget=budget,
+        timeout=timeout, max_output_tokens=max_output_tokens, observer=observer,
+    )
+    payload["proposed_answer"] = draft.answer
+    reviewed = call_structured(
+        stage="sql_answer_review", model=model,
+        system=_REVIEW_SYSTEM + multi_instruction
+        + "\nFor every step, compare the original question, its reference clause, "
+        "the step subrequest, and the actual SQL predicates. Return "
+        "zero-based step_index values in scope_valid_step_indices only for steps "
+        "with exactly the requested "
+        "population, date, category, and grouping; reject extra filters leaked "
+        "from another clause. Return zero-based covered_step_indices only for steps whose "
+        "evidence is accurately represented in the final answer. Verify that "
+        "multiple steps for one clause together cover its whole request. Set "
+        "requires_new_query for a missing or incorrectly scoped part.\n"
+        + _RESULT_EXAMPLES + _REVIEW_EXAMPLES
+        + planner_examples(shared_context.database_context),
+        payload=payload, response_model=ReviewedMultiAnswer, budget=budget,
+        timeout=timeout, max_output_tokens=max_output_tokens, observer=observer,
+    )
+    if reviewed.requires_new_query:
+        return ReplanRequest(reason=reviewed.query_issue or "A requested part lacks supporting evidence")
+    def covers_every_step(indices: tuple[int, ...]) -> bool:
+        supplied = set(indices)
+        return len(indices) == len(steps) and supplied in (
+            set(range(len(steps))), set(range(1, len(steps) + 1))
+        )
+
+    if not covers_every_step(reviewed.covered_step_indices):
+        return ReplanRequest(reason="The final answer review did not verify every requested part")
+    if not covers_every_step(reviewed.scope_valid_step_indices):
+        return ReplanRequest(reason="The final answer review found a step with incorrect scope or an extra filter")
+    return reviewed.answer
 
 
 def answer_result(
@@ -1268,14 +1448,19 @@ def answer_result(
                 "review requested a new query without identifying the evidence gap",
             )
         return ReplanRequest(reason=reviewed.query_issue)
-    return proposed_answer if shared_context.count_reconciliation else reviewed.answer
+    return reviewed.answer
 
 
 __all__ = [
+    "ExecutedPlanStep",
+    "MultiSqlPlan",
     "PlannerAnswer",
     "ReplanRequest",
     "ReviewedAnswer",
     "answer_result",
+    "answer_multi_result",
     "build_count_reconciliation_sql",
+    "is_count_reconciliation_plan",
     "request_sql",
+    "retry_plan_step",
 ]

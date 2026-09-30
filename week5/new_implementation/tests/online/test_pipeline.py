@@ -134,37 +134,115 @@ def database_context_with_locations():
 
 
 class PipelineTests(unittest.TestCase):
-    def test_count_reconciliation_intent_covers_explanation_and_its_correction(self):
-        first = (
-            "By status, count distinct people with positive worked hours and "
-            "all attendance records, then explain why the counts differ."
+    def test_new_count_question_does_not_inherit_reconciliation(self):
+        dependencies = self.dependencies()
+        question = "How many attendance records are there by department?"
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request=question, locale="en",
+                request_relationship="new", subject_relationship="all_authorized",
+            ), count_reconciliation=False,
+        )
+        plans = []
+        def planner(**kwargs):
+            plans.append(kwargs["shared_context"].count_reconciliation)
+            return "SELECT COUNT(*) AS records FROM attendance_records"
+        dependencies.planner = planner
+        dependencies.executor = lambda *_args, **_kwargs: SqlExecutionResult(
+            columns=(), rows=({"records": 5},),
+            coverage=ExecutionCoverage(fetched_rows=1, result_limit=100, response_bytes=20),
         )
         prior = VerifiedTurn(
-            turn_id="prior",
-            original_question=first,
-            rewritten_request=first,
-            answer="Prior answer.",
-            locale="en",
-            executed_sql="SELECT 1",
+            turn_id="prior", original_question="Explain the positive-hours count gap",
+            rewritten_request="Explain the positive-hours count gap", answer="Prior answer",
+            locale="en", executed_sql="SELECT 1", count_reconciliation=True,
+        )
+        state = ConversationState(verified_turns=(prior,))
+        outcome = run_turn(TurnRequest(
+            question=question, state=state, access_context=LOCAL_DEMO_ACCESS,
+        ), dependencies=dependencies)
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(plans, [False])
+
+    def test_changed_group_follow_up_gets_fresh_plan(self):
+        dependencies = self.dependencies()
+        question = "Now group that comparison by department instead."
+        dependencies.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+            decision=ReadyReference(
+                rewritten_request=question, locale="en",
+                request_relationship="follow_up", subject_relationship="all_authorized",
+            ), count_reconciliation=True,
+        )
+        dependencies.context_loader = lambda **_kwargs: database_context_with_departments()
+        plans = []
+        def planner(**kwargs):
+            plans.append(kwargs["shared_context"].current_question)
+            return (
+                "SELECT department, COUNT(*) AS all_record_count, "
+                "COUNT(DISTINCT employee_id) AS all_people_count, "
+                "COUNT(*) FILTER (WHERE total_worked_hrs > 0) AS qualifying_record_count, "
+                "COUNT(DISTINCT employee_id) FILTER (WHERE total_worked_hrs > 0) "
+                "AS qualifying_people_count FROM attendance_records GROUP BY department"
+            )
+        dependencies.planner = planner
+        dependencies.executor = lambda *_args, **_kwargs: SqlExecutionResult(
+            columns=(), rows=({"department": "Operations"},),
+            coverage=ExecutionCoverage(fetched_rows=1, result_limit=100, response_bytes=25),
+        )
+        prior = VerifiedTurn(
+            turn_id="prior", original_question="Compare by status",
+            rewritten_request="Compare by status", answer="Prior answer",
+            locale="en", executed_sql="SELECT status FROM attendance_records",
             count_reconciliation=True,
         )
-        self.assertTrue(pipeline._wants_count_reconciliation(first, None))
-        self.assertTrue(
-            pipeline._wants_count_reconciliation(
-                "That explanation assumes duplicate records; check and revise why the measures differ.",
-                prior,
-            )
+        outcome = run_turn(TurnRequest(
+            question=question, state=ConversationState(verified_turns=(prior,)),
+            access_context=LOCAL_DEMO_ACCESS,
+        ), dependencies=dependencies)
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(plans, [question])
+        self.assertIn("department", outcome.state.verified_turns[-1].executed_sql)
+
+    def test_confirming_ambiguous_employee_keeps_reconciliation_intent(self):
+        dependencies = self.dependencies()
+        dependencies.reference_writer = lambda *_args, **_kwargs: self.fail(
+            "confirmation must use the pending interpretation"
         )
-        self.assertFalse(
-            pipeline._wants_count_reconciliation(
-                "Count all records and distinct employees by status.", None
+        base = database_context()
+        table = base.tables[0]
+        dependencies.context_loader = lambda **_kwargs: base.model_copy(update={
+            "tables": (table.model_copy(update={"columns": table.columns + (
+                DatabaseColumn(name="status", data_type="text", nullable=True,
+                               description="Workflow status."),
+            )}),),
+        })
+        seen = []
+        def planner(**kwargs):
+            seen.append(kwargs["shared_context"].count_reconciliation)
+            return (
+                "SELECT status, COUNT(*) AS all_record_count, "
+                "COUNT(DISTINCT employee_id) AS all_people_count, "
+                "COUNT(*) FILTER (WHERE total_worked_hrs > 0) AS qualifying_record_count, "
+                "COUNT(DISTINCT employee_id) FILTER (WHERE total_worked_hrs > 0) "
+                "AS qualifying_people_count FROM attendance_records "
+                "WHERE employee_id = 'A1' GROUP BY status"
             )
+        dependencies.planner = planner
+        pending = PendingEmployeeConfirmation(
+            original_question="Explain the two count measures for Ali by status.",
+            mention="Ali", options=(EmployeeOption(employee_id="A1", employee_name="Wail Ali"),),
+            resolution=PendingResolution(
+                rewritten_request="Explain the two count measures for Ali by status.",
+                locale="en", request_relationship="new", subject_relationship="employees",
+            ), count_reconciliation=True,
         )
-        self.assertFalse(
-            pipeline._wants_count_reconciliation(
-                "Now show hours for Engineering.", prior
-            )
-        )
+        outcome = run_turn(TurnRequest(
+            question="1", state=ConversationState(pending_employee_confirmation=pending),
+            access_context=LOCAL_DEMO_ACCESS,
+        ), dependencies=dependencies)
+        self.assertIsInstance(outcome, Answered)
+        self.assertEqual(seen, [True])
+        self.assertTrue(outcome.state.verified_turns[-1].count_reconciliation)
 
     def test_independent_clauses_do_not_get_one_global_status_filter(self):
         sql = (
@@ -2802,7 +2880,7 @@ class PipelineTests(unittest.TestCase):
                 request_relationship="new",
                 subject_relationship="all_authorized",
             ),
-            count_reconciliation=True,
+            count_reconciliation=False,
         )
         base = database_context()
         table = base.tables[0]
@@ -2841,6 +2919,7 @@ class PipelineTests(unittest.TestCase):
         self.assertIn("all_record_count", executed[0])
         self.assertIn("qualifying_record_count", executed[0])
         self.assertEqual(outcome.state.verified_turns[-1].executed_sql, executed[0])
+        self.assertTrue(outcome.state.verified_turns[-1].count_reconciliation)
 
     def test_pipeline_logs_each_application_layer_output(self):
         with self.assertLogs(

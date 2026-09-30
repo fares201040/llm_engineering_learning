@@ -94,6 +94,24 @@ class IngestionLedgerTests(unittest.TestCase):
                 raise RuntimeError("conversion failed")
         self.assertIsNone(ledger.active_generation())
 
+    def test_accepted_partitions_advance_only_on_publication(self):
+        ledger = IngestionLedger(self.path)
+        accepted = [{"source_path": "attendance/a.csv", "name": "CSV",
+                     "domain": "attendance", "status": "valid", "row_count": 2}]
+        with ledger.writer() as writer:
+            generation = writer.begin_generation("candidate")
+            writer.replace_source_snapshots([], [])
+        self.assertIsNone(ledger.accepted_partitions())
+        with self.assertRaises(RuntimeError):
+            with ledger.writer() as writer:
+                writer.set_accepted_partitions(accepted)
+                raise RuntimeError("publication failed")
+        self.assertIsNone(ledger.accepted_partitions())
+        with ledger.writer() as writer:
+            writer.activate_generation(generation)
+            writer.set_accepted_partitions(accepted)
+        self.assertEqual(ledger.accepted_partitions(), accepted)
+
     def test_same_source_resumes_pending_generation_and_its_checkpoint(self):
         from week5.new_implementation.ingestion_state import IngestionLedger
 

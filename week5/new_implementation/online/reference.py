@@ -55,6 +55,7 @@ class ScopeClause(_Strict):
     request: str = Field(min_length=1, max_length=10000)
     current_question_basis: str = Field(min_length=1, max_length=10000)
     carried_from_previous: tuple[str, ...] = Field(default=(), max_length=20)
+    date_scope_relationship: Literal["shared", "independent", "unbounded"] | None = None
 
 
 class ReadyReference(_Strict):
@@ -104,7 +105,12 @@ class ReferenceResponse(_Strict):
 
 class _ModelReferenceResponse(ReferenceResponse):
     count_reconciliation: bool = Field(
-        description="Set true only when this request compares all attendance records with distinct people who had positive worked hours, or revises that same explanation; otherwise false."
+        description=(
+            "Set true when this turn asks to explain the gap between all attendance "
+            "records and distinct people with positive worked hours, including a "
+            "follow-up that revises that same explanation. This is a measure-scope "
+            "decision, not a keyword match. New or unrelated counts are false."
+        )
     )
 
 
@@ -126,6 +132,7 @@ class PendingEmployeeConfirmation(_Strict):
         min_length=1, max_length=MAX_EMPLOYEE_CANDIDATES
     )
     resolution: PendingResolution
+    count_reconciliation: bool = False
 
 
 class BoundReferences(_Strict):
@@ -203,6 +210,12 @@ user request. Keep independent clause scopes separate. Do not copy a value seen
 only in an earlier result or SQL query into carried_from_previous. These entries
 are interpretations for the planner to check against the original question,
 not new authority over it.
+Set date_scope_relationship to shared when the question's common period applies
+to this clause, independent when this clause has its own period, or unbounded
+when the user explicitly asks it to cover all available dates. Do not call a
+clause unbounded merely because its wording omits a date; a leading shared
+period can apply to later clauses. Leave this field null only when the question
+does not establish a relationship to a period.
 prior_reference_scope_clauses contains only earlier reference interpretations,
 not verified user intent. Cross-check each against the earlier original_question
 before using it to resolve a follow-up.
@@ -293,9 +306,18 @@ employee selection retains the prior user-requested scope.
 Set count_reconciliation=true only when the current request asks to explain a
 difference between all attendance records and distinct people with positive
 worked hours, or to check or revise that same explanation in a follow-up.
+Set it true even when the requested tables are worded separately and the
+explanation is requested after them in the same turn.
 It signals a need for measured
 intermediate counts; it does not assert what caused the difference. Leave it
 false for an ordinary count or comparison without a requested explanation.
+Decide from the requested measures and relationship, not isolated words. For
+example, a request for two tables comparing distinct people with positive
+worked hours against all records by one group, followed by an explanation of
+their difference, is true. A follow-up asking whether repeated rows really
+explain that same difference remains true only if it refers to the verified
+prior comparison. A new question about total records and distinct employees
+in another scope is false, even if the prior turn was a reconciliation.
 Return every explicit employee ID, every explicit employee name, each name-and-ID pair
 that claims one identity, every general natural-language criterion describing
 employees, whether the request is new or a follow-up, and whether employees and

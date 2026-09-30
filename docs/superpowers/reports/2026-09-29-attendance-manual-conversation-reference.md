@@ -216,6 +216,53 @@ answer: it showed only part of 112 grouped rows and did not summarize every day.
 That request is not a passing all-dates report. A more compact result or narrower
 requested period is still needed for a complete response.
 
+## September 30 count reconciliation replay
+
+The local Gradio app was restarted after each code change. Same-turn executed
+SQL was captured without storing private rows in this report. The database
+still had 3,964 rows across September 1–7. Independent read-only aggregates
+for September 6 found, by status, all records/all people/positive-hour
+records/positive-hour people: Authorized 78/78/5/5, Draft 280/280/119/119,
+and Pending For Authorization 210/210/165/165.
+
+| ID | Exact prompt and preceding turn | Browser and SQL evidence | Status |
+| --- | --- | --- | --- |
+| R08 | Fresh chat: `On Sep 6, 2026, by approval status count distinct people who actually attended (positive worked hours). Separately count all attendance records by status on that date. Two tables, then explain why those measures differ.` | A model proposal used two matching date/status CTEs plus a UNION and presentation ORDER BY. The runtime rewrote it to one grouped SELECT with `COUNT(*)`, `COUNT(DISTINCT employee_id)`, and positive-hours FILTER counts. The browser showed two real tables with 5/78, 119/280, 165/210. Its final paragraph still speculated about multiple entries despite no duplicate within a status. | Counts and tables pass; explanation fails. |
+| R09 | Fresh replay of R08 after review guidance | The same four-count grouped SQL executed and all six requested values matched independent aggregates. The browser correctly attributed gaps of 73, 161, and 45 records to nonpositive or missing worked hours, without a duplicate-record explanation. The model rendered the requested two tables as lists. | Explanation and counts pass; table format fails. |
+| R10 | After R09: `That explanation assumes duplicate records. For Sep 6, check whether any employee has more than one attendance record within a status, then revise the explanation of why the two measures differ. Keep it brief.` | SQL grouped by status and employee on September 6 and checked for counts above one. The browser correctly reported no duplicates and attributed the gap to records without positive hours. | Pass for the requested correction. |
+
+One intervening stochastic replay of R08 proposed positive-hour people for
+Authorized only, but all-record counts for every status; the browser published
+that asymmetric result. This remains a known failure. General planning guidance
+was strengthened afterward, and R09 used matched scopes, but one passing run
+does not prove that future model proposals will always preserve every group.
+No wording-specific runtime condition was added for these questions.
+
+## Sequential multi-query browser check
+
+The first live run after adding typed multi-step planning failed before SQL:
+the planner numbered two clauses `1, 2`, while the pipeline accepted only
+`0, 1`. After normalizing either numbering convention, a fresh browser run of
+the following exact question executed two independent read-only SQL steps:
+
+`Compare Authorized record counts on Sep 3 versus Sep 6, 2026. Separately, across all available dates, total positive worked hours by country. Use two Markdown tables and say which date has more Authorized records.`
+
+The first step grouped Authorized records by the two dates and returned
+September 3 **89** and September 6 **78**. The second grouped positive worked
+hours by country across all dates and returned Burundi **237.01**, Uganda
+**187.47**, and Yemen **97,847.31**. The browser rendered both Markdown tables
+and correctly identified September 3 as higher. An independent read-only
+aggregate matched the worked-hour values. At this check, the database had
+**21,418** rows dated August 1–September 7, 2026; do not compare its all-date
+totals with the earlier 3,964-row snapshot. This is one observed success, not
+a guarantee that every reference interpretation will decompose correctly.
+
+After the shared-date and plan-retry review fixes, a fresh browser replay of
+the same question again executed two separate SQL steps. It rendered two real
+tables with the same 89/78 Authorized counts and 97,847.31/237.01/187.47
+country-hour totals. The answer identified September 3 as higher and described
+the all-date totals as bounded by the observed September 7 endpoint.
+
 ## Add a new manual case
 
 Record the exact prompt and preceding turns, code commit, data snapshot or

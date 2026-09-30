@@ -41,10 +41,15 @@ from .execution import (
 from .history import model_history
 from .limits import MAX_EMPLOYEE_CANDIDATES
 from .planner import (
+    ExecutedPlanStep,
+    MultiSqlPlan,
     ReplanRequest,
+    answer_multi_result,
     answer_result,
     build_count_reconciliation_sql,
+    is_count_reconciliation_plan,
     request_sql,
+    retry_plan_step,
 )
 from .query_paths import boolean_paths, contributing_where_paths
 from .provider import (
@@ -205,40 +210,6 @@ def _locale(question: str) -> Literal["en", "ar"]:
     ):
         return "ar"
     return "ar" if any("\u0600" <= char <= "\u06ff" for char in question) else "en"
-
-
-def _is_positive_people_record_comparison(question: str) -> bool:
-    words = set(re.findall(r"[a-z]+", question.casefold()))
-    return all(
-        words.intersection(group)
-        for group in (
-            {"all", "every", "total"},
-            {"record", "records"},
-            {"distinct", "unique"},
-            {"people", "person", "persons", "employee", "employees", "staff"},
-            {"positive", "attended"},
-        )
-    )
-
-
-def _wants_count_reconciliation(question: str, previous: VerifiedTurn | None) -> bool:
-    words = set(re.findall(r"[a-z]+", question.casefold()))
-    explanation = bool(
-        words.intersection(
-            {"explain", "explanation", "why", "reason", "cause", "rationale",
-             "differ", "difference", "differences", "gap", "reconcile", "revise"}
-        )
-    )
-    return explanation and (
-        _is_positive_people_record_comparison(question)
-        or bool(
-            previous
-            and previous.count_reconciliation
-            and words.intersection(
-                {"record", "records", "measure", "measures", "duplicate", "duplicates"}
-            )
-        )
-    )
 
 
 def _unwrap_parentheses(node: exp.Expression) -> exp.Expression:
@@ -1361,6 +1332,229 @@ def _result_evidence(result: SqlExecutionResult) -> tuple[Result, ...]:
     )
 
 
+def _multi_result_evidence(steps: tuple[ExecutedPlanStep, ...]) -> tuple[Result, ...]:
+    return tuple(
+        Result(
+            page_content=json.dumps(
+                {**step.result.model_dump(mode="json"),
+                 "step_index": index, "subrequest": step.subrequest,
+                 "executed_sql": step.sql},
+                ensure_ascii=False, indent=2,
+            ),
+            metadata={"kind": "sql_result", "step_index": index,
+                      "row_count": len(step.result.rows)},
+        )
+        for index, step in enumerate(steps)
+    )
+
+
+def _normalized_plan_indices(plan: MultiSqlPlan, clause_count: int) -> tuple[int, ...] | None:
+    supplied = tuple(step.scope_clause_index for step in plan.steps)
+    for offset in (0, 1):
+        normalized = tuple(index - offset for index in supplied)
+        if normalized == tuple(sorted(normalized)) and set(normalized) == set(range(clause_count)):
+            return normalized
+    return None
+
+
+def _prior_step_metadata(turn: VerifiedTurn) -> tuple[dict[str, object], ...]:
+    """Use prior SQL scope for follow-ups without trusting saved result values."""
+    fields = ("scope_clause_index", "subrequest", "sql", "requested_date_scope",
+              "requested_date_scopes", "date_scope")
+    return tuple({key: step[key] for key in fields if key in step}
+                 for step in turn.executed_steps)
+
+
+def _run_multi_plan(
+    *, plan: MultiSqlPlan, deps: RuntimeDependencies,
+    shared_context: SharedModelContext, bound: BoundReferences,
+    previous: ConversationState, question: str, locale: str,
+    allowed_employee_ids: tuple[str, ...] | None, budget: CallBudget,
+    observer: TurnObserver | None, count_reconciliation: bool,
+) -> TurnOutcome:
+    clauses = bound.scope_clauses
+    if len(clauses) > 4:
+        raise ProviderFailure("sql_planner", "incomplete_multi_plan", "At most four independent clauses are supported")
+    allowed_tables = tuple(
+        f"{table.schema_name}.{table.table_name}"
+        for table in shared_context.database_context.tables
+    )
+    for plan_attempt in range(1, 3):
+        log_layer_output("multi_plan", plan, attempt=plan_attempt)
+        clause_indices = _normalized_plan_indices(plan, len(clauses))
+        if clause_indices is None:
+            if plan_attempt == 2:
+                raise ProviderFailure("sql_planner", "incomplete_multi_plan", "Plan steps must cover every independent clause in order")
+            correction = deps.planner(
+                shared_context=shared_context, model=settings.llm_planner_model,
+                budget=budget, timeout=settings.llm_planner_timeout_seconds,
+                max_output_tokens=settings.llm_planner_max_output_tokens,
+                attempt=plan_attempt + 1, observer=observer,
+                sql_execution_failure={
+                    "error_type": "plan_structure",
+                    "database_error": (
+                        "Plan steps must cover every independent scope clause in "
+                        "order. Use either zero-based indices 0 through N-1 or "
+                        "one-based indices 1 through N consistently. Multiple "
+                        "steps may share one clause index when needed for a comparison."
+                    ),
+                    "failed_plan": plan.model_dump(mode="json"),
+                },
+            )
+            if not isinstance(correction, MultiSqlPlan):
+                raise ProviderFailure("sql_planner", "invalid_multi_replan", "The planner did not return a corrected multi-step plan")
+            plan = correction
+            continue
+        all_clause_dates = tuple(_explicit_date_scopes(item.request) for item in clauses)
+        executed: list[ExecutedPlanStep] = []
+        total_rows = 0
+        total_bytes = 0
+        for index, planned in enumerate(plan.steps):
+            clause_index = clause_indices[index]
+            clause = clauses[clause_index]
+            clause_dates = all_clause_dates[clause_index]
+            step_dates = _explicit_date_scopes(planned.subrequest)
+            if clause_dates and step_dates and not step_dates.issubset(clause_dates):
+                raise ProviderFailure("sql_planner", "multi_step_scope_mismatch",
+                                      "A plan step introduced a date outside its clause")
+            if len(clause_dates) == 1:
+                clause_date_scope = next(iter(clause_dates))
+            elif len(clause_dates) > 1 and len(step_dates) == 1:
+                clause_date_scope = next(iter(step_dates))
+            elif clause.date_scope_relationship in {"independent", "unbounded"}:
+                clause_date_scope = None
+            elif shared_context.required_date_scope is not None:
+                clause_date_scope = shared_context.required_date_scope
+            else:
+                clause_date_scope = None
+            requested_dates = tuple(sorted(clause_dates or step_dates))
+            if not requested_dates and clause_date_scope is not None:
+                requested_dates = (clause_date_scope,)
+            sql = planned.sql
+            failure: dict[str, object] | None = None
+            for attempt in range(1, SQL_EXECUTION_ATTEMPT_LIMIT + 1):
+                if attempt > 1:
+                    assert failure is not None
+                    sql = retry_plan_step(
+                        shared_context=shared_context, step=planned, failure=failure,
+                        model=settings.llm_planner_model, budget=budget,
+                        timeout=settings.llm_planner_timeout_seconds,
+                        max_output_tokens=settings.llm_planner_max_output_tokens,
+                        attempt=attempt, observer=observer,
+                    )
+                sql = _repair_group_order(_repair_group_matched_count(sql))
+                sql = _strip_private_projections(
+                    sql, public_columns=tuple(
+                        column.name for table in shared_context.database_context.tables
+                        for column in table.columns
+                    ),
+                )
+                if sql is None:
+                    raise ProviderFailure("sql_planner", "private_source_payload", "A plan step projected private source data")
+                try:
+                    validate_read_query(sql, allowed_tables=allowed_tables)
+                    semantic_issue = _sql_semantic_issue(
+                        clause.request, sql,
+                        rewritten_request=clause.request,
+                        allow_rewritten_contracts=False,
+                        database_context=shared_context.database_context,
+                        required_date_scope=clause_date_scope,
+                        independent_clauses=False,
+                    )
+                    if semantic_issue is not None:
+                        raise ValueError(f"SQL semantic issue: {semantic_issue}")
+                    if clause_date_scope is not None and not _has_required_date_scope(
+                        sql, clause_date_scope, independent_clauses=True,
+                    ):
+                        raise ValueError("SQL does not preserve the clause's required date scope")
+                    result = deps.executor(
+                        sql, dsn=settings.postgres_readonly_dsn,
+                        connect_timeout=settings.postgres_connect_timeout_seconds,
+                        statement_timeout_ms=settings.postgres_statement_timeout_ms,
+                        lock_timeout_ms=settings.postgres_lock_timeout_ms,
+                        idle_timeout_ms=settings.postgres_idle_transaction_timeout_ms,
+                        result_limit=min(settings.max_exact_results, 1000),
+                        max_response_bytes=settings.max_sql_result_bytes,
+                        allowed_tables=allowed_tables,
+                        scope_employee_ids=allowed_employee_ids,
+                    )
+                except (ValueError, psycopg.ProgrammingError, psycopg.DataError, RuntimeError) as exc:
+                    if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
+                        raise ProviderFailure("sql_planner", "multi_step_failed", str(exc)) from exc
+                    failure = {
+                        "retry_number": attempt, "failed_sql": sql,
+                        "error_type": type(exc).__name__, "database_error": str(exc)[:4000],
+                        "scope_clause_index": clause_index,
+                        "subrequest": planned.subrequest,
+                    }
+                    log_layer_output("sql_execution_failure", failure, attempt=attempt)
+                    continue
+                total_rows += len(result.rows)
+                total_bytes += result.coverage.response_bytes
+                if total_rows > min(settings.max_exact_results, 1000):
+                    raise ProviderFailure("sql_execution", "multi_result_bound", "Combined plan results exceeded the row bound")
+                if total_bytes > settings.max_sql_result_bytes:
+                    raise ProviderFailure("sql_execution", "multi_result_bound", "Combined plan results exceeded the response-size bound")
+                executed.append(ExecutedPlanStep(
+                    scope_clause_index=clause_index, subrequest=planned.subrequest,
+                    sql=sql, requested_date_scope=clause_date_scope,
+                    requested_date_scopes=requested_dates,
+                    date_scope=_sql_date_scope(sql), result=result,
+                ))
+                log_layer_output("sql_execution", {"step_index": index, "sql": sql,
+                                                   "result": result.model_dump(mode="json")})
+                break
+        steps = tuple(executed)
+        answer = answer_multi_result(
+            shared_context=shared_context, steps=steps, employees=bound.employees,
+            locale=bound.locale, model=settings.llm_planner_model, budget=budget,
+            timeout=settings.llm_planner_timeout_seconds,
+            max_output_tokens=settings.llm_planner_max_output_tokens,
+            observer=observer,
+        )
+        if isinstance(answer, ReplanRequest):
+            if plan_attempt == 2:
+                raise ProviderFailure("sql_answer_review", "replan_limit_exceeded", answer.reason)
+            replanned = deps.planner(
+                shared_context=shared_context, model=settings.llm_planner_model,
+                budget=budget, timeout=settings.llm_planner_timeout_seconds,
+                max_output_tokens=settings.llm_planner_max_output_tokens,
+                attempt=plan_attempt + 1, observer=observer,
+                sql_execution_failure={"error_type": "answer_review_requery",
+                                       "database_error": answer.reason,
+                                       "executed_steps": [step.model_dump(mode="json") for step in steps]},
+            )
+            if not isinstance(replanned, MultiSqlPlan):
+                raise ProviderFailure("sql_planner", "invalid_multi_replan", "The replanner omitted independent clauses")
+            plan = replanned
+            continue
+        published_employees = bound.employees
+        verified = VerifiedTurn(
+            turn_id=uuid4().hex, original_question=question,
+            rewritten_request=bound.updated_request, answer=answer,
+            locale=bound.locale, employees=published_employees,
+            executed_sql=steps[0].sql, count_reconciliation=count_reconciliation,
+            date_scope=(steps[0].date_scope if all(
+                step.date_scope == steps[0].date_scope for step in steps) else None),
+            requested_date_scope=(steps[0].requested_date_scope if all(
+                step.requested_date_scope == steps[0].requested_date_scope
+                for step in steps) else None),
+            result={"steps": [step.result.model_dump(mode="json") for step in steps]},
+            executed_steps=tuple(step.model_dump(mode="json") for step in steps),
+            scope_clauses=clauses,
+        )
+        new_state = previous.model_copy(update={
+            "verified_turns": (previous.verified_turns + (verified,))[-50:],
+            "active_employee_ids": tuple(item.employee_id for item in published_employees),
+            "active_employees": published_employees,
+            "pending_employee_confirmation": None,
+        })
+        _emit(observer, "publication", "completed")
+        log_layer_output("publication", new_state)
+        return Answered(reply=answer, evidence=_multi_result_evidence(steps), state=new_state)
+    raise AssertionError("unreachable multi-plan branch")
+
+
 def run_turn(
     request: TurnRequest,
     *,
@@ -1461,6 +1655,7 @@ def run_turn(
                     "confirmed employee is outside the authorized directory"
                 )
             question = pending.original_question
+            count_reconciliation = pending.count_reconciliation
             bound = complete_confirmation(pending, selected)
             log_layer_output(
                 "employee_confirmation",
@@ -1573,10 +1768,7 @@ def run_turn(
                     prior_decision=reference,
                 )
                 log_layer_output("reference_reconsidered", reference)
-            prior_count_turn = previous.verified_turns[-1] if previous.verified_turns else None
-            count_reconciliation = _wants_count_reconciliation(
-                question, prior_count_turn
-            ) or reference.count_reconciliation
+            count_reconciliation = bool(reference.count_reconciliation)
             if isinstance(reference.decision, UnsupportedReference):
                 bound = BoundReferences(
                     rewritten_request=question,
@@ -1600,12 +1792,15 @@ def run_turn(
         log_layer_output("employee_resolution", bound)
 
         if bound.confirmation is not None:
+            confirmation = bound.confirmation.model_copy(
+                update={"count_reconciliation": count_reconciliation}
+            )
             state = previous.model_copy(
-                update={"pending_employee_confirmation": bound.confirmation}
+                update={"pending_employee_confirmation": confirmation}
             )
             log_layer_output("publication", state)
             return Clarification(
-                reply=_confirmation_reply(bound.confirmation, bound.locale),
+                reply=_confirmation_reply(confirmation, bound.locale),
                 state=state,
                 reason="employee_confirmation",
             )
@@ -1641,6 +1836,7 @@ def run_turn(
                     mention=bound.unresolved_mention,
                     options=verified_postgres,
                     resolution=bound.pending_resolution,
+                    count_reconciliation=count_reconciliation,
                 )
                 state = previous.model_copy(
                     update={"pending_employee_confirmation": pending}
@@ -1691,6 +1887,7 @@ def run_turn(
             and bound.subject_relationship in {"employees", "all_authorized"}
             and bound.employee_ids == tuple(item.employee_id for item in active)
             and bool(previous.verified_turns)
+            and not previous.verified_turns[-1].executed_steps
         )
         if native_scope_eligible and is_grouped_month_comparison_question(question):
             database_context = deps.context_loader(
@@ -1803,7 +2000,14 @@ def run_turn(
                     else None
                 ),
                 "previous_executed_sql": (
-                    previous_turn.executed_sql if previous_turn is not None else None
+                    previous_turn.executed_sql
+                    if previous_turn is not None and not previous_turn.executed_steps
+                    else None
+                ),
+                "previous_executed_steps": (
+                    _prior_step_metadata(previous_turn)
+                    if previous_turn is not None and previous_turn.executed_steps
+                    else None
                 ),
             },
         }
@@ -1813,7 +2017,9 @@ def run_turn(
                 "verified_turns": [
                     {
                         **turn,
-                        "executed_sql": previous.verified_turns[-1].executed_sql,
+                        **({"executed_steps": _prior_step_metadata(previous.verified_turns[-1])}
+                           if previous.verified_turns[-1].executed_steps else
+                           {"executed_sql": previous.verified_turns[-1].executed_sql}),
                     }
                     for turn in trusted_context["verified_turns"]
                 ],
@@ -1829,11 +2035,12 @@ def run_turn(
             previous_verified_turn=(
                 {
                     "request": previous.verified_turns[-1].rewritten_request,
-                    "sql": previous.verified_turns[-1].executed_sql,
-                    "having": _previous_having(
-                        previous.verified_turns[-1].executed_sql
-                    ),
-                    "date_scope": previous.verified_turns[-1].date_scope,
+                    **({"executed_steps": _prior_step_metadata(previous.verified_turns[-1])}
+                       if previous.verified_turns[-1].executed_steps else {
+                           "sql": previous.verified_turns[-1].executed_sql,
+                           "having": _previous_having(previous.verified_turns[-1].executed_sql),
+                           "date_scope": previous.verified_turns[-1].date_scope,
+                       }),
                 }
                 if bound.request_relationship == "follow_up" and previous.verified_turns
                 else None
@@ -1851,28 +2058,24 @@ def run_turn(
             scope_provenance=scope_provenance,
             database_context=database_context,
         )
+        initial_sql: str | None = None
+        if len(bound.scope_clauses) > 1 and not count_reconciliation:
+            planned = deps.planner(
+                shared_context=shared_context, model=settings.llm_planner_model,
+                budget=budget, timeout=settings.llm_planner_timeout_seconds,
+                max_output_tokens=settings.llm_planner_max_output_tokens,
+                attempt=1, observer=observer,
+            )
+            if isinstance(planned, MultiSqlPlan):
+                return _run_multi_plan(
+                    plan=planned, deps=deps, shared_context=shared_context,
+                    bound=bound, previous=previous, question=question,
+                    locale=locale, allowed_employee_ids=allowed_employee_ids,
+                    budget=budget, observer=observer,
+                    count_reconciliation=count_reconciliation,
+                )
+            initial_sql = planned
         sql_execution_failure: dict[str, object] | None = None
-        reusable_count_sql = (
-            previous_turn.executed_sql
-            if count_reconciliation
-            and previous_turn is not None
-            and previous_turn.count_reconciliation
-            and not _is_positive_people_record_comparison(question)
-            and any(
-                phrase in question.casefold()
-                for phrase in ("that explanation", "duplicate", "revise")
-            )
-            and not any(
-                term in question.casefold()
-                for term in ("department", "country", "location", "job")
-            )
-            and not bound.employee_ids
-            and not bound.employee_criteria
-            and len(bound.scope_clauses) <= 1
-            and enforced_date_scope == _verified_requested_date_scope(previous_turn)
-            and _requested_workflow_status(question) is None
-            else None
-        )
         for attempt in range(1, SQL_EXECUTION_ATTEMPT_LIMIT + 1):
             planner_args: dict[str, object] = {
                 "shared_context": shared_context,
@@ -1890,8 +2093,8 @@ def run_turn(
                 if native_comparison is not None and attempt == 1
                 else native_running_total.sql
                 if native_running_total is not None and attempt == 1
-                else reusable_count_sql
-                if reusable_count_sql is not None and attempt == 1
+                else initial_sql
+                if initial_sql is not None and attempt == 1
                 else deps.planner(**planner_args)
             )
             sql = _repair_group_order(_repair_group_matched_count(sql))
@@ -1912,6 +2115,11 @@ def run_turn(
                     ),
                     state=previous,
                     capability="private_source_payload",
+                )
+            if not count_reconciliation and is_count_reconciliation_plan(shared_context, sql):
+                count_reconciliation = True
+                shared_context = shared_context.model_copy(
+                    update={"count_reconciliation": True}
                 )
             if count_reconciliation:
                 reconciled_sql = build_count_reconciliation_sql(shared_context, sql)

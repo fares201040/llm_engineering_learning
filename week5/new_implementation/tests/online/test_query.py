@@ -61,6 +61,21 @@ class StructuredProbe(BaseModel):
 
 
 class DatabaseContextTests(unittest.TestCase):
+    def test_clock_time_display_guidance_reaches_answer_context(self):
+        shared = SharedModelContext(
+            current_question="Show my swipe times.",
+            updated_request="Show the employee's swipe times.",
+            database_context=database_context(),
+        )
+        meanings = {
+            item["name"]: item["description"]
+            for item in shared.model_payload()["database_context"]["business_meanings"]
+        }
+
+        self.assertIn("HH:MM", meanings["clock_time_display"])
+        self.assertIn("omit seconds", meanings["clock_time_display"])
+        self.assertIn("full precision", meanings["clock_time_display"])
+
     def test_default_reference_uses_planner_model(self):
         with patch.dict("os.environ", {"LLM_MODEL": "", "LLM_REFERENCE_MODEL": ""}):
             current = Settings.from_environment()

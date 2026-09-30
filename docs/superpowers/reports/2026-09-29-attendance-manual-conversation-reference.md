@@ -171,6 +171,38 @@ Markdown rendering. They do not establish a deterministic success rate across
 model runs. The later source changes gave the models general evidence guidance
 and removed a false date-scope rejection; they did not encode these answer values.
 
+## Fresh browser conversation, September 30 follow-up
+
+This replay began at `c4c88f2b` with a clean checkout. The read-only database
+still held 3,964 records for September 1–7, 2026. The same-turn local trace
+recorded reference scope, executed SQL, rows, draft, and review. Its private
+contents remain outside Git. The independent aggregates below were run against
+the same snapshot. Later prompt and UI changes were loaded only after restarting
+the app. Status describes the observed browser run, not a deterministic guarantee.
+
+| ID | Exact prompt and preceding turn | Browser, SQL, and independent check | Status |
+| --- | --- | --- | --- |
+| R01 | New chat: `Across all available dates, by shift show (1) distinct employees with positive worked hours, and (2) OFF-day attendance record counts. Use separate Markdown tables.` | Executed independent source branches: positive hours grouped by shift with distinct employee IDs, and both OFF day types grouped by shift. Real tables showed 289, 211, 141, 48, and 312 people across the five shifts; the OFF-shift OFF-day count was 1,112. Independent aggregates matched. | Pass. |
+| R02 | After R01: `For that OFF shift, split OFF-day records into positive worked hours versus zero or missing worked hours. Give record counts and distinct people for each group as bullets, then one brief takeaway.` | SQL retained OFF shift and both OFF day types, and grouped by positive versus nonpositive/missing hours. Browser bullets and independent SQL agreed: 566 records/312 people with positive hours, 546 records/353 people without. | Pass. |
+| R03 | After R02: `Correction: drop the OFF shift and day-type filters. Compare Authorized record counts on Sep 3 versus Sep 6, 2026. Separately, across all available dates, total positive worked hours by country. Use two Markdown tables and say which date has more Authorized records.` | SQL kept the two branches independent and counted 89 versus 78 Authorized records correctly. It cast the country hour sums to `bigint` for a UNION, so browser rows showed Uganda 21 instead of 21.47 and Yemen 15,681 instead of 15,681.14. Read-only sums established the lost decimals. | Fail before precision guidance. |
+| R04 | After R03: `Those country hours look rounded. Give the positive worked-hour totals to two decimal places by country across all available dates. Drop the Authorized and two-date filters; only revise the country-hours report.` | SQL removed the status and date filters. Real table showed Burundi 29.00, Uganda 21.47, Yemen 15,681.14; independent sums matched. A fresh two-part browser replay after shared precision guidance also kept these decimals and the 89/78 counts. | Pass for observed correction and fresh replay. |
+| R05 | After R04: `On Sep 6, 2026, by approval status count distinct people who actually attended (positive worked hours). Separately count all attendance records by status on that date. Two tables, then explain why those measures differ.` | SQL returned the right values: Authorized 5 people/78 records, Draft 119/280, Pending 165/210. Independent SQL found no duplicate employee/date/status groups and positive-record counts equaled positive-person counts. The answer incorrectly attributed the gap to possible duplicate records. Fresh browser replays after three prompt adjustments still made unsupported duplicate claims, once adding invented split-shift and swipe causes. Those prompt adjustments were not retained. | Fail: explanatory inference, counts pass. |
+| R06 | After R05: `That explanation assumes duplicate records. For Sep 6, check whether any employee has more than one attendance record within a status, then revise the explanation of why the two measures differ. Keep it brief.` | SQL found no duplicate groups. The draft said so, but review inserted a contradictory multiple-record explanation. The correct cause on this snapshot is the positive-hours eligibility condition: within each status, all records and all people coincide, while only 5/119/165 records have positive hours. | Fail before attempted prompt guidance; exact follow-up not rerun afterward. |
+| R07 | Fresh chat, exact N03 context: `Across all available dates, count distinct people by country. Separately, sum worked hours by work location for Engineering only. Present both as Markdown tables, then say which Engineering location has the most hours.` Then exact N04 follow-up: `For Engineering only, keep all dates and show the top 3 work locations by worked hours. Add each location’s share of all Engineering worked hours, and one brief takeaway. Do not repeat the country counts.` | First exact follow-up safe-failed after four attempts at `ROUND(double precision, integer)`. General PostgreSQL numeric-cast guidance was added and the app restarted. The next browser replay succeeded after one SQL retry, casting the entire percentage expression to numeric before rounding. Same-turn rows and independent totals gave Shift-Eng 868.61/24.07%, RTG-Eng 763.51/21.16%, QC-Eng 555.19/15.39% out of 3,608.21 Engineering hours. The answer omitted country counts and avoided a staffing or activity claim, though “workload” was a loose label for total hours. | Fail before SQL guidance; pass on observed rerun. |
+
+A representative nonempty swipe-time browser turn after the time guidance displayed
+effective and device clock times as `08:18` and `15:41`, matching stored values
+with `:00` seconds. The employee identifier and trace are intentionally omitted
+here. The explicit **Clear conversation** control visibly emptied a pending chat
+when activated by keyboard; a new count request then showed only its own turn and
+returned the independently checked 74 Authorized records on September 2. Mouse
+click replay on Clear was inconclusive in the automation surface.
+
+One deliberately broad daily-department Markdown request was bounded in the
+answer: it showed only part of 112 grouped rows and did not summarize every day.
+That request is not a passing all-dates report. A more compact result or narrower
+requested period is still needed for a complete response.
+
 ## Add a new manual case
 
 Record the exact prompt and preceding turns, code commit, data snapshot or

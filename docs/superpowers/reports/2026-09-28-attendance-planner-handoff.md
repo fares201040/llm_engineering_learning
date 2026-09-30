@@ -135,6 +135,52 @@ answerer and reviewer a general evidence boundary for analytical prose.
 
 ## Next work
 
+### September 30 fresh long-conversation continuation
+
+Starting from clean `c4c88f2b`, a fresh Gradio browser conversation exercised
+independent shift breakdowns, OFF-day follow-up, removal of inherited filters,
+decimal hour totals, a correction, and different record/person measures. The
+database remained at 3,964 rows dated September 1–7. Same-turn SQL, result rows,
+draft, and review were captured locally outside Git and compared with read-only
+aggregates. Exact nonprivate prompts and outcomes are R01–R06 in the manual
+reference.
+
+- R01–R02 passed with separate source scopes, correct aggregates, rendered tables
+  and bullets.
+- R03 exposed a UNION cast of decimal worked hours to `bigint`. General planner
+  and review guidance now preserves numeric precision. A restarted browser
+  replay returned Uganda 21.47 and Yemen 15,681.14 hours while retaining the
+  correct 89/78 Authorized counts.
+- R05–R06 exposed a separate model failure: correct person and record counts
+  were followed by an unsupported duplicate-record explanation. One review
+  even contradicted its own no-duplicates SQL check. Three model-guidance
+  adjustments did not make the explanation reliable with `gpt-4.1-mini`, so
+  those ineffective additions were removed. No wording-specific runtime rule
+  was added. A future architectural choice should improve model reasoning or
+  the evidence shape and be measured with fresh browser replays.
+- The exact N03-to-N04 Engineering follow-up was rerun. Its first replay
+  safe-failed because the planner repeatedly called PostgreSQL's two-argument
+  ROUND on a double-precision expression. General numeric-cast guidance fixed
+  the observed browser rerun after one SQL retry. The top-three hours and shares
+  matched independent aggregates; the answer did not repeat country counts or
+  infer staffing/activity from the hours.
+- An explicit **Clear conversation** button was wired to the existing sequence
+  gate after the Chatbot's built-in Clear callback did not fire in this session.
+  Keyboard activation cleared a pending turn, and the next count answer appeared
+  alone. Mouse-click automation did not establish a reliable result.
+- Shared schema and answer/review guidance now presents clock times in 24-hour
+  `HH:MM` without altering stored evidence. A nonempty browser swipe-time answer
+  showed `08:18` and `15:41`, matching source `HH:MM:SS` values.
+- A broad all-date/all-department report produced only part of 112 grouped rows
+  and omitted requested day summaries. It remains an incomplete report case.
+
+The exact H01–H04 seed is still unavailable. L14 remains ambiguous; the exact
+L25/L28 interruptions and the Colab/private gates were not rerun in this
+continuation. Do not treat earlier
+browser passes or historical evaluation counts as current acceptance results.
+
+## Earlier next-work list
+
 1. Revisit the L22/L23 and L37 wording cases with same-turn SQL and row traces.
    Use new nearby requests to test whether aggregation and analytical labels
    generalize, without adding phrase-specific runtime rules.

@@ -66,6 +66,17 @@ class DatabaseBusinessMeaning(_Strict):
 
 BUSINESS_MEANINGS = (
     DatabaseBusinessMeaning(
+        name="clock_time_display",
+        description=(
+            "In user-facing answers, display clock times in 24-hour HH:MM format "
+            "and omit seconds, including the time component of a timestamp. "
+            "This applies to effective swipes, device swipes, and scheduled times. "
+            "Keep dates and any relevant time zone indication. Preserve full precision "
+            "in stored values, SQL predicates, executed rows, and evidence; this is "
+            "presentation guidance, not a query or measurement rule."
+        ),
+    ),
+    DatabaseBusinessMeaning(
         name="available_dataset_boundary",
         description=(
             "This interface exposes attendance records and documented attendance "

@@ -49,8 +49,16 @@ class LaunchModeTests(unittest.TestCase):
     def test_clear_event_resets_visible_chatbot_history(self):
         with patch.object(new_app.gr.Blocks, "launch", autospec=True) as launch:
             new_app.main()
-        dependencies = launch.call_args.args[0].config["dependencies"]
-        clear = next(item for item in dependencies if item["targets"][0][1] == "clear")
+        config = launch.call_args.args[0].config
+        components = {item["id"]: item for item in config["components"]}
+        dependencies = config["dependencies"]
+        clear = next(
+            item
+            for item in dependencies
+            if item["targets"][0][1] == "click"
+            and components[item["targets"][0][0]]["props"].get("value")
+            == "Clear conversation"
+        )
         display = next(
             item for item in dependencies if item["targets"][0][1] == "change"
         )
@@ -67,7 +75,7 @@ class LaunchModeTests(unittest.TestCase):
             item for item in dependencies if item["targets"][0][1] == "submit"
         )
         clear_handlers = [
-            item for item in dependencies if item["targets"][0][1] == "clear"
+            item for item in dependencies if item["targets"][0][1] == "click"
         ]
 
         self.assertEqual(len(dependencies), 3)

@@ -417,6 +417,9 @@ def main():
         #attendance-chat .bot-row:has(table) .message {
             width: 100%;
         }
+        #attendance-chat button[title="Clear"] {
+            display: none;
+        }
         """,
     ) as ui:
         turn_gate = gr.State(value=_TurnGate())
@@ -443,6 +446,7 @@ def main():
             show_label=False,
             elem_id="attendance-question",
         )
+        clear_button = gr.Button("Clear conversation", size="sm", variant="secondary")
         with gr.Accordion("📚 Retrieved Context", open=False):
             context_markdown = gr.Markdown(
                 label="📚 Retrieved Context",
@@ -468,7 +472,7 @@ def main():
             trigger_mode="multiple",
             show_progress="hidden",
         )
-        chatbot.clear(
+        clear_button.click(
             reset_session,
             inputs=[turn_gate, client_sequence],
             outputs=[chatbot, context_markdown],

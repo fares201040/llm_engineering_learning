@@ -82,6 +82,8 @@ implementation only when the user asks about those details.
 For an unsupported request, one clear sentence is usually enough. Do not add an
 example query, hypothetical data structure, or speculative path to an answer.
 Choose a concise sentence, list, or table that answers every requested part.
+Display clock times in 24-hour HH:MM without seconds. Keep dates and
+durations distinct from clock times.
 When the user asks to show or list attendance records, include actual bounded
 record rows with identifying fields and the requested details, plus the full
 matched_count. A description of available columns is not a record list.
@@ -224,6 +226,10 @@ request a corrected query if the status predicate is absent, even when the
 proposed answer sounds plausible. If the user requested only a count and bounded detail rows support it via
 matched_count, keep the final answer to the requested count and scope rather
 than describing unrelated fields visible only in the sample.
+Check whether a cast or rounding operation in executed SQL has discarded the
+precision of a measured value, especially when differently typed aggregates
+are combined. If so, request a new query that preserves the measure; the final
+answer cannot recover digits that the result rows no longer contain.
 For a requested record list, preserve representative returned rows and the full
 match count in the final answer instead of describing the table's columns.
 For independent clauses, inspect each contributing SQL branch separately. A
@@ -280,6 +286,9 @@ answer. A count attached after GROUP BY is a group count unless the query counts
 source rows separately. For a requested count of matching records, an absent
 group means zero observed matches; describe it as none or zero, without exposing
 NULL and SQL implementation details to the user.
+For user-facing clock times, use 24-hour HH:MM without seconds while
+preserving the underlying SQL and result precision. Do not apply clock
+formatting to dates or hour durations.
 If the user asks for one overall total and a separate grouped breakdown,
 verify the overall total appears explicitly in the answer. When complete
 grouped rows partition the whole requested scope, sum their conditional
@@ -669,6 +678,16 @@ Preserve every requested measure and its aggregation level. If the user asks to
 compare totals and count records where underlying values differ, retrieve the two
 totals over the full scope and the differing-record count in the same query or
 equivalent summary. A filtered list of differing rows cannot give full-scope totals.
+Preserve the precision of numeric measures through every CTE, cast, and UNION.
+When combining a decimal SUM with integer counts, use compatible decimal result
+types or separate metric columns; do not cast measured hours or amounts to an
+integer just to make the branches align. Round only to the precision requested
+or justified by the source measure.
+In PostgreSQL, two-argument ROUND requires a numeric input. For a floating
+aggregate or percentage expression, cast the entire expression to numeric
+before rounding, or return the unrounded value for answer presentation.
+Casting ROUND's result or just a constant leaves the input floating and does
+not resolve that database error.
 Keep the full requested row set for aggregate comparisons; express a condition
 that only applies to one count inside that count's FILTER or CASE expression,
 not in WHERE where it would also restrict the sums.

@@ -98,8 +98,8 @@ def prepare_private_data() -> dict[str, str]:
 
     prepare_private_runtime()
     settings = json.loads(PRIVATE_RUNTIME.read_text(encoding="utf-8"))
-    settings["LLM_REFERENCE_MODEL"] = "openai/gpt-4.1-mini"
-    settings["LLM_PLANNER_MODEL"] = "openai/gpt-4.1-mini"
+    settings["LLM_REFERENCE_MODEL"] = "openai/gpt-5-nano"
+    settings["LLM_PLANNER_MODEL"] = "openai/gpt-5-nano"
     PRIVATE_RUNTIME.write_text(json.dumps(settings, indent=2), encoding="utf-8")
     PRIVATE_RUNTIME.chmod(0o600)
     return settings

@@ -208,9 +208,9 @@ def write_runtime_config(path: Path, settings: dict[str, str]) -> None:
 
 def _model_settings() -> dict[str, str]:
     defaults = {
-        "LLM_REFERENCE_MODEL": "openai/gpt-4.1-mini",
+        "LLM_REFERENCE_MODEL": "openai/gpt-5-nano",
         "LLM_REFERENCE_TIMEOUT_SECONDS": "180",
-        "LLM_PLANNER_MODEL": "openai/gpt-4.1-mini",
+        "LLM_PLANNER_MODEL": "openai/gpt-5-nano",
         "LLM_PLANNER_TIMEOUT_SECONDS": "180",
         "LLM_PLANNER_MAX_OUTPUT_TOKENS": "6000",
     }

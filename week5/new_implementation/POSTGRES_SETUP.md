@@ -90,8 +90,8 @@ versions are implementation details, not deployment settings. For the current Ph
 local run, configure the model roles as follows:
 
 ```env
-LLM_REFERENCE_MODEL=openai/gpt-4.1-mini
-LLM_PLANNER_MODEL=openai/gpt-4.1-mini
+LLM_REFERENCE_MODEL=openai/gpt-5-nano
+LLM_PLANNER_MODEL=openai/gpt-5-nano
 LLM_PLANNER_MAX_OUTPUT_TOKENS=6000
 ```
 

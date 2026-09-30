@@ -1,7 +1,7 @@
 # Run the attendance chatbot in Colab
 
 The launcher rebuilds the source package every time, so edits to the current local
-application files are included automatically. It uses `gpt-4.1-mini` through the
+application files are included automatically. It uses `gpt-5-nano` through the
 OpenAI API for reference resolution, SQL planning, final
 answering, and answer review. The reviewer can request another bounded query
 when a materially wrong answer needs evidence available in the database.

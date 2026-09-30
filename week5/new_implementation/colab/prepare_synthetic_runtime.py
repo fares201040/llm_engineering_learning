@@ -127,13 +127,13 @@ def main() -> None:
             "ATTENDANCE_PHASE2_SOURCE_ROOT": str(SOURCE_ROOT),
             "POSTGRES_READONLY_DSN": dsn,
             "POSTGRES_ATTENDANCE_TABLE": "attendance_records",
-            "LLM_REFERENCE_MODEL": "openai/gpt-4.1-mini",
-            "LLM_PLANNER_MODEL": "openai/gpt-4.1-mini",
+            "LLM_REFERENCE_MODEL": "openai/gpt-5-nano",
+            "LLM_PLANNER_MODEL": "openai/gpt-5-nano",
             "LLM_PLANNER_MAX_OUTPUT_TOKENS": "6000",
         }
-    settings["LLM_PLANNER_MODEL"] = "openai/gpt-4.1-mini"
+    settings["LLM_PLANNER_MODEL"] = "openai/gpt-5-nano"
     settings["LLM_PLANNER_MAX_OUTPUT_TOKENS"] = "6000"
-    settings["LLM_REFERENCE_MODEL"] = "openai/gpt-4.1-mini"
+    settings["LLM_REFERENCE_MODEL"] = "openai/gpt-5-nano"
     if OPENAI_KEY_FILE.is_file():
         settings["OPENAI_API_KEY"] = OPENAI_KEY_FILE.read_text(encoding="utf-8").strip()
         OPENAI_KEY_FILE.unlink()

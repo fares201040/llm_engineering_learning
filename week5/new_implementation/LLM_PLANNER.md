@@ -28,7 +28,7 @@ query, witness query, narrative query route, shadow/canary path, or old state ad
 
 ## Model roles and payloads
 
-The reference and query-planning roles use `openai/gpt-4.1-mini` by default.
+The reference and query-planning roles use `openai/gpt-5-nano` by default.
 The planner also answers from executed rows and reviews its answer. Set
 `LLM_PLANNER_MAX_OUTPUT_TOKENS=6000`.
 

@@ -1,6 +1,6 @@
-from datetime import date, datetime, time as dt_time
+from datetime import date, datetime, time as dt_time, timezone
 from dataclasses import dataclass, replace
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from time import perf_counter
 from collections import defaultdict
 import hashlib
@@ -8,6 +8,9 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
+import shutil
+import sqlite3
 import tempfile
 from typing import Sequence
 
@@ -723,10 +726,11 @@ def convert_excel_to_jsonl(ledger=None):
     return JSONL_OUTPUT_PATH
 
 
-def convert_sources_to_jsonl(ledger=None):
+def convert_sources_to_jsonl(ledger=None, *, persist=True):
     previous_partitions = _read_source_manifest().get("partitions") or []
-    JSONL_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    INVALID_JSONL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if persist:
+        JSONL_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        INVALID_JSONL_PATH.parent.mkdir(parents=True, exist_ok=True)
 
     sources = _source_files()
     if not sources:
@@ -820,7 +824,7 @@ def convert_sources_to_jsonl(ledger=None):
         )
     )
 
-    if not unsafe_reasons:
+    if persist and not unsafe_reasons:
         temporary_paths = []
         try:
             output = tempfile.NamedTemporaryFile(
@@ -871,14 +875,14 @@ def convert_sources_to_jsonl(ledger=None):
         }
         for source in sources
     ]
-    if not unsafe_reasons:
+    if persist and not unsafe_reasons:
         _write_source_manifest(
             signature,
             len(valid_records),
             len(invalid_payloads),
             summaries,
         )
-    if ledger is not None and not unsafe_reasons:
+    if persist and ledger is not None and not unsafe_reasons:
         refreshed_snapshots = []
         for source in sources:
             source_valid = [
@@ -1243,13 +1247,9 @@ def _make_record_id(record):
     The key intentionally uses source-independent business values so the same
     attendance record receives the same ID after re-ingestion.
     """
-    identity = {
-        "Employee_ID": record.get("Employee_ID"),
-        "Date": record.get("Date"),
-        "Shift": record.get("Shift"),
-        "Schedule_From_Time": record.get("Schedule_From_Time"),
-        "Schedule_To_Time": record.get("Schedule_To_Time"),
-    }
+    if record.get("_record_id"):
+        return record["_record_id"]
+    identity = {"Employee_ID": record.get("Employee_ID"), "Date": record.get("Date")}
 
     digest = hashlib.sha1(_canonical_json(identity).encode("utf-8")).hexdigest()[:12]
 
@@ -1263,10 +1263,200 @@ def _make_record_id(record):
 
 def _record_update_sort_key(record):
     """
-    Prefer the newest duplicate record when last_Updated_date is available.
-    ISO timestamps sort correctly as strings. Missing timestamps sort first.
+    Compare updates by instant. Naive source timestamps are interpreted as UTC.
     """
-    return str(record.get("last_Updated_date") or "")
+    value = record.get("last_Updated_date")
+    if not value:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    parsed = datetime.fromisoformat(str(value))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _business_key(record):
+    return (str(record["Employee_ID"]), str(record["Date"]))
+
+
+def apply_existing_record_ids(documents, existing_rows):
+    """Retain installed sink IDs so a logical-key migration does not rewrite vectors."""
+    ids_by_key = {}
+    for row in existing_rows:
+        key = (str(row["employee_id"]), str(row["attendance_date"]))
+        prior = ids_by_key.setdefault(key, row["record_id"])
+        if prior != row["record_id"]:
+            raise ValueError(
+                f"Existing sink has multiple IDs for {key}: "
+                f"{prior}, {row['record_id']}"
+            )
+    for document in documents:
+        existing_id = ids_by_key.get(_business_key(document["record"]))
+        if existing_id:
+            document["record"]["_record_id"] = existing_id
+
+
+def _existing_postgres_rows():
+    if not ENABLE_POSTGRES:
+        return []
+    if not POSTGRES_DSN:
+        raise ValueError("ENABLE_POSTGRES is true but POSTGRES_DSN is empty.")
+    import psycopg
+
+    with psycopg.connect(POSTGRES_DSN) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SET TRANSACTION READ ONLY")
+            cur.execute("SELECT to_regclass(%s)", (POSTGRES_ATTENDANCE_TABLE,))
+            if cur.fetchone()[0] is None:
+                return []
+            cur.execute(
+                f"SELECT record_id, employee_id, attendance_date, content_hash "
+                f"FROM {POSTGRES_ATTENDANCE_TABLE}"
+            )
+            return [
+                dict(zip(("record_id", "employee_id", "attendance_date", "content_hash"), row))
+                for row in cur.fetchall()
+            ]
+
+
+def _existing_chroma_rows():
+    if not settings.chroma_db_path.exists():
+        return []
+    client = create_chroma_client()
+    if COLLECTION_NAME not in {item.name for item in client.list_collections()}:
+        return []
+    collection = client.get_collection(COLLECTION_NAME)
+    existing = collection.get(include=["metadatas"])
+    rows = []
+    for item_id, metadata in zip(existing.get("ids") or [], existing.get("metadatas") or []):
+        metadata = metadata or {}
+        if metadata.get("chunk_type") != "attendance_record":
+            continue
+        if not metadata.get("Employee_ID") or not metadata.get("Date"):
+            continue
+        rows.append({
+            "record_id": metadata.get("record_id") or item_id.split(":part-")[0],
+            "employee_id": metadata["Employee_ID"],
+            "attendance_date": metadata["Date"],
+            "content_hash": metadata.get("content_hash"),
+        })
+    return rows
+
+
+def _preview_chroma_rows():
+    """Read Chroma metadata from a disposable copy, never its live client."""
+    live_path = settings.chroma_db_path
+    if not live_path.exists():
+        return [], "store_absent", {"copy_seconds": 0.0, "copied_bytes": 0}
+    with tempfile.TemporaryDirectory(prefix="attendance-chroma-preview-") as temporary:
+        copied_path = Path(temporary) / "chroma"
+        copy_started = perf_counter()
+        shutil.copytree(live_path, copied_path)
+        copy_details = {
+            "copy_seconds": round(perf_counter() - copy_started, 3),
+            "copied_bytes": sum(
+                path.stat().st_size for path in copied_path.rglob("*") if path.is_file()
+            ),
+        }
+        database = copied_path / "chroma.sqlite3"
+        if not database.is_file():
+            raise RuntimeError("Chroma snapshot has no chroma.sqlite3 database")
+        with closing(sqlite3.connect(database)) as connection:
+            connection.execute("PRAGMA query_only = ON")
+            collections = connection.execute(
+                "SELECT id FROM collections WHERE name = ?", (COLLECTION_NAME,)
+            ).fetchall()
+            if not collections:
+                return [], "collection_absent", copy_details
+            if len(collections) != 1:
+                raise RuntimeError(
+                    f"Chroma snapshot has multiple collections named {COLLECTION_NAME!r}"
+                )
+            result = connection.execute(
+                "SELECT e.id, e.embedding_id, m.key, m.string_value "
+                "FROM embeddings AS e "
+                "JOIN segments AS s ON s.id = e.segment_id "
+                "LEFT JOIN embedding_metadata AS m ON m.id = e.id "
+                "WHERE s.collection = ? AND m.key IN "
+                "('record_id', 'chunk_type', 'Employee_ID', 'Date', 'content_hash')",
+                (collections[0][0],),
+            ).fetchall()
+        metadata_by_id = {}
+        for numeric_id, item_id, key, value in result:
+            entry = metadata_by_id.setdefault(numeric_id, {"item_id": item_id})
+            entry[key] = value
+        rows = []
+        for metadata in metadata_by_id.values():
+            if metadata.get("chunk_type") != "attendance_record":
+                continue
+            if not metadata.get("Employee_ID") or not metadata.get("Date"):
+                continue
+            rows.append({
+                "record_id": metadata.get("record_id") or metadata["item_id"].split(":part-")[0],
+                "employee_id": metadata["Employee_ID"],
+                "attendance_date": metadata["Date"],
+                "content_hash": metadata.get("content_hash"),
+            })
+        return rows, "snapshot_inspected", copy_details
+
+
+def _source_locator(document):
+    return f"{document.get('source')}#{document.get('sheet')}!{document.get('excel_row')}"
+
+
+def find_duplicate_conflicts(documents):
+    """Return every employee/day whose available source versions lack a winner."""
+    groups = defaultdict(list)
+    for document in documents:
+        groups[_business_key(document["record"])].append(document)
+    conflicts = []
+    for (employee, day), group in sorted(groups.items()):
+        ordered = sorted(group, key=_source_locator)
+        by_source = {}
+        for document in ordered:
+            source = document.get("source")
+            prior = by_source.setdefault(source, document)
+            if _content_hash(_business_record(prior["record"])) != _content_hash(
+                _business_record(document["record"])
+            ):
+                conflicts.append(
+                    f"Conflicting rows in same source for {employee} {day}: "
+                    f"{_source_locator(prior)} versus {_source_locator(document)}"
+                )
+                break
+        if len(group) < 2:
+            continue
+        unresolved = next(
+            (
+                (first, second)
+                for index, first in enumerate(ordered)
+                for second in ordered[index + 1 :]
+                if first.get("source") != second.get("source")
+                and _content_hash(_business_record(first["record"]))
+                != _content_hash(_business_record(second["record"]))
+                and (
+                    not first["record"].get("last_Updated_date")
+                    or not second["record"].get("last_Updated_date")
+                )
+            ),
+            None,
+        )
+        if unresolved:
+            first, second = unresolved
+            conflicts.append(
+                f"missing last_Updated_date for conflicting overlap {employee} {day}: "
+                f"{_source_locator(first)} versus {_source_locator(second)}"
+            )
+            continue
+        newest = max(_record_update_sort_key(doc["record"]) for doc in group)
+        top = [doc for doc in ordered if _record_update_sort_key(doc["record"]) == newest]
+        distinct = {_content_hash(_business_record(doc["record"])) for doc in top}
+        if len(distinct) > 1 and len({doc.get("source") for doc in top}) > 1:
+            conflicts.append(
+                f"ambiguous overlap for {employee} {day}, last_Updated_date="
+                f"{top[0]['record'].get('last_Updated_date') or '<missing>'}: "
+                + " versus ".join(_source_locator(doc) for doc in top)
+            )
+    return conflicts
 
 
 def canonicalize_documents(documents, stats=None):
@@ -1274,26 +1464,27 @@ def canonicalize_documents(documents, stats=None):
     if stats is None:
         stats = IngestionStats()
 
+    conflicts = find_duplicate_conflicts(documents)
+    if conflicts:
+        raise ValueError("; ".join(conflicts))
+
     selected = {}
-    hashes = {}
     for document in documents:
         record = document["record"]
-        record_id = _make_record_id(record)
-        content_hash = _content_hash(_business_record(record))
+        record_id = _business_key(record)
         previous = selected.get(record_id)
         if previous is None:
             selected[record_id] = document
-            hashes[record_id] = content_hash
             continue
 
         stats.duplicate_records += 1
-        if hashes[record_id] == content_hash:
-            continue
-        if _record_update_sort_key(record) >= _record_update_sort_key(
-            previous["record"]
+        current_updated = _record_update_sort_key(record)
+        previous_updated = _record_update_sort_key(previous["record"])
+        if current_updated > previous_updated or (
+            current_updated == previous_updated
+            and _source_locator(document) < _source_locator(previous)
         ):
             selected[record_id] = document
-            hashes[record_id] = content_hash
 
     return list(selected.values())
 
@@ -1666,6 +1857,7 @@ def sync_embeddings_to_chroma(chunks, stats=None, ledger=None, generation=None):
             item
             for item in record_items
             if existing_by_id[item["id"]].get("metadata_hash") != item["metadata_hash"]
+            and existing_by_id[item["id"]].get("content_hash") != item["content_hash"]
         ]
         if changed_metadata:
             stats.changed_records += 1
@@ -1980,7 +2172,7 @@ def sync_attendance_records_to_postgres(documents, stats=None, *, connection=Non
     if not ENABLE_POSTGRES:
         return stats
 
-    if not POSTGRES_DSN:
+    if connection is None and not POSTGRES_DSN:
         raise ValueError("ENABLE_POSTGRES is true but POSTGRES_DSN is empty.")
 
     psycopg = None
@@ -1992,29 +2184,7 @@ def sync_attendance_records_to_postgres(documents, stats=None, *, connection=Non
                 'PostgreSQL is enabled. Install psycopg with: uv add "psycopg[binary]"'
             ) from exc
 
-    rows_by_id = {}
-
-    # Reuse the same newest-version rule as Chroma duplicate handling.
-    for document in documents:
-        values = _postgres_attendance_values(document)
-        previous = rows_by_id.get(values["record_id"])
-
-        if previous is None:
-            rows_by_id[values["record_id"]] = (values, document)
-            continue
-
-        previous_values, previous_document = previous
-
-        if previous_values["content_hash"] == values["content_hash"]:
-            continue
-
-        previous_updated = _record_update_sort_key(previous_document["record"])
-        current_updated = _record_update_sort_key(document["record"])
-
-        if current_updated >= previous_updated:
-            rows_by_id[values["record_id"]] = (values, document)
-
-    rows = [values for values, _ in rows_by_id.values()]
+    rows = [_postgres_attendance_values(document) for document in canonicalize_documents(documents)]
     current_ids = [row["record_id"] for row in rows]
 
     connection_context = (
@@ -2230,8 +2400,6 @@ def sync_attendance_records_to_postgres(documents, stats=None, *, connection=Non
                 WHERE
                     {POSTGRES_ATTENDANCE_TABLE}.content_hash
                     IS DISTINCT FROM EXCLUDED.content_hash
-                    OR {POSTGRES_ATTENDANCE_TABLE}.raw_row_key
-                    IS DISTINCT FROM EXCLUDED.raw_row_key
             """
 
             for row in rows:
@@ -2492,6 +2660,113 @@ def _journal_documents(documents, ledger=None):
     return ledger, generation
 
 
+def preview_import():
+    """Inspect candidate sources and authoritative structured rows without writes."""
+    snapshot = convert_sources_to_jsonl(persist=False)
+    documents = list(snapshot.documents)
+    existing = _existing_postgres_rows() if ENABLE_POSTGRES else []
+    coverage_dates = sorted({doc["record"]["Date"] for doc in documents})
+    source_dates = defaultdict(set)
+    for document in documents:
+        source_dates[document["source"]].add(document["record"]["Date"])
+    sources = sorted({
+        summary["source_path"] for summary in snapshot.partition_summaries
+    })
+    source_coverage = {}
+    for source in sources:
+        dates = sorted(source_dates.get((KNOWLEDGE_BASE_PATH / source).as_posix(), ()))
+        source_coverage[source] = {
+            "min": dates[0] if dates else None,
+            "max": dates[-1] if dates else None,
+            "months": sorted({day[:7] for day in dates}),
+        }
+    report = {
+        "mode": "read_only_preview",
+        "source_files": sources,
+        "source_summary": [
+            {**summary, "date_coverage": source_coverage[summary["source_path"]]}
+            for summary in snapshot.partition_summaries
+        ],
+        "source_date_coverage": source_coverage,
+        "date_coverage": {
+            "min": coverage_dates[0] if coverage_dates else None,
+            "max": coverage_dates[-1] if coverage_dates else None,
+            "months": sorted({day[:7] for day in coverage_dates}),
+        },
+        "source_rows": len(documents),
+        "invalid_rows": snapshot.invalid_count,
+        "unsafe_reasons": list(snapshot.unsafe_reasons),
+        "duplicate_conflicts": [],
+        "comparison": (
+            "postgres_attendance_records"
+            if ENABLE_POSTGRES else "unavailable_postgres_disabled"
+        ),
+        "chroma_comparison": None,
+        "chroma_records": None,
+        "chroma_snapshot": None,
+        "chroma_counts": None,
+        "counts": None,
+    }
+    try:
+        chroma_rows, chroma_status, chroma_snapshot = _preview_chroma_rows()
+    except (OSError, RuntimeError, shutil.Error, sqlite3.DatabaseError) as exc:
+        report["chroma_comparison"] = "snapshot_error"
+        report["unsafe_reasons"].append(
+            f"Chroma snapshot could not be inspected: {type(exc).__name__}: {exc}"
+        )
+        return report
+    report["chroma_comparison"] = chroma_status
+    report["chroma_snapshot"] = chroma_snapshot
+    report["chroma_records"] = len({
+        (row["employee_id"], row["attendance_date"]) for row in chroma_rows
+    })
+    if not documents:
+        report["unsafe_reasons"].append(
+            "zero valid attendance records; ingestion refuses destructive sink synchronization"
+        )
+        return report
+    report["duplicate_conflicts"] = find_duplicate_conflicts(documents)
+    if report["duplicate_conflicts"]:
+        return report
+    canonical = canonicalize_documents(documents)
+    try:
+        apply_existing_record_ids(canonical, existing + chroma_rows)
+    except ValueError as exc:
+        report["unsafe_reasons"].append(str(exc))
+        return report
+    if snapshot.unsafe_reasons or snapshot.invalid_count:
+        return report
+    current = {_business_key(doc["record"]): doc for doc in canonical}
+    chroma_stored = {
+        (str(row["employee_id"]), str(row["attendance_date"])): row
+        for row in chroma_rows
+    }
+    report["chroma_counts"] = _preview_change_counts(current, chroma_stored)
+    if not ENABLE_POSTGRES:
+        return report
+    stored = {
+        (str(row["employee_id"]), str(row["attendance_date"])): row
+        for row in existing
+    }
+    report["counts"] = _preview_change_counts(current, stored)
+    return report
+
+
+def _preview_change_counts(current, stored):
+    return {
+        "new": len(current.keys() - stored.keys()),
+        "changed": sum(
+            _content_hash(_business_record(doc["record"])) != stored[key]["content_hash"]
+            for key, doc in current.items() if key in stored
+        ),
+        "unchanged": sum(
+            _content_hash(_business_record(doc["record"])) == stored[key]["content_hash"]
+            for key, doc in current.items() if key in stored
+        ),
+        "removed": len(stored.keys() - current.keys()),
+    }
+
+
 def _run_ingestion(ledger):
     started = perf_counter()
     stats = IngestionStats()
@@ -2541,6 +2816,7 @@ def _run_ingestion(ledger):
         )
 
     documents = canonicalize_documents(documents, stats)
+    apply_existing_record_ids(documents, _existing_postgres_rows() + _existing_chroma_rows())
     stats.jsonl_records = len(documents)
 
     stage_started = perf_counter()
@@ -2593,15 +2869,25 @@ def _run_ingestion(ledger):
     logger.info("Ingestion complete")
 
 
-def main():
+def main(argv=None):
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Attendance source ingestion")
+    parser.add_argument("--preview", action="store_true", help="Read-only import preview")
+    args = parser.parse_args(argv if argv is not None else [])
     logging.basicConfig(
         level=getattr(logging, settings.log_level, logging.INFO),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    if args.preview:
+        print(json.dumps(preview_import(), indent=2, ensure_ascii=False))
+        return
     ledger = IngestionLedger(settings.ingestion_state_path)
     with ledger.run_lock():
         return _run_ingestion(ledger)
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    main(sys.argv[1:])

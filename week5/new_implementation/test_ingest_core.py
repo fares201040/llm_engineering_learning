@@ -1,4 +1,7 @@
 import unittest
+from dataclasses import replace
+from pathlib import Path
+from unittest.mock import patch
 
 from pydantic import ValidationError
 
@@ -130,6 +133,103 @@ class NormalizationTests(unittest.TestCase):
 
 
 class ChunkingTests(unittest.TestCase):
+    def test_shift_and_schedule_edits_keep_logical_id(self):
+        original = {"Employee_ID": "E-1", "Date": "2026-09-03", "Shift": "Day", "Schedule_From_Time": "08:00:00"}
+        edited = {**original, "Shift": "Night", "Schedule_From_Time": "20:00:00"}
+        self.assertEqual(ingest._make_record_id(original), ingest._make_record_id(edited))
+
+    def test_conflicting_rows_within_one_source_are_rejected(self):
+        old = {"Employee_ID": "E-1", "Date": "2026-09-03", "Status": "Absent"}
+        new = {**old, "Status": "Present", "last_Updated_date": "2026-09-04T09:00:00"}
+        with self.assertRaisesRegex(ValueError, "same source.*E-1.*2026-09-03"):
+            ingest.canonicalize_documents([_document(old, 1), _document(new, 2)])
+
+    def test_equal_update_times_across_sources_are_explicit_conflict(self):
+        old = {"Employee_ID": "E-1", "Date": "2026-09-03", "Status": "Absent", "last_Updated_date": "2026-09-04T09:00:00"}
+        new = {**old, "Status": "Present"}
+        other = _document(new)
+        other["source"] = "other.xlsx"
+        with self.assertRaisesRegex(ValueError, "ambiguous.*E-1.*2026-09-03"):
+            ingest.canonicalize_documents([_document(old), other])
+
+    def test_missing_timestamp_cannot_resolve_conflicting_cross_source_rows(self):
+        first = _document({"Employee_ID": "E-1", "Date": "2026-09-03", "Status": "Absent"})
+        second = _document({"Employee_ID": "E-1", "Date": "2026-09-03", "Status": "Present", "last_Updated_date": "2026-09-04T09:00:00"})
+        second["source"] = "other.xlsx"
+        with self.assertRaisesRegex(ValueError, "missing.*last_Updated_date"):
+            ingest.canonicalize_documents([first, second])
+
+    def test_offset_timestamps_are_ordered_by_instant(self):
+        later_local_clock = _document({"Employee_ID": "E-1", "Date": "2026-09-03", "Status": "Old", "last_Updated_date": "2026-09-04T13:00:00+03:00"})
+        later_instant = _document({"Employee_ID": "E-1", "Date": "2026-09-03", "Status": "New", "last_Updated_date": "2026-09-04T11:00:00+00:00"})
+        later_instant["source"] = "other.xlsx"
+        self.assertEqual(ingest.canonicalize_documents([later_local_clock, later_instant])[0]["record"]["Status"], "New")
+
+    def test_equal_instants_with_different_offsets_are_conflict(self):
+        first = _document({"Employee_ID": "E-1", "Date": "2026-09-03", "Status": "Absent", "last_Updated_date": "2026-09-04T14:00:00+03:00"})
+        second = _document({"Employee_ID": "E-1", "Date": "2026-09-03", "Status": "Present", "last_Updated_date": "2026-09-04T11:00:00+00:00"})
+        second["source"] = "other.xlsx"
+        with self.assertRaisesRegex(ValueError, "ambiguous overlap"):
+            ingest.canonicalize_documents([first, second])
+
+    def test_preview_conflict_scan_reports_every_ambiguous_employee_day(self):
+        documents = []
+        for employee in ("E-1", "E-2"):
+            first = _document({"Employee_ID": employee, "Date": "2026-09-03", "Status": "Absent"})
+            second = _document({"Employee_ID": employee, "Date": "2026-09-03", "Status": "Present"})
+            second["source"] = "other.xlsx"
+            documents.extend((first, second))
+        conflicts = ingest.find_duplicate_conflicts(documents)
+        self.assertEqual(len(conflicts), 2)
+        self.assertIn("E-1", conflicts[0])
+        self.assertIn("E-2", conflicts[1])
+
+    def test_legacy_id_can_be_reused_for_same_employee_day(self):
+        record = {"Employee_ID": "E-1", "Date": "2026-09-03", "Shift": "Night"}
+        ingest.apply_existing_record_ids([_document(record)], [{"record_id": "attendance:legacy", "employee_id": "E-1", "attendance_date": "2026-09-03"}])
+        self.assertEqual(ingest._make_record_id(record), "attendance:legacy")
+
+    def test_legacy_id_survives_both_sink_rows_and_future_import(self):
+        old = {"Employee_ID": "E-1", "Date": "2026-09-03", "Shift": "Day"}
+        legacy = {"record_id": "attendance:legacy", "employee_id": "E-1", "attendance_date": "2026-09-03"}
+        ingest.apply_existing_record_ids([_document(old)], [legacy, legacy])
+        self.assertEqual(ingest._make_record_id(old), "attendance:legacy")
+        future = {**old, "Shift": "Night"}
+        ingest.apply_existing_record_ids([_document(future)], [legacy])
+        self.assertEqual(ingest._make_record_id(future), "attendance:legacy")
+
+    def test_divergent_sink_ids_for_one_employee_day_are_rejected(self):
+        rows = [
+            {"record_id": "postgres-id", "employee_id": "E-1", "attendance_date": "2026-09-03"},
+            {"record_id": "chroma-id", "employee_id": "E-1", "attendance_date": "2026-09-03"},
+        ]
+        with self.assertRaisesRegex(ValueError, "multiple IDs"):
+            ingest.apply_existing_record_ids([_document({"Employee_ID": "E-1", "Date": "2026-09-03"})], rows)
+
+    def test_chroma_only_legacy_metadata_resolves_record_id(self):
+        class Collection:
+            def get(self, include):
+                return {"ids": ["attendance:legacy"], "metadatas": [{
+                    "chunk_type": "attendance_record", "record_id": "attendance:legacy",
+                    "Employee_ID": "E-1", "Date": "2026-09-03",
+                }]}
+
+        class Client:
+            def list_collections(self):
+                return [type("CollectionName", (), {"name": ingest.COLLECTION_NAME})()]
+
+            def get_collection(self, _name):
+                return Collection()
+
+        with (
+            patch.object(ingest, "settings", replace(ingest.settings, chroma_db_path=Path.cwd())),
+            patch.object(ingest, "create_chroma_client", return_value=Client()),
+        ):
+            rows = ingest._existing_chroma_rows()
+        record = {"Employee_ID": "E-1", "Date": "2026-09-03", "Shift": "Night"}
+        ingest.apply_existing_record_ids([_document(record)], rows)
+        self.assertEqual(ingest._make_record_id(record), "attendance:legacy")
+
     def test_duplicate_logical_records_collapse_to_one_chunk(self):
         record = {
             "Employee_ID": "E-1",
@@ -196,7 +296,7 @@ class ChunkingTests(unittest.TestCase):
         stats = ingest.IngestionStats()
 
         canonical = ingest.canonicalize_documents(
-            [_document(old, 1), _document(new, 2)], stats
+            [_document(old, 1), {**_document(new, 2), "source": "newer.xlsx"}], stats
         )
         daily = ingest.create_record_chunks(canonical)
         periods = ingest.create_employee_period_chunks(canonical)

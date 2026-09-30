@@ -1,8 +1,11 @@
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
+from dataclasses import replace
+from hashlib import sha256
 import importlib.util
 import json
 from pathlib import Path
 import shutil
+import sqlite3
 import unittest
 from unittest.mock import patch
 import uuid
@@ -23,6 +26,122 @@ def workspace_temp_directory():
 
 
 class SourceIngestionModuleTests(unittest.TestCase):
+    def test_preview_detects_divergent_chroma_id_without_opening_live_client(self):
+        with workspace_temp_directory() as root:
+            folder = root / "attendance"
+            folder.mkdir()
+            (folder / "sample.csv").write_text(
+                "Employee ID,Name,Date\nE-1,Example,2026-09-03\n", encoding="utf-8"
+            )
+            chroma_path = root / "chroma"
+            chroma_path.mkdir()
+            database = chroma_path / "chroma.sqlite3"
+            with closing(sqlite3.connect(database)) as connection:
+                connection.executescript("""
+                    CREATE TABLE collections (id TEXT, name TEXT);
+                    CREATE TABLE segments (id TEXT, collection TEXT);
+                    CREATE TABLE embeddings (id INTEGER, segment_id TEXT, embedding_id TEXT);
+                    CREATE TABLE embedding_metadata (id INTEGER, key TEXT, string_value TEXT);
+                    INSERT INTO collections VALUES ('c1', 'test');
+                    INSERT INTO segments VALUES ('s1', 'c1');
+                    INSERT INTO embeddings VALUES (1, 's1', 'attendance:chroma-legacy');
+                    INSERT INTO embedding_metadata VALUES (1, 'record_id', 'attendance:chroma-legacy');
+                    INSERT INTO embedding_metadata VALUES (1, 'chunk_type', 'attendance_record');
+                    INSERT INTO embedding_metadata VALUES (1, 'Employee_ID', 'E-1');
+                    INSERT INTO embedding_metadata VALUES (1, 'Date', '2026-09-03');
+                """)
+                business_hash = sha256(
+                    b'{"Date":"2026-09-03","Employee_ID":"E-1","Name":"Example"}'
+                ).hexdigest()
+                connection.execute(
+                    "INSERT INTO embedding_metadata VALUES (1, 'content_hash', ?)",
+                    (business_hash,),
+                )
+                connection.commit()
+            before = sha256(database.read_bytes()).hexdigest()
+            existing_row = {
+                "record_id": "attendance:postgres-legacy", "employee_id": "E-1",
+                "attendance_date": "2026-09-03", "content_hash": business_hash,
+            }
+            with (
+                patch.object(ingest, "KNOWLEDGE_BASE_PATH", root),
+                patch.object(ingest, "SOURCE_MANIFEST_PATH", root / "missing.json"),
+                patch.object(ingest, "settings", replace(ingest.settings, chroma_db_path=chroma_path)),
+                patch.object(ingest, "COLLECTION_NAME", "test"),
+                patch.object(ingest, "ENABLE_POSTGRES", True),
+                patch.object(ingest, "_existing_postgres_rows", return_value=[existing_row]),
+                patch.object(ingest, "create_chroma_client", side_effect=AssertionError("live client opened")),
+            ):
+                preview = ingest.preview_import()
+                existing_row["record_id"] = "attendance:chroma-legacy"
+                safe_preview = ingest.preview_import()
+            self.assertEqual(before, sha256(database.read_bytes()).hexdigest())
+            self.assertIsNone(preview["counts"])
+            self.assertIn("multiple IDs", " ".join(preview["unsafe_reasons"]))
+            self.assertEqual(preview["chroma_comparison"], "snapshot_inspected")
+            self.assertEqual(safe_preview["counts"]["unchanged"], 1)
+            self.assertEqual(safe_preview["chroma_counts"]["unchanged"], 1)
+            self.assertGreater(safe_preview["chroma_snapshot"]["copied_bytes"], 0)
+
+    def test_preview_reads_sources_without_writing_derived_files(self):
+        with workspace_temp_directory() as root:
+            folder = root / "attendance"
+            folder.mkdir()
+            (folder / "september.csv").write_text(
+                "Employee ID,Name,Date,Shift\nE-1,Example,2026-09-03,Night\n",
+                encoding="utf-8",
+            )
+            output = root / "derived" / "attendance.jsonl"
+            invalid = root / "derived" / "attendance.invalid.jsonl"
+            manifest = root / "derived" / "attendance.sources.json"
+            existing_row = {
+                "record_id": "attendance:legacy", "employee_id": "E-1",
+                "attendance_date": "2026-09-03", "content_hash": "old-hash",
+            }
+            with (
+                patch.object(ingest, "KNOWLEDGE_BASE_PATH", root),
+                patch.object(ingest, "JSONL_OUTPUT_PATH", output),
+                patch.object(ingest, "INVALID_JSONL_PATH", invalid),
+                patch.object(ingest, "SOURCE_MANIFEST_PATH", manifest),
+                patch.object(ingest, "ENABLE_POSTGRES", True),
+                patch.object(ingest, "_existing_postgres_rows", return_value=[existing_row]),
+            ):
+                preview = ingest.preview_import()
+                existing_row["content_hash"] = sha256(
+                    b'{"Date":"2026-09-03","Employee_ID":"E-1","Name":"Example","Shift":"Night"}'
+                ).hexdigest()
+                unchanged_preview = ingest.preview_import()
+            self.assertFalse(output.exists())
+            self.assertFalse(invalid.exists())
+            self.assertFalse(manifest.exists())
+            self.assertEqual(preview["counts"]["changed"], 1)
+            self.assertEqual(preview["counts"]["new"], 0)
+            self.assertEqual(unchanged_preview["counts"]["unchanged"], 1)
+            self.assertEqual(unchanged_preview["counts"]["changed"], 0)
+            self.assertEqual(preview["date_coverage"]["min"], "2026-09-03")
+            self.assertEqual(
+                preview["source_date_coverage"]["attendance/september.csv"]["months"],
+                ["2026-09"],
+            )
+
+    def test_preview_refuses_removed_counts_when_no_valid_records(self):
+        with workspace_temp_directory() as root:
+            folder = root / "attendance"
+            folder.mkdir()
+            (folder / "empty.csv").write_text("Employee ID,Name,Date\n", encoding="utf-8")
+            with (
+                patch.object(ingest, "KNOWLEDGE_BASE_PATH", root),
+                patch.object(ingest, "SOURCE_MANIFEST_PATH", root / "missing.json"),
+                patch.object(ingest, "ENABLE_POSTGRES", True),
+                patch.object(ingest, "_existing_postgres_rows", return_value=[{
+                    "record_id": "legacy", "employee_id": "E-1",
+                    "attendance_date": "2026-09-03", "content_hash": "hash",
+                }]),
+            ):
+                preview = ingest.preview_import()
+        self.assertIsNone(preview["counts"])
+        self.assertIn("zero valid", " ".join(preview["unsafe_reasons"]))
+
     def test_source_ingestion_module_exists(self):
         spec = importlib.util.find_spec("week5.new_implementation.source_ingestion")
         self.assertIsNotNone(spec)

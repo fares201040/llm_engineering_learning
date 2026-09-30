@@ -161,7 +161,7 @@ class PostgresIngestionTests(unittest.TestCase):
         rendered = "\n".join(sql for sql, _params in executions)
         self.assertIn("ADD COLUMN IF NOT EXISTS raw_row_key TEXT", rendered)
         self.assertIn("raw_row_key = EXCLUDED.raw_row_key", rendered)
-        self.assertIn(
+        self.assertNotIn(
             "OR attendance_records.raw_row_key IS DISTINCT FROM EXCLUDED.raw_row_key",
             rendered,
         )
@@ -203,6 +203,36 @@ class _FakeChromaClient:
 
 
 class ChromaIngestionSafetyTests(unittest.TestCase):
+    def test_provenance_only_change_leaves_chroma_record_untouched(self):
+        item = {
+            "id": "attendance:e-1", "record_id": "attendance:e-1",
+            "content_hash": "business-hash", "embedding_input_hash": "text-hash",
+            "metadata_hash": "new-provenance-hash", "metadata": {"source": "new.xlsx"},
+        }
+
+        class Collection:
+            def get(self, include):
+                return {"ids": ["attendance:e-1"], "metadatas": [{
+                    "record_id": "attendance:e-1", "content_hash": "business-hash",
+                    "embedding_input_hash": "text-hash", "metadata_hash": "old-provenance-hash",
+                }]}
+
+            def update(self, **_kwargs):
+                raise AssertionError("unchanged business record was updated")
+
+            def delete(self, **_kwargs):
+                raise AssertionError("unchanged business record was deleted")
+
+        with (
+            patch.object(ingest, "_prepare_embedding_items", return_value=[item]),
+            patch.object(ingest, "create_chroma_client", return_value=_FakeChromaClient(Collection())),
+            patch.object(ingest, "_embed_items") as embed,
+        ):
+            stats = ingest.sync_embeddings_to_chroma([])
+        embed.assert_not_called()
+        self.assertEqual(stats.unchanged_records, 1)
+        self.assertEqual(stats.metadata_updates, 0)
+
     def test_embedding_batch_uses_selected_model(self):
         stats = ingest.IngestionStats()
         items = [
@@ -222,12 +252,12 @@ class ChromaIngestionSafetyTests(unittest.TestCase):
         item = {
             "id": "attendance:e-1",
             "record_id": "attendance:e-1",
-            "content_hash": "same-content",
+            "content_hash": "new-content",
             "chunk_type": "attendance_record",
             "text": "same text",
             "metadata": {
                 "record_id": "attendance:e-1",
-                "content_hash": "same-content",
+                "content_hash": "new-content",
                 "embedding_input_hash": "same-embedding",
                 "metadata_hash": "new-metadata",
                 "domain": "attendance",
@@ -247,7 +277,7 @@ class ChromaIngestionSafetyTests(unittest.TestCase):
                     "metadatas": [
                         {
                             "record_id": "attendance:e-1",
-                            "content_hash": "same-content",
+                            "content_hash": "old-content",
                             "embedding_input_hash": "same-embedding",
                             "metadata_hash": "old-metadata",
                         }

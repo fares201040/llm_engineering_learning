@@ -52,6 +52,60 @@ powershell -ExecutionPolicy Bypass -File .\week5\new_implementation\setup_postgr
 
 ## Run ingestion
 
+Place each January through December attendance export under
+`week5/new-knowledge-base/attendance/` (XLSX or CSV), or set
+`KNOWLEDGE_BASE_PATH` to your source root. Keep the `Employee_ID`, `Name`, and
+`Date` columns. One employee/day may appear in several monthly files only when
+the rows are identical or different `last_Updated_date` values establish a
+newest version. Conflicting rows within one file, and cross-file conflicts with
+equal or missing update timestamps, stop the import and identify both source
+locations. The newest timestamp wins when it is distinct. Resolve reported
+conflicts in the source files before importing. Offset-aware timestamps are
+compared as instants; timestamps without an offset are interpreted as UTC for
+comparison.
+
+Preview the candidate sources first:
+
+```powershell
+uv run python -m week5.new_implementation.ingest --preview
+```
+
+Preview parses source files in memory and performs a read-only comparison with
+`attendance_records` when PostgreSQL is enabled. It copies the Chroma directory
+to a temporary location and reads the copy's metadata with SQLite; it never
+opens a client on the live Chroma directory. The temporary copy is removed
+after preview. Allow temporary disk space at least as large as the Chroma
+directory (currently about 260 MB). `chroma_snapshot` reports copied bytes
+and copy time. Run preview while no ingestion is writing either sink.
+
+The report includes source files, partitions, overall and per-source date
+range/months, invalid rows, unsafe source changes, duplicate conflicts, and
+new/changed/unchanged/removed counts. `counts` compares PostgreSQL;
+`chroma_counts` compares Chroma. A null count means that comparison is
+unavailable or the candidate is unsafe. `chroma_comparison` says whether the
+copied collection was inspected, absent, or unreadable. Divergent IDs for one
+employee/day across the sinks make preview unsafe and leave counts null. Preview
+does not write the JSONL projection, manifest, SQLite ledger, PostgreSQL, or
+live Chroma. Check that the expected January–December months appear, review
+the counts and conflicts, and then run the import command below.
+
+Identity is `Employee_ID` plus normalized attendance `Date`. Shift and schedule
+changes therefore update that logical row. Existing PostgreSQL and Chroma record
+IDs are retained by employee/day during migration; unchanged September rows
+should appear unchanged in the PostgreSQL preview. If the sinks contain
+different IDs for one employee/day, ingestion stops rather than deleting one
+or re-embedding the row silently. Chroma-only migration requires its existing
+attendance metadata to contain `Employee_ID` and `Date`; rows lacking those
+fields cannot be matched and will be rebuilt. A newly added employee/day
+receives the new ID format. Back up the databases and ledger before the first
+production import.
+
+An unchanged business row keeps its existing PostgreSQL row and Chroma vector,
+even if the winning source file or row location changes. Its previous typed
+provenance remains in those sinks; the append-only raw-source table still keeps
+the new source row. Preview's `unchanged` count follows this business-content
+rule.
+
 Install Python dependencies and run the offline pipeline as a module:
 
 ```powershell

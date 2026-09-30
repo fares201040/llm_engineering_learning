@@ -1,10 +1,10 @@
 # Attendance planner handoff
 
-Updated: 2026-09-29
+Updated: 2026-09-30
 
 Branch: `main`
 
-Conversation logic baseline: `e5e9dadc3b0ed0fd3cfc6b9370ce7df8840461db`
+Baseline before this continuation: `25478e1f`
 
 ## Current runtime
 
@@ -18,7 +18,7 @@ answer against executed rows. Review can request a bounded requery. Only the rev
 answer and verified state are published.
 
 The Gradio chatbot renders Markdown with HTML sanitization. It shows the user's
-question immediately, shows a short `Thinking ...` assistant message while the
+question immediately, shows a short `Generating Answer...` assistant message while the
 answer is prepared, and progressively replaces it with the **reviewed final answer**
 in cumulative chunks. This display pacing happens after review, not during model
 generation. Clear and Submit
@@ -52,7 +52,7 @@ review. They do not encode a test employee, an answer value, or a special respon
 for one request phrase. The governing instructions are in
 `week5/new_implementation/AGENTS.md`.
 
-## Verification on the conversation logic baseline
+## Historical verification on the earlier conversation logic commit
 
 - `.venv\Scripts\python.exe -m unittest discover -s week5/new_implementation -p 'test_*.py'`:
   **254 tests, OK**.
@@ -76,13 +76,68 @@ The exact checked prompts retained from this work are in
 The local launch, browser conversation, UI checks, and SQL/row review procedure
 are in the [browser test guide](../../../week5/new_implementation/BROWSER_TEST_GUIDE.md).
 
+## September 30 continuation
+
+The browser replay report records the prior L01–L42 and M01–M03 checks. This
+continuation used fresh Gradio browser chats and the same 3,964-row database
+snapshot dated September 1–7, 2026. The exact new prompts and observations are
+in the [manual conversation reference](2026-09-29-attendance-manual-conversation-reference.md)
+under N01–N07. Independent read-only aggregates checked the reported counts and
+worked-hour totals. Same-turn SQL was captured for the final two-part repair.
+
+- N01–N03 passed as browser answers: a two-date Draft/Authorized comparison,
+  a Pending-only follow-up that retained the dates, and independent country-person
+  and Engineering-location reports. Tables and bullets rendered as HTML table
+  rows and list items in the Gradio chat.
+- N04 showed a real presentation error: an Engineering hours ranking inferred
+  that the leading location was more active or staffed. The answer and review
+  prompts now tell the models to state observed totals and shares without
+  attributing them to unmeasured staffing or activity. A neighboring fresh-chat
+  ranking (N05) returned the supported ranking and share without that inference.
+  The exact N04 conversation was not rerun after the change.
+- The initial N07 two-part follow-up safe-failed after four SQL attempts. The
+  runtime date parser had recognized only September 5 in “Sep 2 versus Sep 5,
+  2026,” so its structural date check rejected an otherwise independent query.
+  It now recognizes both dates and leaves the different branch scopes to the
+  planner and reviewer. On the browser rerun, SQL used separate CTEs: September
+  2 and 5 all-department worked hours, and all-date Draft counts by country.
+  Both rendered tables matched independent aggregates.
+- The initial in-chat progress text is now `Generating Answer...`. A fresh
+  browser turn showed it before the reviewed answer. The Gradio Chatbot still
+  renders Markdown with HTML sanitization; no fixed answer template was added.
+
+These changes retain model discretion. The parser fix removes a false rejection;
+it does not choose SQL or compute the answer. The prompt addition gives the
+answerer and reviewer a general evidence boundary for analytical prose.
+
+### Remaining issues and evidence gaps
+
+1. L14 remains ambiguous between a shift label and a calendar date. The user
+   clarified it in L15, but the first shorthand question has no single proven
+   intended interpretation.
+2. L04 returned correct totals with an unrequested detailed split. L22's
+   “shifts n day counts” did not produce per-shift day counts without L23's
+   clarification. L23's counts were correct, but its prose called an OFF day a
+   worked day. These scope and wording cases have not been rerun in this
+   continuation.
+3. L37's numeric result matched the database, but the prose used “present” for
+   people across all attendance statuses. That wording has not been rerun.
+4. The exact H01–H04 conversation cannot be faithfully replayed because its
+   preceding employee question was not retained. L25 and L28 interruption
+   timing also remains unverified for those exact turns. A separate Clear while
+   pending was previously observed to keep old work from repopulating the chat.
+5. Only the final N07 repair has same-turn SQL in this continuation. N01–N05
+   match independent aggregates and visible browser rows, but their exact SQL
+   scope remains unverified. LLM outputs can vary across runs; single passing
+   replays do not establish deterministic acceptance.
+6. The Colab notebook gate and private evaluation have not been rerun for this
+   source. The earlier verification numbers above remain historical.
+
 ## Next work
 
-1. Restart Gradio from the current checkout and run a fresh **many-turn sequence of
-   short, informal messages in the actual UI**. Check rendered answers, SQL and rows
-   when a number or scope is in doubt, follow-up state, correction, Clear/Submit,
-   Markdown, and visible progressive display. Record each new verified prompt in the
-   manual conversation reference. The user requested this in a new clean chat.
+1. Revisit the L22/L23 and L37 wording cases with same-turn SQL and row traces.
+   Use new nearby requests to test whether aggregation and analytical labels
+   generalize, without adding phrase-specific runtime rules.
 2. Revisit the older synthetic long scenario. The September 28 run observed a
    wrong turn-4 date restriction and record/day wording, then an interrupted turn 5.
    These are historical observations; this commit has not rerun that Colab scenario.

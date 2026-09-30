@@ -72,14 +72,14 @@ For an agent using the Codex browser tool:
    each clause independently so a filter from one branch does not leak to another.
 4. Use **Clear** when a question must start with no conversation history. Confirm
    the chat and Retrieved Context become empty, then send the new question.
-   Run an occasional Clear while `Thinking ...` is visible, immediately submit a
+   Run an occasional Clear while `Generating Answer...` is visible, immediately submit a
    new question, and check that the old answer never returns.
 5. Choose fresh cases by comparing with the manual reference first. A useful new
    case changes the intent or scope, not just a name or date in an old question.
    Avoid saving private employee details in the reference document.
 
 After Return, the user message should appear promptly with an assistant
-`Thinking ...` message. The pipeline completes SQL execution, drafting, and answer
+`Generating Answer...` message. The pipeline completes SQL execution, drafting, and answer
 review before it reveals the reviewed reply in cumulative Markdown chunks. This is
 **progressive display after review**, not live provider-token streaming. A short
 answer can appear in one update; use a longer list or table to check progressive
@@ -120,7 +120,7 @@ matching one phrase or hardcoding an expected number.
 
 ## 5. Check the browser display and state
 
-- **Progress:** confirm `Thinking ...` appears in the chat, then is replaced by
+- **Progress:** confirm `Generating Answer...` appears in the chat, then is replaced by
   the reviewed answer. For a long reply, observe at least two different answer
   states before the final state. The reply should grow cumulatively without a
   duplicate assistant message.
@@ -130,7 +130,7 @@ matching one phrase or hardcoding an expected number.
   display failure. Check that HTML remains sanitized.
 - **Conversation state:** check a follow-up retains only justified subject and
   filters. A broad new request should not inherit an old employee or date.
-- **Clear:** test once while idle and once during `Thinking ...`. The old chat and
+- **Clear:** test once while idle and once during `Generating Answer...`. The old chat and
   context should disappear, and an old pending reply must not repopulate the page.
   The next submit should use a fresh conversation.
 - **Errors:** if a safe failure or obviously wrong count appears, capture the

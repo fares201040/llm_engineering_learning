@@ -244,6 +244,25 @@ class PipelineTests(unittest.TestCase):
             )
         )
 
+    def test_shared_year_day_comparison_has_no_single_global_date_scope(self):
+        question = (
+            "Compare all-department hours on Sep 2 versus Sep 5, 2026; "
+            "separately count Draft records across all dates."
+        )
+        self.assertEqual(
+            pipeline._explicit_date_scopes(question),
+            {("2026-09-02", "2026-09-02"), ("2026-09-05", "2026-09-05")},
+        )
+        self.assertIsNone(
+            pipeline._required_date_scope(
+                question,
+                request_relationship="follow_up",
+                subject_relationship="all_authorized",
+                previous_scope=None,
+                rewritten_request=question,
+            )
+        )
+
     def test_compound_union_does_not_inherit_one_global_period(self):
         prior = ("2026-09-01", "2026-09-07")
         self.assertIsNone(

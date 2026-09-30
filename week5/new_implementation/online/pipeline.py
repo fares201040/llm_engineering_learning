@@ -949,6 +949,29 @@ def _explicit_date_scopes(question: str) -> set[tuple[str, str]]:
             )
         except ValueError:
             return set()
+    # A comparison can give the year once after several month/day values.
+    # Keep each requested day separate instead of enforcing the last one as
+    # a global date bound on every independent query branch.
+    shared_year_day = rf"(?:{month_pattern})\s+\d{{1,2}}(?:st|nd|rd|th)?"
+    for match in re.finditer(
+        rf"\b(?:{shared_year_day})(?:\s*(?:,|&|or|vs\.?|versus)\s*"
+        rf"(?:{shared_year_day}))+\s*,?\s*(?P<y>\d{{4}})\b",
+        question,
+        re.IGNORECASE,
+    ):
+        if any(a <= match.start() and match.end() <= b for (a, b), _ in found):
+            continue
+        year = int(match["y"])
+        for day_match in re.finditer(
+            rf"\b(?P<m>{month_pattern})\s+(?P<d>\d{{1,2}})(?:st|nd|rd|th)?\b",
+            match.group()[: match.start("y") - match.start()],
+            re.IGNORECASE,
+        ):
+            try:
+                day = date(year, months[day_match["m"].casefold()], int(day_match["d"]))
+            except ValueError:
+                return set()
+            add(match, day, day)
     for match in re.finditer(
         r"\b(?P<operator>before|after|on\s+or\s+before|on\s+or\s+after)\s+"
         r"(?P<day>\d{4}-\d{1,2}-\d{1,2})\b",

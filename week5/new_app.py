@@ -303,7 +303,7 @@ def chat_with_state_stream(
     arabic = any("\u0600" <= char <= "\u06ff" for char in last_message)
     if gate.current() != generation:
         return
-    display = history + [{"role": "assistant", "content": "Thinking ..."}]
+    display = history + [{"role": "assistant", "content": "Generating Answer..."}]
     yield list(display), format_context([]), current_state
     try:
         reply, context, updated_state = answer_question_with_state(

@@ -290,7 +290,8 @@ class SessionStateTests(unittest.TestCase):
         self.assertTrue(updates[0]["clear_input"])
         self.assertEqual(updates[0]["submitted_message"], "question")
         self.assertEqual(
-            updates[0]["history"][-1], {"role": "assistant", "content": "Thinking ..."}
+            updates[0]["history"][-1],
+            {"role": "assistant", "content": "Generating Answer..."},
         )
         self.assertTrue(all("status" not in item for item in updates))
         self.assertTrue(all(not item["clear_input"] for item in updates[1:]))
@@ -313,7 +314,7 @@ class SessionStateTests(unittest.TestCase):
             old = new_app.chat_with_state_stream(
                 [{"role": "user", "content": "old question"}], state, gate, 1
             )
-            self.assertEqual(next(old)[0][-1]["content"], "Thinking ...")
+            self.assertEqual(next(old)[0][-1]["content"], "Generating Answer...")
             thread = Thread(target=lambda: old_outputs.extend(old))
             thread.start()
             self.assertTrue(old_started.wait(timeout=5))
@@ -356,10 +357,10 @@ class SessionStateTests(unittest.TestCase):
             original_history, [{"role": "user", "content": "Summarize attendance"}]
         )
         self.assertEqual(
-            progress[0][-1], {"role": "assistant", "content": "Thinking ..."}
+            progress[0][-1], {"role": "assistant", "content": "Generating Answer..."}
         )
         self.assertTrue(
-            all(item[0][-1]["content"] != "Thinking ..." for item in snapshots)
+            all(item[0][-1]["content"] != "Generating Answer..." for item in snapshots)
         )
         self.assertGreater(len(snapshots), 1)
         self.assertGreaterEqual(new_app._REVEAL_INTERVAL_SECONDS, 0.12)
@@ -463,7 +464,7 @@ class SessionStateTests(unittest.TestCase):
             )
 
         log_error.assert_called_once_with("APDC attendance answer failed safely")
-        self.assertEqual(snapshots[0][0][-1]["content"], "Thinking ...")
+        self.assertEqual(snapshots[0][0][-1]["content"], "Generating Answer...")
         self.assertIn("try again", snapshots[-1][0][-1]["content"].lower())
         self.assertNotIn("password", snapshots[-1][0][-1]["content"])
         self.assertIs(snapshots[-1][2], state)

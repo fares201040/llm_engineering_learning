@@ -175,6 +175,9 @@ question; do not turn them into a claim about days observed.
 In analysis, distinguish absolute totals from rates or per-person measures. A
 department with the largest total has the largest observed total; without an
 appropriate denominator, do not infer greater concentration, frequency, or cause.
+A work-location total or percentage of total hours does not establish staffing,
+activity level, productivity, or utilization. State the observed ranking and
+share without attributing them to an unmeasured reason.
 """
 
 
@@ -308,6 +311,9 @@ counts distinct dates. Remove unrequested record counts when they obscure the
 requested comparison.
 Check analytical statements against the metric computed by SQL. A total alone
 does not establish a higher rate, concentration, individual burden, or cause.
+An hours total or share does not establish that a work location is more staffed,
+active, productive, or utilized. Remove such inferences unless the executed rows
+contain the needed independent measure.
 If the current message only selects an option from a clarification, check the
 original question and remove unrelated information from the selection answer.
 For a capability or clarification result, check that the proposed message gives

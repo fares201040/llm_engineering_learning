@@ -145,6 +145,32 @@ across September 1–7, 2026, but its exact wording was not retained. Other
 follow-ups requested shift, weekday, and exception counts; their exact prompts
 were not retained. They are intentionally not presented as verbatim test cases.
 
+## New browser questions, September 30 continuation
+
+N01–N04 were sent consecutively in one Gradio chat before the final guidance
+changes. N05 started a fresh chat after those changes. N06–N07 were consecutive
+in another fresh chat after the date parser repair. The database still held
+3,964 attendance records dated September 1–7, 2026. The source baseline was
+`25478e1f`; subsequent fixes in this continuation changed the code under test.
+Only N06–N07 have same-turn executed SQL captured in this continuation. For the
+other entries, numeric checks use independent read-only aggregates, but exact
+browser-turn SQL scope is **unverified**.
+
+| ID | Exact user question and preceding turn | Browser observation and evidence | Status |
+| --- | --- | --- | --- |
+| N01 | New chat: `For Sep 2 and Sep 5, 2026, show Draft and Authorized record counts for each day in a Markdown table. Which day has more Draft records?` | Real HTML table: Sep 2 Draft 234, Authorized 74; Sep 5 Draft 188, Authorized 138. Sep 2 has more Draft records. All four cells matched read-only aggregates. | Pass for answer and Markdown; SQL scope unverified. |
+| N02 | After N01: `Same two dates, but Pending For Authorization only. Give each daily count and the combined total in bullets.` | Real list items: Sep 2 257, Sep 5 242; combined 499. The prior Draft/Authorized categories were replaced. Counts matched aggregates. | Pass for answer and Markdown; SQL scope unverified. |
+| N03 | After N02: `Across all available dates, count distinct people by country. Separately, sum worked hours by work location for Engineering only. Present both as Markdown tables, then say which Engineering location has the most hours.` | Two real tables. Distinct people: Burundi 1, Uganda 1, Yemen 566. Engineering location hours matched all ten aggregate groups; Shift-Eng led at 868.61 hours. The all-country branch was not narrowed to Engineering in the visible result. | Pass for answer and Markdown; SQL scope unverified. |
+| N04 | After N03: `For Engineering only, keep all dates and show the top 3 work locations by worked hours. Add each location’s share of all Engineering worked hours, and one brief takeaway. Do not repeat the country counts.` | The table values and percentages matched the 3,608.21-hour department denominator: Shift-Eng 868.61/24.07%, RTG-Eng 763.51/21.16%, QC-Eng 555.19/15.39%. The takeaway added “most active or staffed,” which the hour totals cannot establish. | Fail for unsupported inference; exact follow-up not rerun after guidance. |
+| N05 | New chat after guidance: `For Engineering across all available dates, rank the top 3 work locations by worked hours. Include each share of the Engineering total and a brief takeaway in a Markdown table.` | Real table gave the same top three amounts and shares. Takeaway stated that they collectively account for over 60% of observed Engineering hours; it made no staffing or activity claim. `Generating Answer...` appeared first. | Pass for neighboring answer and Markdown; SQL scope unverified. |
+| N06 | New chat after date parser repair: `For Engineering, what are the total worked hours across all available dates?` | 3,608.21 hours. Same-turn SQL used `SUM(total_worked_hrs)` with only `department = 'Engineering'`, matching the aggregate. | Pass. |
+| N07 | After N06: `Ignore Engineering now. Compare total worked hours for all departments on Sep 2 versus Sep 5, 2026, and say which day is higher. Separately, across all dates, count Draft records by country. Use two Markdown tables.` | Initial browser attempt safe-failed with `date_scope_mismatch` after four SQL attempts. After the shared-year date parser repair, same-turn SQL used independent CTEs: all-department hours on the two dates, and all-date Draft record counts by country. The rendered tables showed 2,386.87 hours on Sep 2 and 2,219.30 on Sep 5; Draft counts Burundi 1 and Yemen 1,668. Independent aggregates matched. | Fail before repair; pass after repair. |
+
+These cases exercise follow-up scope, analysis, two-part requests, and browser
+Markdown rendering. They do not establish a deterministic success rate across
+model runs. The later source changes gave the models general evidence guidance
+and removed a false date-scope rejection; they did not encode these answer values.
+
 ## Add a new manual case
 
 Record the exact prompt and preceding turns, code commit, data snapshot or

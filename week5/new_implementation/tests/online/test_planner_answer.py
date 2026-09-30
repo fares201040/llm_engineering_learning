@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import pytest
 
-from week5.new_implementation.online.context import SharedModelContext
+from week5.new_implementation.online.context import DatabaseColumn, SharedModelContext
 from week5.new_implementation.online.execution import (
     ExecutionCoverage,
     ResultColumn,
@@ -15,11 +15,26 @@ from week5.new_implementation.online.planner import (
     ReplanRequest,
     ReviewedAnswer,
     answer_result,
+    _reconciliation_group,
+    build_count_reconciliation_sql,
+    request_sql,
 )
 from week5.new_implementation.online.provider import CallBudget
 from week5.new_implementation.online.provider import ProviderFailure
 from week5.new_implementation.online.reference import Employee
 from week5.new_implementation.tests.online.test_query import database_context
+
+
+def _count_database_context():
+    context = database_context()
+    table = context.tables[0]
+    status = DatabaseColumn(
+        name="status", data_type="text", nullable=True,
+        description="Workflow approval status.",
+    )
+    return context.model_copy(update={
+        "tables": (table.model_copy(update={"columns": table.columns + (status,)}),)
+    })
 
 
 @patch("week5.new_implementation.online.planner.call_structured")
@@ -225,3 +240,310 @@ def test_comparison_report_requests_a_supported_markdown_table(call):
     assert all(
         "Markdown table" in item.kwargs["system"] for item in call.call_args_list
     )
+
+
+@patch("week5.new_implementation.online.planner.call_structured")
+def test_count_explanation_requeries_when_intermediate_counts_are_missing(call):
+    shared = SharedModelContext(
+        current_question="Explain why all records exceed people with positive hours by status.",
+        updated_request="Explain the count difference by status.",
+        count_reconciliation=True,
+        database_context=_count_database_context(),
+    )
+    result = SqlExecutionResult(
+        columns=(
+            ResultColumn(name="status"),
+            ResultColumn(name="all_record_count"),
+            ResultColumn(name="qualifying_people_count"),
+        ),
+        rows=(
+            {"status": "Draft", "all_record_count": 6, "qualifying_people_count": 2},
+        ),
+        coverage=ExecutionCoverage(fetched_rows=1, result_limit=100, response_bytes=80),
+    )
+
+    decision = answer_result(
+        shared_context=shared,
+        sql=(
+            "SELECT status, COUNT(*) AS all_record_count, "
+            "COUNT(DISTINCT employee_id) FILTER (WHERE total_worked_hrs > 0) "
+            "AS qualifying_people_count FROM attendance_records GROUP BY status"
+        ),
+        result=result,
+        employees=(),
+        locale="en",
+        model="openai/gpt-5-nano",
+        budget=CallBudget(),
+        timeout=30,
+        max_output_tokens=3000,
+    )
+
+    assert isinstance(decision, ReplanRequest)
+    assert "qualifying_record_count" in decision.reason
+    call.assert_not_called()
+
+
+@patch("week5.new_implementation.online.planner.call_structured")
+def test_count_explanation_does_not_publish_free_text_review(call):
+    call.return_value = ReviewedAnswer(
+        answer="The difference comes from duplicate attendance records."
+    )
+    shared = SharedModelContext(
+        current_question="Compare attending people and all records by status, then explain the difference in two tables.",
+        updated_request="Compare the two measures by status and explain the gap.",
+        count_reconciliation=True,
+        database_context=_count_database_context(),
+    )
+    result = SqlExecutionResult(
+        columns=tuple(
+            ResultColumn(name=name)
+            for name in (
+                "status",
+                "all_record_count",
+                "all_people_count",
+                "qualifying_record_count",
+                "qualifying_people_count",
+            )
+        ),
+        rows=(
+            {
+                "status": "Authorized",
+                "all_record_count": 78,
+                "all_people_count": 78,
+                "qualifying_record_count": 5,
+                "qualifying_people_count": 5,
+            },
+            {
+                "status": "Draft",
+                "all_record_count": 280,
+                "all_people_count": 280,
+                "qualifying_record_count": 119,
+                "qualifying_people_count": 119,
+            },
+        ),
+        coverage=ExecutionCoverage(fetched_rows=2, result_limit=100, response_bytes=160),
+    )
+    sql = (
+        "SELECT status, COUNT(*) AS all_record_count, "
+        "COUNT(DISTINCT employee_id) AS all_people_count, "
+        "COUNT(*) FILTER (WHERE total_worked_hrs > 0) AS qualifying_record_count, "
+        "COUNT(DISTINCT employee_id) FILTER (WHERE total_worked_hrs > 0) "
+        "AS qualifying_people_count FROM attendance_records GROUP BY status"
+    )
+
+    answer = answer_result(
+        shared_context=shared,
+        sql=sql,
+        result=result,
+        employees=(),
+        locale="en",
+        model="openai/gpt-5-nano",
+        budget=CallBudget(),
+        timeout=30,
+        max_output_tokens=3000,
+    )
+
+    assert isinstance(answer, str)
+    assert answer.count("| Status |") == 2
+    assert "73" in answer and "161" in answer
+    assert "repeated positive-hour" not in answer.lower()
+    assert [item.kwargs["stage"] for item in call.call_args_list] == [
+        "sql_answer_review"
+    ]
+
+
+def test_count_reconciliation_accepts_equivalent_positive_hour_sql():
+    shared = SharedModelContext(
+        current_question="Explain the count difference.",
+        updated_request="Explain the count difference.",
+        count_reconciliation=True,
+        database_context=_count_database_context(),
+    )
+    sql = (
+        "SELECT COALESCE(status, '') AS status, "
+        "COUNT(*) AS all_record_count, "
+        "COUNT(DISTINCT employee_id) AS all_people_count, "
+        "COUNT(*) FILTER (WHERE COALESCE(total_worked_hrs, 0) > 0) "
+        "AS qualifying_record_count, "
+        "COUNT(DISTINCT CASE WHEN COALESCE(total_worked_hrs, 0) > 0 "
+        "THEN employee_id END) AS qualifying_people_count "
+        "FROM attendance_records GROUP BY status"
+    )
+    assert _reconciliation_group(shared, sql) == "status"
+
+
+def test_count_reconciliation_builds_measured_sql_from_matching_source_scopes():
+    shared = SharedModelContext(
+        current_question="Explain the count difference.",
+        updated_request="Explain the count difference.",
+        count_reconciliation=True,
+        database_context=_count_database_context(),
+    )
+    proposed = (
+        "WITH attendees AS (SELECT status, COUNT(DISTINCT employee_id) AS people "
+        "FROM attendance_records WHERE attendance_date = DATE '2026-09-06' "
+        "AND COALESCE(total_worked_hrs, 0) > 0 GROUP BY status), "
+        "records AS (SELECT status, COUNT(*) AS records FROM attendance_records "
+        "WHERE attendance_date = DATE '2026-09-06' GROUP BY status) "
+        "SELECT status, people AS value FROM attendees UNION ALL "
+        "SELECT status, records AS value FROM records"
+    )
+    sql = build_count_reconciliation_sql(shared, proposed)
+    assert isinstance(sql, str)
+    assert "all_record_count" in sql
+    assert "qualifying_record_count" in sql
+    assert "2026-09-06" in sql
+    assert _reconciliation_group(shared, sql) == "status"
+
+
+def test_count_reconciliation_rejects_mismatched_source_scopes():
+    shared = SharedModelContext(
+        current_question="Explain the count difference.",
+        updated_request="Explain the count difference.",
+        count_reconciliation=True,
+        database_context=_count_database_context(),
+    )
+    proposed = (
+        "WITH attendees AS (SELECT status, COUNT(DISTINCT employee_id) AS people "
+        "FROM attendance_records WHERE attendance_date = DATE '2026-09-06' "
+        "AND total_worked_hrs > 0 GROUP BY status), "
+        "records AS (SELECT status, COUNT(*) AS records FROM attendance_records "
+        "WHERE attendance_date = DATE '2026-09-06' AND status = 'Draft' GROUP BY status) "
+        "SELECT status, people AS value FROM attendees UNION ALL "
+        "SELECT status, records AS value FROM records"
+    )
+    assert build_count_reconciliation_sql(shared, proposed) is None
+
+
+@patch("week5.new_implementation.online.planner.call_structured")
+def test_reviewer_receives_the_planners_retry_evidence(call):
+    call.side_effect = [
+        PlannerAnswer(answer="Five people attended."),
+        ReviewedAnswer(answer="Five people attended."),
+    ]
+    shared = SharedModelContext(
+        current_question="How many people attended?",
+        updated_request="Count attending people.",
+        database_context=database_context(),
+    )
+    result = SqlExecutionResult(
+        columns=(ResultColumn(name="people"),),
+        rows=({"people": 5},),
+        coverage=ExecutionCoverage(fetched_rows=1, result_limit=100, response_bytes=25),
+    )
+    feedback = {"error_type": "answer_review_requery", "database_error": "Missing scope"}
+    answer_result(
+        shared_context=shared,
+        sql="SELECT COUNT(DISTINCT employee_id) AS people FROM attendance_records",
+        result=result,
+        employees=(),
+        locale="en",
+        model="openai/gpt-5-nano",
+        budget=CallBudget(),
+        timeout=30,
+        max_output_tokens=3000,
+        sql_execution_failure=feedback,
+    )
+    assert all(
+        item.kwargs["payload"]["sql_execution_failure"] == feedback
+        for item in call.call_args_list
+    )
+
+
+@patch("week5.new_implementation.online.planner.call_structured")
+@patch("week5.new_implementation.online.planner.call_text")
+def test_reviewer_receives_every_planner_input(call_text, call_structured):
+    call_text.return_value = "SELECT COUNT(*) AS records FROM attendance_records"
+    call_structured.side_effect = [
+        PlannerAnswer(answer="Five records."),
+        ReviewedAnswer(answer="Five records."),
+    ]
+    shared = SharedModelContext(
+        current_question="How many records?",
+        updated_request="Count records.",
+        conversation_history=({"role": "user", "content": "Earlier question"},),
+        trusted_context={"verified_turns": []},
+        database_context=database_context(),
+    )
+    feedback = {"error_type": "retry", "database_error": "Use the same scope"}
+    sql = request_sql(
+        shared_context=shared, model="openai/gpt-5-nano", budget=CallBudget(),
+        timeout=30, max_output_tokens=3000, sql_execution_failure=feedback,
+    )
+    result = SqlExecutionResult(
+        columns=(ResultColumn(name="records"),), rows=({"records": 5},),
+        coverage=ExecutionCoverage(fetched_rows=1, result_limit=100, response_bytes=25),
+    )
+    answer_result(
+        shared_context=shared, sql=sql, result=result, employees=(), locale="en",
+        model="openai/gpt-5-nano", budget=CallBudget(), timeout=30,
+        max_output_tokens=3000, sql_execution_failure=feedback,
+    )
+    planner_payload = call_text.call_args.kwargs["payload"]
+    reviewer_payload = call_structured.call_args_list[-1].kwargs["payload"]
+    assert all(reviewer_payload[key] == value for key, value in planner_payload.items())
+    assert reviewer_payload["executed_sql"] == sql
+    assert reviewer_payload["database_result"] == result.model_dump(mode="json")
+
+
+@patch("week5.new_implementation.online.planner.call_structured")
+def test_count_correction_separates_repeated_records_from_gap_contribution(call):
+    call.return_value = ReviewedAnswer(
+        answer="All of the gap comes from repeated records."
+    )
+    shared = SharedModelContext(
+        current_question="Check whether anyone has multiple records within a status and revise the explanation.",
+        updated_request="Check repeated records and revise the count explanation.",
+        count_reconciliation=True,
+        request_relationship="new",
+        database_context=_count_database_context(),
+    )
+    result = SqlExecutionResult(
+        columns=tuple(
+            ResultColumn(name=name)
+            for name in (
+                "status",
+                "all_record_count",
+                "all_people_count",
+                "qualifying_record_count",
+                "qualifying_people_count",
+            )
+        ),
+        rows=(
+            {
+                "status": "Draft",
+                "all_record_count": 6,
+                "all_people_count": 3,
+                "qualifying_record_count": 4,
+                "qualifying_people_count": 2,
+            },
+        ),
+        coverage=ExecutionCoverage(fetched_rows=1, result_limit=100, response_bytes=80),
+    )
+    sql = (
+        "SELECT status, COUNT(*) AS all_record_count, "
+        "COUNT(DISTINCT employee_id) AS all_people_count, "
+        "COUNT(*) FILTER (WHERE total_worked_hrs > 0) AS qualifying_record_count, "
+        "COUNT(DISTINCT employee_id) FILTER (WHERE total_worked_hrs > 0) "
+        "AS qualifying_people_count FROM attendance_records GROUP BY status"
+    )
+
+    answer = answer_result(
+        shared_context=shared,
+        sql=sql,
+        result=result,
+        employees=(),
+        locale="en",
+        model="openai/gpt-5-nano",
+        budget=CallBudget(),
+        timeout=30,
+        max_output_tokens=3000,
+    )
+
+    assert isinstance(answer, str)
+    assert "multiple attendance records" in answer.lower()
+    assert "2 records without positive worked hours" in answer
+    assert "2 extra positive-hour records" in answer
+    assert [item.kwargs["stage"] for item in call.call_args_list] == [
+        "sql_answer_review"
+    ]

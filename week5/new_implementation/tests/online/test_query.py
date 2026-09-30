@@ -481,6 +481,7 @@ class DatabaseContextTests(unittest.TestCase):
                 "updated_request",
                 "previous_verified_turn",
                 "request_relationship",
+                "count_reconciliation",
                 "subject_relationship",
                 "resolved_employee_ids",
                 "required_date_scope",
@@ -499,13 +500,14 @@ class DatabaseContextTests(unittest.TestCase):
         serialized = json.dumps(shared.model_payload())
         self.assertNotIn("semantic_contracts", serialized)
         self.assertEqual(
-            list(shared.model_payload())[-10:],
+            list(shared.model_payload())[-11:],
             [
                 "current_question",
                 "latest_user_message",
                 "updated_request",
                 "previous_verified_turn",
                 "request_relationship",
+                "count_reconciliation",
                 "subject_relationship",
                 "resolved_employee_ids",
                 "required_date_scope",

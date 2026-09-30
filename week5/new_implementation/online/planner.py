@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
+from sqlglot import exp, parse_one
+from sqlglot.errors import ParseError
 
 from .context import SharedModelContext
 from .execution import SqlExecutionResult
@@ -38,6 +40,369 @@ class ReplanRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
     reason: str = Field(min_length=1, max_length=4000)
+
+
+_COUNT_FIELDS = (
+    "all_record_count",
+    "all_people_count",
+    "qualifying_record_count",
+    "qualifying_people_count",
+)
+_COUNT_REPLAN = (
+    "A count-difference explanation needs one grouped SELECT over the same "
+    "source and scope with COUNT(*) AS all_record_count, "
+    "COUNT(DISTINCT employee_id) AS all_people_count, "
+    "COUNT(*) FILTER (WHERE total_worked_hrs > 0) AS qualifying_record_count, "
+    "and COUNT(DISTINCT employee_id) FILTER (WHERE total_worked_hrs > 0) "
+    "AS qualifying_people_count. Keep the positive-hours condition inside "
+    "FILTER, not the source WHERE, and return one complete row per requested group."
+)
+
+
+def _positive_hours(expression: exp.Expression | None) -> bool:
+    if not isinstance(expression, exp.GT):
+        return False
+    value = expression.this
+    if isinstance(value, exp.Coalesce):
+        if (
+            len(value.expressions) != 1
+            or not isinstance(value.expressions[0], exp.Literal)
+            or value.expressions[0].this != "0"
+            or value.expressions[0].is_string
+        ):
+            return False
+        value = value.this
+    return (
+        isinstance(value, exp.Column)
+        and value.name.casefold() == "total_worked_hrs"
+        and isinstance(expression.expression, exp.Literal)
+        and expression.expression.this == "0"
+        and not expression.expression.is_string
+    )
+
+
+def _person_column(expression: exp.Expression | None) -> bool:
+    return isinstance(expression, exp.Column) and expression.name.casefold() == "employee_id"
+
+
+def _count_matches(expression: exp.Expression, *, distinct: bool, filtered: bool) -> bool:
+    if isinstance(expression, exp.Filter):
+        where = expression.args.get("expression")
+        if not filtered or not isinstance(where, exp.Where) or not _positive_hours(where.this):
+            return False
+        expression = expression.this
+        filtered = False
+    if not isinstance(expression, exp.Count):
+        return False
+    argument = expression.this
+    if distinct:
+        if not isinstance(argument, exp.Distinct) or len(argument.expressions) != 1:
+            return False
+        item = argument.expressions[0]
+        if filtered:
+            if not isinstance(item, exp.Case) or len(item.args.get("ifs") or ()) != 1 or item.args.get("default"):
+                return False
+            branch = item.args["ifs"][0]
+            return (
+                isinstance(branch, exp.If)
+                and _positive_hours(branch.this)
+                and _person_column(branch.args.get("true"))
+            )
+        return _person_column(item)
+    if filtered:
+        return False
+    return isinstance(argument, exp.Star)
+
+
+def _reconciliation_group(
+    shared_context: SharedModelContext, sql: str
+) -> str | None | ReplanRequest:
+    try:
+        query = parse_one(sql, read="postgres")
+    except (ParseError, ValueError):
+        return ReplanRequest(reason=_COUNT_REPLAN)
+    if not isinstance(query, exp.Select) or any(
+        query.args.get(part)
+        for part in ("with_", "joins", "having", "limit", "offset", "distinct")
+    ):
+        return ReplanRequest(reason=_COUNT_REPLAN)
+    source = query.args.get("from_")
+    table = source.this if isinstance(source, exp.From) else None
+    if not isinstance(table, exp.Table):
+        return ReplanRequest(reason=_COUNT_REPLAN)
+    schema = next(
+        (
+            item
+            for item in shared_context.database_context.tables
+            if item.table_name.casefold() == table.name.casefold()
+            and item.schema_name.casefold() == (table.db or "public").casefold()
+        ),
+        None,
+    )
+    columns = {column.name.casefold(): column for column in schema.columns} if schema else {}
+    if (
+        "total_worked_hrs" not in columns
+        or "employee_id" not in columns
+        or columns["employee_id"].nullable
+        or any(
+            column.name.casefold() == "total_worked_hrs"
+            for column in (query.args.get("where") or exp.Where()).find_all(exp.Column)
+        )
+    ):
+        return ReplanRequest(reason=_COUNT_REPLAN)
+    group_clause = query.args.get("group")
+    group: str | None = None
+    if group_clause is not None:
+        if (
+            len(group_clause.expressions) != 1
+            or not isinstance(group_clause.expressions[0], exp.Column)
+            or not query.expressions
+        ):
+            return ReplanRequest(reason=_COUNT_REPLAN)
+        group = group_clause.expressions[0].name
+        if group.casefold() not in columns:
+            return ReplanRequest(reason=_COUNT_REPLAN)
+        projected_group = query.expressions[0] if query.expressions else None
+        if isinstance(projected_group, exp.Alias) and projected_group.alias.casefold() == group.casefold():
+            projected_group = projected_group.this
+        if isinstance(projected_group, exp.Coalesce):
+            if (
+                len(projected_group.expressions) != 1
+                or not isinstance(projected_group.expressions[0], exp.Literal)
+                or projected_group.expressions[0].this != ""
+            ):
+                return ReplanRequest(reason=_COUNT_REPLAN)
+            projected_group = projected_group.this
+        if not (
+            isinstance(projected_group, exp.Column)
+            and projected_group.name.casefold() == group.casefold()
+        ):
+            return ReplanRequest(reason=_COUNT_REPLAN)
+    projections = query.expressions[1:] if group else query.expressions
+    aliases = {
+        item.alias.casefold(): item.this
+        for item in projections
+        if isinstance(item, exp.Alias)
+    }
+    if len(projections) != 4 or set(aliases) != set(_COUNT_FIELDS):
+        return ReplanRequest(reason=_COUNT_REPLAN)
+    for name, distinct, filtered in (
+        ("all_record_count", False, False),
+        ("all_people_count", True, False),
+        ("qualifying_record_count", False, True),
+        ("qualifying_people_count", True, True),
+    ):
+        if not _count_matches(aliases[name], distinct=distinct, filtered=filtered):
+            return ReplanRequest(reason=_COUNT_REPLAN)
+    return group
+
+
+def _and_terms(expression: exp.Expression) -> tuple[exp.Expression, ...]:
+    if isinstance(expression, exp.And):
+        return _and_terms(expression.this) + _and_terms(expression.expression)
+    return (expression,)
+
+
+def build_count_reconciliation_sql(
+    shared_context: SharedModelContext, proposed_sql: str
+) -> str | None:
+    """Retain a model-planned scope while measuring both count populations."""
+    if not isinstance(_reconciliation_group(shared_context, proposed_sql), ReplanRequest):
+        return proposed_sql
+    try:
+        query = parse_one(proposed_sql, read="postgres")
+    except (ParseError, ValueError):
+        return None
+    branches = []
+    for select in query.find_all(exp.Select):
+        source = select.args.get("from_")
+        table = source.this if isinstance(source, exp.From) else None
+        if not isinstance(table, exp.Table) or select.args.get("joins"):
+            continue
+        schema = next(
+            (
+                item for item in shared_context.database_context.tables
+                if item.table_name.casefold() == table.name.casefold()
+                and item.schema_name.casefold() == (table.db or "public").casefold()
+            ), None,
+        )
+        if schema is None:
+            continue
+        columns = {column.name.casefold(): column for column in schema.columns}
+        if (
+            "total_worked_hrs" not in columns
+            or "employee_id" not in columns
+            or columns["employee_id"].nullable
+        ):
+            return None
+        grouping = select.args.get("group")
+        if (
+            grouping is None or len(grouping.expressions) != 1
+            or not isinstance(grouping.expressions[0], exp.Column)
+        ):
+            return None
+        group = grouping.expressions[0].name
+        if group.casefold() not in columns:
+            return None
+        where = select.args.get("where")
+        terms = _and_terms(where.this) if isinstance(where, exp.Where) else ()
+        positive = any(_positive_hours(term) for term in terms)
+        scope = tuple(sorted(
+            term.sql(dialect="postgres").casefold()
+            for term in terms if not _positive_hours(term)
+        ))
+        all_records = any(
+            isinstance(item.this, exp.Count) and isinstance(item.this.this, exp.Star)
+            for item in select.expressions if isinstance(item, exp.Alias)
+        )
+        positive_people = any(
+            isinstance(item.this, exp.Count)
+            and isinstance(item.this.this, exp.Distinct)
+            and len(item.this.this.expressions) == 1
+            and _person_column(item.this.this.expressions[0])
+            for item in select.expressions if isinstance(item, exp.Alias)
+        ) or (
+            bool(select.args.get("distinct"))
+            and any(_person_column(item) for item in select.expressions)
+        )
+        branches.append((schema, table, group, where, scope, positive, all_records, positive_people))
+    if len(branches) != 2:
+        return None
+    all_branch = next((item for item in branches if item[6] and not item[5]), None)
+    attended_branch = next((item for item in branches if item[5] and item[7]), None)
+    if (
+        all_branch is None or attended_branch is None
+        or all_branch[0] != attended_branch[0]
+        or all_branch[2].casefold() != attended_branch[2].casefold()
+        or all_branch[4] != attended_branch[4]
+    ):
+        return None
+    schema, table, group, where, _, _, _, _ = all_branch
+    def quoted(value: str) -> str:
+        return '"' + value.replace('"', '""') + '"'
+    alias = table.alias
+    prefix = f"{quoted(alias)}." if alias else ""
+    source = f"{quoted(schema.schema_name)}.{quoted(schema.table_name)}"
+    if alias:
+        source += f" AS {quoted(alias)}"
+    where_sql = f" WHERE {where.this.sql(dialect='postgres')}" if where else ""
+    field = f"{prefix}{quoted(group)}"
+    employee = f"{prefix}{quoted('employee_id')}"
+    hours = f"{prefix}{quoted('total_worked_hrs')}"
+    return (
+        f"SELECT {field}, COUNT(*) AS all_record_count, "
+        f"COUNT(DISTINCT {employee}) AS all_people_count, "
+        f"COUNT(*) FILTER (WHERE {hours} > 0) AS qualifying_record_count, "
+        f"COUNT(DISTINCT {employee}) FILTER (WHERE {hours} > 0) "
+        f"AS qualifying_people_count FROM {source}{where_sql} GROUP BY {field}"
+    )
+
+
+def _count_reconciliation_answer(
+    *, shared_context: SharedModelContext, sql: str, result: SqlExecutionResult, locale: str
+) -> str | ReplanRequest:
+    group = _reconciliation_group(shared_context, sql)
+    if isinstance(group, ReplanRequest):
+        return group
+    expected = set(_COUNT_FIELDS) | ({group} if group else set())
+    if (
+        not result.coverage.complete
+        or {item.name for item in result.columns} != expected
+        or len(result.rows) != result.coverage.fetched_rows
+    ):
+        return ReplanRequest(reason=_COUNT_REPLAN)
+    seen: set[object] = set()
+    facts: list[tuple[str, int, int, int, int]] = []
+    for row in result.rows:
+        if set(row) != expected or any(type(row[name]) is not int for name in _COUNT_FIELDS):
+            return ReplanRequest(reason=_COUNT_REPLAN)
+        all_records, all_people, qualifying_records, qualifying_people = (
+            row[name] for name in _COUNT_FIELDS
+        )
+        if not (
+            all_records >= all_people >= qualifying_people >= 0
+            and all_records >= qualifying_records >= qualifying_people
+            and all_records - all_people >= qualifying_records - qualifying_people
+        ):
+            return ReplanRequest(reason=_COUNT_REPLAN)
+        label = str(row[group]) if group and row[group] is not None else "Overall"
+        if label in seen:
+            return ReplanRequest(reason=_COUNT_REPLAN)
+        seen.add(label)
+        facts.append((label, all_records, all_people, qualifying_records, qualifying_people))
+    if not facts:
+        return "No attendance records matched the requested scope." if locale != "ar" else "لا توجد سجلات حضور مطابقة للنطاق المطلوب."
+    scope = "in the requested scope"
+    if shared_context.required_date_scope is not None:
+        start, end = shared_context.required_date_scope
+        scope = f"on {start}" if start == end else f"from {start} to {end}"
+    group_label = group.replace("_", " ").title() if group else "Group"
+    repeated_any = any(all_records > all_people for _, all_records, all_people, _, _ in facts)
+    details = []
+    for label, all_records, _, qualifying_records, qualifying_people in facts:
+        excluded = all_records - qualifying_records
+        repeated_qualifying = qualifying_records - qualifying_people
+        details.append(
+            f"{label}: {excluded} records without positive worked hours and "
+            f"{repeated_qualifying} extra positive-hour records beyond one per person"
+        )
+    explanation = "; ".join(details) + "."
+    multiplicity = (
+        f"Some employees have multiple attendance records within a {group_label.lower()} {scope}. "
+        if repeated_any
+        else f"No employee has more than one attendance record within a {group_label.lower()} {scope}. "
+    )
+    correction = any(
+        word in shared_context.current_question.casefold()
+        for word in (
+            "revise", "correct", "duplicate", "more than one",
+            "راجع", "صحح", "مكرر", "أكثر من سجل",
+        )
+    )
+    if locale == "ar":
+        repeated = (
+            "توجد سجلات حضور متعددة لبعض الموظفين ضمن الحالة نفسها. "
+            if repeated_any else
+            "لا يوجد موظف له أكثر من سجل حضور واحد ضمن الحالة نفسها. "
+        )
+        gaps = "؛ ".join(
+            f"{label}: {all_records - qualifying_records} سجلًا بلا ساعات عمل موجبة، "
+            f"و{qualifying_records - qualifying_people} سجلًا إضافيًا بساعات موجبة للشخص نفسه"
+            for label, all_records, _, qualifying_records, qualifying_people in facts
+        )
+        if shared_context.request_relationship == "follow_up" or correction:
+            return repeated + "فروق العد: " + gaps + "."
+        people_rows = "\n".join(
+            f"| {label} | {qualifying_people} |"
+            for label, _, _, _, qualifying_people in facts
+        )
+        record_rows = "\n".join(
+            f"| {label} | {all_records} |"
+            for label, all_records, _, _, _ in facts
+        )
+        return (
+            "الأشخاص الذين حضروا بساعات عمل موجبة:\n\n"
+            f"| {group_label} | عدد الأشخاص |\n| --- | ---: |\n{people_rows}\n\n"
+            "جميع سجلات الحضور:\n\n"
+            f"| {group_label} | عدد السجلات |\n| --- | ---: |\n{record_rows}\n\n"
+            f"الفرق: {gaps}. ولا تكشف هذه الأعداد سبب غياب ساعات العمل الموجبة."
+        )
+    if shared_context.request_relationship == "follow_up" or correction:
+        return multiplicity + "The count gaps are: " + explanation
+    people_rows = "\n".join(
+        f"| {label} | {qualifying_people} |" for label, _, _, _, qualifying_people in facts
+    )
+    record_rows = "\n".join(
+        f"| {label} | {all_records} |" for label, all_records, _, _, _ in facts
+    )
+    return (
+        f"Attending people {scope}:\n\n| {group_label} | People with positive worked hours |\n"
+        f"| --- | ---: |\n{people_rows}\n\n"
+        f"Attendance records {scope}:\n\n| {group_label} | All records |\n"
+        f"| --- | ---: |\n{record_rows}\n\n"
+        f"The differences are: {explanation} "
+        "These counts do not establish why a record lacks positive worked hours."
+    )
 
 
 _ANSWER_SYSTEM = """You are the attendance conversation's SQL planner after your
@@ -744,6 +1109,13 @@ Choose a result shape that gives enough evidence for every requested part:
   filters into another. A running total over dates requires daily
   aggregation followed by an ordered running SUM. In PostgreSQL, repeat aggregate
   expressions in HAVING instead of referring to SELECT aliases.
+When count_reconciliation is true, the requested explanation needs intermediate
+measurements even if the user wants only two displayed tables. Return a single
+grouped SELECT over the full requested scope with the four count aliases in the
+schema-grounded count-difference example. Do not compute causes with SQL text
+literals. Keep the positive-hours condition inside FILTER, so all-record counts
+retain rows without positive hours. The application will compute the explanation
+from these measured counts and retain the user's requested presentation.
 
 If the current request clearly compares with a previous grouped result, use the
 previous_verified_turn SQL to understand its metric and group eligibility. Keep
@@ -840,33 +1212,47 @@ def answer_result(
     timeout: float,
     max_output_tokens: int,
     observer: TurnObserver | None = None,
+    sql_execution_failure: dict[str, object] | None = None,
 ) -> str | ReplanRequest:
     """Use the planner to answer and review the executed result."""
 
-    payload = shared_context.model_payload()
+    payload = _planning_payload(shared_context)
+    if sql_execution_failure is not None:
+        payload["sql_execution_failure"] = sql_execution_failure
     payload.update(
         executed_sql=sql,
         database_result=result.model_dump(mode="json"),
         authoritative_employees=[item.model_dump(mode="json") for item in employees],
         answer_locale=locale,
     )
-    draft = call_structured(
-        stage="sql_final_answer",
-        model=model,
-        system=_ANSWER_SYSTEM + _RESULT_EXAMPLES,
-        payload=payload,
-        response_model=PlannerAnswer,
-        budget=budget,
-        timeout=timeout,
-        max_output_tokens=max_output_tokens,
-        observer=observer,
-    )
+    if shared_context.count_reconciliation:
+        proposed_answer = _count_reconciliation_answer(
+            shared_context=shared_context, sql=sql, result=result, locale=locale
+        )
+        if isinstance(proposed_answer, ReplanRequest):
+            return proposed_answer
+    else:
+        draft = call_structured(
+            stage="sql_final_answer",
+            model=model,
+            system=_ANSWER_SYSTEM + _RESULT_EXAMPLES,
+            payload=payload,
+            response_model=PlannerAnswer,
+            budget=budget,
+            timeout=timeout,
+            max_output_tokens=max_output_tokens,
+            observer=observer,
+        )
+        proposed_answer = draft.answer
     review_payload = dict(payload)
-    review_payload["proposed_answer"] = draft.answer
+    review_payload["proposed_answer"] = proposed_answer
     reviewed = call_structured(
         stage="sql_answer_review",
         model=model,
-        system=_REVIEW_SYSTEM + _RESULT_EXAMPLES + _REVIEW_EXAMPLES,
+        system=(
+            _REVIEW_SYSTEM + _RESULT_EXAMPLES + _REVIEW_EXAMPLES
+            + planner_examples(shared_context.database_context)
+        ),
         payload=review_payload,
         response_model=ReviewedAnswer,
         budget=budget,
@@ -882,7 +1268,7 @@ def answer_result(
                 "review requested a new query without identifying the evidence gap",
             )
         return ReplanRequest(reason=reviewed.query_issue)
-    return reviewed.answer
+    return proposed_answer if shared_context.count_reconciliation else reviewed.answer
 
 
 __all__ = [
@@ -890,5 +1276,6 @@ __all__ = [
     "ReplanRequest",
     "ReviewedAnswer",
     "answer_result",
+    "build_count_reconciliation_sql",
     "request_sql",
 ]

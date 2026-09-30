@@ -315,6 +315,20 @@ def planner_examples(context: DatabaseContext) -> str:
             "UNION ALL SELECT 'hr_location' AS breakdown, group_value, "
             "NULL::bigint AS record_count, people_count FROM hr_locations;"
         )
+    if {"status", "employee_id", "total_worked_hrs"}.issubset(columns):
+        examples.append(
+            "Explain a difference between all record counts and distinct people "
+            "with positive worked hours. Keep the current request's date and other "
+            "source filters; change the grouping key when requested. The two "
+            "displayed measures and the intermediate counts share one source:\n"
+            f'SELECT "status", COUNT(*) AS all_record_count, '
+            'COUNT(DISTINCT "employee_id") AS all_people_count, '
+            'COUNT(*) FILTER (WHERE "total_worked_hrs" > 0) '
+            'AS qualifying_record_count, '
+            'COUNT(DISTINCT "employee_id") FILTER '
+            '(WHERE "total_worked_hrs" > 0) AS qualifying_people_count '
+            f'FROM {source} GROUP BY "status";'
+        )
     if context.relationships:
         relation = context.relationships[0]
         if relation.from_columns and relation.to_columns:

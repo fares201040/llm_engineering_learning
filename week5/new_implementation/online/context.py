@@ -104,6 +104,21 @@ BUSINESS_MEANINGS = (
         ),
     ),
     DatabaseBusinessMeaning(
+        name="count_difference_explanation",
+        description=(
+            "A difference between all attendance records and distinct people "
+            "with positive worked hours changes both row eligibility and counting "
+            "unit. Measure all records, distinct people among all records, records "
+            "with total_worked_hrs > 0, and distinct people among those positive-hour "
+            "records under the same group and scope before explaining a gap. For "
+            "non-null employee IDs, all records minus positive-hour people equals "
+            "records without positive hours plus extra positive-hour records beyond "
+            "one per person. Multiple records for one person within a group are "
+            "not necessarily duplicate physical data. These counts do not establish "
+            "why a record lacks positive worked hours."
+        ),
+    ),
+    DatabaseBusinessMeaning(
         name="total_worked_hours",
         description=(
             "Total worked hours means SUM(total_worked_hrs) across all rows "
@@ -235,6 +250,7 @@ class SharedModelContext(_Strict):
     updated_request: str = Field(min_length=1, max_length=60000)
     previous_verified_turn: dict[str, object] | None = None
     request_relationship: Literal["new", "follow_up"] = "new"
+    count_reconciliation: bool = False
     subject_relationship: (
         Literal["employees", "criteria", "union", "intersection", "all_authorized"]
         | None
@@ -347,6 +363,7 @@ class SharedModelContext(_Strict):
             "updated_request": self.updated_request,
             "previous_verified_turn": self.previous_verified_turn,
             "request_relationship": self.request_relationship,
+            "count_reconciliation": self.count_reconciliation,
             "subject_relationship": self.subject_relationship,
             "resolved_employee_ids": self.resolved_employee_ids,
             "required_date_scope": self.required_date_scope,

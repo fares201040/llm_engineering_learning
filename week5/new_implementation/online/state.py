@@ -26,6 +26,7 @@ class VerifiedTurn(_Strict):
     locale: Literal["en", "ar"]
     employees: tuple[Employee, ...] = Field(default=(), max_length=20)
     executed_sql: str = Field(min_length=1, max_length=100000)
+    count_reconciliation: bool = False
     date_scope: tuple[str, str] | None = None
     requested_date_scope: tuple[str, str] | None = None
     result: dict[str, object] = Field(default_factory=dict)

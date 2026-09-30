@@ -40,7 +40,12 @@ from .execution import (
 )
 from .history import model_history
 from .limits import MAX_EMPLOYEE_CANDIDATES
-from .planner import ReplanRequest, answer_result, request_sql
+from .planner import (
+    ReplanRequest,
+    answer_result,
+    build_count_reconciliation_sql,
+    request_sql,
+)
 from .query_paths import boolean_paths, contributing_where_paths
 from .provider import (
     CallBudget,
@@ -200,6 +205,40 @@ def _locale(question: str) -> Literal["en", "ar"]:
     ):
         return "ar"
     return "ar" if any("\u0600" <= char <= "\u06ff" for char in question) else "en"
+
+
+def _is_positive_people_record_comparison(question: str) -> bool:
+    words = set(re.findall(r"[a-z]+", question.casefold()))
+    return all(
+        words.intersection(group)
+        for group in (
+            {"all", "every", "total"},
+            {"record", "records"},
+            {"distinct", "unique"},
+            {"people", "person", "persons", "employee", "employees", "staff"},
+            {"positive", "attended"},
+        )
+    )
+
+
+def _wants_count_reconciliation(question: str, previous: VerifiedTurn | None) -> bool:
+    words = set(re.findall(r"[a-z]+", question.casefold()))
+    explanation = bool(
+        words.intersection(
+            {"explain", "explanation", "why", "reason", "cause", "rationale",
+             "differ", "difference", "differences", "gap", "reconcile", "revise"}
+        )
+    )
+    return explanation and (
+        _is_positive_people_record_comparison(question)
+        or bool(
+            previous
+            and previous.count_reconciliation
+            and words.intersection(
+                {"record", "records", "measure", "measures", "duplicate", "duplicates"}
+            )
+        )
+    )
 
 
 def _unwrap_parentheses(node: exp.Expression) -> exp.Expression:
@@ -1335,6 +1374,7 @@ def run_turn(
     budget = CallBudget(limit=settings.llm_turn_provider_call_limit)
     question = request.question
     as_of_date = date.today().isoformat()
+    count_reconciliation = False
     try:
         native_comparison = None
         native_running_total = None
@@ -1533,6 +1573,10 @@ def run_turn(
                     prior_decision=reference,
                 )
                 log_layer_output("reference_reconsidered", reference)
+            prior_count_turn = previous.verified_turns[-1] if previous.verified_turns else None
+            count_reconciliation = _wants_count_reconciliation(
+                question, prior_count_turn
+            ) or reference.count_reconciliation
             if isinstance(reference.decision, UnsupportedReference):
                 bound = BoundReferences(
                     rewritten_request=question,
@@ -1795,6 +1839,7 @@ def run_turn(
                 else None
             ),
             request_relationship=bound.request_relationship,
+            count_reconciliation=count_reconciliation,
             subject_relationship=bound.subject_relationship,
             resolved_employee_ids=bound.employee_ids,
             required_date_scope=enforced_date_scope,
@@ -1807,6 +1852,27 @@ def run_turn(
             database_context=database_context,
         )
         sql_execution_failure: dict[str, object] | None = None
+        reusable_count_sql = (
+            previous_turn.executed_sql
+            if count_reconciliation
+            and previous_turn is not None
+            and previous_turn.count_reconciliation
+            and not _is_positive_people_record_comparison(question)
+            and any(
+                phrase in question.casefold()
+                for phrase in ("that explanation", "duplicate", "revise")
+            )
+            and not any(
+                term in question.casefold()
+                for term in ("department", "country", "location", "job")
+            )
+            and not bound.employee_ids
+            and not bound.employee_criteria
+            and len(bound.scope_clauses) <= 1
+            and enforced_date_scope == _verified_requested_date_scope(previous_turn)
+            and _requested_workflow_status(question) is None
+            else None
+        )
         for attempt in range(1, SQL_EXECUTION_ATTEMPT_LIMIT + 1):
             planner_args: dict[str, object] = {
                 "shared_context": shared_context,
@@ -1824,6 +1890,8 @@ def run_turn(
                 if native_comparison is not None and attempt == 1
                 else native_running_total.sql
                 if native_running_total is not None and attempt == 1
+                else reusable_count_sql
+                if reusable_count_sql is not None and attempt == 1
                 else deps.planner(**planner_args)
             )
             sql = _repair_group_order(_repair_group_matched_count(sql))
@@ -1845,6 +1913,29 @@ def run_turn(
                     state=previous,
                     capability="private_source_payload",
                 )
+            if count_reconciliation:
+                reconciled_sql = build_count_reconciliation_sql(shared_context, sql)
+                if reconciled_sql is None:
+                    if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
+                        raise ProviderFailure(
+                            "sql_planner", "count_reconciliation_unavailable",
+                            "The two count populations could not be verified against one source scope.",
+                        )
+                    sql_execution_failure = {
+                        "retry_number": attempt,
+                        "failed_sql": sql,
+                        "error_type": "count_reconciliation_scope",
+                        "database_error": (
+                            "Plan the all-record and positive-worked-hours distinct-person "
+                            "counts by the same group, table, date, and filters. "
+                            "The only source difference must be positive worked hours."
+                        ),
+                    }
+                    log_layer_output(
+                        "sql_execution_failure", sql_execution_failure, attempt=attempt
+                    )
+                    continue
+                sql = reconciled_sql
             log_layer_output("sql_planner", sql, attempt=attempt)
             if (
                 _planner_control_alias(sql) == "unsupported_capability"
@@ -2151,6 +2242,7 @@ def run_turn(
                 timeout=settings.llm_planner_timeout_seconds,
                 max_output_tokens=settings.llm_planner_max_output_tokens,
                 observer=observer,
+                sql_execution_failure=sql_execution_failure,
             )
             if isinstance(answer, ReplanRequest):
                 if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
@@ -2202,6 +2294,7 @@ def run_turn(
             locale=bound.locale,
             employees=published_employees,
             executed_sql=sql,
+            count_reconciliation=count_reconciliation,
             date_scope=date_scope,
             requested_date_scope=(
                 enforced_date_scope if len(bound.scope_clauses) <= 1 else None

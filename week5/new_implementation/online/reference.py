@@ -96,6 +96,16 @@ ReferenceDecision = (
 
 class ReferenceResponse(_Strict):
     decision: ReferenceDecision
+    count_reconciliation: bool = Field(
+        default=False,
+        description="Whether this turn asks to explain or revise a gap between all attendance records and distinct people with positive worked hours.",
+    )
+
+
+class _ModelReferenceResponse(ReferenceResponse):
+    count_reconciliation: bool = Field(
+        description="Set true only when this request compares all attendance records with distinct people who had positive worked hours, or revises that same explanation; otherwise false."
+    )
 
 
 class PendingResolution(_Strict):
@@ -280,6 +290,12 @@ For an ambiguous follow-up, mark request_relationship as follow_up so confirmed
 employee selection retains the prior user-requested scope.
 
 ## Structured output
+Set count_reconciliation=true only when the current request asks to explain a
+difference between all attendance records and distinct people with positive
+worked hours, or to check or revise that same explanation in a follow-up.
+It signals a need for measured
+intermediate counts; it does not assert what caused the difference. Leave it
+false for an ordinary count or comparison without a requested explanation.
 Return every explicit employee ID, every explicit employee name, each name-and-ID pair
 that claims one identity, every general natural-language criterion describing
 employees, whether the request is new or a follow-up, and whether employees and
@@ -369,7 +385,7 @@ def request_references(
                 model=model,
                 system=_SYSTEM,
                 payload=payload,
-                response_model=ReferenceResponse,
+                response_model=_ModelReferenceResponse,
                 budget=budget,
                 timeout=timeout,
                 max_output_tokens=max_output_tokens,

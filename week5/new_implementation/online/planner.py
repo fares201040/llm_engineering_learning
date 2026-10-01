@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlglot import exp, parse_one
 from sqlglot.errors import ParseError
 
@@ -46,19 +48,36 @@ class SqlPlanStep(BaseModel):
     """One independently scoped part of a multi-part question."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-    scope_clause_index: int = Field(ge=0, le=4)
+    scope_clause_index: int = Field(ge=0, le=12)
     subrequest: str = Field(min_length=1, max_length=10000)
     sql: str = Field(min_length=1, max_length=100000)
 
 
 class MultiSqlPlan(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-    steps: tuple[SqlPlanStep, ...] = Field(min_length=2, max_length=4)
+    steps: tuple[SqlPlanStep, ...] = Field(min_length=2, max_length=12)
+
+
+class SqlPlanChoice(BaseModel):
+    """Let the planner choose one SQL statement or independently scoped steps."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+    mode: Literal["single", "multi"]
+    sql: str | None
+    steps: tuple[SqlPlanStep, ...] = Field(max_length=12)
+
+    @model_validator(mode="after")
+    def _valid_choice(self):
+        if self.mode == "single" and self.sql and not self.steps:
+            return self
+        if self.mode == "multi" and self.sql is None and len(self.steps) >= 2:
+            return self
+        raise ValueError("planner must choose exactly one SQL or two or more steps")
 
 
 class ExecutedPlanStep(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-    scope_clause_index: int = Field(ge=0, le=3)
+    scope_clause_index: int = Field(ge=0, le=11)
     subrequest: str
     sql: str
     requested_date_scope: tuple[str, str] | None = None
@@ -70,6 +89,7 @@ class ExecutedPlanStep(BaseModel):
 class ReviewedMultiAnswer(ReviewedAnswer):
     covered_step_indices: tuple[int, ...] = ()
     scope_valid_step_indices: tuple[int, ...] = ()
+    covered_clause_indices: tuple[int, ...] = ()
 
 
 _COUNT_FIELDS = (
@@ -1256,19 +1276,21 @@ def request_sql(
     if sql_execution_failure is not None:
         payload["sql_execution_failure"] = sql_execution_failure
     clauses = shared_context.scope_provenance.get("reference_scope_clauses", ())
-    if len(clauses) > 1 and not shared_context.count_reconciliation:
-        if len(clauses) > 4:
-            raise ProviderFailure("sql_planner", "too_many_scope_clauses", "At most four independent request clauses are supported")
+    if 1 < len(clauses) <= 12 and not shared_context.count_reconciliation:
         payload["plan_scope_clauses"] = list(clauses)
-        return call_structured(
+        choice = call_structured(
             stage="sql_planner",
             model=model,
             system=(
                 _SYSTEM.split("## Output contract")[0]
-                + "## Output contract\nReturn a structured plan with two to four steps "
-                "covering every plan_scope_clauses entry in nondecreasing index order. "
-                "A clause may need multiple steps, such as separate dates in a comparison. "
-                "Each step has "
+                + "## Output contract\nChoose the SQL result shape that best answers "
+                "the full request. Return mode=single with one read-only SELECT or WITH "
+                "statement in sql and no steps when a shared query preserves all clauses. "
+                "Return mode=multi with sql=null and two to twelve ordered steps when "
+                "separate source scopes or measures are clearer. Multi steps must cover "
+                "every plan_scope_clauses entry in nondecreasing index order. A clause "
+                "may need multiple steps, such as separate dates in a comparison. Each "
+                "step has "
                 "scope_clause_index, subrequest, and one executable read-only PostgreSQL "
                 "SELECT or WITH SQL statement. The subrequest must preserve that clause's "
                 "population, filters, measure, grouping, and inherited scope justified by "
@@ -1278,13 +1300,16 @@ def request_sql(
                 + planner_examples(shared_context.database_context)
             ),
             payload=payload,
-            response_model=MultiSqlPlan,
+            response_model=SqlPlanChoice,
             budget=budget,
             timeout=timeout,
             max_output_tokens=max_output_tokens,
             attempt=attempt,
             observer=observer,
         )
+        if choice.mode == "single":
+            return choice.sql
+        return MultiSqlPlan(steps=choice.steps)
     sql = call_text(
         stage="sql_planner",
         model=model,
@@ -1356,9 +1381,14 @@ def answer_multi_result(
         "zero-based step_index values in scope_valid_step_indices only for steps "
         "with exactly the requested "
         "population, date, category, and grouping; reject extra filters leaked "
-        "from another clause. Return zero-based covered_step_indices only for steps whose "
+        "from another clause. A date literal alone is not evidence that its branch "
+        "contributes rows; inspect the full predicates and returned groups for each "
+        "requested period. Return zero-based covered_step_indices only for steps whose "
         "evidence is accurately represented in the final answer. Verify that "
-        "multiple steps for one clause together cover its whole request. Set "
+        "multiple steps for one clause together cover its whole request. Return "
+        "zero-based covered_clause_indices only when every requested measure, "
+        "period, and grouping within that entire clause has evidence in the "
+        "executed SQL and result rows. Set "
         "requires_new_query for a missing or incorrectly scoped part.\n"
         + _RESULT_EXAMPLES + _REVIEW_EXAMPLES
         + planner_examples(shared_context.database_context),
@@ -1377,6 +1407,16 @@ def answer_multi_result(
         return ReplanRequest(reason="The final answer review did not verify every requested part")
     if not covers_every_step(reviewed.scope_valid_step_indices):
         return ReplanRequest(reason="The final answer review found a step with incorrect scope or an extra filter")
+    requested_clauses = {step.scope_clause_index for step in steps}
+    covered_clauses = set(reviewed.covered_clause_indices)
+    if (
+        len(reviewed.covered_clause_indices) != len(requested_clauses)
+        or covered_clauses not in (
+            requested_clauses,
+            {index + 1 for index in requested_clauses},
+        )
+    ):
+        return ReplanRequest(reason="The final answer review did not verify every requested clause")
     return reviewed.answer
 
 
@@ -1454,6 +1494,7 @@ def answer_result(
 __all__ = [
     "ExecutedPlanStep",
     "MultiSqlPlan",
+    "SqlPlanChoice",
     "PlannerAnswer",
     "ReplanRequest",
     "ReviewedAnswer",

@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time
 from decimal import Decimal
 from difflib import SequenceMatcher
 import json
 import re
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Iterator, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlglot import exp, parse
@@ -17,6 +18,7 @@ from sqlglot.errors import ParseError
 from .limits import MAX_EMPLOYEE_CANDIDATES
 
 if TYPE_CHECKING:
+    from psycopg import Connection
     from .reference import Employee, EmployeeOption
 
 
@@ -249,6 +251,7 @@ def execute_sql(
     max_response_bytes: int = 1000000,
     allowed_tables: tuple[str, ...] | None = None,
     scope_employee_ids: tuple[str, ...] | None = None,
+    connection: Connection | None = None,
 ) -> SqlExecutionResult:
     """Execute one bounded read query with any authorized row scope."""
 
@@ -262,18 +265,74 @@ def execute_sql(
             sql, employee_ids=scope_employee_ids, allowed_tables=allowed_tables
         )
 
+    def run_query(active_connection) -> SqlExecutionResult:
+        cursor = active_connection.execute(sql)
+        description = cursor.description or ()
+        raw_rows = cursor.fetchmany(result_limit + 1) if description else ()
+        if len(raw_rows) > result_limit:
+            raise RuntimeError("result row bound exceeded")
+        rows = tuple(
+            {str(key): _json_value(value) for key, value in dict(row).items()}
+            for row in raw_rows
+        )
+        response_bytes = len(
+            json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+        if response_bytes > max_response_bytes:
+            raise RuntimeError("result response-size bound exceeded")
+        columns = tuple(
+            ResultColumn(
+                name=str(item.name),
+                type_code=(str(item.type_code) if item.type_code is not None else None),
+            )
+            for item in description
+        )
+        return SqlExecutionResult(
+            columns=columns,
+            rows=rows,
+            coverage=ExecutionCoverage(
+                fetched_rows=len(rows), result_limit=result_limit,
+                response_bytes=response_bytes,
+            ),
+        )
+
+    if connection is not None:
+        connection.execute("SAVEPOINT attendance_step")
+        try:
+            result = run_query(connection)
+            connection.execute("RELEASE SAVEPOINT attendance_step")
+            return result
+        except Exception:
+            connection.execute("ROLLBACK TO SAVEPOINT attendance_step")
+            connection.execute("RELEASE SAVEPOINT attendance_step")
+            raise
+
+    with open_read_snapshot(
+        dsn=dsn, connect_timeout=connect_timeout,
+        statement_timeout_ms=statement_timeout_ms,
+        lock_timeout_ms=lock_timeout_ms, idle_timeout_ms=idle_timeout_ms,
+    ) as single_connection:
+        return run_query(single_connection)
+
+
+@contextmanager
+def open_read_snapshot(
+    *, dsn: str, connect_timeout: int = 5,
+    statement_timeout_ms: int = 30000, lock_timeout_ms: int = 3000,
+    idle_timeout_ms: int = 30000,
+) -> Iterator[Connection]:
+    """Keep multiple read queries on one repeatable-read snapshot."""
+
     import psycopg
     from psycopg.rows import dict_row
 
     with psycopg.connect(
-        dsn,
-        connect_timeout=connect_timeout,
-        row_factory=dict_row,
+        dsn, connect_timeout=connect_timeout, row_factory=dict_row,
     ) as connection:
         try:
-            connection.execute(
-                "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
-            )
+            connection.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             connection.execute(
                 "SELECT set_config('statement_timeout', %s, true)",
                 (str(statement_timeout_ms),),
@@ -286,45 +345,9 @@ def execute_sql(
                 "SELECT set_config('idle_in_transaction_session_timeout', %s, true)",
                 (str(idle_timeout_ms),),
             )
-            cursor = connection.execute(sql)
-            description = cursor.description or ()
-            raw_rows = cursor.fetchmany(result_limit + 1) if description else ()
-            if len(raw_rows) > result_limit:
-                raise RuntimeError("result row bound exceeded")
-            rows = tuple(
-                {str(key): _json_value(value) for key, value in dict(row).items()}
-                for row in raw_rows
-            )
-            response_bytes = len(
-                json.dumps(rows, ensure_ascii=False, separators=(",", ":")).encode(
-                    "utf-8"
-                )
-            )
-            if response_bytes > max_response_bytes:
-                raise RuntimeError("result response-size bound exceeded")
-            columns = tuple(
-                ResultColumn(
-                    name=str(item.name),
-                    type_code=(
-                        str(item.type_code) if item.type_code is not None else None
-                    ),
-                )
-                for item in description
-            )
-            result = SqlExecutionResult(
-                columns=columns,
-                rows=rows,
-                coverage=ExecutionCoverage(
-                    fetched_rows=len(rows),
-                    result_limit=result_limit,
-                    response_bytes=response_bytes,
-                ),
-            )
+            yield connection
+        finally:
             connection.rollback()
-            return result
-        except Exception:
-            connection.rollback()
-            raise
 
 
 def load_employee_directory(

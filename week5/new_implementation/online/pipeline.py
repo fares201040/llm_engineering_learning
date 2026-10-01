@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import calendar
+from contextlib import nullcontext
 from datetime import date, timedelta
 import json
 import math
@@ -32,6 +33,7 @@ from .execution import (
     SqlExecutionResult,
     authorize_access,
     execute_sql,
+    open_read_snapshot,
     load_employee_directory,
     search_employee_directory_postgres,
     validate_read_query,
@@ -43,6 +45,7 @@ from .limits import MAX_EMPLOYEE_CANDIDATES
 from .planner import (
     ExecutedPlanStep,
     MultiSqlPlan,
+    SqlPlanStep,
     ReplanRequest,
     answer_multi_result,
     answer_result,
@@ -183,9 +186,10 @@ class RuntimeDependencies:
             ..., tuple[EmployeeOption, ...]
         ] = search_employee_directory_postgres,
         context_loader: Callable[..., DatabaseContext] = load_database_context,
-        planner: Callable[..., str] = request_sql,
+        planner: Callable[..., str | MultiSqlPlan] = request_sql,
         executor: Callable[..., SqlExecutionResult] = execute_sql,
         answerer: Callable[..., str | ReplanRequest] = answer_result,
+        snapshot_factory: Callable[..., object] | None = None,
     ):
         self.reference_writer = reference_writer
         self.directory_loader = directory_loader
@@ -195,9 +199,10 @@ class RuntimeDependencies:
         self.planner = planner
         self.executor = executor
         self.answerer = answerer
+        self.snapshot_factory = snapshot_factory
 
 
-DEPENDENCIES = RuntimeDependencies()
+DEPENDENCIES = RuntimeDependencies(snapshot_factory=open_read_snapshot)
 
 
 def _locale(question: str) -> Literal["en", "ar"]:
@@ -247,115 +252,6 @@ def _has_multiple_source_scopes(sql: str) -> bool:
         for statement in statements
         if statement is not None
     )
-
-
-def _requested_workflow_status(question: str) -> str | None:
-    """Recognize one named category only when the request has a single scope."""
-
-    folded = question.casefold()
-    if re.search(r"\b(?:separately|versus|vs)\b", folded):
-        return None
-    if re.search(
-        r"\b(?:not|without|except|excluding)\s+(?:the\s+)?"
-        r"(?:draft|authorized|pending)\b",
-        folded,
-    ):
-        return None
-    if re.search(r"\b(?:all|every)\s+statuses\b", folded):
-        return None
-    if re.search(r"[;,]|\b(?:and|also|plus)\b", folded) and re.search(
-        r"\b(?:all|every)\b", folded
-    ):
-        return None
-    statuses = {
-        status
-        for status in ("draft", "authorized", "pending")
-        if re.search(rf"\b{status}\b", folded)
-    }
-    if len(statuses) != 1:
-        return None
-    status = statuses.pop()
-    if status == "authorized" and re.search(r"\b(?:ot|overtime|hours?)\b", folded):
-        return None
-    return status
-
-
-def _has_required_workflow_status(
-    sql: str, status: str, *, independent_clauses: bool = False
-) -> bool:
-    paths = contributing_where_paths(sql, include_scalar_subqueries=False)
-
-    def status_expression(node: exp.Expression) -> bool:
-        columns = {column.name.casefold() for column in node.find_all(exp.Column)}
-        return "status" in columns or (
-            "record_json" in columns
-            and any(
-                isinstance(literal, exp.Literal)
-                and literal.is_string
-                and str(literal.this).casefold() == "status"
-                for literal in node.find_all(exp.Literal)
-            )
-        )
-
-    def matches(predicate: exp.Expression) -> bool:
-        def status_value(node: exp.Expression) -> bool:
-            return (
-                isinstance(node, exp.Literal)
-                and node.is_string
-                and str(node.this).casefold()
-                == (
-                    "Pending For Authorization" if status == "pending" else status
-                ).casefold()
-            )
-
-        if isinstance(predicate, exp.EQ):
-            return (
-                status_expression(predicate.this) and status_value(predicate.expression)
-            ) or (
-                status_expression(predicate.expression) and status_value(predicate.this)
-            )
-        if isinstance(predicate, exp.In):
-            return (
-                status_expression(predicate.this)
-                and bool(predicate.expressions)
-                and all(status_value(value) for value in predicate.expressions)
-            )
-        return False
-
-    matching_paths = (any(matches(predicate) for predicate in path) for path in paths)
-    if paths and (any(matching_paths) if independent_clauses else all(matching_paths)):
-        return True
-    if any(status_expression(predicate) for path in paths for predicate in path):
-        return False
-    try:
-        statements = parse(sql, read="postgres")
-    except ParseError:
-        return False
-    for statement in statements:
-        if not isinstance(statement, exp.Select):
-            continue
-        filtered_projections = []
-        unfiltered_count_projections = []
-        for item in statement.expressions:
-            has_status_filter = any(
-                isinstance(filtered.this, exp.Count)
-                and isinstance(filtered.expression, exp.Where)
-                and matches(filtered.expression.this)
-                for filtered in item.find_all(exp.Filter)
-            )
-            if has_status_filter:
-                filtered_projections.append(item)
-            if any(
-                count.find_ancestor(exp.Filter) is None
-                and count.find_ancestor(exp.Window) is None
-                for count in item.find_all(exp.Count)
-            ):
-                unfiltered_count_projections.append(item)
-        if filtered_projections and all(
-            item in filtered_projections for item in unfiltered_count_projections
-        ):
-            return True
-    return False
 
 
 def _carried_verified_employees(
@@ -430,12 +326,9 @@ def _has_self_membership_filter(sql: str) -> bool:
 
 
 def _sql_semantic_issue(
-    question: str,
+    _question: str,
     sql: str,
     *,
-    rewritten_request: str = "",
-    allow_rewritten_contracts: bool = True,
-    database_context: DatabaseContext | None = None,
     required_date_scope: tuple[str, str] | None = None,
     independent_clauses: bool = False,
 ) -> str | None:
@@ -447,24 +340,18 @@ def _sql_semantic_issue(
         statements = parse(sql, read="postgres")
     except ParseError:
         statements = ()
-    running_total_found = False
     for statement in statements:
         if statement is None:
             continue
-        if any(True for _ in statement.find_all(exp.ArrayAgg)):
-            return "nested_result_shape"
         for alias in statement.find_all(exp.Alias):
             if alias.alias.casefold() != "running_total":
                 continue
-            running_total_found = True
             if not (
                 isinstance(alias.this, exp.Window)
                 and isinstance(alias.this.this, exp.Sum)
                 and alias.this.args.get("order") is not None
             ):
                 return "invalid_running_total_expression"
-            if not any(True for _ in statement.find_all(exp.Group)):
-                return "running_total_requires_daily_grouping"
         # Only the published result needs a matched_count. An inner grouped CTE
         # may use LIMIT to select an eligible cohort before the outer query
         # computes a scalar or a different result shape.
@@ -476,145 +363,19 @@ def _sql_semantic_issue(
                 for item in select_node.expressions
                 if item.alias_or_name.casefold() == "matched_count"
             ]
-            if not matched or not all(
+            if matched and not all(
                 isinstance(item, exp.Alias)
                 and isinstance(item.this, exp.Window)
                 and isinstance(item.this.this, exp.Count)
                 for item in matched
             ):
                 return "invalid_grouped_matched_count"
-            if not any(
-                aggregate.find_ancestor(exp.Window) is None
-                for item in select_node.expressions
-                for aggregate in item.find_all(exp.AggFunc)
-            ):
-                return "missing_group_measure"
-            order = select_node.args.get("order")
-            if order is not None and any(
-                isinstance(column, exp.Column)
-                and column.name.casefold() == "matched_count"
-                for column in order.find_all(exp.Column)
-            ):
-                return "group_order_uses_total_count"
-    if is_running_total_question(question) and not running_total_found:
-        return "missing_running_total_expression"
-    folded = question.casefold()
-    detail_noun = re.search(
-        r"\b(?:attendance|details?|entries|records?|rows?)\b", folded
-    )
-    detail_verb = re.search(r"\b(?:display|give|list|show)\b", folded)
-    aggregate_intent = re.search(
-        r"\b(?:average|avg|count|how many|maximum|max|minimum|min|sum|total)\b",
-        folded,
-    )
-    select = re.search(r"\bSELECT\b(.*?)\bFROM\b", sql, re.IGNORECASE | re.DOTALL)
-    select_list = select.group(1) if select else ""
-    scalar_aggregate = bool(
-        re.search(r"\b(?:AVG|COUNT|MAX|MIN|SUM)\s*\(", select_list, re.IGNORECASE)
-        and not re.search(r"\bOVER\s*\(", select_list, re.IGNORECASE)
-    )
-    grouped_result = any(
-        isinstance(statement, exp.Select) and statement.args.get("group") is not None
-        for statement in statements
-    )
-    if (
-        detail_noun
-        and detail_verb
-        and not aggregate_intent
-        and scalar_aggregate
-        and not grouped_result
-        and not re.search(r"\brecord_id\b", select_list, re.IGNORECASE)
-    ):
-        return "detail_request_requires_rows"
     separate_sources = independent_clauses and _has_multiple_source_scopes(sql)
     if not _has_required_date_scope(
         sql, required_date_scope, independent_clauses=separate_sources
     ):
         return "date_scope_mismatch"
-    requested_status = _requested_workflow_status(question)
-    if requested_status and not _has_required_workflow_status(
-        sql, requested_status, independent_clauses=separate_sources
-    ):
-        return "missing_workflow_status_filter"
     return None
-
-
-def _repair_group_order(sql: str) -> str:
-    """Order bounded groups by their sole measure when total-count sort is inert."""
-
-    try:
-        statements = parse(sql, read="postgres")
-    except ParseError:
-        return sql
-    if len(statements) != 1 or statements[0] is None:
-        return sql
-    statement = statements[0]
-    changed = False
-    for select_node in statement.find_all(exp.Select):
-        if not (select_node.args.get("group") and select_node.args.get("limit")):
-            continue
-        measures = [
-            item.alias
-            for item in select_node.expressions
-            if isinstance(item, exp.Alias)
-            and item.alias.casefold() != "matched_count"
-            and any(
-                aggregate.find_ancestor(exp.Window) is None
-                for aggregate in item.find_all(exp.AggFunc)
-            )
-        ]
-        if len(measures) != 1:
-            continue
-        order = select_node.args.get("order")
-        if order is None:
-            continue
-        for ordered in order.expressions:
-            if (
-                isinstance(ordered.this, exp.Column)
-                and ordered.this.name.casefold() == "matched_count"
-            ):
-                ordered.set("this", exp.column(measures[0]))
-                changed = True
-    return statement.sql(dialect="postgres") if changed else sql
-
-
-def _repair_group_matched_count(sql: str) -> str:
-    """Give a valid grouped window count the published coverage alias."""
-
-    try:
-        statements = parse(sql, read="postgres")
-    except ParseError:
-        return sql
-    if len(statements) != 1 or not isinstance(statements[0], exp.Select):
-        return sql
-    statement = statements[0]
-    if not (statement.args.get("group") and statement.args.get("limit")):
-        return sql
-    if any(
-        item.alias_or_name.casefold() == "matched_count"
-        for item in statement.expressions
-    ):
-        return sql
-    candidates = [
-        item
-        for item in statement.expressions
-        if isinstance(item, exp.Alias)
-        and isinstance(item.this, exp.Window)
-        and isinstance(item.this.this, exp.Count)
-        and isinstance(item.this.this.this, exp.Star)
-        and not item.this.args.get("partition_by")
-        and not item.this.args.get("order")
-    ]
-    if len(candidates) != 1:
-        return sql
-    old_alias = candidates[0].alias
-    candidates[0].set("alias", exp.to_identifier("matched_count"))
-    order = statement.args.get("order")
-    if order is not None:
-        for column in order.find_all(exp.Column):
-            if column.name.casefold() == old_alias.casefold():
-                column.set("this", exp.to_identifier("matched_count"))
-    return statement.sql(dialect="postgres")
 
 
 def _strip_private_projections(
@@ -895,7 +656,7 @@ def _explicit_date_scopes(question: str) -> set[tuple[str, str]]:
     # being counted again as independent day mentions.
     for match in re.finditer(
         r"\b(?P<first>\d{4}-\d{1,2}-\d{1,2})\s*"
-        r"(?:to|through|and|[-–—])\s*"
+        r"(?:to|through|[-–—])\s*"
         r"(?P<last>\d{4}-\d{1,2}-\d{1,2})\b",
         question,
         re.IGNORECASE,
@@ -909,8 +670,35 @@ def _explicit_date_scopes(question: str) -> set[tuple[str, str]]:
         except ValueError:
             return set()
     for match in re.finditer(
+        r"\b(?:between|from)\s+(?P<first>\d{4}-\d{1,2}-\d{1,2})\s+"
+        r"and\s+(?P<last>\d{4}-\d{1,2}-\d{1,2})\b",
+        question,
+        re.IGNORECASE,
+    ):
+        try:
+            add(match, date.fromisoformat(match["first"]), date.fromisoformat(match["last"]))
+        except ValueError:
+            return set()
+    for match in re.finditer(
         rf"\b(?P<first_m>{month_pattern})\s+(?P<first_d>\d{{1,2}})\s*"
-        rf"(?:to|through|and|[-–—])\s*"
+        rf"(?:to|through|[-–—])\s*"
+        rf"(?P<last_m>{month_pattern})\s+(?P<last_d>\d{{1,2}})\s*,?\s*"
+        rf"(?P<y>\d{{4}})\b",
+        question,
+        re.IGNORECASE,
+    ):
+        try:
+            year = int(match["y"])
+            add(
+                match,
+                date(year, months[match["first_m"].casefold()], int(match["first_d"])),
+                date(year, months[match["last_m"].casefold()], int(match["last_d"])),
+            )
+        except ValueError:
+            return set()
+    for match in re.finditer(
+        rf"\b(?:between|from)\s+(?P<first_m>{month_pattern})\s+"
+        rf"(?P<first_d>\d{{1,2}})\s+and\s+"
         rf"(?P<last_m>{month_pattern})\s+(?P<last_d>\d{{1,2}})\s*,?\s*"
         rf"(?P<y>\d{{4}})\b",
         question,
@@ -1025,13 +813,29 @@ def _explicit_date_scopes(question: str) -> set[tuple[str, str]]:
                 return set()
             add(match, day, day)
     month_token = rf"(?:{month_pattern})"
-    separator = r"\s*(?:,|and|or|vs\.?|versus|/|&|[-–—]|to|through)\s*"
+    for match in re.finditer(
+        rf"\b(?P<first>{month_token})\s*(?:to|through|[-–—])\s*"
+        rf"(?P<last>{month_token})\s+(?P<y>\d{{4}})\b",
+        question,
+        re.IGNORECASE,
+    ):
+        year = int(match["y"])
+        first = months[match["first"].casefold()]
+        last = months[match["last"].casefold()]
+        add(
+            match,
+            date(year, first, 1),
+            date(year, last, calendar.monthrange(year, last)[1]),
+        )
+    separator = r"\s*(?:,|and|or|vs\.?|versus|/|&)\s*"
     for match in re.finditer(
         rf"\b(?P<months>{month_token}(?:{separator}{month_token})+)"
         rf"\s+(?P<y>\d{{4}})\b",
         question,
         re.IGNORECASE,
     ):
+        if any(a <= match.start() and match.end() <= b for (a, b), _ in found):
+            continue
         year = int(match["y"])
         for month_match in re.finditer(month_token, match["months"], re.IGNORECASE):
             month = months[month_match.group().casefold()]
@@ -1365,21 +1169,31 @@ def _prior_step_metadata(turn: VerifiedTurn) -> tuple[dict[str, object], ...]:
                  for step in turn.executed_steps)
 
 
+class _MultiStepRetry(Exception):
+    def __init__(self, index: int, step: SqlPlanStep, failure: dict[str, object]):
+        self.index = index
+        self.step = step
+        self.failure = failure
+        super().__init__(str(failure["database_error"]))
+
+
 def _run_multi_plan(
     *, plan: MultiSqlPlan, deps: RuntimeDependencies,
     shared_context: SharedModelContext, bound: BoundReferences,
-    previous: ConversationState, question: str, locale: str,
+    previous: ConversationState, question: str,
     allowed_employee_ids: tuple[str, ...] | None, budget: CallBudget,
     observer: TurnObserver | None, count_reconciliation: bool,
-) -> TurnOutcome:
+) -> TurnOutcome | str:
     clauses = bound.scope_clauses
-    if len(clauses) > 4:
-        raise ProviderFailure("sql_planner", "incomplete_multi_plan", "At most four independent clauses are supported")
+    if len(clauses) > 12:
+        raise ProviderFailure("sql_planner", "incomplete_multi_plan", "The multi-step plan exceeds its execution bound")
     allowed_tables = tuple(
         f"{table.schema_name}.{table.table_name}"
         for table in shared_context.database_context.tables
     )
-    for plan_attempt in range(1, 3):
+    plan_attempt = 1
+    step_retries = 0
+    while plan_attempt <= 2:
         log_layer_output("multi_plan", plan, attempt=plan_attempt)
         clause_indices = _normalized_plan_indices(plan, len(clauses))
         if clause_indices is None:
@@ -1401,109 +1215,122 @@ def _run_multi_plan(
                     "failed_plan": plan.model_dump(mode="json"),
                 },
             )
+            if isinstance(correction, str):
+                return correction
             if not isinstance(correction, MultiSqlPlan):
                 raise ProviderFailure("sql_planner", "invalid_multi_replan", "The planner did not return a corrected multi-step plan")
             plan = correction
+            plan_attempt += 1
             continue
         all_clause_dates = tuple(_explicit_date_scopes(item.request) for item in clauses)
         executed: list[ExecutedPlanStep] = []
         total_rows = 0
         total_bytes = 0
-        for index, planned in enumerate(plan.steps):
-            clause_index = clause_indices[index]
-            clause = clauses[clause_index]
-            clause_dates = all_clause_dates[clause_index]
-            step_dates = _explicit_date_scopes(planned.subrequest)
-            if clause_dates and step_dates and not step_dates.issubset(clause_dates):
-                raise ProviderFailure("sql_planner", "multi_step_scope_mismatch",
-                                      "A plan step introduced a date outside its clause")
-            if len(clause_dates) == 1:
-                clause_date_scope = next(iter(clause_dates))
-            elif len(clause_dates) > 1 and len(step_dates) == 1:
-                clause_date_scope = next(iter(step_dates))
-            elif clause.date_scope_relationship in {"independent", "unbounded"}:
-                clause_date_scope = None
-            elif shared_context.required_date_scope is not None:
-                clause_date_scope = shared_context.required_date_scope
-            else:
-                clause_date_scope = None
-            requested_dates = tuple(sorted(clause_dates or step_dates))
-            if not requested_dates and clause_date_scope is not None:
-                requested_dates = (clause_date_scope,)
-            sql = planned.sql
-            failure: dict[str, object] | None = None
-            for attempt in range(1, SQL_EXECUTION_ATTEMPT_LIMIT + 1):
-                if attempt > 1:
-                    assert failure is not None
-                    sql = retry_plan_step(
-                        shared_context=shared_context, step=planned, failure=failure,
-                        model=settings.llm_planner_model, budget=budget,
-                        timeout=settings.llm_planner_timeout_seconds,
-                        max_output_tokens=settings.llm_planner_max_output_tokens,
-                        attempt=attempt, observer=observer,
+        total_row_limit = min(1000, min(settings.max_exact_results, 1000) * len(plan.steps))
+        snapshot_context = (
+            deps.snapshot_factory(
+                dsn=settings.postgres_readonly_dsn,
+                connect_timeout=settings.postgres_connect_timeout_seconds,
+                statement_timeout_ms=settings.postgres_statement_timeout_ms,
+                lock_timeout_ms=settings.postgres_lock_timeout_ms,
+                idle_timeout_ms=settings.postgres_idle_transaction_timeout_ms,
+            )
+            if deps.snapshot_factory is not None else nullcontext(None)
+        )
+        try:
+            with snapshot_context as snapshot_connection:
+                for index, planned in enumerate(plan.steps):
+                    clause_index = clause_indices[index]
+                    clause = clauses[clause_index]
+                    clause_dates = all_clause_dates[clause_index]
+                    step_dates = _explicit_date_scopes(planned.subrequest)
+                    if clause_dates and step_dates and not step_dates.issubset(clause_dates):
+                        raise ProviderFailure("sql_planner", "multi_step_scope_mismatch",
+                                              "A plan step introduced a date outside its clause")
+                    if len(clause_dates) == 1:
+                        clause_date_scope = next(iter(clause_dates))
+                    elif len(clause_dates) > 1 and len(step_dates) == 1:
+                        clause_date_scope = next(iter(step_dates))
+                    elif clause.date_scope_relationship in {"independent", "unbounded"}:
+                        clause_date_scope = None
+                    elif shared_context.required_date_scope is not None:
+                        clause_date_scope = shared_context.required_date_scope
+                    else:
+                        clause_date_scope = None
+                    requested_dates = tuple(sorted(clause_dates or step_dates))
+                    if not requested_dates and clause_date_scope is not None:
+                        requested_dates = (clause_date_scope,)
+                    sql = _strip_private_projections(
+                        planned.sql, public_columns=tuple(
+                            column.name for table in shared_context.database_context.tables
+                            for column in table.columns
+                        ),
                     )
-                sql = _repair_group_order(_repair_group_matched_count(sql))
-                sql = _strip_private_projections(
-                    sql, public_columns=tuple(
-                        column.name for table in shared_context.database_context.tables
-                        for column in table.columns
-                    ),
-                )
-                if sql is None:
-                    raise ProviderFailure("sql_planner", "private_source_payload", "A plan step projected private source data")
-                try:
-                    validate_read_query(sql, allowed_tables=allowed_tables)
-                    semantic_issue = _sql_semantic_issue(
-                        clause.request, sql,
-                        rewritten_request=clause.request,
-                        allow_rewritten_contracts=False,
-                        database_context=shared_context.database_context,
-                        required_date_scope=clause_date_scope,
-                        independent_clauses=False,
-                    )
-                    if semantic_issue is not None:
-                        raise ValueError(f"SQL semantic issue: {semantic_issue}")
-                    if clause_date_scope is not None and not _has_required_date_scope(
-                        sql, clause_date_scope, independent_clauses=True,
-                    ):
-                        raise ValueError("SQL does not preserve the clause's required date scope")
-                    result = deps.executor(
-                        sql, dsn=settings.postgres_readonly_dsn,
-                        connect_timeout=settings.postgres_connect_timeout_seconds,
-                        statement_timeout_ms=settings.postgres_statement_timeout_ms,
-                        lock_timeout_ms=settings.postgres_lock_timeout_ms,
-                        idle_timeout_ms=settings.postgres_idle_transaction_timeout_ms,
-                        result_limit=min(settings.max_exact_results, 1000),
-                        max_response_bytes=settings.max_sql_result_bytes,
-                        allowed_tables=allowed_tables,
-                        scope_employee_ids=allowed_employee_ids,
-                    )
-                except (ValueError, psycopg.ProgrammingError, psycopg.DataError, RuntimeError) as exc:
-                    if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
-                        raise ProviderFailure("sql_planner", "multi_step_failed", str(exc)) from exc
-                    failure = {
-                        "retry_number": attempt, "failed_sql": sql,
-                        "error_type": type(exc).__name__, "database_error": str(exc)[:4000],
-                        "scope_clause_index": clause_index,
-                        "subrequest": planned.subrequest,
-                    }
-                    log_layer_output("sql_execution_failure", failure, attempt=attempt)
-                    continue
-                total_rows += len(result.rows)
-                total_bytes += result.coverage.response_bytes
-                if total_rows > min(settings.max_exact_results, 1000):
-                    raise ProviderFailure("sql_execution", "multi_result_bound", "Combined plan results exceeded the row bound")
-                if total_bytes > settings.max_sql_result_bytes:
-                    raise ProviderFailure("sql_execution", "multi_result_bound", "Combined plan results exceeded the response-size bound")
-                executed.append(ExecutedPlanStep(
-                    scope_clause_index=clause_index, subrequest=planned.subrequest,
-                    sql=sql, requested_date_scope=clause_date_scope,
-                    requested_date_scopes=requested_dates,
-                    date_scope=_sql_date_scope(sql), result=result,
-                ))
-                log_layer_output("sql_execution", {"step_index": index, "sql": sql,
-                                                   "result": result.model_dump(mode="json")})
-                break
+                    if sql is None:
+                        raise ProviderFailure("sql_planner", "private_source_payload", "A plan step projected private source data")
+                    try:
+                        validate_read_query(sql, allowed_tables=allowed_tables)
+                        semantic_issue = _sql_semantic_issue(
+                            clause.request, sql, required_date_scope=clause_date_scope,
+                            independent_clauses=False,
+                        )
+                        if semantic_issue is not None:
+                            raise ValueError(f"SQL semantic issue: {semantic_issue}")
+                        result = deps.executor(
+                            sql, dsn=settings.postgres_readonly_dsn,
+                            connect_timeout=settings.postgres_connect_timeout_seconds,
+                            statement_timeout_ms=settings.postgres_statement_timeout_ms,
+                            lock_timeout_ms=settings.postgres_lock_timeout_ms,
+                            idle_timeout_ms=settings.postgres_idle_transaction_timeout_ms,
+                            result_limit=min(settings.max_exact_results, 1000),
+                            max_response_bytes=settings.max_sql_result_bytes,
+                            allowed_tables=allowed_tables,
+                            scope_employee_ids=allowed_employee_ids,
+                            **({"connection": snapshot_connection}
+                               if snapshot_connection is not None else {}),
+                        )
+                    except (ValueError, psycopg.ProgrammingError, psycopg.DataError, RuntimeError) as exc:
+                        failure = {
+                            "retry_number": step_retries + 1, "failed_sql": sql,
+                            "error_type": type(exc).__name__, "database_error": str(exc)[:4000],
+                            "scope_clause_index": clause_index,
+                            "subrequest": planned.subrequest,
+                        }
+                        log_layer_output("sql_execution_failure", failure, attempt=step_retries + 1)
+                        raise _MultiStepRetry(index, planned, failure) from exc
+                    total_rows += len(result.rows)
+                    total_bytes += result.coverage.response_bytes
+                    if total_rows > total_row_limit:
+                        raise ProviderFailure("sql_execution", "multi_result_bound", "Combined plan results exceeded the row bound")
+                    if total_bytes > settings.max_sql_result_bytes:
+                        raise ProviderFailure("sql_execution", "multi_result_bound", "Combined plan results exceeded the response-size bound")
+                    executed.append(ExecutedPlanStep(
+                        scope_clause_index=clause_index, subrequest=planned.subrequest,
+                        sql=sql, requested_date_scope=clause_date_scope,
+                        requested_date_scopes=requested_dates,
+                        date_scope=_sql_date_scope(sql), result=result,
+                    ))
+                    log_layer_output("sql_execution", {"step_index": index, "sql": sql,
+                                                       "result": result.model_dump(mode="json")})
+        except _MultiStepRetry as retry:
+            if step_retries >= SQL_EXECUTION_ATTEMPT_LIMIT - 1:
+                raise ProviderFailure(
+                    "sql_planner", "multi_step_failed", str(retry)
+                ) from retry
+            step_retries += 1
+            corrected_sql = retry_plan_step(
+                shared_context=shared_context, step=retry.step,
+                failure=retry.failure, model=settings.llm_planner_model,
+                budget=budget, timeout=settings.llm_planner_timeout_seconds,
+                max_output_tokens=settings.llm_planner_max_output_tokens,
+                attempt=step_retries + 1, observer=observer,
+            )
+            corrected_steps = list(plan.steps)
+            corrected_steps[retry.index] = retry.step.model_copy(
+                update={"sql": corrected_sql}
+            )
+            plan = MultiSqlPlan(steps=tuple(corrected_steps))
+            continue
         steps = tuple(executed)
         answer = answer_multi_result(
             shared_context=shared_context, steps=steps, employees=bound.employees,
@@ -1524,9 +1351,12 @@ def _run_multi_plan(
                                        "database_error": answer.reason,
                                        "executed_steps": [step.model_dump(mode="json") for step in steps]},
             )
+            if isinstance(replanned, str):
+                return replanned
             if not isinstance(replanned, MultiSqlPlan):
                 raise ProviderFailure("sql_planner", "invalid_multi_replan", "The replanner omitted independent clauses")
             plan = replanned
+            plan_attempt += 1
             continue
         published_employees = bound.employees
         verified = VerifiedTurn(
@@ -2067,14 +1897,18 @@ def run_turn(
                 attempt=1, observer=observer,
             )
             if isinstance(planned, MultiSqlPlan):
-                return _run_multi_plan(
+                multi_outcome = _run_multi_plan(
                     plan=planned, deps=deps, shared_context=shared_context,
                     bound=bound, previous=previous, question=question,
-                    locale=locale, allowed_employee_ids=allowed_employee_ids,
+                    allowed_employee_ids=allowed_employee_ids,
                     budget=budget, observer=observer,
                     count_reconciliation=count_reconciliation,
                 )
-            initial_sql = planned
+                if not isinstance(multi_outcome, str):
+                    return multi_outcome
+                initial_sql = multi_outcome
+            else:
+                initial_sql = planned
         sql_execution_failure: dict[str, object] | None = None
         for attempt in range(1, SQL_EXECUTION_ATTEMPT_LIMIT + 1):
             planner_args: dict[str, object] = {
@@ -2097,7 +1931,17 @@ def run_turn(
                 if initial_sql is not None and attempt == 1
                 else deps.planner(**planner_args)
             )
-            sql = _repair_group_order(_repair_group_matched_count(sql))
+            if isinstance(sql, MultiSqlPlan):
+                multi_outcome = _run_multi_plan(
+                    plan=sql, deps=deps, shared_context=shared_context,
+                    bound=bound, previous=previous, question=question,
+                    allowed_employee_ids=allowed_employee_ids,
+                    budget=budget, observer=observer,
+                    count_reconciliation=count_reconciliation,
+                )
+                if not isinstance(multi_outcome, str):
+                    return multi_outcome
+                sql = multi_outcome
             sql = _strip_private_projections(
                 sql,
                 public_columns=tuple(
@@ -2213,62 +2057,24 @@ def run_turn(
             semantic_issue = _sql_semantic_issue(
                 question,
                 sql,
-                rewritten_request=bound.updated_request,
-                allow_rewritten_contracts=(bound.request_relationship == "follow_up"),
-                database_context=database_context,
                 required_date_scope=enforced_date_scope,
                 independent_clauses=len(bound.scope_clauses) > 1,
             )
             if semantic_issue in {
-                "nested_result_shape",
-                "detail_request_requires_rows",
                 "invalid_grouped_matched_count",
-                "missing_group_measure",
-                "group_order_uses_total_count",
                 "invalid_running_total_expression",
-                "missing_running_total_expression",
-                "running_total_requires_daily_grouping",
                 "self_membership_filter",
                 "date_scope_mismatch",
-                "missing_workflow_status_filter",
             }:
                 if attempt == SQL_EXECUTION_ATTEMPT_LIMIT:
                     raise ProviderFailure(
                         "sql_semantics", semantic_issue, semantic_issue
                     )
                 database_error = semantic_issue
-                if semantic_issue == "nested_result_shape":
+                if semantic_issue == "invalid_grouped_matched_count":
                     database_error = (
-                        "Return flat relational columns and bounded rows rather than "
-                        "an array aggregate. Include the requested date or detail "
-                        "column on each row and COUNT(*) OVER() AS matched_count."
-                    )
-                elif semantic_issue == "detail_request_requires_rows":
-                    database_error = (
-                        "The user requested attendance detail rows, but this SQL "
-                        "returns only an aggregate. Return bounded matching rows with "
-                        "record_id and COUNT(*) OVER() AS matched_count."
-                    )
-                elif semantic_issue == "invalid_grouped_matched_count":
-                    database_error = (
-                        "A bounded grouped result must include COUNT(*) OVER() "
-                        "AS matched_count for the number of returned groups. "
-                        "Do not use COUNT(*) AS matched_count for each group's "
-                        "indicator rows; give that measure a distinct alias."
-                    )
-                elif semantic_issue == "missing_group_measure":
-                    database_error = (
-                        "The grouped query selects group keys and a total group "
-                        "count but no measure for each group. Add the requested "
-                        "per-group aggregate, such as COUNT(*) AS indicator_count "
-                        "over qualifying rows. Keep COUNT(*) OVER() AS "
-                        "matched_count for the number of groups."
-                    )
-                elif semantic_issue == "group_order_uses_total_count":
-                    database_error = (
-                        "The grouped query orders by matched_count, which is the "
-                        "same total number of groups on every row. Order by the "
-                        "requested per-group measure or a meaningful group key."
+                        "The matched_count alias is not a grouped window count. "
+                        "Use another alias for a per-group measure."
                     )
                 elif semantic_issue == "invalid_running_total_expression":
                     database_error = (
@@ -2278,21 +2084,6 @@ def run_turn(
                         "the requested date column ROWS BETWEEN UNBOUNDED "
                         "PRECEDING AND "
                         "CURRENT ROW) AS running_total."
-                    )
-                elif semantic_issue == "missing_running_total_expression":
-                    database_error = (
-                        "The request asks for a cumulative running total, but the "
-                        "SQL returns only daily values. Aggregate the requested "
-                        "measure by date, then select SUM(daily_value) OVER "
-                        "(ORDER BY date ROWS BETWEEN UNBOUNDED PRECEDING AND "
-                        "CURRENT ROW) AS running_total."
-                    )
-                elif semantic_issue == "running_total_requires_daily_grouping":
-                    database_error = (
-                        "The cumulative window runs over raw attendance rows, "
-                        "so a date can appear more than once. Aggregate the "
-                        "requested measure by date first, then apply the ordered "
-                        "running SUM to those daily values."
                     )
                 elif semantic_issue == "self_membership_filter":
                     database_error = (
@@ -2305,12 +2096,6 @@ def run_turn(
                         "The SQL omitted or incorrectly scoped the required inclusive "
                         "attendance_date range. Apply both bounds to every OR branch: "
                         f"{enforced_date_scope[0]} through {enforced_date_scope[1]}."
-                    )
-                elif semantic_issue == "missing_workflow_status_filter":
-                    database_error = (
-                        "The current question explicitly requests one workflow "
-                        "status. Filter status to that named category on every "
-                        "contributing source path before counting or grouping."
                     )
                 sql_execution_failure = {
                     "retry_number": attempt,
@@ -2396,9 +2181,6 @@ def run_turn(
             semantic_issue = _sql_semantic_issue(
                 question,
                 sql,
-                rewritten_request=bound.updated_request,
-                allow_rewritten_contracts=(bound.request_relationship == "follow_up"),
-                database_context=database_context,
                 required_date_scope=enforced_date_scope,
                 independent_clauses=len(bound.scope_clauses) > 1,
             )

@@ -30,7 +30,7 @@ class VerifiedTurn(_Strict):
     date_scope: tuple[str, str] | None = None
     requested_date_scope: tuple[str, str] | None = None
     result: dict[str, object] = Field(default_factory=dict)
-    executed_steps: tuple[dict[str, object], ...] = Field(default=(), max_length=4)
+    executed_steps: tuple[dict[str, object], ...] = Field(default=(), max_length=12)
     scope_clauses: tuple[ScopeClause, ...] = Field(default=(), max_length=20)
 
     @model_validator(mode="after")

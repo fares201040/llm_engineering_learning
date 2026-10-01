@@ -1,5 +1,6 @@
 """Independent SQL evidence for a multi-part attendance request."""
 
+from contextlib import contextmanager
 from unittest.mock import patch
 
 from week5.new_implementation.online.context import SharedModelContext
@@ -7,11 +8,12 @@ from week5.new_implementation.online.execution import (
     ExecutionCoverage, LOCAL_DEMO_ACCESS, SqlExecutionResult,
 )
 from week5.new_implementation.online.pipeline import (
-    Answered, Failed, RuntimeDependencies, TurnRequest, run_turn,
+    Answered, Failed, RuntimeDependencies, TurnRequest,
+    _explicit_date_scopes, run_turn,
 )
 from week5.new_implementation.online.planner import (
     ExecutedPlanStep, MultiSqlPlan, PlannerAnswer, ReplanRequest, ReviewedMultiAnswer,
-    SqlPlanStep, answer_multi_result, request_sql,
+    SqlPlanChoice, SqlPlanStep, answer_multi_result, request_sql,
 )
 from week5.new_implementation.online.provider import CallBudget
 from week5.new_implementation.online.reference import (
@@ -30,6 +32,10 @@ CLAUSES = (
 SQLS = (
     "SELECT COUNT(*) AS n FROM attendance_records WHERE status = 'Authorized'",
     "SELECT COUNT(*) AS n FROM attendance_records",
+)
+SHARED_SQL = (
+    "SELECT COUNT(*) FILTER (WHERE status = 'Authorized') AS authorized_count, "
+    "COUNT(*) AS overall_count FROM attendance_records"
 )
 
 
@@ -72,6 +78,83 @@ def test_pipeline_executes_and_publishes_separate_scoped_results():
     assert outcome.state.verified_turns[-1].executed_steps[1]["sql"] == SQLS[1]
     assert answerer.call_args.kwargs["steps"][0].result.rows[0]["n"] == 2
     assert answerer.call_args.kwargs["steps"][1].result.rows[0]["n"] == 5
+
+
+def test_multi_steps_share_one_snapshot_connection():
+    executed = []
+    deps = _dependencies(_plan(), executed)
+    marker = object()
+    openings = []
+    connections = []
+
+    @contextmanager
+    def snapshot_factory(**kwargs):
+        openings.append(kwargs)
+        yield marker
+
+    original_executor = deps.executor
+    deps.snapshot_factory = snapshot_factory
+    deps.executor = lambda sql, **kwargs: (
+        connections.append(kwargs.get("connection"))
+        or original_executor(sql, **kwargs)
+    )
+    with patch("week5.new_implementation.online.pipeline.answer_multi_result",
+               return_value="Both counts."):
+        outcome = run_turn(TurnRequest(
+            question="Count Authorized attendance records and count all attendance records.",
+            access_context=LOCAL_DEMO_ACCESS,
+        ), dependencies=deps)
+    assert isinstance(outcome, Answered)
+    assert len(openings) == 1
+    assert connections == [marker, marker]
+
+
+def test_failed_step_is_replanned_after_snapshot_closes():
+    bad_sql = "SELECT broken_column FROM attendance_records"
+    plan = _plan((SQLS[0], bad_sql))
+    executed = []
+    deps = _dependencies(plan, executed)
+    active = False
+    openings = []
+
+    @contextmanager
+    def snapshot_factory(**_kwargs):
+        nonlocal active
+        assert not active
+        active = True
+        openings.append(object())
+        try:
+            yield openings[-1]
+        finally:
+            active = False
+
+    def executor(sql, **_kwargs):
+        executed.append(sql)
+        if sql == bad_sql:
+            raise ValueError("unknown column")
+        return SqlExecutionResult(
+            rows=({"n": 2},),
+            coverage=ExecutionCoverage(fetched_rows=1, result_limit=100,
+                                       response_bytes=12),
+        )
+
+    def corrected_step(**_kwargs):
+        assert not active
+        return SQLS[1]
+
+    deps.snapshot_factory = snapshot_factory
+    deps.executor = executor
+    with patch("week5.new_implementation.online.pipeline.retry_plan_step",
+               side_effect=corrected_step), patch(
+                   "week5.new_implementation.online.pipeline.answer_multi_result",
+                   return_value="Both counts."):
+        outcome = run_turn(TurnRequest(
+            question="Count Authorized attendance records and count all attendance records.",
+            access_context=LOCAL_DEMO_ACCESS,
+        ), dependencies=deps)
+    assert isinstance(outcome, Answered)
+    assert len(openings) == 2
+    assert executed == [SQLS[0], bad_sql, SQLS[0], SQLS[1]]
 
 
 def test_one_based_clause_indices_are_normalized():
@@ -139,15 +222,235 @@ def test_request_sql_uses_structured_plan_for_independent_clauses():
         database_context=database_context(),
     )
     with patch("week5.new_implementation.online.planner.call_structured",
-               return_value=_plan()) as call:
+               return_value=SqlPlanChoice(mode="multi", sql=None, steps=_plan().steps)) as call:
         result = request_sql(shared_context=shared, model="test", budget=CallBudget(),
                              timeout=2, max_output_tokens=1000)
     assert isinstance(result, MultiSqlPlan)
-    assert call.call_args.kwargs["response_model"] is MultiSqlPlan
+    assert call.call_args.kwargs["response_model"] is SqlPlanChoice
     system = call.call_args.kwargs["system"]
     assert "database_context defines available fields and business meanings" in system
-    assert "Return a structured plan" in system
+    assert "Choose the SQL result shape" in system
     assert "read-only PostgreSQL" in system
+
+
+def test_planner_can_choose_one_sql_for_related_clauses():
+    shared = SharedModelContext(
+        current_question="Related measures", updated_request="Related measures",
+        scope_provenance={"reference_scope_clauses": [c.model_dump() for c in CLAUSES]},
+        database_context=database_context(),
+    )
+    with patch("week5.new_implementation.online.planner.call_structured",
+               return_value=SqlPlanChoice(mode="single", sql=SHARED_SQL, steps=())):
+        result = request_sql(shared_context=shared, model="test", budget=CallBudget(),
+                             timeout=2, max_output_tokens=1000)
+    assert result == SHARED_SQL
+
+
+def test_multi_review_can_switch_to_one_complete_query():
+    executed = []
+    deps = _dependencies(_plan(), executed)
+    calls = []
+    deps.planner = lambda **kwargs: calls.append(kwargs) or (
+        _plan() if len(calls) == 1 else SHARED_SQL
+    )
+    deps.answerer = lambda **_kwargs: "2 Authorized records; 5 records overall."
+    with patch("week5.new_implementation.online.pipeline.answer_multi_result",
+               return_value=ReplanRequest(reason="Use one shared result")):
+        outcome = run_turn(TurnRequest(
+            question="Count Authorized attendance records and count all attendance records.",
+            access_context=LOCAL_DEMO_ACCESS,
+        ), dependencies=deps)
+    assert isinstance(outcome, Answered)
+    assert executed == [*SQLS, SHARED_SQL]
+    assert len(outcome.state.verified_turns[-1].executed_steps) == 0
+
+
+def test_single_choice_can_replan_when_one_clause_lacks_evidence():
+    executed = []
+    deps = _dependencies(_plan(), executed)
+    planner_calls = []
+    deps.planner = lambda **kwargs: planner_calls.append(kwargs) or (
+        SQLS[1] if len(planner_calls) == 1 else SHARED_SQL
+    )
+    answer_calls = []
+
+    def answerer(**_kwargs):
+        answer_calls.append(None)
+        if len(answer_calls) == 1:
+            return ReplanRequest(reason="Authorized count is missing")
+        return "2 Authorized records; 5 records overall."
+
+    deps.answerer = answerer
+    outcome = run_turn(TurnRequest(
+        question="Count Authorized attendance records and count all attendance records.",
+        access_context=LOCAL_DEMO_ACCESS,
+    ), dependencies=deps)
+    assert isinstance(outcome, Answered)
+    assert executed == [SQLS[1], SHARED_SQL]
+    assert planner_calls[1]["sql_execution_failure"]["error_type"] == "answer_review_requery"
+
+
+def test_multi_date_clause_replans_when_steps_repeat_one_date():
+    clauses = (
+        ScopeClause(request="Compare counts on 2026-09-03 and 2026-09-04.",
+                    current_question_basis="Compare counts on two dates"),
+        ScopeClause(request="Count all records.",
+                    current_question_basis="Count all records",
+                    date_scope_relationship="unbounded"),
+    )
+    day_sql = (
+        "SELECT COUNT(*) AS n FROM attendance_records "
+        "WHERE attendance_date = DATE '2026-09-03'"
+    )
+    plan = MultiSqlPlan(steps=(
+        SqlPlanStep(scope_clause_index=0, subrequest="Count 2026-09-03", sql=day_sql),
+        SqlPlanStep(scope_clause_index=0, subrequest="Count 2026-09-03 again", sql=day_sql),
+        SqlPlanStep(scope_clause_index=1, subrequest=clauses[1].request, sql=SQLS[1]),
+    ))
+    executed = []
+    deps = _dependencies(plan, executed)
+    question = "Compare counts on 2026-09-03 and 2026-09-04; count all records."
+    deps.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+        decision=ReadyReference(
+            rewritten_request=question, locale="en", request_relationship="new",
+            subject_relationship="all_authorized", scope_clauses=clauses,
+        )
+    )
+    calls = []
+    deps.planner = lambda **kwargs: calls.append(kwargs) or plan
+    with patch("week5.new_implementation.online.pipeline.answer_multi_result",
+               return_value=ReplanRequest(reason="The second date lacks evidence")):
+        outcome = run_turn(
+            TurnRequest(question=question, access_context=LOCAL_DEMO_ACCESS),
+            dependencies=deps,
+        )
+    assert isinstance(outcome, Failed)
+    assert outcome.code == "replan_limit_exceeded"
+    assert calls[1]["sql_execution_failure"]["error_type"] == "answer_review_requery"
+    assert not outcome.state.verified_turns
+
+
+def test_more_than_four_clauses_do_not_fail_before_planning():
+    shared = SharedModelContext(
+        current_question="Five independent measures", updated_request="Five independent measures",
+        scope_provenance={"reference_scope_clauses": [
+            {"request": f"Count group {i}", "current_question_basis": f"group {i}"}
+            for i in range(5)
+        ]},
+        database_context=database_context(),
+    )
+    steps = tuple(SqlPlanStep(scope_clause_index=i, subrequest=f"Count group {i}",
+                              sql=SQLS[1]) for i in range(5))
+    with patch("week5.new_implementation.online.planner.call_structured",
+               return_value=SqlPlanChoice(mode="multi", sql=None, steps=steps)):
+        result = request_sql(shared_context=shared, model="test", budget=CallBudget(),
+                             timeout=2, max_output_tokens=1000)
+    assert isinstance(result, MultiSqlPlan)
+    assert len(result.steps) == 5
+
+
+def test_five_clause_plan_executes_and_publishes():
+    clauses = tuple(ScopeClause(request=f"Count group {i}.",
+                                current_question_basis=f"group {i}") for i in range(5))
+    plan = MultiSqlPlan(steps=tuple(
+        SqlPlanStep(scope_clause_index=i, subrequest=clause.request, sql=SQLS[1])
+        for i, clause in enumerate(clauses)
+    ))
+    executed = []
+    deps = _dependencies(plan, executed)
+    deps.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+        decision=ReadyReference(
+            rewritten_request="Count five groups", locale="en",
+            request_relationship="new", subject_relationship="all_authorized",
+            scope_clauses=clauses,
+        )
+    )
+    with patch("week5.new_implementation.online.pipeline.answer_multi_result",
+               return_value="Five counts."):
+        outcome = run_turn(TurnRequest(
+            question="Count five groups", access_context=LOCAL_DEMO_ACCESS,
+        ), dependencies=deps)
+    assert isinstance(outcome, Answered)
+    assert len(executed) == 5
+    assert len(outcome.state.verified_turns[-1].executed_steps) == 5
+
+
+def test_multi_plan_caps_combined_rows_before_answering():
+    clauses = tuple(ScopeClause(request=f"Count group {i}.",
+                                current_question_basis=f"group {i}") for i in range(11))
+    plan = MultiSqlPlan(steps=tuple(
+        SqlPlanStep(scope_clause_index=i, subrequest=clause.request, sql=SQLS[1])
+        for i, clause in enumerate(clauses)
+    ))
+    executed = []
+    deps = _dependencies(plan, executed)
+    deps.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+        decision=ReadyReference(
+            rewritten_request="Count eleven groups", locale="en",
+            request_relationship="new", subject_relationship="all_authorized",
+            scope_clauses=clauses,
+        )
+    )
+    deps.executor = lambda sql, **_kwargs: executed.append(sql) or SqlExecutionResult(
+        rows=tuple({"n": i} for i in range(100)),
+        coverage=ExecutionCoverage(fetched_rows=100, result_limit=100,
+                                   response_bytes=1000),
+    )
+    outcome = run_turn(TurnRequest(
+        question="Count eleven groups", access_context=LOCAL_DEMO_ACCESS,
+    ), dependencies=deps)
+    assert isinstance(outcome, Failed)
+    assert outcome.code == "multi_result_bound"
+    assert len(executed) == 11
+    assert not outcome.state.verified_turns
+
+
+def test_month_range_and_month_comparison_have_distinct_scopes():
+    assert _explicit_date_scopes("March to May 2026") == {
+        ("2026-03-01", "2026-05-31")
+    }
+    assert _explicit_date_scopes("Compare March and May 2026") == {
+        ("2026-03-01", "2026-03-31"),
+        ("2026-05-01", "2026-05-31"),
+    }
+
+
+def test_conditional_aggregate_can_cover_two_months_in_one_step():
+    clauses = (
+        ScopeClause(request="Compare March and May 2026 attendance counts.",
+                    current_question_basis="Compare March and May"),
+        ScopeClause(request="Count all records across all dates.",
+                    current_question_basis="Count all records",
+                    date_scope_relationship="unbounded"),
+    )
+    comparison_sql = (
+        "SELECT COUNT(*) FILTER (WHERE attendance_date BETWEEN DATE '2026-03-01' "
+        "AND DATE '2026-03-31') AS march_count, "
+        "COUNT(*) FILTER (WHERE attendance_date BETWEEN DATE '2026-05-01' "
+        "AND DATE '2026-05-31') AS may_count FROM attendance_records"
+    )
+    plan = MultiSqlPlan(steps=(
+        SqlPlanStep(scope_clause_index=0, subrequest=clauses[0].request,
+                    sql=comparison_sql),
+        SqlPlanStep(scope_clause_index=1, subrequest=clauses[1].request,
+                    sql=SQLS[1]),
+    ))
+    executed = []
+    deps = _dependencies(plan, executed)
+    question = "Compare March and May 2026 attendance counts; separately count all dates."
+    deps.reference_writer = lambda *_args, **_kwargs: ReferenceResponse(
+        decision=ReadyReference(
+            rewritten_request=question, locale="en", request_relationship="new",
+            subject_relationship="all_authorized", scope_clauses=clauses,
+        )
+    )
+    with patch("week5.new_implementation.online.pipeline.answer_multi_result",
+               return_value="Both month counts and the total."):
+        outcome = run_turn(TurnRequest(
+            question=question, access_context=LOCAL_DEMO_ACCESS,
+        ), dependencies=deps)
+    assert isinstance(outcome, Answered)
+    assert executed == [comparison_sql, SQLS[1]]
 
 
 def test_count_reconciliation_uses_single_sql_contract_even_with_two_clauses():
@@ -176,7 +479,7 @@ def test_second_step_write_query_is_rejected_without_publication():
         ), dependencies=_dependencies(bad, executed))
     assert isinstance(outcome, Failed)
     assert outcome.code == "multi_step_failed"
-    assert executed == [SQLS[0]]
+    assert executed == [SQLS[0]] * 4
     assert not outcome.state.verified_turns
 
 
@@ -227,24 +530,24 @@ def test_shared_date_is_enforced_when_only_first_clause_names_it():
                            dependencies=deps)
     assert isinstance(outcome, Failed)
     assert outcome.code == "multi_step_failed"
-    assert executed == [sqls[0]]
+    assert executed == [sqls[0]] * 4
 
 
-def test_planner_subrequest_cannot_drop_clause_status():
+def test_review_can_reject_a_step_that_drops_clause_status():
     executed = []
     plan = MultiSqlPlan(steps=(
         SqlPlanStep(scope_clause_index=0, subrequest="Count records.", sql=SQLS[1]),
         SqlPlanStep(scope_clause_index=1, subrequest=CLAUSES[1].request, sql=SQLS[1]),
     ))
-    with patch("week5.new_implementation.online.pipeline.retry_plan_step",
-               return_value=SQLS[1]):
+    with patch("week5.new_implementation.online.pipeline.answer_multi_result",
+               return_value=ReplanRequest(reason="Status scope omitted")):
         outcome = run_turn(TurnRequest(
             question="Count Authorized attendance records and count all attendance records.",
             access_context=LOCAL_DEMO_ACCESS,
         ), dependencies=_dependencies(plan, executed))
     assert isinstance(outcome, Failed)
-    assert outcome.code == "multi_step_failed"
-    assert executed == []
+    assert outcome.code == "replan_limit_exceeded"
+    assert executed == [SQLS[1], SQLS[1]] * 2
 
 
 def test_multi_turn_persists_distinct_clause_date_scopes():
@@ -343,11 +646,13 @@ def test_multi_answer_review_must_cover_every_step():
     with patch("week5.new_implementation.online.planner.call_structured",
                side_effect=[PlannerAnswer(answer="Both counts"),
                             ReviewedMultiAnswer(answer="Both counts",
-                                                covered_step_indices=(0,))]):
+                                                covered_step_indices=(0,),
+                                                covered_clause_indices=(0, 1))]) as call:
         outcome = answer_multi_result(shared_context=shared, steps=steps, employees=(),
                                       locale="en", model="test", budget=CallBudget(),
                                       timeout=2, max_output_tokens=1000)
     assert outcome.reason == "The final answer review did not verify every requested part"
+    assert "A date literal alone is not evidence" in call.call_args.kwargs["system"]
 
 
 def test_multi_answer_review_replans_an_extra_filter():
@@ -361,8 +666,28 @@ def test_multi_answer_review_replans_an_extra_filter():
                side_effect=[PlannerAnswer(answer="Both counts"),
                             ReviewedMultiAnswer(answer="Both counts",
                                                 covered_step_indices=(0, 1),
-                                                scope_valid_step_indices=(0,))]):
+                                                scope_valid_step_indices=(0,),
+                                                covered_clause_indices=(0, 1))]):
         outcome = answer_multi_result(shared_context=shared, steps=steps, employees=(),
                                       locale="en", model="test", budget=CallBudget(),
                                       timeout=2, max_output_tokens=1000)
     assert "incorrect scope" in outcome.reason
+
+
+def test_multi_answer_review_must_verify_every_clause():
+    shared = SharedModelContext(current_question="Two counts", updated_request="Two counts",
+                                database_context=database_context())
+    result = SqlExecutionResult(rows=({"n": 2},), coverage=ExecutionCoverage(
+        fetched_rows=1, result_limit=100, response_bytes=12))
+    steps = tuple(ExecutedPlanStep(scope_clause_index=i, subrequest=CLAUSES[i].request,
+                                   sql=SQLS[i], result=result) for i in range(2))
+    with patch("week5.new_implementation.online.planner.call_structured",
+               side_effect=[PlannerAnswer(answer="Both counts"),
+                            ReviewedMultiAnswer(answer="Both counts",
+                                                covered_step_indices=(0, 1),
+                                                scope_valid_step_indices=(0, 1),
+                                                covered_clause_indices=(0,))]):
+        outcome = answer_multi_result(shared_context=shared, steps=steps, employees=(),
+                                      locale="en", model="test", budget=CallBudget(),
+                                      timeout=2, max_output_tokens=1000)
+    assert "every requested clause" in outcome.reason

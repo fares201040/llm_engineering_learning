@@ -263,6 +263,37 @@ tables with the same 89/78 Authorized counts and 97,847.31/237.01/187.47
 country-hour totals. The answer identified September 3 as higher and described
 the all-date totals as bounded by the observed September 7 endpoint.
 
+## October 1 multi-query acceptance replay
+
+The local app was restarted from the current working tree. The browser
+automation surface failed to initialize, so these submissions used the live
+Gradio `/submit_chat` endpoint on `http://127.0.0.1:7860/`. The database still
+had 21,418 attendance rows. The first two combined-count requests were answered
+with one SQL execution each; their published totals matched independent
+read-only aggregates: 18,229 Authorized out of 21,418 overall, and 565 records
+on each of September 3 and 4, 2026.
+
+For `Use separate queries for these independent requests, then give one answer:
+(1) count Authorized attendance records on 2026-09-03; (2) total positive worked
+hours by country across all available dates.`, the same-turn log showed one
+`multi_plan` and two `sql_execution` completions. The answer gave **89** records
+for the first part and **237.01**, **187.47**, and **97,847.31** positive hours
+for Burundi, Uganda, and Yemen. All four values matched independent read-only
+aggregates. The INFO log did not include SQL text, so SQL predicate scope was
+not independently inspected in this replay.
+
+After the shared read-only snapshot change, the app was restarted and the same
+two-query request was submitted again. The log again showed one `multi_plan`,
+two successful SQL executions, and reviewed publication. The answer repeated
+the independently checked 89 record count and 237.01/187.47/97,847.31 country
+totals. A direct read-only executor check also confirmed that two queries can
+run on one connection and that a failed query rolls back to its savepoint so
+the next query succeeds.
+
+After removing the date-literal guard and requiring the final reviewer to
+account for every scope clause, another restarted live run again produced two
+SQL executions and the same independently verified values.
+
 ## Add a new manual case
 
 Record the exact prompt and preceding turns, code commit, data snapshot or

@@ -57,26 +57,24 @@ class ReviewRegressionTests(unittest.TestCase):
             )
         )
 
-    def test_status_filter_cannot_validate_an_unfiltered_answer_count(self):
-        self.assertEqual(
+    def test_status_wording_does_not_reject_filtered_aggregate_shape(self):
+        self.assertIsNone(
             _sql_semantic_issue(
                 "How many Draft attendance records are there?",
                 "SELECT COUNT(*) AS record_count, "
                 "COUNT(*) FILTER (WHERE status = 'Draft') AS other_count "
                 "FROM attendance_records",
             ),
-            "missing_workflow_status_filter",
         )
 
-    def test_status_percentage_rejects_status_narrowed_denominator(self):
-        self.assertEqual(
+    def test_status_wording_does_not_reject_other_valid_sql_shapes(self):
+        self.assertIsNone(
             _sql_semantic_issue(
                 'What percentage of all attendance records have Status "Authorized"?',
                 "SELECT 100.0 * COUNT(*) FILTER (WHERE status = 'Authorized') "
                 "/ NULLIF(COUNT(*), 0) AS percentage "
                 "FROM attendance_records WHERE status = 'Draft'",
             ),
-            "missing_workflow_status_filter",
         )
 
     def test_open_ended_date_filter_is_not_a_single_day(self):

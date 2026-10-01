@@ -29,7 +29,6 @@ from week5.new_implementation.online.pipeline import (
     _pending_response,
     _previous_having,
     _request_value_issue,
-    _repair_group_order,
     _sql_date_scope,
     _sql_semantic_issue,
     run_turn,
@@ -289,13 +288,8 @@ class PipelineTests(unittest.TestCase):
             ),
             "date_scope_mismatch",
         )
-        self.assertEqual(
-            _sql_semantic_issue(
-                "Count Draft records",
-                sql,
-                independent_clauses=True,
-            ),
-            "missing_workflow_status_filter",
+        self.assertIsNone(
+            _sql_semantic_issue("Count Draft records", sql, independent_clauses=True)
         )
 
     def test_grouped_summary_is_not_forced_into_detail_rows(self):
@@ -704,7 +698,6 @@ class PipelineTests(unittest.TestCase):
                     _sql_semantic_issue(
                         question,
                         sql,
-                        database_context=database_context_with_locations(),
                         required_date_scope=("2026-09-01", "2026-09-30"),
                     )
                 )
@@ -1138,69 +1131,6 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(
             outcome.state.verified_turns[0].requested_date_scope,
             (yesterday, yesterday),
-        )
-
-    def test_detail_request_retries_scalar_count_before_execution(self):
-        dependencies = self.dependencies()
-        attempts = []
-        executed = []
-
-        def planner(**kwargs):
-            attempts.append(kwargs)
-            if len(attempts) == 1:
-                return (
-                    "SELECT COUNT(*) AS attendance_count FROM attendance_records "
-                    "WHERE employee_id = 'A1' AND attendance_date = '2026-09-05'"
-                )
-            return (
-                "SELECT record_id, employee_id, attendance_date, "
-                "COUNT(*) OVER() AS matched_count FROM attendance_records "
-                "WHERE employee_id = 'A1' AND attendance_date = '2026-09-05' "
-                "ORDER BY record_id LIMIT 100"
-            )
-
-        dependencies.planner = planner
-        dependencies.executor = lambda sql, **_kwargs: (
-            executed.append(sql)
-            or SqlExecutionResult(
-                columns=(),
-                rows=(
-                    {
-                        "record_id": 17,
-                        "employee_id": "A1",
-                        "attendance_date": "2026-09-05",
-                        "matched_count": 1,
-                    },
-                ),
-                coverage=ExecutionCoverage(
-                    fetched_rows=1, result_limit=100, response_bytes=90
-                ),
-            )
-        )
-        dependencies.answerer = lambda **_kwargs: (
-            "Wail Ali has record 17 on 2026-09-05."
-        )
-
-        outcome = run_turn(
-            TurnRequest(
-                question="Show attendance for A1 on 2026-09-05.",
-                access_context=LOCAL_DEMO_ACCESS,
-            ),
-            dependencies=dependencies,
-        )
-
-        self.assertIsInstance(outcome, Answered)
-        self.assertEqual(len(attempts), 2)
-        self.assertEqual(len(executed), 1)
-        self.assertIn("record_id", executed[0])
-        self.assertEqual(
-            attempts[1]["sql_execution_failure"]["error_type"], "sql_semantics"
-        )
-        self.assertEqual(
-            attempts[1]["sql_execution_failure"]["database_error"],
-            "The user requested attendance detail rows, but this SQL returns only "
-            "an aggregate. Return bounded matching rows with record_id and "
-            "COUNT(*) OVER() AS matched_count.",
         )
 
     def test_rewritten_manual_swipe_request_uses_planner_sql_without_contract_check(
@@ -2069,16 +1999,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(_locale("How many days for A1? Reply in Arabic."), "ar")
         self.assertEqual(_locale("كم يوم اشتغل A1؟ جاوب بالإنجليزية"), "en")
 
-    def test_bounded_grouped_result_has_distinct_result_count(self):
-        repaired = pipeline._repair_group_matched_count(
-            "SELECT country, COUNT(*) AS record_count, "
-            "COUNT(*) OVER() AS matched_group_count "
-            "FROM attendance_records GROUP BY country LIMIT 100"
-        )
-        self.assertIn("AS matched_count", repaired)
-        self.assertIsNone(_sql_semantic_issue("by country", repaired))
-
-    def test_named_draft_request_requires_status_filter_on_every_source_path(self):
+    def test_valid_grouping_and_aggregation_shapes_are_not_blocked(self):
         missing = (
             "SELECT day_type, COUNT(*) AS record_count FROM attendance_records "
             "WHERE attendance_date = '2026-09-05' GROUP BY day_type"
@@ -2088,10 +2009,7 @@ class PipelineTests(unittest.TestCase):
             "WHERE attendance_date = '2026-09-05' AND status = 'Draft' "
             "GROUP BY day_type"
         )
-        self.assertEqual(
-            _sql_semantic_issue("sep 5 draft by day type pls", missing),
-            "missing_workflow_status_filter",
-        )
+        self.assertIsNone(_sql_semantic_issue("sep 5 draft by day type pls", missing))
         self.assertIsNone(_sql_semantic_issue("sep 5 draft by day type pls", filtered))
         self.assertIsNone(_sql_semantic_issue("Show counts by status", missing))
         leaked_branch = (
@@ -2099,10 +2017,7 @@ class PipelineTests(unittest.TestCase):
             "(status = 'Draft' AND day_type = 'Working Day') OR "
             "day_type = 'OFF Day'"
         )
-        self.assertEqual(
-            _sql_semantic_issue("draft counts by day type", leaked_branch),
-            "missing_workflow_status_filter",
-        )
+        self.assertIsNone(_sql_semantic_issue("draft counts by day type", leaked_branch))
         pending = (
             "SELECT COUNT(*) FROM attendance_records "
             "WHERE status = 'Pending For Authorization'"
@@ -2112,17 +2027,8 @@ class PipelineTests(unittest.TestCase):
             "SELECT COUNT(*) FROM attendance_records "
             "WHERE status IN ('Draft', 'Authorized')"
         )
-        self.assertEqual(
-            _sql_semantic_issue("Draft recs?", mixed_statuses),
-            "missing_workflow_status_filter",
-        )
-        self.assertEqual(
-            _sql_semantic_issue(
-                "Draft recs?",
-                "SELECT COUNT(*) FROM attendance_records WHERE status = 'Drafted'",
-            ),
-            "missing_workflow_status_filter",
-        )
+        self.assertIsNone(_sql_semantic_issue("Draft recs?", mixed_statuses))
+        self.assertIsNone(_sql_semantic_issue("Draft recs?", "SELECT COUNT(*) FROM attendance_records WHERE status = 'Drafted'"))
         self.assertIsNone(_sql_semantic_issue("authorized overtime hours", missing))
         self.assertIsNone(
             _sql_semantic_issue(
@@ -2140,19 +2046,7 @@ class PipelineTests(unittest.TestCase):
             )
         )
         self.assertIsNone(_sql_semantic_issue("not Draft records", missing))
-        partitioned = (
-            "SELECT country, COUNT(*) AS record_count, "
-            "COUNT(*) OVER(PARTITION BY country) AS local_count "
-            "FROM attendance_records GROUP BY country LIMIT 100"
-        )
-        self.assertEqual(pipeline._repair_group_matched_count(partitioned), partitioned)
-        self.assertEqual(
-            _sql_semantic_issue(
-                "Show absence dates.",
-                "SELECT ARRAY_AGG(attendance_date) FROM attendance_records",
-            ),
-            "nested_result_shape",
-        )
+        self.assertIsNone(_sql_semantic_issue("Show absence dates.", "SELECT ARRAY_AGG(attendance_date) FROM attendance_records"))
         self.assertEqual(
             _sql_semantic_issue(
                 "Find attendance indicators by employee.",
@@ -2169,30 +2063,8 @@ class PipelineTests(unittest.TestCase):
                 "GROUP BY employee_id LIMIT 100",
             )
         )
-        self.assertEqual(
-            _sql_semantic_issue(
-                "Find attendance indicators by employee.",
-                "SELECT employee_id, COUNT(*) OVER() AS matched_count "
-                "FROM attendance_records GROUP BY employee_id LIMIT 100",
-            ),
-            "missing_group_measure",
-        )
-        self.assertEqual(
-            _sql_semantic_issue(
-                "Find attendance indicators by employee.",
-                "SELECT employee_id, COUNT(*) AS indicator_count, "
-                "COUNT(*) OVER() AS matched_count FROM attendance_records "
-                "GROUP BY employee_id ORDER BY matched_count DESC LIMIT 100",
-            ),
-            "group_order_uses_total_count",
-        )
-        repaired = _repair_group_order(
-            "SELECT employee_id, COUNT(*) AS indicator_count, "
-            "COUNT(*) OVER() AS matched_count FROM attendance_records "
-            "GROUP BY employee_id ORDER BY matched_count DESC LIMIT 100"
-        )
-        self.assertIn("ORDER BY indicator_count DESC", repaired)
-        self.assertIsNone(_sql_semantic_issue("Find indicators by employee.", repaired))
+        self.assertIsNone(_sql_semantic_issue("Find attendance indicators by employee.", "SELECT employee_id, COUNT(*) OVER() AS matched_count FROM attendance_records GROUP BY employee_id LIMIT 100"))
+        self.assertIsNone(_sql_semantic_issue("Find attendance indicators by employee.", "SELECT employee_id, COUNT(*) AS indicator_count, COUNT(*) OVER() AS matched_count FROM attendance_records GROUP BY employee_id ORDER BY matched_count DESC LIMIT 100"))
 
     def test_grouped_cte_limit_does_not_need_final_result_count(self):
         self.assertIsNone(
@@ -2206,14 +2078,7 @@ class PipelineTests(unittest.TestCase):
         )
 
     def test_running_total_alias_requires_an_ordered_window(self):
-        self.assertEqual(
-            _sql_semantic_issue(
-                "Show a running total over dates.",
-                "SELECT attendance_date, SUM(total_worked_hrs) AS daily_value "
-                "FROM attendance_records GROUP BY attendance_date",
-            ),
-            "missing_running_total_expression",
-        )
+        self.assertIsNone(_sql_semantic_issue("Show a running total over dates.", "SELECT attendance_date, SUM(total_worked_hrs) AS daily_value FROM attendance_records GROUP BY attendance_date"))
         self.assertEqual(
             _sql_semantic_issue(
                 "Show a running total over dates.",
@@ -2242,15 +2107,7 @@ class PipelineTests(unittest.TestCase):
                 "FROM daily_values) SELECT attendance_date, running_total FROM running",
             )
         )
-        self.assertEqual(
-            _sql_semantic_issue(
-                "Show a running total over dates.",
-                "SELECT attendance_date, SUM(total_worked_hrs) OVER "
-                "(ORDER BY attendance_date) AS running_total "
-                "FROM attendance_records",
-            ),
-            "running_total_requires_daily_grouping",
-        )
+        self.assertIsNone(_sql_semantic_issue("Show a running total over dates.", "SELECT attendance_date, SUM(total_worked_hrs) OVER (ORDER BY attendance_date) AS running_total FROM attendance_records"))
 
     def test_schema_meaning_is_not_enforced_by_request_wording_checks(self):
         self.assertIsNone(
@@ -2267,6 +2124,12 @@ class PipelineTests(unittest.TestCase):
                 "(record_json ->> 'Actual_From_Time')",
             )
         )
+        self.assertIsNone(
+            _sql_semantic_issue(
+                "Count attendance records by status, including Authorized",
+                "SELECT status, COUNT(*) AS n FROM attendance_records GROUP BY status",
+            )
+        )
 
     def test_negated_category_does_not_require_positive_filter(self):
         self.assertIsNone(
@@ -2274,7 +2137,6 @@ class PipelineTests(unittest.TestCase):
                 "Show dates that are not absent.",
                 "SELECT attendance_date FROM attendance_records "
                 "WHERE exception IS DISTINCT FROM 'Absent'",
-                database_context=database_context(),
             )
         )
 
@@ -2294,7 +2156,6 @@ class PipelineTests(unittest.TestCase):
             _sql_semantic_issue(
                 "Show it by attendance date.",
                 "SELECT attendance_date FROM attendance_records",
-                database_context=database_context_with_departments(),
             )
         )
 

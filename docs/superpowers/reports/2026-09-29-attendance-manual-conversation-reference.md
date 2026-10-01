@@ -294,6 +294,41 @@ After removing the date-literal guard and requiring the final reviewer to
 account for every scope clause, another restarted live run again produced two
 SQL executions and the same independently verified values.
 
+## October 1 continuous chat and scope check
+
+These three questions were submitted in order through the live Gradio
+`/submit_chat` endpoint on `http://127.0.0.1:7860/`, with one persistent chat
+session. This was an endpoint conversation, **not a browser UI check**. The app
+was running code from `3e33174853692c81d384ca0d00843f5d58149ebb`.
+The database snapshot had 21,418 attendance rows. Independent read-only
+aggregates for September 3 found 565 records: 89 Authorized, 238 Draft, and
+238 Pending For Authorization. The Retrieved Context JSON supplied the scalar
+rows below; the same-turn executed SQL was unavailable, so SQL predicate scope
+is unverified.
+
+| ID | Exact prompt and preceding turns | Published answer and row check | Status |
+| --- | --- | --- | --- |
+| C01 | New chat: `How many attendance records are there on 2026-09-03?` | Answer and result row gave **89**, labeled Authorized. The requested all-status count is **565**. | **Fail**: the answer narrowed the population without a requested status filter; same-turn SQL unavailable. |
+| C02 | After C01: `I meant all statuses, not just Authorized. What is the total record count on 2026-09-03?` | Answer and result row gave **565**, matching the independent all-status count. | **Pass** for the numeric answer; SQL scope unverified. |
+| C03 | After C02: `How many of those are Draft?` | Answer and result row gave **238** Draft records, matching the independent aggregate. | **Pass** for the numeric answer; SQL scope unverified. |
+
+The reviewer prompt now includes a general example requiring a new query when
+an unrequested workflow-status filter narrows an attendance count. Answer and
+review guidance also distinguish accessible records from the `Authorized`
+workflow status. Three separate direct pipeline reproductions of C01 after the
+first prompt edit executed date-only SQL and returned 565. A later direct pair
+after both edits executed date-only SQL for C01 (565) and date-plus-Authorized
+SQL for the neighboring explicit-status question (89). These are independent
+reproductions, not the endpoint turns' exact SQL and not browser verification.
+
+The Codex browser control failed to initialize (`failed to write kernel
+assets: The system cannot find the path specified`). A fallback launch of a
+local headless Chrome browser was rejected by automatic policy review as
+blocked by policy. Browser display, Clear behavior, and post-edit browser
+retest therefore remain **unverified** for this session. The running app was
+not restarted after the prompt edits, so the endpoint conversation above
+does not validate those edits in the Gradio process.
+
 ## Add a new manual case
 
 Record the exact prompt and preceding turns, code commit, data snapshot or

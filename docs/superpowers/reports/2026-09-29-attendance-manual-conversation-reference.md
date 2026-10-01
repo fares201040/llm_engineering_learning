@@ -329,6 +329,54 @@ retest therefore remain **unverified** for this session. The running app was
 not restarted after the prompt edits, so the endpoint conversation above
 does not validate those edits in the Gradio process.
 
+## October 1 browser conversation after Codex restart
+
+The Codex browser tool worked after the desktop app restart. A fresh Gradio
+server at `http://127.0.0.1:7860/` loaded baseline commit `74c3d935` for the
+first ten turns below. All ten were entered in one browser chat. The database
+held 21,418 rows dated August 1 through September 7, 2026. Retrieved Context
+rows, a same-turn local DEBUG SQL trace, and independent read-only PostgreSQL
+aggregates were checked. The temporary trace was removed after this summary;
+no employee rows are copied here. A **pass** describes this observed run only.
+
+| ID | Exact browser question | Answer and SQL check | Status |
+| --- | --- | --- | --- |
+| B01 | `How many attendance records are there on 2026-09-03?` | **565**; executed SQL counted all rows for that date, matching the independent aggregate. | Pass. |
+| B02 | `Of those, how many are Authorized?` | **89** of 565; SQL retained September 3 and added `status = 'Authorized'`. | Pass. |
+| B03 | `On Sep 4 instead, how many Draft records? Separately, how many records of all statuses are there that day?` | **160 Draft**, **565 all-status**; SQL used a conditional Draft count and unrestricted total on September 4. | Pass. |
+| B04 | `Drop the status and date filters. Across all available dates, how many attendance records and how many distinct employees?` | **21,418 records**, **573 people**; SQL had neither old filter and counted distinct employee IDs. | Pass. |
+| B05 | `For Sep 5, give attendance record counts by status. Separately, across all available dates, count distinct employees by country. Use two Markdown tables.` | SQL used separate branches in one statement. Browser rendered two real tables: Sep 5 Authorized/Draft/Pending **138/188/242**, and all-date Burundi/Uganda/Yemen distinct people **1/1/571**. | Pass. |
+| B06 | `For Sep 6, by status compare distinct people who actually attended (positive worked hours) with all attendance record counts. Use two tables and briefly explain why the measures differ.` | SQL measured all records, all people, positive-hour records, and positive-hour people. Browser tables showed positive people **5/119/165** versus all records **78/280/210** (Authorized/Draft/Pending), and correctly attributed the gaps to zero-hour rows on this snapshot. | Pass. |
+| B07 | `Were duplicate employee records within a status the cause of that Sep 6 gap? Check the data, then correct the explanation if needed.` | SQL checked per-status employee multiplicity; all duplicate arrays were empty. Browser said duplicates did not cause the gap. Independent duplicate-group count was zero. | Pass. |
+| B08 | `Use separate queries for these independent requests: compare Authorized record counts on Sep 3 versus Sep 6, 2026; separately, across all available dates, total positive worked hours by country. Use two tables and say which date has more Authorized records.` | One `multi_plan` executed **two SQL steps**. Browser rendered real tables: **89 vs 78** Authorized; positive hours Burundi **237.01**, Uganda **187.47**, Yemen **97,847.31**. The date comparison and independent aggregates matched. | Pass. |
+| B09 | `Now just Sep 5 Draft records by day type. Do not repeat the country hours or Authorized comparison.` | SQL used September 5 and `status = 'Draft'`; browser gave OFF Day (ZAS) **40**, Working Day **148**, omitting prior branches. | Pass. |
+| B10 | `Same Sep 5 day-type split, but drop the Draft filter so it includes all statuses.` | Executed SQL returned seven day-type/status groups covering all statuses. The draft answer described those groups, but final review replaced it with B09's **Draft-only 40/148** table. Independent all-status day-type totals were OFF Day **6**, OFF Day (ZAS) **202**, Working Day **360**. | **Fail:** final reviewer reused the prior filtered answer. |
+
+The B10 failure was in answer review after correct broader SQL, not in the
+executor. A small model-facing reviewer example and instruction now direct the
+reviewer to use current rows when a follow-up removes a prior filter and to
+aggregate complete joint groups by the requested dimension. No phrase-specific
+runtime validation was added. After restarting Gradio from the edited source,
+the browser retest was:
+
+| ID | Exact browser question and preceding turn | Answer and SQL check | Status |
+| --- | --- | --- | --- |
+| B11 | Fresh chat: `Sep 5 Draft records by day type, please.` | The first SQL proposal omitted Draft, but review requested a new query before publication. Corrected SQL used `status = 'Draft'`; browser gave **40/148** and total **188**. | Pass after one SQL retry. |
+| B12 | After B11: `Same Sep 5 day-type split, but drop the Draft filter so it includes all statuses.` | SQL filtered only September 5; browser table gave OFF Day **6**, OFF Day (ZAS) **202**, Working Day **360**. The final reviewer kept the broader scope. | Pass on observed retest. |
+| B13 | After B12: `Now make that Authorized only, same Sep 5 day types.` | SQL added `status = 'Authorized'`; browser table gave OFF Day (ZAS) **121**, Working Day **17**, total **138**. | Pass. |
+
+An idle **Clear conversation** emptied chat and Retrieved Context. A later
+seven-day table request was intentionally interrupted with Clear while
+`Generating Answer...` was visible; it is **interrupted**, not an answer pass.
+The next request was submitted in the cleared browser chat and checked
+separately below.
+
+| ID | Exact browser question | Answer and SQL check | Status |
+| --- | --- | --- | --- |
+| B14 | New chat after pending Clear: `How many Authorized attendance records are on Sep 2, 2026?` | Browser showed only this user turn and **74** Authorized records. SQL used the September 2 date and Authorized status; Retrieved Context and independent aggregate were both 74. The interrupted table reply did not return to the chat. | Pass for answer and observed Clear behavior. |
+| B15 | After B14: `On Sep 5, how many Draft attendance records are in each day type?` | SQL replaced the old date and Authorized filter with September 5 and Draft. Browser table showed OFF Day (ZAS) **40**, Working Day **148**, total **188**. | Pass. |
+| B16 | After B15: `Actually remove Draft and count every status together for those same Sep 5 day types.` | Date-only SQL grouped by day type. Browser bullets showed OFF Day **6**, OFF Day (ZAS) **202**, Working Day **360**, total **568**; Retrieved Context and independent aggregate matched. | Pass on a second, differently worded filter-removal run. |
+
 ## Add a new manual case
 
 Record the exact prompt and preceding turns, code commit, data snapshot or

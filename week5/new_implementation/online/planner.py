@@ -708,6 +708,9 @@ answers an intersection question instead. For listed record details, count
 each category directly from the returned rows before stating category totals.
 If a follow-up asks only for a new metric or breakdown, omit earlier measures
 and groups from the answer even if SQL returned them.
+When a follow-up removes a prior filter, use the current executed rows to
+answer the broader scope. Never restore the earlier filtered answer merely
+because it appears in conversation history.
 If both breakdowns use the same source rows and the query returned all joint
 groups, sum their counts separately along each dimension and give the requested
 two breakdowns in the answer. Requery if those joint groups are incomplete.
@@ -888,6 +891,13 @@ question asks for a count and the samples do not establish those totals.
 _REVIEW_EXAMPLES = """
 
 Examples of reviewing a proposed answer:
+Earlier request: "Draft records by day type on May 12?"
+Current request: "Drop Draft; show all statuses by day type on May 12."
+SQL returns complete day-type/status groups: OFF Day has Draft=2 and
+Authorized=3; Working Day has Draft=4 and Authorized=5.
+Review decision: requires_new_query=false. Reviewed answer gives OFF Day=5
+and Working Day=9 across statuses. It does not repeat the previous Draft-only
+counts or present the extra status breakdown as the requested result.
 Request: "How many attendance records were recorded on May 12?"
 SQL counts rows on that date but also filters status = 'Authorized'.
 Proposed answer reports the Authorized count. Review decision:
